@@ -21,7 +21,7 @@ def load_config():
         with open(CONFIG_FILE) as f:
             return json.load(f)
     return {
-        'guide_path':  '/Volumes/EPG/guide.xml',
+        'guide_path':  '/Volumes/EPG/guide/guide.xml',
         'timezone':    'America/New_York',
         'ts_input':    os.path.expanduser('~/Movies'),
         'ts_output':   os.path.expanduser('~/Movies/Converted'),
