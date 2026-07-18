@@ -2,7 +2,7 @@
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
 VERSION = "v20260718"
 
-import json, os, re, subprocess, threading, time, uuid
+import json, os, re, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
@@ -21,7 +21,8 @@ def load_config():
         with open(CONFIG_FILE) as f:
             return json.load(f)
     return {
-        'guide_path':  '/Volumes/EPG/guide/guide.xml',
+        'guide_path':  '/Volumes/EPG/guide.xml',
+        'db_path':     '/Volumes/EPG/Movies.db',
         'timezone':    'America/New_York',
         'ts_input':    os.path.expanduser('~/Movies'),
         'ts_output':   os.path.expanduser('~/Movies/Converted'),
@@ -55,6 +56,36 @@ def load_watchlist():
 def save_watchlist(wl):
     with open(WATCHLIST_FILE, 'w') as f:
         json.dump(wl, f, indent=2)
+
+# ── Movies.db ────────────────────────────────────────────────────────────────
+
+def get_db():
+    cfg = load_config()
+    path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_rows(sql, params=()):
+    try:
+        conn = get_db()
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f'[DB] {e}')
+        return []
+
+def db_run(sql, params=()):
+    try:
+        conn = get_db()
+        conn.execute(sql, params)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f'[DB] {e}')
+        return False
 
 # ── EPG Parsing ───────────────────────────────────────────────────────────────
 
@@ -184,8 +215,17 @@ def index():
 
 @app.route('/epg-web/api/status')
 def api_status():
+    progs = _epg['programmes']
+    extra = {}
+    if progs:
+        from zoneinfo import ZoneInfo
+        cfg = load_config()
+        ltz = ZoneInfo(cfg.get('timezone','America/New_York'))
+        first = datetime.fromtimestamp(progs[0]['start_ts'], tz=ltz).strftime('%Y-%m-%d %H:%M')
+        last  = datetime.fromtimestamp(progs[-1]['start_ts'], tz=ltz).strftime('%Y-%m-%d %H:%M')
+        extra = {'range_first': first, 'range_last': last}
     return jsonify({'ok': True, 'time': datetime.now().strftime('%I:%M:%S %p'),
-                    'loaded': _epg['loaded'], 'programmes': len(_epg['programmes'])})
+                    'loaded': _epg['loaded'], 'programmes': len(progs), **extra})
 
 @app.route('/epg-web/api/config', methods=['GET'])
 def api_get_config():
@@ -275,15 +315,40 @@ def api_guide():
 def api_channels():
     if not _epg['channels']:
         return jsonify({'error': 'Guide not loaded'}), 400
-    q = request.args.get('q','').lower()
+    q      = request.args.get('q','').lower()
+    favonly= request.args.get('fav','') == '1'
+    # Load favorites from DB
+    fav_rows = db_rows('SELECT channel_id, nickname, firestick_no FROM channels WHERE favorite=1')
+    fav_ids  = {r['channel_id'] for r in fav_rows}
+    fav_nick = {r['channel_id']: r['nickname'] for r in fav_rows}
+    fav_fs   = {r['channel_id']: r['firestick_no'] for r in fav_rows}
+
     chs = _epg['channels']
-    if q:
-        chs = [c for c in chs if q in c['name'].lower()]
-    return jsonify({'channels': chs, 'total': len(chs)})
+    # Annotate
+    annotated = []
+    for c in chs:
+        if q and q not in c['name'].lower():
+            continue
+        is_fav = c['id'] in fav_ids
+        if favonly and not is_fav:
+            continue
+        annotated.append({**c, 'favorite': is_fav,
+                          'nickname': fav_nick.get(c['id'],''),
+                          'firestick_no': fav_fs.get(c['id'],'')})
+    # Favorites first
+    annotated.sort(key=lambda c: (not c['favorite'], c['name']))
+    return jsonify({'channels': annotated, 'total': len(annotated)})
 
 @app.route('/epg-web/api/schedule', methods=['GET'])
 def api_get_schedule():
-    return jsonify({'schedule': load_schedule()})
+    status_filter = request.args.get('status', '')
+    if status_filter:
+        rows = db_rows('SELECT * FROM scheduled_recordings WHERE status=? ORDER BY start_time DESC LIMIT 500', (status_filter,))
+    else:
+        rows = db_rows('SELECT * FROM scheduled_recordings ORDER BY start_time DESC LIMIT 500')
+    # Also include any JSON-scheduled items
+    json_sched = load_schedule()
+    return jsonify({'schedule': rows, 'pending': json_sched})
 
 @app.route('/epg-web/api/schedule', methods=['POST'])
 def api_post_schedule():
@@ -326,53 +391,66 @@ def api_post_schedule():
 
 @app.route('/epg-web/api/recommendations')
 def api_recommendations():
-    if not _epg['programmes']:
-        return jsonify({'error': 'Guide not loaded'}), 400
+    # Wanted titles from DB cross-referenced with guide
+    wanted = db_rows('SELECT * FROM wanted_titles ORDER BY status, title')
     now_ts = datetime.now(timezone.utc).timestamp()
-    wl = load_watchlist()
-    wl_titles = {w['title'].lower() for w in wl}
 
-    # Count upcoming airings per title
-    from collections import Counter
-    title_count = Counter()
-    title_progs = {}
-    for p in _epg['programmes']:
-        if p['stop_ts'] <= now_ts:
-            continue
-        t = p['title']
-        title_count[t] += 1
-        if t not in title_progs:
-            title_progs[t] = p
+    # Build quick lookup of next airing per title from guide
+    next_airing = {}
+    if _epg['programmes']:
+        for p in _epg['programmes']:
+            if p['stop_ts'] <= now_ts:
+                continue
+            t = p['title'].lower()
+            if t not in next_airing:
+                next_airing[t] = p
 
-    # Watchlist shows first, then most-aired
-    recs = []
-    for title, prog in title_progs.items():
-        recs.append({**prog, 'airings': title_count[title],
-                     'on_watchlist': title.lower() in wl_titles})
+    result = []
+    for w in wanted:
+        airing = next_airing.get(w['title'].lower()) or next_airing.get(w['normalized_title'].lower() if w['normalized_title'] else '')
+        result.append({
+            'id':         w['id'],
+            'title':      w['title'],
+            'year':       w['year'],
+            'type':       w['type'],
+            'status':     w['status'],
+            'notes':      w['notes'],
+            'source':     w['source'],
+            'imdb_id':    w['imdb_id'],
+            'updated_at': w['updated_at'],
+            'next_airing': airing,
+        })
+    return jsonify({'recommendations': result})
 
-    recs.sort(key=lambda r: (not r['on_watchlist'], -r['airings']))
-    return jsonify({'recommendations': recs[:100]})
-
-@app.route('/epg-web/api/watchlist', methods=['GET'])
-def api_get_watchlist():
-    return jsonify({'watchlist': load_watchlist()})
-
-@app.route('/epg-web/api/watchlist', methods=['POST'])
-def api_post_watchlist():
+@app.route('/epg-web/api/wanted', methods=['POST'])
+def api_wanted():
     data = request.json or {}
     action = data.get('action')
-    title = data.get('title','').strip()
-    wl = load_watchlist()
     if action == 'add':
-        if not any(w['title'].lower() == title.lower() for w in wl):
-            wl.append({'title': title, 'added': datetime.now().strftime('%Y-%m-%d')})
-            save_watchlist(wl)
-        return jsonify({'ok': True, 'watchlist': wl})
+        title = data.get('title','').strip()
+        year  = data.get('year','')
+        norm  = title.lower().replace("'",'').replace('-',' ')
+        db_run('INSERT OR IGNORE INTO wanted_titles (title,normalized_title,year,type,source,status,created_at,updated_at) VALUES (?,?,?,?,?,?,datetime("now"),datetime("now"))',
+               (title, norm, year, data.get('type','movie'), 'manual', 'wanted'))
+        return jsonify({'ok': True})
     if action == 'remove':
-        wl = [w for w in wl if w['title'].lower() != title.lower()]
-        save_watchlist(wl)
-        return jsonify({'ok': True, 'watchlist': wl})
+        db_run('DELETE FROM wanted_titles WHERE id=?', (data.get('id'),))
+        return jsonify({'ok': True})
+    if action == 'update':
+        db_run('UPDATE wanted_titles SET status=?,notes=?,updated_at=datetime("now") WHERE id=?',
+               (data.get('status'), data.get('notes',''), data.get('id')))
+        return jsonify({'ok': True})
     return jsonify({'error': 'Unknown action'}), 400
+
+@app.route('/epg-web/api/library')
+def api_library():
+    q = request.args.get('q','').strip()
+    if q:
+        rows = db_rows('SELECT * FROM master_titles WHERE title LIKE ? OR genre LIKE ? OR actors LIKE ? ORDER BY title LIMIT 200',
+                       (f'%{q}%', f'%{q}%', f'%{q}%'))
+    else:
+        rows = db_rows('SELECT * FROM master_titles ORDER BY title LIMIT 500')
+    return jsonify({'library': rows, 'total': len(rows)})
 
 # ── Conversion routes ─────────────────────────────────────────────────────────
 
@@ -575,6 +653,7 @@ tr:hover td{background:#141414;}
 .status-msg{font-size:13px;color:#555;margin:8px 0;}
 .status-msg.ok{color:#4ade80;} .status-msg.err{color:#f87171;}
 .empty{color:#333;text-align:center;padding:40px;font-size:14px;}
+.ch-fav{border-color:#4a3a00!important;background:#1a1500!important;}
 .search-row{display:flex;gap:8px;margin-bottom:14px;}
 .search-row input{flex:1;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;
                   color:#e2e8f0;padding:7px 10px;font-size:13px;}
@@ -619,11 +698,17 @@ tr:hover td{background:#141414;}
 <!-- RECOMMENDATIONS -->
 <div id="pane-recommendations" class="pane">
   <div class="card">
-    <h2>Recommended Shows</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h2 style="margin:0;">Wanted Titles</h2>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-primary btn-sm" onclick="addWanted()">+ Add</button>
+        <button class="btn btn-ghost btn-sm" onclick="loadRecs()">↻ Refresh</button>
+      </div>
+    </div>
     <div id="rec-status" class="status-msg"></div>
     <div style="overflow-x:auto;">
       <table><thead><tr>
-        <th>Title</th><th>Channel</th><th>Next Airing</th><th>Airings</th><th>Actions</th>
+        <th>Title</th><th>Next Airing on Guide</th><th>Status</th><th>Actions</th>
       </tr></thead><tbody id="rec-body"></tbody></table>
     </div>
   </div>
@@ -635,6 +720,9 @@ tr:hover td{background:#141414;}
     <h2>All Channels</h2>
     <div class="search-row">
       <input id="ch-search" placeholder="Search channels…" oninput="loadChannels()">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#64748b;white-space:nowrap;cursor:pointer;">
+        <input type="checkbox" id="ch-fav-only" onchange="loadChannels()"> ★ Favorites only
+      </label>
     </div>
     <div id="ch-status" class="status-msg"></div>
     <div id="ch-grid" class="ch-grid"></div>
@@ -644,9 +732,16 @@ tr:hover td{background:#141414;}
 <!-- SCHEDULE -->
 <div id="pane-schedule" class="pane">
   <div class="card">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
       <h2 style="margin:0;">Recording Schedule</h2>
-      <button class="btn btn-ghost btn-sm" onclick="loadSchedule()">↻ Refresh</button>
+      <select id="sched-filter" onchange="loadSchedule()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 8px;font-size:12px;">
+        <option value="">All statuses</option>
+        <option value="scheduled">Scheduled</option>
+        <option value="completed">Completed</option>
+        <option value="failed">Failed</option>
+        <option value="cancelled">Cancelled</option>
+      </select>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadSchedule()">↻ Refresh</button>
     </div>
     <div id="sched-empty" class="empty" style="display:none;">
       Schedule Empty<br><span style="font-size:12px;color:#333;margin-top:6px;display:block;">
@@ -689,7 +784,9 @@ tr:hover td{background:#141414;}
   <div class="modal">
     <h3>⚙ Settings</h3>
     <div class="mrow"><label>Guide XML path</label>
-      <input id="s-path" placeholder="/Volumes/.../epg/guide.xml"></div>
+      <input id="s-path" placeholder="/Volumes/EPG/guide.xml"></div>
+    <div class="mrow"><label>Movies.db path</label>
+      <input id="s-db" placeholder="/Volumes/EPG/Movies.db"></div>
     <div class="mrow"><label>Timezone</label>
       <input id="s-tz" placeholder="America/New_York"></div>
     <div class="mrow"><label>TS input folder (source .ts files)</label>
@@ -747,6 +844,7 @@ function switchTab(name) {
 async function openSettings() {
   const cfg = await (await fetch('/epg-web/api/config')).json();
   document.getElementById('s-path').value  = cfg.guide_path || '';
+  document.getElementById('s-db').value    = cfg.db_path    || '';
   document.getElementById('s-tz').value    = cfg.timezone   || 'America/New_York';
   document.getElementById('s-tsin').value  = cfg.ts_input   || '';
   document.getElementById('s-tsout').value = cfg.ts_output  || '';
@@ -756,6 +854,7 @@ function closeSettings() { document.getElementById('modal-overlay').classList.re
 async function saveSettings() {
   await post('/epg-web/api/config', {
     guide_path: document.getElementById('s-path').value.trim(),
+    db_path:    document.getElementById('s-db').value.trim(),
     timezone:   document.getElementById('s-tz').value.trim() || 'America/New_York',
     ts_input:   document.getElementById('s-tsin').value.trim(),
     ts_output:  document.getElementById('s-tsout').value.trim(),
@@ -889,41 +988,57 @@ async function loadRecs() {
   try {
     const d = await (await fetch('/epg-web/api/recommendations')).json();
     if (d.error) { setEl('rec-status',d.error,'err'); return; }
-    setEl('rec-status','','');
-    const wl = (await (await fetch('/epg-web/api/watchlist')).json()).watchlist || [];
-    const wlSet = new Set(wl.map(w=>w.title.toLowerCase()));
+    const recs = d.recommendations || [];
+    setEl('rec-status', recs.length + ' wanted titles','');
+    const STATUS_BADGE = {wanted:'badge-record', found:'badge-wl', recorded:'badge-recorded', cancelled:'badge-skipped'};
     const tbody = document.getElementById('rec-body');
-    tbody.innerHTML = d.recommendations.map(r => `
-      <tr>
-        <td class="title-cell">${esc(r.title)}
-          ${wlSet.has(r.title.toLowerCase()) ? '<span class="badge badge-wl" style="margin-left:5px;">★</span>' : ''}
+    tbody.innerHTML = recs.map(r => {
+      const a = r.next_airing;
+      return `<tr>
+        <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
+          <span class="badge ${STATUS_BADGE[r.status]||'badge-record'}" style="margin-left:5px;">${esc(r.status||'wanted')}</span>
         </td>
-        <td class="ch-cell">${esc(r.channel)}</td>
-        <td class="time-cell">${esc(r.start_fmt)}</td>
-        <td style="color:#555;font-size:12px;">${r.airings}×</td>
+        <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>
+        <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
         <td class="act-cell">
-          <button class="btn btn-ghost btn-sm" onclick='wlToggle(${JSON.stringify(r.title)},${wlSet.has(r.title.toLowerCase())})'>
-            ${wlSet.has(r.title.toLowerCase()) ? '★ Watching' : '☆ Watch'}
-          </button>
-          <button class="btn btn-success btn-sm" onclick='addToSchedule(${JSON.stringify(r)})'>+ Schedule</button>
+          ${a ? `<button class="btn btn-success btn-sm" onclick='addToSchedule(${JSON.stringify(a)})'>+ Schedule</button>` : ''}
+          <button class="btn btn-ghost btn-sm" onclick='updateWanted(${r.id},"recorded")'>✅ Got it</button>
+          <button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button>
         </td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
   } catch(e) { setEl('rec-status','Failed: '+e.message,'err'); }
 }
-async function wlToggle(title, isOn) {
-  await post('/epg-web/api/watchlist', {action: isOn ? 'remove' : 'add', title});
+async function updateWanted(id, status) {
+  await post('/epg-web/api/wanted', {action:'update', id, status});
+  loadRecs();
+}
+async function removeWanted(id) {
+  if (!confirm('Remove from wanted list?')) return;
+  await post('/epg-web/api/wanted', {action:'remove', id});
+  loadRecs();
+}
+async function addWanted() {
+  const title = prompt('Movie/show title:');
+  if (!title) return;
+  await post('/epg-web/api/wanted', {action:'add', title, type:'movie'});
   loadRecs();
 }
 
 // ── Channels ──────────────────────────────────────────────────────────────────
 async function loadChannels() {
-  const q = document.getElementById('ch-search').value.trim();
+  const q    = document.getElementById('ch-search').value.trim();
+  const fav  = document.getElementById('ch-fav-only').checked ? '1' : '0';
   try {
-    const d = await (await fetch(`/epg-web/api/channels?q=${encodeURIComponent(q)}`)).json();
+    const d = await (await fetch(`/epg-web/api/channels?q=${encodeURIComponent(q)}&fav=${fav}`)).json();
     if (d.error) { setEl('ch-status',d.error,'err'); return; }
     setEl('ch-status',`${d.total} channels`,'');
     document.getElementById('ch-grid').innerHTML = d.channels.map((c,i) =>
-      `<div class="ch-card"><span class="ch-num">${i+1}</span>${esc(c.name)}</div>`
+      `<div class="ch-card ${c.favorite?'ch-fav':''}">
+        <span class="ch-num">${c.firestick_no||i+1}</span>
+        ${c.favorite?'<span style="color:#fcd34d;margin-right:4px;">★</span>':''}
+        ${esc(c.nickname||c.name)}
+      </div>`
     ).join('');
   } catch(e) { setEl('ch-status','Failed','err'); }
 }
@@ -935,26 +1050,29 @@ async function addToSchedule(prog) {
   setGS(msg,'ok');
 }
 async function loadSchedule() {
-  const d = await (await fetch('/epg-web/api/schedule')).json();
+  const statusFilter = document.getElementById('sched-filter') ? document.getElementById('sched-filter').value : '';
+  const url = '/epg-web/api/schedule' + (statusFilter ? '?status='+statusFilter : '');
+  const d   = await (await fetch(url)).json();
   const sched = d.schedule || [];
   const tbl = document.getElementById('sched-table');
   const emp = document.getElementById('sched-empty');
   if (!sched.length) { tbl.style.display='none'; emp.style.display='block'; return; }
   tbl.style.display='table'; emp.style.display='none';
-  const SL = {to_record:'📋 To Record', recorded:'✅ Recorded', skipped:'⛔ Skipped'};
-  const SB = {to_record:'badge-record', recorded:'badge-recorded', skipped:'badge-skipped'};
+  const SB = {
+    scheduled:'badge-record', recording:'badge-wl',
+    completed:'badge-recorded', failed:'badge-skipped',
+    cancelled:'badge-skipped', to_record:'badge-record',
+    recorded:'badge-recorded', skipped:'badge-skipped'
+  };
   document.getElementById('sched-body').innerHTML = sched.map((r,i) => `
     <tr>
-      <td class="title-cell">${esc(r.title)}</td>
-      <td class="ch-cell">${esc(r.channel)}</td>
-      <td class="time-cell">${esc(r.start_fmt)}<br>${esc(r.stop_fmt)}</td>
-      <td><span class="badge ${SB[r.status]||''}">${SL[r.status]||r.status}</span></td>
-      <td class="act-cell">
-        ${r.status!=='recorded'?`<button class="btn btn-success btn-sm" onclick="schedUpdate(${i},'recorded')">✅</button>`:''}
-        ${r.status!=='skipped' ?`<button class="btn btn-ghost btn-sm"   onclick="schedUpdate(${i},'skipped')">⛔</button>`:''}
-        ${r.status!=='to_record'?`<button class="btn btn-ghost btn-sm"  onclick="schedUpdate(${i},'to_record')">↩</button>`:''}
-        <button class="btn btn-danger btn-sm" onclick="schedRemove(${i})">✕</button>
+      <td class="title-cell">${esc(r.title)}
+        ${r.episode_title?`<br><span style="font-size:11px;color:#555;">S${r.season_number||'?'}E${r.episode_number||'?'} ${esc(r.episode_title)}</span>`:''}
       </td>
+      <td class="ch-cell">${esc(r.channel)}</td>
+      <td class="time-cell">${esc(r.start_time||r.start_fmt||'')}</td>
+      <td><span class="badge ${SB[r.status]||''}">${esc(r.status||'')}</span></td>
+      <td style="font-size:11px;color:#555;">${esc(r.failure_reason||'')}</td>
     </tr>`).join('');
 }
 async function schedUpdate(i,s){await post('/epg-web/api/schedule',{action:'update',index:i,status:s});loadSchedule();}
