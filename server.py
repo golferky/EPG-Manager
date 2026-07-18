@@ -21,7 +21,7 @@ def load_config():
         with open(CONFIG_FILE) as f:
             return json.load(f)
     return {
-        'guide_path':  '/Volumes/CACHEDEV1_DATA/epg/guide.xml',
+        'guide_path':  '/Volumes/EPG/guide.xml',
         'timezone':    'America/New_York',
         'ts_input':    os.path.expanduser('~/Movies'),
         'ts_output':   os.path.expanduser('~/Movies/Converted'),
@@ -711,20 +711,24 @@ let _guideHours = 4;
 const PX_PER_MIN = 4;           // 1 min = 4px → 30min = 120px, 1hr = 240px
 
 // ── Clock + live status ───────────────────────────────────────────────────────
-async function tickClock() {
+function tickClock() {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+async function refreshStatus() {
   try {
     const d = await (await fetch('/epg-web/api/status')).json();
-    document.getElementById('clock').textContent = d.time;
     if (d.programmes) {
       document.getElementById('live-badge').textContent =
         `● Server live · ${d.programmes.toLocaleString()} prog`;
     }
-  } catch(e) {
-    document.getElementById('live-badge').textContent = '● Server live';
-  }
+  } catch(e) {}
 }
-setInterval(tickClock, 1000);
-tickClock();
+setInterval(refreshStatus, 30000);
+refreshStatus();
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
