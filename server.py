@@ -359,7 +359,7 @@ def _stream_url(channel_id):
     if not rows:
         return None, 'No stream_id found for channel'
     sid = rows[0]['stream_id']
-    url = f"{cfg['epg_url'].rstrip('/')}live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
+    url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
     return url, None
 
 def _safe_filename(title):
