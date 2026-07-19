@@ -559,16 +559,25 @@ def api_guide():
     ch_filter  = request.args.get('ch', '').lower()
     fav_only   = request.args.get('fav', '0') == '1'
     movie_only = request.args.get('movie', '0') == '1'
+    ps_only    = request.args.get('ps',  '0') == '1'
+    sd_only    = request.args.get('sd',  '0') == '1'
 
     # Build allowed channel set from Movies.db if filtering
     allowed_ch_ids = None
-    if fav_only or movie_only:
+    if fav_only or movie_only or ps_only:
         where_parts = []
         if fav_only:   where_parts.append('favorite = 1')
         if movie_only: where_parts.append('is_movie_channel = 1')
-        where = ' AND '.join(where_parts)
-        rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where} AND guide_channel IS NOT NULL AND guide_channel != ""')
+        where = (' AND '.join(where_parts) + ' AND ' if where_parts else '') + \
+                'guide_channel IS NOT NULL AND guide_channel != ""'
+        rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
         allowed_ch_ids = {r['guide_channel'] for r in rows}
+
+    # For SD-only: channels NOT in Movies.db (no stream_id)
+    excluded_ch_ids = None
+    if sd_only:
+        rows = db_rows('SELECT guide_channel FROM channels WHERE guide_channel IS NOT NULL AND guide_channel != ""')
+        excluded_ch_ids = {r['guide_channel'] for r in rows}
 
     # Collect channels present in window
     ch_set = set()
@@ -577,6 +586,8 @@ def api_guide():
         if p['stop_ts'] <= ws_ts or p['start_ts'] >= we_ts:
             continue
         if allowed_ch_ids is not None and p['channel_id'] not in allowed_ch_ids:
+            continue
+        if excluded_ch_ids is not None and p['channel_id'] in excluded_ch_ids:
             continue
         if ch_filter and ch_filter not in p['channel'].lower():
             continue
@@ -1346,6 +1357,8 @@ tr:hover td{background:#141414;}
       <option value="all">All Channels</option>
       <option value="fav">★ Favorites</option>
       <option value="movie">🎬 Movie Channels</option>
+      <option value="ps">📡 PrimeStreams Only</option>
+      <option value="sd">📺 SD Only</option>
     </select>
     <div style="position:relative;display:inline-block;">
       <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value)" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;">
@@ -1749,8 +1762,10 @@ async function fetchAndRenderGuide() {
   const ch = document.getElementById('ch-filter').value.trim();
   if (ch) params.set('ch', ch);
   const mode = document.getElementById('guide-ch-mode').value;
-  if (mode === 'fav')   params.set('fav', '1');
+  if (mode === 'fav')   params.set('fav',   '1');
   if (mode === 'movie') params.set('movie', '1');
+  if (mode === 'ps')    params.set('ps',    '1');
+  if (mode === 'sd')    params.set('sd',    '1');
   params.set('ch_offset', _chOffset);
   try {
     const r = await fetch('/epg-web/api/guide?' + params);
