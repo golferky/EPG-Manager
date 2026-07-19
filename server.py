@@ -617,45 +617,58 @@ def api_guide():
 
 @app.route('/epg-web/api/search')
 def api_search():
-    """Search channels and upcoming programs in guide.db."""
+    """Search channels and current/upcoming programs in guide.db."""
     q = request.args.get('q', '').strip()
     if len(q) < 2:
         return jsonify({'channels': [], 'programs': []})
-    cfg     = load_config()
-    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
-    now_utc = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-    like    = f'%{q}%'
-    results = {'channels': [], 'programs': []}
+    cfg      = load_config()
+    db_path  = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    from zoneinfo import ZoneInfo
+    local_tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+    now_utc  = datetime.now(timezone.utc)
+    now_str  = now_utc.strftime('%Y%m%d%H%M%S')
+    like     = f'%{q}%'
+    results  = {'channels': [], 'programs': []}
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        # Channel matches from guide_channels
-        ch_rows = conn.execute(
-            'SELECT DISTINCT channel_id, channel_name FROM guide_channels WHERE channel_name LIKE ? ORDER BY channel_name LIMIT 20',
-            (like,)
-        ).fetchall()
+
+        # Channel name matches (only channels with current/future programming)
+        ch_rows = conn.execute('''
+            SELECT DISTINCT g.channel_id, g.channel_name
+            FROM guide g
+            WHERE g.channel_name LIKE ? AND g.end_utc > ?
+            ORDER BY g.channel_name LIMIT 20
+        ''', (like, now_str)).fetchall()
         results['channels'] = [{'id': r['channel_id'], 'name': r['channel_name']} for r in ch_rows]
-        # Also check guide table for channel names not in guide_channels
-        if len(results['channels']) < 20:
-            existing = {r['id'] for r in results['channels']}
-            extra = conn.execute(
-                'SELECT DISTINCT channel_id, channel_name FROM guide WHERE channel_name LIKE ? ORDER BY channel_name LIMIT 20',
-                (like,)
-            ).fetchall()
-            for r in extra:
-                if r['channel_id'] not in existing:
-                    results['channels'].append({'id': r['channel_id'], 'name': r['channel_name']})
-                    existing.add(r['channel_id'])
-                if len(results['channels']) >= 20:
-                    break
-        # Program matches (upcoming only)
-        prog_rows = conn.execute(
-            '''SELECT DISTINCT title, category FROM guide
-               WHERE title LIKE ? AND end_utc > ?
-               ORDER BY title LIMIT 20''',
-            (like, now_utc)
-        ).fetchall()
-        results['programs'] = [{'title': r['title'], 'category': r['category']} for r in prog_rows]
+
+        # Program title matches — one row per channel airing it, current/upcoming only
+        prog_rows = conn.execute('''
+            SELECT title, channel_id, channel_name, start_utc, end_utc, category
+            FROM guide
+            WHERE title LIKE ? AND end_utc > ?
+            ORDER BY start_utc
+            LIMIT 40
+        ''', (like, now_str)).fetchall()
+
+        programs = []
+        for r in prog_rows:
+            try:
+                su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                sl = su.astimezone(local_tz)
+                on_now = su <= now_utc < eu
+                programs.append({
+                    'title':        r['title'],
+                    'channel_id':   r['channel_id'],
+                    'channel_name': r['channel_name'],
+                    'start_fmt':    ('ON NOW' if on_now else sl.strftime('%a %-I:%M %p')),
+                    'category':     r['category'] or '',
+                    'on_now':       on_now,
+                })
+            except Exception:
+                continue
+        results['programs'] = programs
         conn.close()
     except Exception as e:
         print(f'[search] {e}')
@@ -1687,9 +1700,13 @@ function onSearchInput(val) {
       ).join('');
     }
     if (d.programs && d.programs.length) {
-      html += '<div style="padding:6px 12px;font-size:11px;color:#f59e0b;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;">🎬 Programs</div>';
+      html += '<div style="padding:6px 12px;font-size:11px;color:#f59e0b;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;">🎬 On Now / Upcoming</div>';
       html += d.programs.map(p =>
-        `<div class="sr" onclick="searchOpenProg(${JSON.stringify(p.title).replace(/"/g,'&quot;')})" style="padding:8px 14px;cursor:pointer;font-size:13px;color:#e2e8f0;border-bottom:1px solid #1e293b;">${esc(p.title)}<span style="color:#64748b;font-size:11px;margin-left:8px;">${esc(p.category||'')}</span></div>`
+        `<div class="sr" onclick="searchOpenProg(${JSON.stringify(p.title).replace(/"/g,'&quot;')})" style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:10px;">
+          <span style="font-size:12px;min-width:70px;color:${p.on_now?'#22c55e':'#94a3b8'};font-weight:${p.on_now?'600':'400'};">${esc(p.start_fmt)}</span>
+          <span style="flex:1;font-size:13px;color:#e2e8f0;">${esc(p.title)}</span>
+          <span style="font-size:11px;color:#64748b;text-align:right;">${esc(p.channel_name)}</span>
+        </div>`
       ).join('');
     }
     if (!html) html = '<div style="padding:12px 14px;color:#64748b;font-size:13px;">No results</div>';
