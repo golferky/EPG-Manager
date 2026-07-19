@@ -815,39 +815,24 @@ def api_prog_info():
     omdb_key = cfg.get('omdb_key', '')
     tmdb_key = cfg.get('tmdb_key', '')
 
-    # 1. Check master_titles in Movies.db
+    # 1. Check master_titles — for in_library flag + local poster fallback
+    lib_row = None
     rows = db_rows(
-        'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated, imdb_votes FROM master_titles WHERE lower(title)=lower(?) LIMIT 1',
+        'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated FROM master_titles WHERE lower(title)=lower(?) LIMIT 1',
         (title,)
     )
     if not rows:
         rows = db_rows(
-            'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated, imdb_votes FROM master_titles WHERE lower(title) LIKE lower(?) LIMIT 1',
+            'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated FROM master_titles WHERE lower(title) LIKE lower(?) LIMIT 1',
             (f'%{title}%',)
         )
     if rows:
-        r = rows[0]
-        return jsonify({
-            'source':   'library',
-            'in_library': True,
-            'title':    r['title'],
-            'year':     r['year'] or '',
-            'genre':    r['genre'] or '',
-            'rated':    r['rated'] or '',
-            'plot':     r['plot'] or '',
-            'actors':   r['actors'] or '',
-            'director': r['director'] or '',
-            'poster':   r['poster_url'] or '',
-            'imdb_rating': r['imdb_rating'] or '',
-            'imdb_votes':  r['imdb_votes'] or '',
-        })
+        lib_row = rows[0]
 
-    # 2. Check guide_listings
-    gl = db_rows('SELECT title, plot, actors, director, year, star_rating, genre FROM guide_listings WHERE lower(title)=lower(?) LIMIT 1', (title,))
-    if not gl:
-        gl = db_rows('SELECT title, plot, actors, director, year, star_rating, genre FROM guide_listings WHERE lower(title) LIKE lower(?) LIMIT 1', (f'%{title}%',))
+    in_library  = lib_row is not None
+    local_poster = lib_row['poster_url'] if lib_row and lib_row.get('poster_url') else ''
 
-    # 3. OMDB lookup
+    # 2. OMDB — primary enrichment source (best actor/director coverage)
     if omdb_key:
         try:
             q   = quote(title)
@@ -856,9 +841,11 @@ def api_prog_info():
             with urlreq.urlopen(url, timeout=5) as resp:
                 od = json.loads(resp.read())
             if od.get('Response') == 'True':
+                poster = od.get('Poster','')
+                if poster == 'N/A': poster = ''
                 return jsonify({
                     'source':      'omdb',
-                    'in_library':  False,
+                    'in_library':  in_library,
                     'title':       od.get('Title',''),
                     'year':        od.get('Year',''),
                     'genre':       od.get('Genre',''),
@@ -866,14 +853,14 @@ def api_prog_info():
                     'plot':        od.get('Plot',''),
                     'actors':      od.get('Actors',''),
                     'director':    od.get('Director',''),
-                    'poster':      od.get('Poster','') if od.get('Poster') != 'N/A' else '',
+                    'poster':      poster or local_poster,
                     'imdb_rating': od.get('imdbRating',''),
                     'imdb_votes':  od.get('imdbVotes',''),
                 })
         except Exception as e:
             print(f'[OMDB] {e}')
 
-    # 4. TMDB lookup
+    # 3. TMDB fallback
     if tmdb_key:
         try:
             q   = quote(title)
@@ -886,7 +873,7 @@ def api_prog_info():
                 poster = f"https://image.tmdb.org/t/p/w300{m['poster_path']}" if m.get('poster_path') else ''
                 return jsonify({
                     'source':      'tmdb',
-                    'in_library':  False,
+                    'in_library':  in_library,
                     'title':       m.get('title') or m.get('name',''),
                     'year':        (m.get('release_date') or m.get('first_air_date',''))[:4],
                     'genre':       '',
@@ -894,27 +881,47 @@ def api_prog_info():
                     'plot':        m.get('overview',''),
                     'actors':      '',
                     'director':    '',
-                    'poster':      poster,
+                    'poster':      poster or local_poster,
                     'imdb_rating': str(round(m.get('vote_average',0),1)),
                     'imdb_votes':  '',
                 })
         except Exception as e:
             print(f'[TMDB] {e}')
 
-    # 5. Fallback to guide_listings data
+    # 4. Fall back to whatever we have locally
+    if lib_row:
+        return jsonify({
+            'source':      'library',
+            'in_library':  True,
+            'title':       lib_row['title'],
+            'year':        lib_row['year'] or '',
+            'genre':       lib_row['genre'] or '',
+            'rated':       lib_row['rated'] or '',
+            'plot':        lib_row['plot'] or '',
+            'actors':      lib_row['actors'] or '',
+            'director':    lib_row['director'] or '',
+            'poster':      local_poster,
+            'imdb_rating': lib_row['imdb_rating'] or '',
+            'imdb_votes':  '',
+        })
+
+    # 5. guide_listings
+    gl = db_rows('SELECT title, plot, actors, director, year, star_rating, genre FROM guide_listings WHERE lower(title)=lower(?) LIMIT 1', (title,))
+    if not gl:
+        gl = db_rows('SELECT title, plot, actors, director, year, star_rating, genre FROM guide_listings WHERE lower(title) LIKE lower(?) LIMIT 1', (f'%{title}%',))
     if gl:
         g = gl[0]
         return jsonify({
-            'source':   'guide',
-            'in_library': False,
-            'title':    g['title'],
-            'year':     g['year'] or '',
-            'genre':    g['genre'] or '',
-            'rated':    '',
-            'plot':     g['plot'] or '',
-            'actors':   g['actors'] or '',
-            'director': g['director'] or '',
-            'poster':   '',
+            'source':      'guide',
+            'in_library':  False,
+            'title':       g['title'],
+            'year':        g['year'] or '',
+            'genre':       g['genre'] or '',
+            'rated':       '',
+            'plot':        g['plot'] or '',
+            'actors':      g['actors'] or '',
+            'director':    g['director'] or '',
+            'poster':      '',
             'imdb_rating': g['star_rating'] or '',
             'imdb_votes':  '',
         })
@@ -1184,8 +1191,7 @@ tr:hover td{background:#141414;}
         <div id="pm-poster-wrap" style="flex-shrink:0;width:130px;background:#0d1117;">
           <img id="pm-poster" src="" alt="" style="width:130px;height:195px;object-fit:cover;display:block;">
         </div>
-        <div style="flex:1;padding:20px 20px 14px;display:flex;flex-direction:column;justify-content:space-between;">
-          <div>
+        <div style="flex:1;padding:20px 20px 14px;overflow-y:auto;">
             <div style="display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
               <h3 id="pm-title" style="font-size:18px;font-weight:700;color:#f1f5f9;margin:0;line-height:1.3;"></h3>
               <span id="pm-library-badge" style="display:none;background:#166534;color:#86efac;font-size:10px;font-weight:600;padding:2px 7px;border-radius:99px;white-space:nowrap;margin-top:3px;">IN LIBRARY</span>
@@ -1193,13 +1199,13 @@ tr:hover td{background:#141414;}
             <div id="pm-air" style="font-size:12px;color:#3b82f6;margin-bottom:8px;font-weight:500;"></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
               <span id="pm-year"  style="font-size:12px;color:#94a3b8;"></span>
-              <span id="pm-rated" style="font-size:11px;background:#1e293b;color:#64748b;padding:1px 6px;border-radius:4px;"></span>
+              <span id="pm-rated" style="font-size:11px;background:#1e293b;color:#94a3b8;padding:1px 6px;border-radius:4px;"></span>
               <span id="pm-genre" style="font-size:12px;color:#94a3b8;"></span>
               <span id="pm-imdb"  style="font-size:12px;color:#fbbf24;font-weight:600;"></span>
             </div>
-            <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0 0 8px;"></p>
-          </div>
-          <div id="pm-actors" style="font-size:12px;color:#64748b;"></div>
+            <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0 0 10px;"></p>
+            <div id="pm-actors" style="font-size:12px;color:#94a3b8;margin-bottom:4px;"></div>
+            <div id="pm-director" style="font-size:12px;color:#94a3b8;"></div>
         </div>
       </div>
       <!-- Footer -->
@@ -1604,7 +1610,8 @@ async function openProg(p) {
   document.getElementById('pm-rated').textContent = info.rated || '';
   document.getElementById('pm-genre').textContent = info.genre || '';
   document.getElementById('pm-imdb').textContent  = info.imdb_rating ? '★ ' + info.imdb_rating : '';
-  document.getElementById('pm-actors').textContent = info.actors ? '🎭 ' + info.actors : (info.director ? '🎬 ' + info.director : '');
+  document.getElementById('pm-actors').textContent   = info.actors  ? '🎭 ' + info.actors  : '';
+  document.getElementById('pm-director').textContent = info.director ? '🎬 ' + info.director : '';
 
   const libBadge = document.getElementById('pm-library-badge');
   libBadge.style.display = info.in_library ? 'inline-block' : 'none';
@@ -1622,13 +1629,13 @@ async function openProg(p) {
 
   // Record button state
   const btn = document.getElementById('pm-rec-btn');
-  if (p.stop_ts < now) {
-    btn.style.display = 'none';
+  if (p.start_ts <= now) {
+    btn.style.display = 'none';  // already started or aired
   } else if (alreadyRec) {
-    btn.disabled = true; btn.textContent = '✅ Already recording'; btn.style.display = '';
+    btn.disabled = true; btn.textContent = '✅ Already scheduled'; btn.style.display = '';
   } else {
     btn.disabled = false; btn.style.display = '';
-    btn.textContent = p.start_ts > now ? '⏱ Schedule Recording' : '🔴 Record Now';
+    btn.textContent = '⏱ Schedule Recording';
   }
 
   document.getElementById('pm-loading').style.display = 'none';
