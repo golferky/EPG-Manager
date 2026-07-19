@@ -1689,7 +1689,7 @@ function onSearchInput(val) {
     if (d.programs && d.programs.length) {
       html += '<div style="padding:6px 12px;font-size:11px;color:#f59e0b;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;">🎬 Programs</div>';
       html += d.programs.map(p =>
-        `<div class="sr" onclick="searchOpenProg(${JSON.stringify(p.title)})" style="padding:8px 14px;cursor:pointer;font-size:13px;color:#e2e8f0;border-bottom:1px solid #1e293b;">${esc(p.title)}<span style="color:#64748b;font-size:11px;margin-left:8px;">${esc(p.category||'')}</span></div>`
+        `<div class="sr" onclick="searchOpenProg(${JSON.stringify(p.title).replace(/"/g,'&quot;')})" style="padding:8px 14px;cursor:pointer;font-size:13px;color:#e2e8f0;border-bottom:1px solid #1e293b;">${esc(p.title)}<span style="color:#64748b;font-size:11px;margin-left:8px;">${esc(p.category||'')}</span></div>`
       ).join('');
     }
     if (!html) html = '<div style="padding:12px 14px;color:#64748b;font-size:13px;">No results</div>';
