@@ -962,7 +962,7 @@ def api_airings():
             SELECT channel_id, channel_name, start_utc, end_utc
             FROM guide
             WHERE (lower(title) = lower(?) OR lower(title) = lower(?))
-            AND start_utc > ?
+            AND end_utc > ?
             ORDER BY start_utc
             LIMIT 30
         ''', (title, clean_title, now_utc)).fetchall()
@@ -987,6 +987,7 @@ def api_airings():
             eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             sl = su.astimezone(local_tz)
             el = eu.astimezone(local_tz)
+            now_ts = datetime.now(timezone.utc).timestamp()
             airings.append({
                 'channel_id':   r['channel_id'],
                 'channel_name': r['channel_name'],
@@ -995,6 +996,7 @@ def api_airings():
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
                 'can_record':   r['channel_id'] in recordable,
+                'on_now':       su.timestamp() <= now_ts < eu.timestamp(),
             })
         except Exception:
             continue
@@ -1773,19 +1775,31 @@ async function openProg(p) {
           recMap[r.channel_id + '|' + r.start_ts] = true;
       });
 
-      // Find first primestreams airing for featured section
-      const nextPS = ar.airings.find(a => a.can_record);
-      if (nextPS) {
-        _nextAiring = nextPS;
+      // Find currently-airing primestreams show (for Play), then next future one (for Record)
+      const livePS   = ar.airings.find(a => a.can_record && a.on_now);
+      const futurePS = ar.airings.find(a => a.can_record && !a.on_now);
+      const featPS   = livePS || futurePS;
+      if (featPS) {
+        _nextAiring = featPS;
         _nextAiring._title = p.title;
-        document.getElementById('pm-next-info').textContent =
-          nextPS.start_fmt + ' – ' + nextPS.stop_fmt + '  ·  ' + nextPS.channel_name;
+        const label = featPS.on_now
+          ? `ON NOW  ·  ${featPS.channel_name}  (until ${featPS.stop_fmt})`
+          : `${featPS.start_fmt} – ${featPS.stop_fmt}  ·  ${featPS.channel_name}`;
+        document.getElementById('pm-next-info').textContent = label;
+
+        // Play button: only when currently airing
+        const pBtn = document.getElementById('pm-play-btn');
+        pBtn.style.display = featPS.on_now ? '' : 'none';
+
+        // Record button: only for future airings
         const rBtn = document.getElementById('pm-rec-next-btn');
-        const key = nextPS.channel_id + '|' + nextPS.start_ts;
-        if (recMap[key]) {
-          rBtn.textContent = '✅ Scheduled'; rBtn.disabled = true;
+        const key = featPS.channel_id + '|' + featPS.start_ts;
+        if (featPS.on_now) {
+          rBtn.style.display = 'none';
+        } else if (recMap[key]) {
+          rBtn.textContent = '✅ Scheduled'; rBtn.disabled = true; rBtn.style.display = '';
         } else {
-          rBtn.textContent = '⏱ Record'; rBtn.disabled = false;
+          rBtn.textContent = '⏱ Record'; rBtn.disabled = false; rBtn.style.display = '';
         }
         document.getElementById('pm-next-wrap').style.display = 'block';
       }
