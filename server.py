@@ -651,7 +651,32 @@ def api_search():
             WHERE g.channel_name LIKE ? AND g.end_utc > ?
             ORDER BY g.channel_name LIMIT 20
         ''', (like, now_str)).fetchall()
-        results['channels'] = [{'id': r['channel_id'], 'name': r['channel_name']} for r in ch_rows]
+        ch_found = {r['channel_id']: {'id': r['channel_id'], 'name': r['channel_name']} for r in ch_rows}
+
+        # Also search Movies.db guide_channel names (e.g. "tastemade.us") and map to guide.db channel_id
+        try:
+            mdb_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+            mconn = sqlite3.connect(mdb_path)
+            mconn.row_factory = sqlite3.Row
+            mrows = mconn.execute(
+                'SELECT guide_channel FROM channels WHERE guide_channel LIKE ? AND guide_channel IS NOT NULL LIMIT 20',
+                (like,)
+            ).fetchall()
+            mconn.close()
+            for mr in mrows:
+                gc = mr['guide_channel']
+                # Find this channel_id in guide.db
+                grows = conn.execute(
+                    'SELECT DISTINCT channel_id, channel_name FROM guide WHERE channel_id=? AND end_utc > ? LIMIT 1',
+                    (gc, now_str)
+                ).fetchall()
+                for gr in grows:
+                    if gr['channel_id'] not in ch_found:
+                        ch_found[gr['channel_id']] = {'id': gr['channel_id'], 'name': gr['channel_name']}
+        except Exception:
+            pass
+
+        results['channels'] = sorted(ch_found.values(), key=lambda x: x['name'])[:20]
 
         # Program title matches — one row per channel airing it, current/upcoming only
         prog_rows = conn.execute('''
