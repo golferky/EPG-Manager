@@ -1203,9 +1203,9 @@ tr:hover td{background:#141414;}
               <span id="pm-genre" style="font-size:12px;color:#94a3b8;"></span>
               <span id="pm-imdb"  style="font-size:12px;color:#fbbf24;font-weight:600;"></span>
             </div>
-            <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0 0 10px;"></p>
-            <div id="pm-actors" style="font-size:12px;color:#94a3b8;margin-bottom:4px;"></div>
-            <div id="pm-director" style="font-size:12px;color:#94a3b8;"></div>
+            <div id="pm-actors" style="font-size:12px;color:#94a3b8;margin-bottom:3px;"></div>
+            <div id="pm-director" style="font-size:12px;color:#94a3b8;margin-bottom:10px;"></div>
+            <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0;"></p>
         </div>
       </div>
       <!-- Footer -->
@@ -1597,8 +1597,7 @@ async function openProg(p) {
   // Fetch enriched info
   let info = {};
   try {
-    const yr = p.start_fmt ? p.start_fmt.substring(0,4) : '';
-    const r  = await fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}&year=${yr}`);
+    const r  = await fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}`);
     if (r.ok) info = await r.json();
   } catch(e) {}
 
