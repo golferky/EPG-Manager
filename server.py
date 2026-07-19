@@ -1150,15 +1150,8 @@ def api_airings():
     except Exception:
         return jsonify({'airings': []})
 
-    # Build set of channel_ids that have a valid stream_id (primestreams only)
-    recordable = set()
-    try:
-        stream_rows = db_rows(
-            'SELECT guide_channel FROM channels WHERE stream_id IS NOT NULL AND stream_id != "" AND stream_id != 0'
-        )
-        recordable = {r['guide_channel'] for r in stream_rows if r['guide_channel']}
-    except Exception:
-        pass
+    # Build set of guide.db channel_ids that have a primestreams stream (incl. name-match fallback)
+    recordable = get_ps_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
 
     airings = []
     for r in rows:
