@@ -811,6 +811,14 @@ def api_prog_info():
     if not title:
         return jsonify({'error': 'No title'}), 400
 
+    # Strip trailing (YYYY) from titles like "Batman Returns (1992)"
+    import re as _re
+    m = _re.match(r'^(.+?)\s*\((\d{4})\)\s*$', title)
+    if m:
+        title = m.group(1).strip()
+        if not year:
+            year = m.group(2)
+
     cfg = load_config()
     omdb_key = cfg.get('omdb_key', '')
     tmdb_key = cfg.get('tmdb_key', '')
