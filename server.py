@@ -955,6 +955,16 @@ def api_airings():
     except Exception:
         return jsonify({'airings': []})
 
+    # Build set of channel_ids that have a valid stream_id (primestreams only)
+    recordable = set()
+    try:
+        stream_rows = db_rows(
+            'SELECT guide_channel FROM channels WHERE stream_id IS NOT NULL AND stream_id != "" AND stream_id != 0'
+        )
+        recordable = {r['guide_channel'] for r in stream_rows if r['guide_channel']}
+    except Exception:
+        pass
+
     airings = []
     for r in rows:
         try:
@@ -969,10 +979,57 @@ def api_airings():
                 'stop_ts':      eu.timestamp(),
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
+                'can_record':   r['channel_id'] in recordable,
             })
         except Exception:
             continue
     return jsonify({'airings': airings})
+
+# ── VLC Play ──────────────────────────────────────────────────────────────────
+
+_vlc_pid = None
+
+@app.route('/epg-web/api/play', methods=['POST'])
+def api_play():
+    global _vlc_pid
+    data       = request.json or {}
+    channel_id = data.get('channel_id','')
+    cfg        = load_config()
+    url, err   = _stream_url(channel_id)
+    if err:
+        return jsonify({'error': err}), 400
+    # Kill existing VLC if running
+    if _vlc_pid:
+        try:
+            import signal
+            os.kill(_vlc_pid, signal.SIGTERM)
+        except Exception:
+            pass
+        _vlc_pid = None
+    try:
+        vlc_paths = [
+            '/Applications/VLC.app/Contents/MacOS/VLC',
+            '/usr/bin/vlc',
+            'vlc',
+        ]
+        vlc_exe = next((p for p in vlc_paths if os.path.exists(p)), 'vlc')
+        proc = subprocess.Popen([vlc_exe, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _vlc_pid = proc.pid
+        return jsonify({'ok': True, 'pid': _vlc_pid})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/play/stop', methods=['POST'])
+def api_play_stop():
+    global _vlc_pid
+    if _vlc_pid:
+        try:
+            import signal
+            os.kill(_vlc_pid, signal.SIGTERM)
+        except Exception:
+            pass
+        _vlc_pid = None
+    return jsonify({'ok': True})
 
 # ── Recording Routes ──────────────────────────────────────────────────────────
 
@@ -1254,10 +1311,19 @@ tr:hover td{background:#141414;}
             <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0;"></p>
         </div>
       </div>
-      <!-- Future airings -->
+      <!-- Next primestreams airing (featured) -->
+      <div id="pm-next-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;background:#0f1923;">
+        <div style="font-size:11px;font-weight:600;color:#3b82f6;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">📡 Next on PrimeStreams</div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <div id="pm-next-info" style="flex:1;font-size:13px;color:#e2e8f0;"></div>
+          <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
+          <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
+        </div>
+      </div>
+      <!-- All future airings -->
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
-        <div style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px;">📅 Future Airings</div>
-        <div id="pm-airings-list"></div>
+        <div style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px;">📅 All Future Airings</div>
+        <div id="pm-airings-list" style="max-height:160px;overflow-y:auto;"></div>
       </div>
       <!-- Footer -->
       <div style="padding:12px 20px;border-top:1px solid #1e293b;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
@@ -1680,7 +1746,9 @@ async function openProg(p) {
   document.getElementById('pm-content').style.display = 'block';
 
   // Fetch future airings
+  document.getElementById('pm-next-wrap').style.display    = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
+  _nextAiring = null;
   try {
     const ar = await (await fetch(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`)).json();
     if (ar.airings && ar.airings.length > 0) {
@@ -1689,15 +1757,36 @@ async function openProg(p) {
         if (['queued','scheduled','recording'].includes(r.status))
           recMap[r.channel_id + '|' + r.start_ts] = true;
       });
+
+      // Find first primestreams airing for featured section
+      const nextPS = ar.airings.find(a => a.can_record);
+      if (nextPS) {
+        _nextAiring = nextPS;
+        _nextAiring._title = p.title;
+        document.getElementById('pm-next-info').textContent =
+          nextPS.start_fmt + ' – ' + nextPS.stop_fmt + '  ·  ' + nextPS.channel_name;
+        const rBtn = document.getElementById('pm-rec-next-btn');
+        const key = nextPS.channel_id + '|' + nextPS.start_ts;
+        if (recMap[key]) {
+          rBtn.textContent = '✅ Scheduled'; rBtn.disabled = true;
+        } else {
+          rBtn.textContent = '⏱ Record'; rBtn.disabled = false;
+        }
+        document.getElementById('pm-next-wrap').style.display = 'block';
+      }
+
+      // Full airings list
       document.getElementById('pm-airings-list').innerHTML = ar.airings.map(a => {
         const key = a.channel_id + '|' + a.start_ts;
         const scheduled = recMap[key];
-        return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e293b;font-size:12px;">
+        return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;">
           <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
           <span style="color:#64748b;flex:1;">${esc(a.channel_name)}</span>
           ${scheduled
-            ? `<span style="color:#22c55e;font-size:11px;">✅ Scheduled</span>`
-            : `<button class="btn btn-primary btn-sm" onclick="recordAiring(${JSON.stringify(a).replace(/"/g,'&quot;')},${JSON.stringify(p.title).replace(/"/g,'&quot;')})">⏱ Record</button>`
+            ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
+            : a.can_record
+              ? `<button class="btn btn-primary btn-sm" onclick="recordAiring(${JSON.stringify(a).replace(/"/g,'&quot;')},${JSON.stringify(p.title).replace(/"/g,'&quot;')})">⏱</button>`
+              : ``
           }
         </div>`;
       }).join('');
@@ -1705,8 +1794,43 @@ async function openProg(p) {
     }
   } catch(e) {}
 }
+
+let _nextAiring = null;
+
+async function playStream() {
+  if (!_nextAiring) return;
+  const btn = document.getElementById('pm-play-btn');
+  btn.disabled = true; btn.textContent = '▶ Playing…';
+  const r = await post('/epg-web/api/play', {channel_id: _nextAiring.channel_id});
+  if (r.ok) {
+    btn.textContent = '■ Stop';
+    btn.onclick = stopStream;
+  } else {
+    btn.disabled = false; btn.textContent = '▶ Play';
+    document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'VLC failed');
+    document.getElementById('pm-status').className = 'status-msg err';
+  }
+}
+
+async function stopStream() {
+  await post('/epg-web/api/play/stop', {});
+  const btn = document.getElementById('pm-play-btn');
+  btn.textContent = '▶ Play'; btn.disabled = false;
+  btn.onclick = playStream;
+}
+
+async function recordNext() {
+  if (!_nextAiring) return;
+  await recordAiring(_nextAiring, _nextAiring._title);
+}
+
 function closeProg() {
   document.getElementById('prog-modal-overlay').style.display = 'none';
+  post('/epg-web/api/play/stop', {});
+  // reset play button for next open
+  const btn = document.getElementById('pm-play-btn');
+  btn.textContent = '▶ Play'; btn.disabled = false;
+  btn.onclick = playStream;
 }
 async function recordAiring(airing, title) {
   const btn = event.target;
