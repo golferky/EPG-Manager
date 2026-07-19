@@ -29,6 +29,11 @@ def load_config():
         'ts_output':     os.path.expanduser('~/Movies/Converted'),
         'sd_user':       '',
         'sd_pass':       '',
+        'epg_url':       'http://primestreams.tv:826/',
+        'epg_user':      '',
+        'epg_pass':      '',
+        'plex_path':     '/Volumes/Plex/Movies',
+        'rec_path':      os.path.expanduser('~/Movies/Recordings'),
     }
 
 def save_config(cfg):
@@ -338,6 +343,112 @@ def _run_conv(conv_id, inp, out):
     except Exception as e:
         with _conv_lock:
             _convs[conv_id].update({'status': 'error', 'error': str(e)})
+
+# ── Recording Engine ──────────────────────────────────────────────────────────
+
+_recs      = {}   # rec_id → {title, channel, start_ts, stop_ts, status, progress, log, pid, file}
+_rec_lock  = threading.Lock()
+
+def _stream_url(channel_id):
+    """Look up stream_id from Movies.db and build the stream URL."""
+    cfg  = load_config()
+    rows = db_rows(
+        'SELECT stream_id FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
+        (channel_id,)
+    )
+    if not rows:
+        return None, 'No stream_id found for channel'
+    sid = rows[0]['stream_id']
+    url = f"{cfg['epg_url'].rstrip('/')}live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
+    return url, None
+
+def _safe_filename(title):
+    return re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:60]
+
+def _run_recording(rec_id):
+    with _rec_lock:
+        rec = _recs[rec_id]
+    cfg      = load_config()
+    rec_dir  = cfg.get('rec_path', os.path.expanduser('~/Movies/Recordings'))
+    plex_dir = cfg.get('plex_path', '/Volumes/Plex/Movies')
+    os.makedirs(rec_dir, exist_ok=True)
+
+    title    = rec['title']
+    start_ts = rec['start_ts']
+    stop_ts  = rec['stop_ts']
+    ch_id    = rec['channel_id']
+
+    # Wait until start time (with 5s buffer)
+    wait = start_ts - time.time() - 5
+    if wait > 0:
+        with _rec_lock:
+            _recs[rec_id]['status'] = f'scheduled ({int(wait//60)}m away)'
+        time.sleep(wait)
+
+    url, err = _stream_url(ch_id)
+    if err:
+        with _rec_lock:
+            _recs[rec_id].update({'status': 'error', 'log': [err]})
+        return
+
+    duration = int(stop_ts - max(start_ts, time.time())) + 30  # 30s buffer
+    ts_file  = os.path.join(rec_dir, f'{_safe_filename(title)}_{int(start_ts)}.ts')
+    mp4_file = ts_file.replace('.ts', '.mp4')
+
+    with _rec_lock:
+        _recs[rec_id].update({'status': 'recording', 'file': ts_file})
+
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', url,
+            '-t', str(duration),
+            '-c', 'copy',
+            ts_file
+        ]
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+        with _rec_lock:
+            _recs[rec_id]['pid'] = proc.pid
+        for line in proc.stderr:
+            with _rec_lock:
+                _recs[rec_id].setdefault('log', []).append(line.strip())
+                if len(_recs[rec_id]['log']) > 50:
+                    _recs[rec_id]['log'] = _recs[rec_id]['log'][-30:]
+        proc.wait()
+
+        if proc.returncode != 0:
+            with _rec_lock:
+                _recs[rec_id]['status'] = 'error'
+            return
+
+        with _rec_lock:
+            _recs[rec_id]['status'] = 'converting'
+
+        # Convert .ts → .mp4
+        conv_cmd = [
+            'ffmpeg', '-y', '-i', ts_file,
+            '-c:v', 'copy', '-c:a', 'aac',
+            mp4_file
+        ]
+        conv = subprocess.run(conv_cmd, capture_output=True, text=True)
+        if conv.returncode == 0:
+            os.remove(ts_file)
+            with _rec_lock:
+                _recs[rec_id].update({'status': 'copying', 'file': mp4_file})
+            # Copy to Plex
+            if os.path.isdir(plex_dir):
+                import shutil
+                dest = os.path.join(plex_dir, os.path.basename(mp4_file))
+                shutil.copy2(mp4_file, dest)
+            with _rec_lock:
+                _recs[rec_id].update({'status': 'done', 'file': mp4_file})
+        else:
+            with _rec_lock:
+                _recs[rec_id].update({'status': 'done_ts', 'file': ts_file})  # keep .ts if convert failed
+
+    except Exception as e:
+        with _rec_lock:
+            _recs[rec_id].update({'status': 'error', 'error': str(e)})
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -689,6 +800,172 @@ def api_conv_cancel():
                 pass
     return jsonify({'ok': True})
 
+# ── Programme Info (OMDB/TMDB enrichment) ────────────────────────────────────
+
+@app.route('/epg-web/api/prog-info')
+def api_prog_info():
+    from urllib import request as urlreq
+    from urllib.parse import quote
+    title = request.args.get('title', '').strip()
+    year  = request.args.get('year', '').strip()
+    if not title:
+        return jsonify({'error': 'No title'}), 400
+
+    cfg = load_config()
+    omdb_key = cfg.get('omdb_key', '')
+    tmdb_key = cfg.get('tmdb_key', '')
+
+    # 1. Check master_titles in Movies.db
+    rows = db_rows(
+        'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated, imdb_votes FROM master_titles WHERE lower(title)=lower(?) LIMIT 1',
+        (title,)
+    )
+    if not rows:
+        rows = db_rows(
+            'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated, imdb_votes FROM master_titles WHERE lower(title) LIKE lower(?) LIMIT 1',
+            (f'%{title}%',)
+        )
+    if rows:
+        r = rows[0]
+        return jsonify({
+            'source':   'library',
+            'in_library': True,
+            'title':    r['title'],
+            'year':     r['year'] or '',
+            'genre':    r['genre'] or '',
+            'rated':    r['rated'] or '',
+            'plot':     r['plot'] or '',
+            'actors':   r['actors'] or '',
+            'director': r['director'] or '',
+            'poster':   r['poster_url'] or '',
+            'imdb_rating': r['imdb_rating'] or '',
+            'imdb_votes':  r['imdb_votes'] or '',
+        })
+
+    # 2. Check guide_listings
+    gl = db_rows('SELECT title, plot, actors, director, year, star_rating, genre FROM guide_listings WHERE lower(title)=lower(?) LIMIT 1', (title,))
+    if not gl:
+        gl = db_rows('SELECT title, plot, actors, director, year, star_rating, genre FROM guide_listings WHERE lower(title) LIKE lower(?) LIMIT 1', (f'%{title}%',))
+
+    # 3. OMDB lookup
+    if omdb_key:
+        try:
+            q   = quote(title)
+            yr  = f'&y={year}' if year else ''
+            url = f'http://www.omdbapi.com/?t={q}{yr}&apikey={omdb_key}'
+            with urlreq.urlopen(url, timeout=5) as resp:
+                od = json.loads(resp.read())
+            if od.get('Response') == 'True':
+                return jsonify({
+                    'source':      'omdb',
+                    'in_library':  False,
+                    'title':       od.get('Title',''),
+                    'year':        od.get('Year',''),
+                    'genre':       od.get('Genre',''),
+                    'rated':       od.get('Rated',''),
+                    'plot':        od.get('Plot',''),
+                    'actors':      od.get('Actors',''),
+                    'director':    od.get('Director',''),
+                    'poster':      od.get('Poster','') if od.get('Poster') != 'N/A' else '',
+                    'imdb_rating': od.get('imdbRating',''),
+                    'imdb_votes':  od.get('imdbVotes',''),
+                })
+        except Exception as e:
+            print(f'[OMDB] {e}')
+
+    # 4. TMDB lookup
+    if tmdb_key:
+        try:
+            q   = quote(title)
+            url = f'https://api.themoviedb.org/3/search/multi?api_key={tmdb_key}&query={q}'
+            with urlreq.urlopen(url, timeout=5) as resp:
+                td = json.loads(resp.read())
+            results = td.get('results', [])
+            if results:
+                m = results[0]
+                poster = f"https://image.tmdb.org/t/p/w300{m['poster_path']}" if m.get('poster_path') else ''
+                return jsonify({
+                    'source':      'tmdb',
+                    'in_library':  False,
+                    'title':       m.get('title') or m.get('name',''),
+                    'year':        (m.get('release_date') or m.get('first_air_date',''))[:4],
+                    'genre':       '',
+                    'rated':       '',
+                    'plot':        m.get('overview',''),
+                    'actors':      '',
+                    'director':    '',
+                    'poster':      poster,
+                    'imdb_rating': str(round(m.get('vote_average',0),1)),
+                    'imdb_votes':  '',
+                })
+        except Exception as e:
+            print(f'[TMDB] {e}')
+
+    # 5. Fallback to guide_listings data
+    if gl:
+        g = gl[0]
+        return jsonify({
+            'source':   'guide',
+            'in_library': False,
+            'title':    g['title'],
+            'year':     g['year'] or '',
+            'genre':    g['genre'] or '',
+            'rated':    '',
+            'plot':     g['plot'] or '',
+            'actors':   g['actors'] or '',
+            'director': g['director'] or '',
+            'poster':   '',
+            'imdb_rating': g['star_rating'] or '',
+            'imdb_votes':  '',
+        })
+
+    return jsonify({'error': 'Not found'}), 404
+
+# ── Recording Routes ──────────────────────────────────────────────────────────
+
+@app.route('/epg-web/api/record', methods=['POST'])
+def api_record():
+    data       = request.json or {}
+    title      = data.get('title', 'Unknown')
+    channel_id = data.get('channel_id', '')
+    start_ts   = float(data.get('start_ts', time.time()))
+    stop_ts    = float(data.get('stop_ts', time.time() + 3600))
+    rec_id     = str(uuid.uuid4())[:8]
+    with _rec_lock:
+        _recs[rec_id] = {
+            'title':      title,
+            'channel_id': channel_id,
+            'start_ts':   start_ts,
+            'stop_ts':    stop_ts,
+            'status':     'queued',
+            'progress':   0,
+            'log':        [],
+            'pid':        None,
+            'file':       None,
+        }
+    t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
+    t.start()
+    return jsonify({'ok': True, 'id': rec_id})
+
+@app.route('/epg-web/api/record/status')
+def api_rec_status():
+    with _rec_lock:
+        return jsonify({'recordings': dict(_recs)})
+
+@app.route('/epg-web/api/record/cancel', methods=['POST'])
+def api_rec_cancel():
+    rec_id = (request.json or {}).get('id','')
+    with _rec_lock:
+        r = _recs.get(rec_id)
+        if r and r.get('pid') and 'recording' in r.get('status',''):
+            try:
+                import signal
+                os.kill(r['pid'], signal.SIGTERM)
+                r['status'] = 'cancelled'
+            except Exception:
+                pass
+    return jsonify({'ok': True})
+
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
 HTML = """<!DOCTYPE html>
@@ -885,6 +1162,53 @@ tr:hover td{background:#141414;}
   <div id="sd-status" class="status-msg" style="display:none;"></div>
   <div class="guide-wrap" id="guide-wrap" style="display:none;">
     <div id="guide-inner"></div>
+  </div>
+  <!-- Recordings panel -->
+  <div id="rec-panel" style="margin-top:16px;display:none;">
+    <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">🔴 Active Recordings</h3>
+    <div id="rec-list"></div>
+  </div>
+</div>
+
+<!-- Programme detail modal -->
+<div id="prog-modal-overlay" onclick="if(event.target===this)closeProg()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;">
+  <div style="background:#111827;border:1px solid #1e2d3d;border-radius:14px;width:90%;max-width:620px;box-shadow:0 24px 80px rgba(0,0,0,.7);overflow:hidden;position:relative;">
+    <!-- Close -->
+    <button onclick="closeProg()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#64748b;font-size:20px;cursor:pointer;line-height:1;">✕</button>
+    <!-- Loading state -->
+    <div id="pm-loading" style="padding:48px;text-align:center;color:#64748b;font-size:14px;">Loading…</div>
+    <!-- Content -->
+    <div id="pm-content" style="display:none;">
+      <!-- Backdrop / poster row -->
+      <div style="display:flex;gap:0;min-height:180px;">
+        <div id="pm-poster-wrap" style="flex-shrink:0;width:130px;background:#0d1117;">
+          <img id="pm-poster" src="" alt="" style="width:130px;height:195px;object-fit:cover;display:block;">
+        </div>
+        <div style="flex:1;padding:20px 20px 14px;display:flex;flex-direction:column;justify-content:space-between;">
+          <div>
+            <div style="display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+              <h3 id="pm-title" style="font-size:18px;font-weight:700;color:#f1f5f9;margin:0;line-height:1.3;"></h3>
+              <span id="pm-library-badge" style="display:none;background:#166534;color:#86efac;font-size:10px;font-weight:600;padding:2px 7px;border-radius:99px;white-space:nowrap;margin-top:3px;">IN LIBRARY</span>
+            </div>
+            <div id="pm-air" style="font-size:12px;color:#3b82f6;margin-bottom:8px;font-weight:500;"></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+              <span id="pm-year"  style="font-size:12px;color:#94a3b8;"></span>
+              <span id="pm-rated" style="font-size:11px;background:#1e293b;color:#64748b;padding:1px 6px;border-radius:4px;"></span>
+              <span id="pm-genre" style="font-size:12px;color:#94a3b8;"></span>
+              <span id="pm-imdb"  style="font-size:12px;color:#fbbf24;font-weight:600;"></span>
+            </div>
+            <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0 0 8px;"></p>
+          </div>
+          <div id="pm-actors" style="font-size:12px;color:#64748b;"></div>
+        </div>
+      </div>
+      <!-- Footer -->
+      <div style="padding:14px 20px;border-top:1px solid #1e293b;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <button id="pm-rec-btn" class="btn btn-primary" onclick="recordProg()">🔴 Record</button>
+        <button class="btn btn-ghost" onclick="closeProg()">Close</button>
+        <div id="pm-status" class="status-msg" style="margin:0;flex:1;text-align:right;"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1216,7 +1540,7 @@ function renderGuide() {
         style="left:${left}px;width:${width}px;"
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
-        onclick="addToSchedule(${pd.replace(/"/g,'&quot;')})">
+        onclick="openProg(${pd.replace(/"/g,'&quot;')})">
         <span class="prog-title">${esc(p.title)}</span>
       </div>`;
     }
@@ -1242,6 +1566,135 @@ function showTip(e, p) {
   tt.style.top     = Math.min(e.clientY + 12, window.innerHeight - 150) + 'px';
 }
 function hideTip() { document.getElementById('tooltip').style.display='none'; }
+
+// ── Programme modal + recording ───────────────────────────────────────────────
+let _currentProg = null;
+async function openProg(p) {
+  hideTip();
+  _currentProg = p;
+  // Show overlay in loading state
+  const overlay = document.getElementById('prog-modal-overlay');
+  overlay.style.display = 'flex';
+  document.getElementById('pm-loading').style.display = 'block';
+  document.getElementById('pm-content').style.display = 'none';
+  document.getElementById('pm-status').textContent = '';
+
+  // Check if already being recorded
+  const now = Date.now() / 1000;
+  const recStatus = await (await fetch('/epg-web/api/record/status')).json();
+  const alreadyRec = Object.values(recStatus.recordings || {}).some(r =>
+    r.title === p.title && r.channel_id === p.channel_id &&
+    Math.abs(r.start_ts - p.start_ts) < 60 &&
+    ['queued','scheduled','recording'].includes(r.status)
+  );
+
+  // Fetch enriched info
+  let info = {};
+  try {
+    const yr = p.start_fmt ? p.start_fmt.substring(0,4) : '';
+    const r  = await fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}&year=${yr}`);
+    if (r.ok) info = await r.json();
+  } catch(e) {}
+
+  // Populate modal
+  document.getElementById('pm-title').textContent = info.title || p.title;
+  document.getElementById('pm-air').textContent   = (p.channel || p.channel_id) + '  ·  ' + p.start_fmt + ' – ' + p.stop_fmt;
+  document.getElementById('pm-plot').textContent  = info.plot || p.desc || p.category || '';
+  document.getElementById('pm-year').textContent  = info.year || '';
+  document.getElementById('pm-rated').textContent = info.rated || '';
+  document.getElementById('pm-genre').textContent = info.genre || '';
+  document.getElementById('pm-imdb').textContent  = info.imdb_rating ? '★ ' + info.imdb_rating : '';
+  document.getElementById('pm-actors').textContent = info.actors ? '🎭 ' + info.actors : (info.director ? '🎬 ' + info.director : '');
+
+  const libBadge = document.getElementById('pm-library-badge');
+  libBadge.style.display = info.in_library ? 'inline-block' : 'none';
+
+  const posterEl = document.getElementById('pm-poster');
+  const posterWrap = document.getElementById('pm-poster-wrap');
+  if (info.poster) {
+    posterEl.src = info.poster;
+    posterEl.style.display = 'block';
+    posterWrap.style.display = 'block';
+  } else {
+    posterEl.style.display = 'none';
+    posterWrap.style.display = 'none';
+  }
+
+  // Record button state
+  const btn = document.getElementById('pm-rec-btn');
+  if (p.stop_ts < now) {
+    btn.style.display = 'none';
+  } else if (alreadyRec) {
+    btn.disabled = true; btn.textContent = '✅ Already recording'; btn.style.display = '';
+  } else {
+    btn.disabled = false; btn.style.display = '';
+    btn.textContent = p.start_ts > now ? '⏱ Schedule Recording' : '🔴 Record Now';
+  }
+
+  document.getElementById('pm-loading').style.display = 'none';
+  document.getElementById('pm-content').style.display = 'block';
+}
+function closeProg() {
+  document.getElementById('prog-modal-overlay').style.display = 'none';
+}
+async function recordProg() {
+  if (!_currentProg) return;
+  const btn = document.getElementById('pm-rec-btn');
+  btn.disabled = true; btn.textContent = '…';
+  const r = await post('/epg-web/api/record', {
+    title:      _currentProg.title,
+    channel_id: _currentProg.channel_id,
+    start_ts:   _currentProg.start_ts,
+    stop_ts:    _currentProg.stop_ts,
+  });
+  if (r.ok) {
+    const el = document.getElementById('pm-status');
+    el.textContent = '✅ Recording queued';
+    el.className = 'status-msg ok';
+    btn.disabled = true; btn.textContent = '✅ Queued';
+    startRecPoll();
+  } else {
+    const el = document.getElementById('pm-status');
+    el.textContent = '❌ ' + (r.error || 'Failed');
+    el.className = 'status-msg err';
+    btn.disabled = false;
+  }
+}
+
+// ── Recordings panel ──────────────────────────────────────────────────────────
+let _recPoll = null;
+function startRecPoll() {
+  if (_recPoll) return;
+  _recPoll = setInterval(updateRecPanel, 3000);
+  updateRecPanel();
+}
+async function updateRecPanel() {
+  const d = await (await fetch('/epg-web/api/record/status')).json();
+  const recs = Object.entries(d.recordings || {});
+  if (recs.length === 0) {
+    document.getElementById('rec-panel').style.display = 'none';
+    return;
+  }
+  document.getElementById('rec-panel').style.display = 'block';
+  const statusIcons = {
+    queued:'⏳', scheduled:'⏱', recording:'🔴', converting:'⚙️',
+    copying:'📤', done:'✅', done_ts:'✅', error:'❌', cancelled:'🚫'
+  };
+  document.getElementById('rec-list').innerHTML = recs.map(([id, r]) => {
+    const icon = statusIcons[r.status] || '•';
+    const active = ['queued','scheduled','recording','converting','copying'].includes(r.status);
+    return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e1e1e;font-size:13px;">
+      <span style="font-size:16px;">${icon}</span>
+      <span style="flex:1;color:#c7d2e7;">${esc(r.title)}</span>
+      <span style="color:#64748b;font-size:11px;">${r.status}</span>
+      ${active ? `<button class="btn btn-danger btn-sm" onclick="cancelRec('${id}')">■</button>` : ''}
+    </div>`;
+  }).join('');
+  // Stop polling when nothing active
+  const anyActive = recs.some(([,r]) => ['queued','scheduled','recording','converting','copying'].includes(r.status));
+  if (!anyActive) { clearInterval(_recPoll); _recPoll = null; }
+}
+async function cancelRec(id) { await post('/epg-web/api/record/cancel', {id}); }
 
 // ── Recommendations ───────────────────────────────────────────────────────────
 async function loadRecs() {
