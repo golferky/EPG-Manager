@@ -1832,7 +1832,7 @@ async function playStream() {
   btn.disabled = true; btn.textContent = '▶ Playing…';
   const r = await post('/epg-web/api/play', {channel_id: _nextAiring.channel_id});
   if (r.ok) {
-    btn.textContent = '■ Stop';
+    btn.textContent = '■ Stop'; btn.disabled = false;
     btn.onclick = stopStream;
   } else {
     btn.disabled = false; btn.textContent = '▶ Play';
