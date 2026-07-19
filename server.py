@@ -598,15 +598,20 @@ def api_guide():
     if ch_filter:
         ordered_channels = [c for c in ordered_channels if ch_filter in c['name'].lower()]
 
-    # Cap at 80 only when no filter is active
-    ch_cap = 200 if ch_filter else 80
+    ch_offset = int(request.args.get('ch_offset', 0))
+    ch_cap    = 200
+    total_ch  = len(ordered_channels)
+    page_chs  = ordered_channels[ch_offset:ch_offset + ch_cap]
+
     return jsonify({
         'window_start': ws.astimezone(local_tz).isoformat(),
         'window_end':   we.astimezone(local_tz).isoformat(),
         'window_start_ts': ws_ts,
         'window_end_ts':   we_ts,
         'hours':        hours,
-        'channels':     ordered_channels[:ch_cap],
+        'channels':     page_chs,
+        'total_channels': total_ch,
+        'ch_offset':    ch_offset,
         'programmes':   progs_in_window,
     })
 
@@ -1333,6 +1338,9 @@ tr:hover td{background:#141414;}
       <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value)" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;">
       <div id="search-dropdown" style="display:none;position:absolute;top:100%;left:0;width:320px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;z-index:500;max-height:320px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);margin-top:4px;"></div>
     </div>
+    <button id="ch-page-prev" class="btn btn-ghost btn-sm" onclick="chPagePrev()" style="display:none;">◀ Prev 200</button>
+    <span id="ch-page-info" style="font-size:12px;color:#64748b;"></span>
+    <button id="ch-page-next" class="btn btn-ghost btn-sm" onclick="chPageNext()" style="display:none;">Next 200 ▶</button>
     <button class="btn btn-primary btn-sm" onclick="loadGuide()">Load Guide</button>
     <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 14 days from Schedules Direct">📡 Fetch SD</button>
   </div>
@@ -1514,6 +1522,7 @@ tr:hover td{background:#141414;}
 let _guideData = null;
 let _guideWindowStart = null;   // ISO string
 let _guideHours = 4;
+let _chOffset = 0;
 const PX_PER_MIN = 4;           // 1 min = 4px → 30min = 120px, 1hr = 240px
 
 // ── Clock + live status ───────────────────────────────────────────────────────
@@ -1696,12 +1705,12 @@ function onSearchInput(val) {
 function clearSearch() {
   document.getElementById('ch-filter').value = '';
   document.getElementById('search-dropdown').style.display = 'none';
-  fetchAndRenderGuide();
+  _chOffset = 0; fetchAndRenderGuide();
 }
 function jumpToChannel(id, name) {
   document.getElementById('search-dropdown').style.display = 'none';
   document.getElementById('ch-filter').value = name;
-  fetchAndRenderGuide();
+  _chOffset = 0; fetchAndRenderGuide();
 }
 async function searchOpenProg(title) {
   document.getElementById('search-dropdown').style.display = 'none';
@@ -1725,6 +1734,7 @@ async function fetchAndRenderGuide() {
   const mode = document.getElementById('guide-ch-mode').value;
   if (mode === 'fav')   params.set('fav', '1');
   if (mode === 'movie') params.set('movie', '1');
+  params.set('ch_offset', _chOffset);
   try {
     const r = await fetch('/epg-web/api/guide?' + params);
     const d = await r.json();
@@ -1732,8 +1742,24 @@ async function fetchAndRenderGuide() {
     _guideData = d;
     if (!_guideWindowStart) _guideWindowStart = d.window_start;
     renderGuide();
+    // Update channel page nav
+    const total = d.total_channels || 0;
+    const offset = d.ch_offset || 0;
+    const cap = 200;
+    const pageEl = document.getElementById('ch-page-info');
+    const prevEl = document.getElementById('ch-page-prev');
+    const nextEl = document.getElementById('ch-page-next');
+    if (pageEl) {
+      const from = total ? offset + 1 : 0;
+      const to   = Math.min(offset + cap, total);
+      pageEl.textContent = total > cap ? `Channels ${from}–${to} of ${total}` : '';
+      prevEl.style.display = offset > 0 ? '' : 'none';
+      nextEl.style.display = offset + cap < total ? '' : 'none';
+    }
   } catch(e) { setGS('Failed: '+e.message,'err'); }
 }
+function chPagePrev() { _chOffset = Math.max(0, _chOffset - 200); fetchAndRenderGuide(); }
+function chPageNext() { _chOffset += 200; fetchAndRenderGuide(); }
 function renderGuide() {
   if (!_guideData) return;
   const d = _guideData;
