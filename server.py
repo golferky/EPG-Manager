@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260718"
+VERSION = "v20260719"
 
 import json, os, re, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -21,11 +21,14 @@ def load_config():
         with open(CONFIG_FILE) as f:
             return json.load(f)
     return {
-        'guide_path':  '/Volumes/EPG/guide.xml',
-        'db_path':     '/Volumes/EPG/Movies.db',
-        'timezone':    'America/New_York',
-        'ts_input':    os.path.expanduser('~/Movies'),
-        'ts_output':   os.path.expanduser('~/Movies/Converted'),
+        'guide_path':    '/Volumes/EPG/guide/guide.xml',
+        'guide_db_path': os.path.join(BASE_DIR, 'guide.db'),
+        'db_path':       '/Volumes/EPG/Movies.db',
+        'timezone':      'America/New_York',
+        'ts_input':      os.path.expanduser('~/Movies'),
+        'ts_output':     os.path.expanduser('~/Movies/Converted'),
+        'sd_user':       '',
+        'sd_pass':       '',
     }
 
 def save_config(cfg):
@@ -103,7 +106,136 @@ def _parse_dt(s):
         dt_str = s
     return datetime.strptime(dt_str[:14], '%Y%m%d%H%M%S').replace(tzinfo=tz)
 
+def ensure_guide_db(db_path):
+    """Create guide.db with schema if it doesn't exist."""
+    conn = sqlite3.connect(db_path)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS guide (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            channel_id TEXT,
+            channel_name TEXT,
+            start_utc TEXT,
+            end_utc TEXT,
+            desc TEXT,
+            category TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_guide_unique
+        ON guide(channel_id, start_utc, title)
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS guide_channels (
+            channel_id TEXT PRIMARY KEY,
+            channel_name TEXT,
+            icon TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def import_xml_to_guide_db(xml_path, db_path):
+    """Parse XMLTV and INSERT OR IGNORE into guide.db. Returns new rows inserted."""
+    import xml.etree.ElementTree as ET
+    ensure_guide_db(db_path)
+
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    channel_map = {}
+    conn = sqlite3.connect(db_path)
+
+    # Upsert channels
+    for ch in root.findall('channel'):
+        cid  = ch.get('id', '')
+        nel  = ch.find('display-name')
+        name = nel.text if nel is not None else cid
+        icon_el = ch.find('icon')
+        icon = icon_el.get('src','') if icon_el is not None else ''
+        channel_map[cid] = name
+        conn.execute('''
+            INSERT OR REPLACE INTO guide_channels(channel_id, channel_name, icon)
+            VALUES (?,?,?)
+        ''', (cid, name, icon))
+
+    inserted = 0
+    for prog in root.findall('programme'):
+        ss = prog.get('start',''); es = prog.get('stop','')
+        ch_id = prog.get('channel','')
+        tel   = prog.find('title')
+        title = tel.text if tel is not None else ''
+        if not ss or not title:
+            continue
+        try:
+            su = _parse_dt(ss)
+            eu = _parse_dt(es) if es else su + timedelta(hours=1)
+        except Exception:
+            continue
+        start_utc = su.astimezone(timezone.utc).strftime('%Y%m%d%H%M%S')
+        end_utc   = eu.astimezone(timezone.utc).strftime('%Y%m%d%H%M%S')
+        del_el = prog.find('desc')
+        desc = del_el.text[:300] if del_el is not None and del_el.text else ''
+        cat_el = prog.find('category')
+        cat = cat_el.text if cat_el is not None else ''
+        cur = conn.execute('''
+            INSERT OR IGNORE INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category)
+            VALUES (?,?,?,?,?,?,?)
+        ''', (title, ch_id, channel_map.get(ch_id, ch_id), start_utc, end_utc, desc, cat))
+        inserted += cur.rowcount
+
+    conn.commit()
+    conn.close()
+    return inserted
+
+def load_epg_from_db(db_path, tz_str='America/New_York'):
+    """Load all accumulated guide data from guide.db into memory."""
+    from zoneinfo import ZoneInfo
+    local_tz = ZoneInfo(tz_str)
+
+    ensure_guide_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    channels = []
+    channel_map = {}
+    for row in conn.execute('SELECT channel_id, channel_name, icon FROM guide_channels ORDER BY channel_name'):
+        cid, name, icon = row['channel_id'], row['channel_name'], row['icon'] or ''
+        channels.append({'id': cid, 'name': name, 'icon': icon})
+        channel_map[cid] = name
+
+    programmes = []
+    for row in conn.execute('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category FROM guide ORDER BY start_utc'):
+        try:
+            su = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            eu = datetime.strptime(row['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        sl = su.astimezone(local_tz)
+        el = eu.astimezone(local_tz)
+        programmes.append({
+            'title':      row['title'],
+            'channel_id': row['channel_id'],
+            'channel':    row['channel_name'] or channel_map.get(row['channel_id'], row['channel_id']),
+            'start_ts':   su.timestamp(),
+            'stop_ts':    eu.timestamp(),
+            'start_iso':  sl.isoformat(),
+            'stop_iso':   el.isoformat(),
+            'start_fmt':  sl.strftime('%Y-%m-%d %H:%M'),
+            'stop_fmt':   el.strftime('%H:%M'),
+            'desc':       row['desc'] or '',
+            'category':   row['category'] or '',
+        })
+
+    conn.close()
+    _epg['channels']    = channels
+    _epg['channel_map'] = channel_map
+    _epg['programmes']  = programmes
+    _epg['loaded']      = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return len(programmes)
+
 def load_epg(path, tz_str='America/New_York'):
+    """Legacy XML-only load (kept for fallback). Prefers guide.db path."""
     import xml.etree.ElementTree as ET
     from zoneinfo import ZoneInfo
     local_tz = ZoneInfo(tz_str)
@@ -236,15 +368,55 @@ def api_post_config():
     save_config(request.json or {})
     return jsonify({'ok': True})
 
+@app.route('/epg-web/api/fetch-sd', methods=['POST'])
+def api_fetch_sd():
+    """Pull fresh guide data from Schedules Direct (runs in background thread)."""
+    cfg     = load_config()
+    sd_user = cfg.get('sd_user','')
+    sd_pass = cfg.get('sd_pass','')
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    tz_str  = cfg.get('timezone','America/New_York')
+    days    = int(request.json.get('days', 14) if request.json else 14)
+    if not sd_user or not sd_pass:
+        return jsonify({'error': 'SD credentials not configured'}), 400
+    _sd_status['running'] = True
+    _sd_status['log']     = []
+    _sd_status['result']  = None
+    _sd_status['error']   = None
+    def _run():
+        try:
+            from sd_guide import fetch_sd_guide
+            def log(msg):
+                print(f'[SD] {msg}')
+                _sd_status['log'].append(msg)
+            result = fetch_sd_guide(sd_user, sd_pass, db_path, days=days, log=log)
+            count = load_epg_from_db(db_path, tz_str)
+            _sd_status['result'] = {**result, 'total_loaded': count}
+        except Exception as e:
+            _sd_status['error'] = str(e)
+        finally:
+            _sd_status['running'] = False
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'message': f'Fetching {days} days from Schedules Direct…'})
+
+@app.route('/epg-web/api/fetch-sd/status')
+def api_fetch_sd_status():
+    return jsonify(_sd_status)
+
+_sd_status = {'running': False, 'log': [], 'result': None, 'error': None}
+
 @app.route('/epg-web/api/load-guide', methods=['POST'])
 def api_load_guide():
-    cfg = load_config()
-    path = cfg.get('guide_path','')
-    if not os.path.exists(path):
-        return jsonify({'error': f'Not found: {path}'}), 400
+    cfg      = load_config()
+    xml_path = cfg.get('guide_path', '/Volumes/EPG/guide/guide.xml')
+    db_path  = cfg.get('guide_db_path', '/Volumes/EPG/guide/guide.db')
+    tz_str   = cfg.get('timezone', 'America/New_York')
+    if not os.path.exists(xml_path):
+        return jsonify({'error': f'Not found: {xml_path}'}), 400
     try:
-        count = load_epg(path, cfg.get('timezone','America/New_York'))
-        return jsonify({'ok': True, 'count': count, 'loaded': _epg['loaded']})
+        new_rows = import_xml_to_guide_db(xml_path, db_path)
+        count    = load_epg_from_db(db_path, tz_str)
+        return jsonify({'ok': True, 'count': count, 'new_rows': new_rows, 'loaded': _epg['loaded']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -273,13 +445,27 @@ def api_guide():
     ws_ts  = ws.timestamp()
     we_ts  = we.timestamp()
 
-    ch_filter = request.args.get('ch', '').lower()
+    ch_filter  = request.args.get('ch', '').lower()
+    fav_only   = request.args.get('fav', '0') == '1'
+    movie_only = request.args.get('movie', '0') == '1'
+
+    # Build allowed channel set from Movies.db if filtering
+    allowed_ch_ids = None
+    if fav_only or movie_only:
+        where_parts = []
+        if fav_only:   where_parts.append('favorite = 1')
+        if movie_only: where_parts.append('is_movie_channel = 1')
+        where = ' AND '.join(where_parts)
+        rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where} AND guide_channel IS NOT NULL AND guide_channel != ""')
+        allowed_ch_ids = {r['guide_channel'] for r in rows}
 
     # Collect channels present in window
     ch_set = set()
     progs_in_window = []
     for p in _epg['programmes']:
         if p['stop_ts'] <= ws_ts or p['start_ts'] >= we_ts:
+            continue
+        if allowed_ch_ids is not None and p['channel_id'] not in allowed_ch_ids:
             continue
         if ch_filter and ch_filter not in p['channel'].lower():
             continue
@@ -686,10 +872,17 @@ tr:hover td{background:#141414;}
     <button class="btn btn-ghost btn-sm" onclick="guideNav(-4)">◀ Earlier</button>
     <span id="guide-window" style="font-size:13px;color:#555;"></span>
     <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
-    <input id="ch-filter" placeholder="Filter channels…" oninput="renderGuide()" style="margin-left:auto;">
+    <select id="guide-ch-mode" onchange="fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
+      <option value="all">All Channels</option>
+      <option value="fav">★ Favorites</option>
+      <option value="movie">🎬 Movie Channels</option>
+    </select>
+    <input id="ch-filter" placeholder="Filter channels…" oninput="fetchAndRenderGuide()" style="width:160px;">
     <button class="btn btn-primary btn-sm" onclick="loadGuide()">Load Guide</button>
+    <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 14 days from Schedules Direct">📡 Fetch SD</button>
   </div>
   <div id="guide-status" class="status-msg"></div>
+  <div id="sd-status" class="status-msg" style="display:none;"></div>
   <div class="guide-wrap" id="guide-wrap" style="display:none;">
     <div id="guide-inner"></div>
   </div>
@@ -784,7 +977,9 @@ tr:hover td{background:#141414;}
   <div class="modal">
     <h3>⚙ Settings</h3>
     <div class="mrow"><label>Guide XML path</label>
-      <input id="s-path" placeholder="/Volumes/EPG/guide.xml"></div>
+      <input id="s-path" placeholder="/Volumes/EPG/guide/guide.xml"></div>
+    <div class="mrow"><label>Guide DB path (accumulates data over time)</label>
+      <input id="s-guidedb" placeholder="/Volumes/EPG/guide/guide.db"></div>
     <div class="mrow"><label>Movies.db path</label>
       <input id="s-db" placeholder="/Volumes/EPG/Movies.db"></div>
     <div class="mrow"><label>Timezone</label>
@@ -827,6 +1022,40 @@ async function refreshStatus() {
 setInterval(refreshStatus, 30000);
 refreshStatus();
 
+// Auto-render guide on page load; if SD is running, poll until done then render
+async function autoLoad() {
+  const s = await (await fetch('/epg-web/api/status')).json();
+  if (s.programmes > 0) {
+    await fetchAndRenderGuide();
+  }
+  // If SD fetch is running in background, show progress and re-render when done
+  const sd = await (await fetch('/epg-web/api/fetch-sd/status')).json();
+  if (sd.running) {
+    const sdEl = document.getElementById('sd-status');
+    sdEl.style.display = '';
+    sdEl.textContent = '📡 Fetching from Schedules Direct…';
+    if (_sdPoll) clearInterval(_sdPoll);
+    _sdPoll = setInterval(async () => {
+      const s2 = await (await fetch('/epg-web/api/fetch-sd/status')).json();
+      const last = s2.log.length ? s2.log[s2.log.length-1] : '…';
+      if (s2.running) {
+        sdEl.textContent = '📡 ' + last;
+      } else if (s2.error) {
+        sdEl.textContent = '❌ ' + s2.error;
+        sdEl.className = 'status-msg err';
+        clearInterval(_sdPoll);
+      } else if (s2.result) {
+        const r = s2.result;
+        sdEl.textContent = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total`;
+        sdEl.className = 'status-msg ok';
+        clearInterval(_sdPoll);
+        await fetchAndRenderGuide();
+      }
+    }, 2000);
+  }
+}
+autoLoad();
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
   const names = ['guide','recommendations','channels','schedule','conversions'];
@@ -843,8 +1072,9 @@ function switchTab(name) {
 // ── Settings ──────────────────────────────────────────────────────────────────
 async function openSettings() {
   const cfg = await (await fetch('/epg-web/api/config')).json();
-  document.getElementById('s-path').value  = cfg.guide_path || '';
-  document.getElementById('s-db').value    = cfg.db_path    || '';
+  document.getElementById('s-path').value    = cfg.guide_path    || '';
+  document.getElementById('s-guidedb').value = cfg.guide_db_path || '';
+  document.getElementById('s-db').value      = cfg.db_path       || '';
   document.getElementById('s-tz').value    = cfg.timezone   || 'America/New_York';
   document.getElementById('s-tsin').value  = cfg.ts_input   || '';
   document.getElementById('s-tsout').value = cfg.ts_output  || '';
@@ -853,8 +1083,9 @@ async function openSettings() {
 function closeSettings() { document.getElementById('modal-overlay').classList.remove('show'); }
 async function saveSettings() {
   await post('/epg-web/api/config', {
-    guide_path: document.getElementById('s-path').value.trim(),
-    db_path:    document.getElementById('s-db').value.trim(),
+    guide_path:    document.getElementById('s-path').value.trim(),
+    guide_db_path: document.getElementById('s-guidedb').value.trim(),
+    db_path:       document.getElementById('s-db').value.trim(),
     timezone:   document.getElementById('s-tz').value.trim() || 'America/New_York',
     ts_input:   document.getElementById('s-tsin').value.trim(),
     ts_output:  document.getElementById('s-tsout').value.trim(),
@@ -871,7 +1102,8 @@ async function loadGuide() {
     const r = await fetch('/epg-web/api/load-guide', {method:'POST'});
     const d = await r.json();
     if (d.error) { setGS('Error: '+d.error, 'err'); return; }
-    setGS(`${d.count.toLocaleString()} programmes loaded · ${d.loaded}`, 'ok');
+    const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new data)';
+    setGS(`${d.count.toLocaleString()} programmes loaded${newInfo} · ${d.loaded}`, 'ok');
     await fetchAndRenderGuide();
   } catch(e) { setGS('Failed: '+e.message,'err'); }
   finally { btn.disabled=false; btn.textContent='↻ Refresh'; }
@@ -879,6 +1111,35 @@ async function loadGuide() {
 function setGS(msg,cls='') {
   const el=document.getElementById('guide-status');
   el.textContent=msg; el.className='status-msg '+(cls||'');
+}
+
+let _sdPoll = null;
+async function fetchSD() {
+  const btn = document.getElementById('btn-sd');
+  const sdEl = document.getElementById('sd-status');
+  btn.disabled = true;
+  sdEl.style.display = '';
+  sdEl.className = 'status-msg';
+  sdEl.textContent = 'Starting Schedules Direct fetch…';
+  await post('/epg-web/api/fetch-sd', {days: 14});
+  if (_sdPoll) clearInterval(_sdPoll);
+  _sdPoll = setInterval(async () => {
+    const s = await (await fetch('/epg-web/api/fetch-sd/status')).json();
+    const last = s.log.length ? s.log[s.log.length - 1] : '…';
+    if (s.running) {
+      sdEl.textContent = '📡 ' + last;
+    } else if (s.error) {
+      sdEl.textContent = '❌ ' + s.error;
+      sdEl.className = 'status-msg err';
+      clearInterval(_sdPoll); btn.disabled = false;
+    } else if (s.result) {
+      const r = s.result;
+      sdEl.textContent = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total · reload guide to see`;
+      sdEl.className = 'status-msg ok';
+      clearInterval(_sdPoll); btn.disabled = false;
+      await loadGuide();
+    }
+  }, 2000);
 }
 function guideNav(hours) {
   if (!_guideWindowStart) return;
@@ -893,6 +1154,9 @@ async function fetchAndRenderGuide() {
   params.set('hours', _guideHours);
   const ch = document.getElementById('ch-filter').value.trim();
   if (ch) params.set('ch', ch);
+  const mode = document.getElementById('guide-ch-mode').value;
+  if (mode === 'fav')   params.set('fav', '1');
+  if (mode === 'movie') params.set('movie', '1');
   try {
     const r = await fetch('/epg-web/api/guide?' + params);
     const d = await r.json();
@@ -918,11 +1182,8 @@ function renderGuide() {
     ws.toLocaleString([], {weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
     + ' – ' + we.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
 
-  // Channel filter
-  const chFilter = document.getElementById('ch-filter').value.trim().toLowerCase();
-  const channels = chFilter
-    ? d.channels.filter(c => c.name.toLowerCase().includes(chFilter))
-    : d.channels;
+  // Channels already filtered server-side
+  const channels = d.channels;
 
   // Build time header
   let timeHTML = `<div class="time-header"><div class="ch-name-hdr"></div>`;
@@ -1152,6 +1413,54 @@ window.onload = async () => {
 </script>
 </body>
 </html>"""
+
+# ── Startup auto-load ────────────────────────────────────────────────────────
+
+def _startup_load():
+    cfg     = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    tz_str  = cfg.get('timezone', 'America/New_York')
+    sd_user = cfg.get('sd_user', '')
+    sd_pass = cfg.get('sd_pass', '')
+
+    # Load whatever's already in guide.db
+    if os.path.exists(db_path):
+        try:
+            count = load_epg_from_db(db_path, tz_str)
+            print(f'[startup] Loaded {count} programmes from guide.db')
+        except Exception as e:
+            print(f'[startup] guide.db load failed: {e}')
+
+    # If SD credentials exist and guide is empty or stale (last entry < 24h from now), auto-fetch
+    if sd_user and sd_pass:
+        stale = True
+        if _epg['programmes']:
+            last_ts = _epg['programmes'][-1]['stop_ts']
+            stale = last_ts < (time.time() + 86400)  # less than 1 day of future data
+        if stale:
+            print('[startup] Guide stale — auto-fetching from Schedules Direct…')
+            _sd_status['running'] = True
+            _sd_status['log']     = []
+            _sd_status['result']  = None
+            _sd_status['error']   = None
+            def _run():
+                try:
+                    from sd_guide import fetch_sd_guide
+                    def log(msg):
+                        print(f'[SD] {msg}')
+                        _sd_status['log'].append(msg)
+                    result = fetch_sd_guide(sd_user, sd_pass, db_path, days=14, log=log)
+                    count  = load_epg_from_db(db_path, tz_str)
+                    _sd_status['result'] = {**result, 'total_loaded': count}
+                    print(f'[startup] SD fetch complete — {count} programmes loaded')
+                except Exception as e:
+                    _sd_status['error'] = str(e)
+                    print(f'[startup] SD fetch error: {e}')
+                finally:
+                    _sd_status['running'] = False
+            threading.Thread(target=_run, daemon=True).start()
+
+_startup_load()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
