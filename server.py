@@ -598,15 +598,63 @@ def api_guide():
     if ch_filter:
         ordered_channels = [c for c in ordered_channels if ch_filter in c['name'].lower()]
 
+    # Cap at 80 only when no filter is active
+    ch_cap = 200 if ch_filter else 80
     return jsonify({
         'window_start': ws.astimezone(local_tz).isoformat(),
         'window_end':   we.astimezone(local_tz).isoformat(),
         'window_start_ts': ws_ts,
         'window_end_ts':   we_ts,
         'hours':        hours,
-        'channels':     ordered_channels[:80],
+        'channels':     ordered_channels[:ch_cap],
         'programmes':   progs_in_window,
     })
+
+@app.route('/epg-web/api/search')
+def api_search():
+    """Search channels and upcoming programs in guide.db."""
+    q = request.args.get('q', '').strip()
+    if len(q) < 2:
+        return jsonify({'channels': [], 'programs': []})
+    cfg     = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    now_utc = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    like    = f'%{q}%'
+    results = {'channels': [], 'programs': []}
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        # Channel matches from guide_channels
+        ch_rows = conn.execute(
+            'SELECT DISTINCT channel_id, channel_name FROM guide_channels WHERE channel_name LIKE ? ORDER BY channel_name LIMIT 20',
+            (like,)
+        ).fetchall()
+        results['channels'] = [{'id': r['channel_id'], 'name': r['channel_name']} for r in ch_rows]
+        # Also check guide table for channel names not in guide_channels
+        if len(results['channels']) < 20:
+            existing = {r['id'] for r in results['channels']}
+            extra = conn.execute(
+                'SELECT DISTINCT channel_id, channel_name FROM guide WHERE channel_name LIKE ? ORDER BY channel_name LIMIT 20',
+                (like,)
+            ).fetchall()
+            for r in extra:
+                if r['channel_id'] not in existing:
+                    results['channels'].append({'id': r['channel_id'], 'name': r['channel_name']})
+                    existing.add(r['channel_id'])
+                if len(results['channels']) >= 20:
+                    break
+        # Program matches (upcoming only)
+        prog_rows = conn.execute(
+            '''SELECT DISTINCT title, category FROM guide
+               WHERE title LIKE ? AND end_utc > ?
+               ORDER BY title LIMIT 20''',
+            (like, now_utc)
+        ).fetchall()
+        results['programs'] = [{'title': r['title'], 'category': r['category']} for r in prog_rows]
+        conn.close()
+    except Exception as e:
+        print(f'[search] {e}')
+    return jsonify(results)
 
 @app.route('/epg-web/api/channels')
 def api_channels():
@@ -1281,7 +1329,10 @@ tr:hover td{background:#141414;}
       <option value="fav">★ Favorites</option>
       <option value="movie">🎬 Movie Channels</option>
     </select>
-    <input id="ch-filter" placeholder="Filter channels…" oninput="fetchAndRenderGuide()" style="width:160px;">
+    <div style="position:relative;display:inline-block;">
+      <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value)" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;">
+      <div id="search-dropdown" style="display:none;position:absolute;top:100%;left:0;width:320px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;z-index:500;max-height:320px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);margin-top:4px;"></div>
+    </div>
     <button class="btn btn-primary btn-sm" onclick="loadGuide()">Load Guide</button>
     <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 14 days from Schedules Direct">📡 Fetch SD</button>
   </div>
@@ -1611,6 +1662,60 @@ function guideNav(hours) {
   _guideWindowStart = d.toISOString();
   fetchAndRenderGuide();
 }
+let _searchTimer = null;
+function onSearchInput(val) {
+  clearTimeout(_searchTimer);
+  const dd = document.getElementById('search-dropdown');
+  if (val.length < 2) { dd.style.display = 'none'; fetchAndRenderGuide(); return; }
+  _searchTimer = setTimeout(async () => {
+    const r = await fetch('/epg-web/api/search?q=' + encodeURIComponent(val));
+    const d = await r.json();
+    let html = '';
+    if (d.channels && d.channels.length) {
+      html += '<div style="padding:6px 12px;font-size:11px;color:#3b82f6;font-weight:600;text-transform:uppercase;letter-spacing:.05em;">📺 Channels</div>';
+      html += d.channels.map(c =>
+        `<div class="sr" onclick="jumpToChannel(${JSON.stringify(c.id)},${JSON.stringify(c.name)})" style="padding:8px 14px;cursor:pointer;font-size:13px;color:#e2e8f0;border-bottom:1px solid #1e293b;">${esc(c.name)}</div>`
+      ).join('');
+    }
+    if (d.programs && d.programs.length) {
+      html += '<div style="padding:6px 12px;font-size:11px;color:#f59e0b;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;">🎬 Programs</div>';
+      html += d.programs.map(p =>
+        `<div class="sr" onclick="searchOpenProg(${JSON.stringify(p.title)})" style="padding:8px 14px;cursor:pointer;font-size:13px;color:#e2e8f0;border-bottom:1px solid #1e293b;">${esc(p.title)}<span style="color:#64748b;font-size:11px;margin-left:8px;">${esc(p.category||'')}</span></div>`
+      ).join('');
+    }
+    if (!html) html = '<div style="padding:12px 14px;color:#64748b;font-size:13px;">No results</div>';
+    dd.innerHTML = html;
+    dd.style.display = 'block';
+    // hover highlight
+    dd.querySelectorAll('.sr').forEach(el => {
+      el.onmouseenter = () => el.style.background = '#1e293b';
+      el.onmouseleave = () => el.style.background = '';
+    });
+  }, 250);
+}
+function clearSearch() {
+  document.getElementById('ch-filter').value = '';
+  document.getElementById('search-dropdown').style.display = 'none';
+  fetchAndRenderGuide();
+}
+function jumpToChannel(id, name) {
+  document.getElementById('search-dropdown').style.display = 'none';
+  document.getElementById('ch-filter').value = name;
+  fetchAndRenderGuide();
+}
+async function searchOpenProg(title) {
+  document.getElementById('search-dropdown').style.display = 'none';
+  document.getElementById('ch-filter').value = '';
+  // Open programme modal directly via prog-info
+  const p = { title, channel:'', channel_id:'', start_fmt:'', stop_fmt:'', desc:'' };
+  openProg(p);
+}
+// Close dropdown when clicking outside
+document.addEventListener('click', e => {
+  if (!e.target.closest('#ch-filter') && !e.target.closest('#search-dropdown'))
+    document.getElementById('search-dropdown').style.display = 'none';
+});
+
 async function fetchAndRenderGuide() {
   const params = new URLSearchParams();
   if (_guideWindowStart) params.set('start', _guideWindowStart);
