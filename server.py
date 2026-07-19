@@ -1986,8 +1986,7 @@ async function recordNext() {
 
 function closeProg() {
   document.getElementById('prog-modal-overlay').style.display = 'none';
-  post('/epg-web/api/play/stop', {});
-  // reset play button for next open
+  // reset play button for next open (VLC keeps running)
   const btn = document.getElementById('pm-play-btn');
   btn.textContent = '▶ Play'; btn.disabled = false;
   btn.onclick = playStream;
