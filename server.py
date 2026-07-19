@@ -111,6 +111,57 @@ def _parse_dt(s):
         dt_str = s
     return datetime.strptime(dt_str[:14], '%Y%m%d%H%M%S').replace(tzinfo=tz)
 
+def get_ps_channel_ids(guide_db_path, movies_db_path):
+    """Return set of guide.db channel_ids that have a primestreams stream_id in Movies.db.
+    Handles both direct ID matches and name-based fallbacks."""
+    try:
+        import re as _re
+        # All Movies.db guide_channels with a stream
+        mconn = sqlite3.connect(movies_db_path)
+        mrows = mconn.execute(
+            'SELECT guide_channel FROM channels WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL AND guide_channel != ""'
+        ).fetchall()
+        mconn.close()
+        ps_guide_channels = {r[0] for r in mrows}
+
+        gconn = sqlite3.connect(guide_db_path)
+        # All distinct channel_id/channel_name pairs in guide.db
+        grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
+        gconn.close()
+
+        result = set()
+        # Build a normalised-name → channel_id map for fallback
+        name_map = {}
+        for cid, cname in grows:
+            key = _re.sub(r'[^a-z0-9]', '', cname.lower())
+            name_map[key] = cid
+            if cid in ps_guide_channels:
+                result.add(cid)   # direct match
+
+        # Fallback: normalise Movies.db guide_channel and look up in name_map
+        for gc in ps_guide_channels:
+            norm = _re.sub(r'[^a-z0-9]', '', gc.lower())  # e.g. tastemadeus
+            # Strip common country/quality suffixes to get base name
+            base = norm
+            for suffix in ('us','uk','za','ca','au','sd','hd','west','east'):
+                if norm.endswith(suffix):
+                    base = norm[:-len(suffix)]
+                    break
+            # Exact match on base
+            if base in name_map:
+                result.add(name_map[base])
+                continue
+            # Prefix match: guide channel name is a prefix of base (TASTE → tastemade)
+            # or base is a prefix of guide channel name
+            for cname_norm, cid in name_map.items():
+                if len(cname_norm) >= 3 and len(base) >= 3:
+                    if base.startswith(cname_norm) or cname_norm.startswith(base):
+                        result.add(cid)
+        return result
+    except Exception as e:
+        print(f'[ps_channel_ids] {e}')
+        return set()
+
 def ensure_guide_db(db_path):
     """Create guide.db with schema if it doesn't exist."""
     conn = sqlite3.connect(db_path)
@@ -357,6 +408,28 @@ def _stream_url(channel_id):
         (channel_id,)
     )
     if not rows:
+        # Fallback: look up channel_name from guide.db, then prefix-match Movies.db
+        try:
+            import re as _re2
+            gdb_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+            gconn = sqlite3.connect(gdb_path)
+            gr = gconn.execute('SELECT channel_name FROM guide WHERE channel_id=? LIMIT 1', (channel_id,)).fetchone()
+            gconn.close()
+            if gr:
+                ch_norm = _re2.sub(r'[^a-z0-9]', '', gr[0].lower())
+                mrows = db_rows('SELECT guide_channel, stream_id FROM channels WHERE stream_id IS NOT NULL AND stream_id!=""')
+                for mr in mrows:
+                    gc_norm = _re2.sub(r'[^a-z0-9]', '', mr['guide_channel'].lower())
+                    base = gc_norm
+                    for sfx in ('us','uk','za','ca','au','sd','hd'):
+                        if gc_norm.endswith(sfx):
+                            base = gc_norm[:-len(sfx)]; break
+                    if len(ch_norm) >= 3 and len(base) >= 3:
+                        if base.startswith(ch_norm) or ch_norm.startswith(base):
+                            rows = [mr]; break
+        except Exception:
+            pass
+    if not rows:
         return None, 'No stream_id found for channel'
     sid = rows[0]['stream_id']
     url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
@@ -565,13 +638,18 @@ def api_guide():
     # Build allowed channel set from Movies.db if filtering
     allowed_ch_ids = None
     if fav_only or movie_only or ps_only:
-        where_parts = []
-        if fav_only:   where_parts.append('favorite = 1')
-        if movie_only: where_parts.append('is_movie_channel = 1')
-        where = (' AND '.join(where_parts) + ' AND ' if where_parts else '') + \
-                'guide_channel IS NOT NULL AND guide_channel != ""'
-        rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
-        allowed_ch_ids = {r['guide_channel'] for r in rows}
+        if ps_only and not fav_only and not movie_only:
+            guide_db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+            movies_db_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+            allowed_ch_ids = get_ps_channel_ids(guide_db_path, movies_db_path)
+        else:
+            where_parts = []
+            if fav_only:   where_parts.append('favorite = 1')
+            if movie_only: where_parts.append('is_movie_channel = 1')
+            where = (' AND '.join(where_parts) + ' AND ' if where_parts else '') + \
+                    'guide_channel IS NOT NULL AND guide_channel != ""'
+            rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
+            allowed_ch_ids = {r['guide_channel'] for r in rows}
 
     # For SD-only: channels NOT in Movies.db (no stream_id)
     excluded_ch_ids = None
