@@ -948,17 +948,24 @@ def api_airings():
     tz_str  = cfg.get('timezone','America/New_York')
     local_tz = ZoneInfo(tz_str)
     now_utc = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+
+    # Strip trailing (YYYY) so "Batman Returns (1992)" also matches "Batman Returns"
+    import re as _re2
+    m2 = _re2.match(r'^(.+?)\s*\((\d{4})\)\s*$', title)
+    clean_title = m2.group(1).strip() if m2 else title
+
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
+        # Search both full title and cleaned title
         rows = conn.execute('''
             SELECT channel_id, channel_name, start_utc, end_utc
             FROM guide
-            WHERE lower(title) = lower(?)
+            WHERE (lower(title) = lower(?) OR lower(title) = lower(?))
             AND start_utc > ?
             ORDER BY start_utc
             LIMIT 30
-        ''', (title, now_utc)).fetchall()
+        ''', (title, clean_title, now_utc)).fetchall()
         conn.close()
     except Exception:
         return jsonify({'airings': []})
