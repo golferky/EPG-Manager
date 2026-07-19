@@ -928,6 +928,52 @@ def api_prog_info():
 
     return jsonify({'error': 'Not found'}), 404
 
+@app.route('/epg-web/api/airings')
+def api_airings():
+    """Return all future airings of a title from guide.db."""
+    from zoneinfo import ZoneInfo
+    title   = request.args.get('title','').strip()
+    if not title:
+        return jsonify({'airings': []})
+    cfg     = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    tz_str  = cfg.get('timezone','America/New_York')
+    local_tz = ZoneInfo(tz_str)
+    now_utc = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''
+            SELECT channel_id, channel_name, start_utc, end_utc
+            FROM guide
+            WHERE lower(title) = lower(?)
+            AND start_utc > ?
+            ORDER BY start_utc
+            LIMIT 30
+        ''', (title, now_utc)).fetchall()
+        conn.close()
+    except Exception:
+        return jsonify({'airings': []})
+
+    airings = []
+    for r in rows:
+        try:
+            su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            sl = su.astimezone(local_tz)
+            el = eu.astimezone(local_tz)
+            airings.append({
+                'channel_id':   r['channel_id'],
+                'channel_name': r['channel_name'],
+                'start_ts':     su.timestamp(),
+                'stop_ts':      eu.timestamp(),
+                'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
+                'stop_fmt':     el.strftime('%-I:%M %p'),
+            })
+        except Exception:
+            continue
+    return jsonify({'airings': airings})
+
 # ── Recording Routes ──────────────────────────────────────────────────────────
 
 @app.route('/epg-web/api/record', methods=['POST'])
@@ -1208,9 +1254,13 @@ tr:hover td{background:#141414;}
             <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0;"></p>
         </div>
       </div>
+      <!-- Future airings -->
+      <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
+        <div style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px;">📅 Future Airings</div>
+        <div id="pm-airings-list"></div>
+      </div>
       <!-- Footer -->
-      <div style="padding:14px 20px;border-top:1px solid #1e293b;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-        <button id="pm-rec-btn" class="btn btn-primary" onclick="recordProg()">🔴 Record</button>
+      <div style="padding:12px 20px;border-top:1px solid #1e293b;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
         <button class="btn btn-ghost" onclick="closeProg()">Close</button>
         <div id="pm-status" class="status-msg" style="margin:0;flex:1;text-align:right;"></div>
       </div>
@@ -1626,44 +1676,57 @@ async function openProg(p) {
     posterWrap.style.display = 'none';
   }
 
-  // Record button state
-  const btn = document.getElementById('pm-rec-btn');
-  if (p.start_ts <= now) {
-    btn.style.display = 'none';  // already started or aired
-  } else if (alreadyRec) {
-    btn.disabled = true; btn.textContent = '✅ Already scheduled'; btn.style.display = '';
-  } else {
-    btn.disabled = false; btn.style.display = '';
-    btn.textContent = '⏱ Schedule Recording';
-  }
-
   document.getElementById('pm-loading').style.display = 'none';
   document.getElementById('pm-content').style.display = 'block';
+
+  // Fetch future airings
+  document.getElementById('pm-airings-wrap').style.display = 'none';
+  try {
+    const ar = await (await fetch(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`)).json();
+    if (ar.airings && ar.airings.length > 0) {
+      const recMap = {};
+      Object.values(recStatus.recordings || {}).forEach(r => {
+        if (['queued','scheduled','recording'].includes(r.status))
+          recMap[r.channel_id + '|' + r.start_ts] = true;
+      });
+      document.getElementById('pm-airings-list').innerHTML = ar.airings.map(a => {
+        const key = a.channel_id + '|' + a.start_ts;
+        const scheduled = recMap[key];
+        return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e293b;font-size:12px;">
+          <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
+          <span style="color:#64748b;flex:1;">${esc(a.channel_name)}</span>
+          ${scheduled
+            ? `<span style="color:#22c55e;font-size:11px;">✅ Scheduled</span>`
+            : `<button class="btn btn-primary btn-sm" onclick="recordAiring(${JSON.stringify(a).replace(/"/g,'&quot;')},${JSON.stringify(p.title).replace(/"/g,'&quot;')})">⏱ Record</button>`
+          }
+        </div>`;
+      }).join('');
+      document.getElementById('pm-airings-wrap').style.display = 'block';
+    }
+  } catch(e) {}
 }
 function closeProg() {
   document.getElementById('prog-modal-overlay').style.display = 'none';
 }
-async function recordProg() {
-  if (!_currentProg) return;
-  const btn = document.getElementById('pm-rec-btn');
+async function recordAiring(airing, title) {
+  const btn = event.target;
   btn.disabled = true; btn.textContent = '…';
   const r = await post('/epg-web/api/record', {
-    title:      _currentProg.title,
-    channel_id: _currentProg.channel_id,
-    start_ts:   _currentProg.start_ts,
-    stop_ts:    _currentProg.stop_ts,
+    title:      title,
+    channel_id: airing.channel_id,
+    start_ts:   airing.start_ts,
+    stop_ts:    airing.stop_ts,
   });
   if (r.ok) {
-    const el = document.getElementById('pm-status');
-    el.textContent = '✅ Recording queued';
-    el.className = 'status-msg ok';
-    btn.disabled = true; btn.textContent = '✅ Queued';
+    btn.textContent = '✅ Scheduled';
+    btn.style.background = '#166534';
+    document.getElementById('pm-status').textContent = `✅ "${title}" queued`;
+    document.getElementById('pm-status').className = 'status-msg ok';
     startRecPoll();
   } else {
-    const el = document.getElementById('pm-status');
-    el.textContent = '❌ ' + (r.error || 'Failed');
-    el.className = 'status-msg err';
-    btn.disabled = false;
+    btn.disabled = false; btn.textContent = '⏱ Record';
+    document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
+    document.getElementById('pm-status').className = 'status-msg err';
   }
 }
 
