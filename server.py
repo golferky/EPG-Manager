@@ -730,10 +730,37 @@ def api_guide():
             'category':   p['category'],
         })
 
-    # Ordered channels
-    ordered_channels = [c for c in _epg['channels'] if c['id'] in ch_set]
+    # Deduplicate channels with the same name — merge SD + primestreams rows into one
+    # Prefer the primestreams XML channel_id (non-numeric) as canonical
+    import re as _re5
+    name_to_canonical = {}   # normalised name → canonical channel_id
+    id_to_canonical   = {}   # any channel_id → canonical channel_id
+
+    ordered_channels_raw = [c for c in _epg['channels'] if c['id'] in ch_set]
     if ch_filter:
-        ordered_channels = [c for c in ordered_channels if ch_filter in c['name'].lower()]
+        ordered_channels_raw = [c for c in ordered_channels_raw if ch_filter in c['name'].lower()]
+
+    for c in ordered_channels_raw:
+        norm = _re5.sub(r'[^a-z0-9]', '', c['name'].lower())
+        if norm not in name_to_canonical:
+            name_to_canonical[norm] = c['id']   # first seen becomes canonical
+        # Prefer domain-style id (non-numeric) as canonical
+        if c['id'].replace('.','').replace('_','').isalpha() or '.' in c['id']:
+            name_to_canonical[norm] = c['id']
+        id_to_canonical[c['id']] = name_to_canonical[norm]
+
+    # Remap programme channel_ids to canonical and dedupe channel list
+    for prog in progs_in_window:
+        canon = id_to_canonical.get(prog['channel_id'], prog['channel_id'])
+        prog['channel_id'] = canon
+
+    seen_ids = set()
+    ordered_channels = []
+    for c in ordered_channels_raw:
+        canon = id_to_canonical.get(c['id'], c['id'])
+        if canon not in seen_ids:
+            seen_ids.add(canon)
+            ordered_channels.append({'id': canon, 'name': c['name'], 'icon': c.get('icon','')})
 
     ch_offset = int(request.args.get('ch_offset', 0))
     ch_cap    = 200
