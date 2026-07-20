@@ -130,17 +130,17 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         gconn.close()
 
         result = set()
-        # Build a normalised-name → channel_id map for fallback
+        # Build a normalised-name → SET of channel_ids map for fallback
         name_map = {}
         for cid, cname in grows:
             key = _re.sub(r'[^a-z0-9]', '', cname.lower())
-            name_map[key] = cid
+            name_map.setdefault(key, set()).add(cid)
             if cid in ps_guide_channels:
                 result.add(cid)   # direct match
 
         # Fallback: normalise Movies.db guide_channel and look up in name_map
         for gc in ps_guide_channels:
-            norm = _re.sub(r'[^a-z0-9]', '', gc.lower())  # e.g. tastemadeus
+            norm = _re.sub(r'[^a-z0-9]', '', gc.lower())  # e.g. cinemaxus
             # Strip common country/quality suffixes to get base name
             base = norm
             for suffix in ('us','uk','za','ca','au','sd','hd','west','east'):
@@ -149,14 +149,13 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
                     break
             # Exact match on base
             if base in name_map:
-                result.add(name_map[base])
+                result.update(name_map[base])
                 continue
             # Prefix match: guide channel name is a prefix of base (TASTE → tastemade)
-            # or base is a prefix of guide channel name
-            for cname_norm, cid in name_map.items():
+            for cname_norm, cids in name_map.items():
                 if len(cname_norm) >= 3 and len(base) >= 3:
                     if base.startswith(cname_norm) or cname_norm.startswith(base):
-                        result.add(cid)
+                        result.update(cids)
         return result
     except Exception as e:
         print(f'[ps_channel_ids] {e}')
@@ -683,7 +682,7 @@ def api_guide():
                 name_map = {}
                 for cid, cname in grows:
                     key = _re4.sub(r'[^a-z0-9]', '', cname.lower())
-                    name_map[key] = cid
+                    name_map.setdefault(key, set()).add(cid)
                 for gc in direct_ids:
                     norm = _re4.sub(r'[^a-z0-9]', '', gc.lower())
                     base = norm
@@ -691,12 +690,12 @@ def api_guide():
                         if norm.endswith(sfx):
                             base = norm[:-len(sfx)]; break
                     if base in name_map:
-                        allowed_ch_ids.add(name_map[base])
+                        allowed_ch_ids.update(name_map[base])
                         continue
-                    for cname_norm, cid in name_map.items():
+                    for cname_norm, cids in name_map.items():
                         if len(cname_norm) >= 3 and len(base) >= 3:
                             if base.startswith(cname_norm) or cname_norm.startswith(base):
-                                allowed_ch_ids.add(cid)
+                                allowed_ch_ids.update(cids)
             except Exception as e:
                 print(f'[fav filter] {e}')
 
