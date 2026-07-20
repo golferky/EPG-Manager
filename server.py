@@ -645,19 +645,60 @@ def api_guide():
 
     # Build allowed channel set from Movies.db if filtering
     allowed_ch_ids = None
+    guide_db_path  = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    movies_db_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
     if fav_only or movie_only or ps_only:
         if ps_only and not fav_only and not movie_only:
-            guide_db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
-            movies_db_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
             allowed_ch_ids = get_ps_channel_ids(guide_db_path, movies_db_path)
         else:
+            # Start with direct guide_channel matches
             where_parts = []
             if fav_only:   where_parts.append('favorite = 1')
             if movie_only: where_parts.append('is_movie_channel = 1')
             where = (' AND '.join(where_parts) + ' AND ' if where_parts else '') + \
                     'guide_channel IS NOT NULL AND guide_channel != ""'
             rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
-            allowed_ch_ids = {r['guide_channel'] for r in rows}
+            direct_ids = {r['guide_channel'] for r in rows}
+            # Also include SD channel_ids that name-match these Movies.db entries
+            # (e.g. 'hbo.us' → numeric SD id for HBO)
+            ps_all = get_ps_channel_ids(guide_db_path, movies_db_path)
+            # get_ps_channel_ids returns ALL ps channel_ids; intersect with direct_ids' ps subset
+            # Build name-map for just the direct_ids channels
+            import re as _re4
+            try:
+                mconn = sqlite3.connect(movies_db_path)
+                mconn.row_factory = sqlite3.Row
+                fav_gc = direct_ids  # guide_channels that are favorites/movie
+                mconn.close()
+            except Exception:
+                fav_gc = set()
+            # From ps_all, keep only those whose guide_channel (via prefix match) is in direct_ids
+            # Simpler: run get_ps_channel_ids but restrict to direct_ids
+            allowed_ch_ids = direct_ids.copy()  # direct matches
+            # Add name-matched SD ids: channels in guide.db whose name prefix-matches a direct_id
+            try:
+                gconn = sqlite3.connect(guide_db_path)
+                grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
+                gconn.close()
+                name_map = {}
+                for cid, cname in grows:
+                    key = _re4.sub(r'[^a-z0-9]', '', cname.lower())
+                    name_map[key] = cid
+                for gc in direct_ids:
+                    norm = _re4.sub(r'[^a-z0-9]', '', gc.lower())
+                    base = norm
+                    for sfx in ('us','uk','za','ca','au','sd','hd','west','east'):
+                        if norm.endswith(sfx):
+                            base = norm[:-len(sfx)]; break
+                    if base in name_map:
+                        allowed_ch_ids.add(name_map[base])
+                        continue
+                    for cname_norm, cid in name_map.items():
+                        if len(cname_norm) >= 3 and len(base) >= 3:
+                            if base.startswith(cname_norm) or cname_norm.startswith(base):
+                                allowed_ch_ids.add(cid)
+            except Exception as e:
+                print(f'[fav filter] {e}')
 
     # For SD-only: channels NOT in Movies.db (no stream_id)
     excluded_ch_ids = None
