@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260719"
+VERSION = "v20260720"
 
-import json, os, re, sqlite3, subprocess, threading, time, uuid
+import json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
@@ -550,6 +550,47 @@ def api_status():
     return jsonify({'ok': True, 'time': datetime.now().strftime('%I:%M:%S %p'),
                     'loaded': _epg['loaded'], 'programmes': len(progs), **extra})
 
+@app.route('/epg-web/api/disk')
+def api_disk():
+    cfg = load_config()
+    checks = [
+        ('NAS (EPG)',    cfg.get('guide_path',   '/Volumes/EPG/guide/guide.xml')),
+        ('Recordings',   cfg.get('rec_path',      os.path.expanduser('~/Movies/Recordings'))),
+        ('Plex',         cfg.get('plex_path',     '/Volumes/Plex/Movies')),
+    ]
+    results = []
+    seen = set()
+    for label, path in checks:
+        # Walk up to find an existing ancestor
+        p = path
+        while p and p != '/' and not os.path.exists(p):
+            p = os.path.dirname(p)
+        if not p or p == '/':
+            results.append({'label': label, 'error': 'Not mounted'})
+            continue
+        try:
+            usage = shutil.disk_usage(p)
+            # Get the actual mount point via df
+            df = subprocess.run(['df', p], capture_output=True, text=True)
+            lines = df.stdout.strip().splitlines()
+            mount = lines[-1].split()[-1] if len(lines) >= 2 else p
+            if mount in seen:
+                # Same volume already listed — just note the label
+                for r in results:
+                    if r.get('mount') == mount:
+                        r['label'] += f' / {label}'
+                continue
+            seen.add(mount)
+            pct = round(usage.used / usage.total * 100, 1) if usage.total else 0
+            results.append({
+                'label': label, 'mount': mount,
+                'total': usage.total, 'used': usage.used, 'free': usage.free,
+                'pct': pct,
+            })
+        except Exception as e:
+            results.append({'label': label, 'error': str(e)})
+    return jsonify({'ok': True, 'disks': results})
+
 @app.route('/epg-web/api/config', methods=['GET'])
 def api_get_config():
     return jsonify(load_config())
@@ -1055,6 +1096,7 @@ def api_prog_info():
     from urllib.parse import quote
     title = request.args.get('title', '').strip()
     year  = request.args.get('year', '').strip()
+    desc  = request.args.get('desc', '').strip()
     if not title:
         return jsonify({'error': 'No title'}), 400
 
@@ -1065,6 +1107,12 @@ def api_prog_info():
         title = m.group(1).strip()
         if not year:
             year = m.group(2)
+
+    # Try to extract year from description (e.g. "Steve McQueen stars in this 1968 thriller")
+    if not year and desc:
+        ym = _re.search(r'\b(19[3-9]\d|20[0-2]\d)\b', desc)
+        if ym:
+            year = ym.group(1)
 
     cfg = load_config()
     omdb_key = cfg.get('omdb_key', '')
@@ -1115,11 +1163,64 @@ def api_prog_info():
         except Exception as e:
             print(f'[OMDB] {e}')
 
+    # 2b. OMDB search fallback — if no year and title lookup returned wrong version,
+    #     do a search (?s=) to get all hits and pick the oldest one for classic titles
+    if omdb_key and not year:
+        try:
+            q   = quote(title)
+            url = f'http://www.omdbapi.com/?s={q}&type=movie&apikey={omdb_key}'
+            with urlreq.urlopen(url, timeout=5) as resp:
+                sd_r = json.loads(resp.read())
+            hits = sd_r.get('Search', [])
+            if len(hits) > 1:
+                # If desc mentions an actor name that appears in one hit's year, prefer it
+                # Otherwise pick the oldest hit (for classic movies airing on movie channels)
+                # Check if desc hints at a specific decade
+                decade_hint = None
+                if desc:
+                    dm = _re.search(r'\b(19[3-9]\d|20[0-2]\d)\b', desc)
+                    if dm:
+                        decade_hint = dm.group(1)
+                best = None
+                if decade_hint:
+                    for h in hits:
+                        hy = (h.get('Year') or '')[:4]
+                        if hy == decade_hint:
+                            best = h; break
+                if not best:
+                    best = hits[0]  # already returned above; skip re-lookup
+                # Fetch full details for best hit
+                imdb_id = best.get('imdbID','')
+                if imdb_id:
+                    url2 = f'http://www.omdbapi.com/?i={imdb_id}&apikey={omdb_key}'
+                    with urlreq.urlopen(url2, timeout=5) as resp2:
+                        od2 = json.loads(resp2.read())
+                    if od2.get('Response') == 'True':
+                        poster = od2.get('Poster','')
+                        if poster == 'N/A': poster = ''
+                        return jsonify({
+                            'source':      'omdb',
+                            'in_library':  in_library,
+                            'title':       od2.get('Title',''),
+                            'year':        od2.get('Year',''),
+                            'genre':       od2.get('Genre',''),
+                            'rated':       od2.get('Rated',''),
+                            'plot':        od2.get('Plot',''),
+                            'actors':      od2.get('Actors',''),
+                            'director':    od2.get('Director',''),
+                            'poster':      poster or local_poster,
+                            'imdb_rating': od2.get('imdbRating',''),
+                            'imdb_votes':  od2.get('imdbVotes',''),
+                        })
+        except Exception as e:
+            print(f'[OMDB-search] {e}')
+
     # 3. TMDB fallback
     if tmdb_key:
         try:
             q   = quote(title)
-            url = f'https://api.themoviedb.org/3/search/multi?api_key={tmdb_key}&query={q}'
+            yr_param = f'&year={year}' if year else ''
+            url = f'https://api.themoviedb.org/3/search/multi?api_key={tmdb_key}&query={q}{yr_param}'
             with urlreq.urlopen(url, timeout=5) as resp:
                 td = json.loads(resp.read())
             results = td.get('results', [])
@@ -1448,6 +1549,47 @@ def api_record():
 def api_rec_status():
     with _rec_lock:
         return jsonify({'recordings': dict(_recs)})
+
+@app.route('/epg-web/api/recordings/files')
+def api_recordings_files():
+    cfg = load_config()
+    rec_dir = cfg.get('rec_path', os.path.expanduser('~/Movies/Recordings'))
+    files = []
+    if os.path.isdir(rec_dir):
+        for fn in sorted(os.listdir(rec_dir)):
+            fp = os.path.join(rec_dir, fn)
+            if os.path.isfile(fp):
+                stat = os.stat(fp)
+                files.append({
+                    'name':     fn,
+                    'size':     stat.st_size,
+                    'mtime':    stat.st_mtime,
+                    'mtime_fmt': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                })
+    files.sort(key=lambda x: x['mtime'], reverse=True)
+    total = sum(f['size'] for f in files)
+    return jsonify({'ok': True, 'dir': rec_dir, 'files': files, 'total': total})
+
+@app.route('/epg-web/api/recordings/delete', methods=['POST'])
+def api_recordings_delete():
+    cfg = load_config()
+    rec_dir = cfg.get('rec_path', os.path.expanduser('~/Movies/Recordings'))
+    names = (request.json or {}).get('files', [])
+    deleted = []
+    errors  = []
+    for fn in names:
+        # Safety: no path traversal
+        fn = os.path.basename(fn)
+        fp = os.path.join(rec_dir, fn)
+        if os.path.isfile(fp):
+            try:
+                os.remove(fp)
+                deleted.append(fn)
+            except Exception as e:
+                errors.append(f'{fn}: {e}')
+        else:
+            errors.append(f'{fn}: not found')
+    return jsonify({'ok': not errors, 'deleted': deleted, 'errors': errors})
 
 @app.route('/epg-web/api/record/cancel', methods=['POST'])
 def api_rec_cancel():
@@ -1796,6 +1938,23 @@ tr:hover td{background:#141414;}
       </table>
     </div>
   </div>
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+      <h2 style="margin:0;">🗑 Recordings Cleanup</h2>
+      <span id="rec-files-total" style="font-size:12px;color:#64748b;"></span>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecFiles()">↻ Refresh</button>
+      <button class="btn btn-sm" id="rec-delete-btn" style="background:#7f1d1d;color:#fca5a5;display:none;" onclick="deleteSelectedRecordings()">🗑 Delete Selected</button>
+    </div>
+    <div id="rec-files-empty" style="display:none;color:#64748b;font-size:13px;">No recording files found.</div>
+    <div id="rec-files-list" style="max-height:320px;overflow-y:auto;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+      <h2 style="margin:0;">💾 Storage</h2>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadDiskUsage()">↻ Refresh</button>
+    </div>
+    <div id="disk-list"></div>
+  </div>
 </div>
 
 <!-- CONVERSIONS -->
@@ -1915,7 +2074,7 @@ function switchTab(name) {
   document.getElementById('pane-'+name).classList.add('active');
   if (name === 'recommendations') loadRecs();
   if (name === 'channels') loadChannels();
-  if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
+  if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); loadRecFiles(); loadDiskUsage(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
 }
 
@@ -2194,7 +2353,10 @@ async function openProg(p) {
   // Fetch enriched info
   let info = {};
   try {
-    const r  = await fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}`);
+    const params = new URLSearchParams({title: p.title});
+    if (p.desc)  params.set('desc', p.desc);
+    if (p.year)  params.set('year', p.year);
+    const r  = await fetch(`/epg-web/api/prog-info?${params}`);
     if (r.ok) info = await r.json();
   } catch(e) {}
 
@@ -2365,6 +2527,93 @@ async function loadSeriesRecordings() {
       (active.length ? '<div style="font-size:11px;color:#3b82f6;font-weight:600;margin-bottom:6px;">ACTIVE</div>' + active.map(renderRow).join('') : '') +
       (inactive.length ? '<div style="font-size:11px;color:#64748b;font-weight:600;margin:12px 0 6px;">CANCELLED</div>' + inactive.map(renderRow).join('') : '');
   } catch(e) {}
+}
+
+function fmtSize(bytes) {
+  if (bytes >= 1e9) return (bytes/1e9).toFixed(2) + ' GB';
+  if (bytes >= 1e6) return (bytes/1e6).toFixed(1) + ' MB';
+  return (bytes/1e3).toFixed(0) + ' KB';
+}
+
+async function loadRecFiles() {
+  const list  = document.getElementById('rec-files-list');
+  const empty = document.getElementById('rec-files-empty');
+  const total = document.getElementById('rec-files-total');
+  const delbtn = document.getElementById('rec-delete-btn');
+  if (!list) return;
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;">Loading…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recordings/files')).json();
+    if (!d.ok || !d.files.length) {
+      list.innerHTML = ''; empty.style.display = '';
+      total.textContent = ''; delbtn.style.display = 'none';
+      return;
+    }
+    empty.style.display = 'none';
+    total.textContent = `${d.files.length} files · ${fmtSize(d.total)}`;
+    list.innerHTML = d.files.map(f => `
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #1e293b;">
+        <input type="checkbox" class="rec-file-chk" data-name="${esc(f.name)}"
+               onchange="updateRecDeleteBtn()" style="flex-shrink:0;">
+        <span style="flex:1;font-size:12px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(f.name)}">${esc(f.name)}</span>
+        <span style="font-size:11px;color:#64748b;white-space:nowrap;">${fmtSize(f.size)}</span>
+        <span style="font-size:11px;color:#475569;white-space:nowrap;">${esc(f.mtime_fmt)}</span>
+      </div>`).join('');
+    delbtn.style.display = 'none';
+  } catch(e) { list.innerHTML = '<div style="color:#ef4444;">Error loading files.</div>'; }
+}
+
+function updateRecDeleteBtn() {
+  const checked = document.querySelectorAll('.rec-file-chk:checked').length;
+  const btn = document.getElementById('rec-delete-btn');
+  if (!btn) return;
+  btn.style.display = checked > 0 ? '' : 'none';
+  btn.textContent = `🗑 Delete Selected (${checked})`;
+}
+
+async function deleteSelectedRecordings() {
+  const checked = [...document.querySelectorAll('.rec-file-chk:checked')].map(c => c.dataset.name);
+  if (!checked.length) return;
+  if (!confirm(`Delete ${checked.length} file(s)? This cannot be undone.`)) return;
+  const btn = document.getElementById('rec-delete-btn');
+  btn.disabled = true; btn.textContent = 'Deleting…';
+  const r = await post('/epg-web/api/recordings/delete', {files: checked});
+  if (r.errors && r.errors.length) alert('Errors:\n' + r.errors.join('\n'));
+  await loadRecFiles();
+  loadDiskUsage();
+}
+
+async function loadDiskUsage() {
+  const el = document.getElementById('disk-list');
+  if (!el) return;
+  el.innerHTML = '<div style="color:#64748b;font-size:13px;">Checking…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/disk')).json();
+    if (!d.ok || !d.disks.length) { el.innerHTML = '<div style="color:#64748b;">No volumes found.</div>'; return; }
+    el.innerHTML = d.disks.map(disk => {
+      if (disk.error) return `
+        <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #1e293b;">
+          <span style="min-width:120px;font-size:13px;color:#94a3b8;">${esc(disk.label)}</span>
+          <span style="font-size:12px;color:#ef4444;">⚠ ${esc(disk.error)}</span>
+        </div>`;
+      const pct = disk.pct;
+      const color = pct >= 90 ? '#ef4444' : pct >= 75 ? '#f59e0b' : '#22c55e';
+      const freeGB = (disk.free / 1e9).toFixed(1);
+      const totalGB = (disk.total / 1e9).toFixed(1);
+      return `
+        <div style="padding:10px 0;border-bottom:1px solid #1e293b;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+            <span style="min-width:120px;font-size:13px;color:#e2e8f0;font-weight:500;">${esc(disk.label)}</span>
+            <span style="font-size:12px;color:#64748b;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(disk.mount)}</span>
+            <span style="font-size:13px;font-weight:600;color:${color};">${pct}%</span>
+            <span style="font-size:12px;color:#64748b;">${freeGB} GB free of ${totalGB} GB</span>
+          </div>
+          <div style="height:6px;background:#1e293b;border-radius:3px;overflow:hidden;">
+            <div style="height:100%;width:${pct}%;background:${color};border-radius:3px;transition:width .4s;"></div>
+          </div>
+        </div>`;
+    }).join('');
+  } catch(e) { el.innerHTML = '<div style="color:#ef4444;">Error loading disk info.</div>'; }
 }
 
 function closeProg() {
