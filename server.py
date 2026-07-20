@@ -188,6 +188,14 @@ def ensure_guide_db(db_path):
             icon TEXT
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS series_recordings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT UNIQUE,
+            created_at TEXT,
+            active INTEGER DEFAULT 1
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -1223,6 +1231,136 @@ def api_play_stop():
 
 # ── Recording Routes ──────────────────────────────────────────────────────────
 
+# ── Series Recordings ────────────────────────────────────────────────────────
+
+def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='America/New_York'):
+    """Queue recordings for all future primestreams airings of title. Returns count scheduled."""
+    from zoneinfo import ZoneInfo
+    import re as _re3
+    local_tz  = ZoneInfo(tz_str)
+    now_utc   = datetime.now(timezone.utc)
+    now_str   = now_utc.strftime('%Y%m%d%H%M%S')
+    clean     = _re3.match(r'^(.+?)\s*\(\d{4}\)\s*$', title)
+    clean_title = clean.group(1).strip() if clean else title
+    recordable = get_ps_channel_ids(guide_db_path, movies_db_path)
+    scheduled = 0
+    try:
+        conn = sqlite3.connect(guide_db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''
+            SELECT channel_id, channel_name, start_utc, end_utc
+            FROM guide
+            WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
+            AND start_utc > ? AND channel_id IN ({})
+            ORDER BY start_utc LIMIT 100
+        '''.format(','.join('?' * len(recordable))),
+            [title, clean_title, now_str] + list(recordable)
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        print(f'[series] query error: {e}')
+        return 0
+    with _rec_lock:
+        existing_keys = {(r['channel_id'], r['start_ts']) for r in _recs.values()
+                         if r.get('status') in ('queued','scheduled','recording')}
+    for r in rows:
+        try:
+            su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            key = (r['channel_id'], su.timestamp())
+            if key in existing_keys:
+                continue
+            rec_id = f"rec_{int(time.time()*1000)}_{r['channel_id'][:8]}"
+            with _rec_lock:
+                _recs[rec_id] = {
+                    'title': title, 'channel_id': r['channel_id'],
+                    'channel': r['channel_name'],
+                    'start_ts': su.timestamp(), 'stop_ts': eu.timestamp(),
+                    'status': 'queued', 'progress': 0, 'log': [], 'pid': None, 'file': None,
+                }
+                existing_keys.add(key)
+            t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
+            t.start()
+            scheduled += 1
+        except Exception as e:
+            print(f'[series] airing error: {e}')
+    return scheduled
+
+@app.route('/epg-web/api/record/series', methods=['GET'])
+def api_series_list():
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    now_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        series = conn.execute('SELECT id, title, created_at, active FROM series_recordings ORDER BY created_at DESC').fetchall()
+        result = []
+        for s in series:
+            # Count upcoming primestreams airings
+            recordable = get_ps_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
+            cnt = 0
+            if recordable:
+                cnt = conn.execute(
+                    'SELECT COUNT(*) FROM guide WHERE lower(title)=lower(?) AND start_utc>? AND channel_id IN ({})'.format(
+                        ','.join('?'*len(recordable))),
+                    [s['title'], now_str] + list(recordable)
+                ).fetchone()[0]
+            result.append({'id': s['id'], 'title': s['title'], 'created_at': s['created_at'],
+                           'active': s['active'], 'upcoming': cnt})
+        conn.close()
+        return jsonify({'series': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/record/series', methods=['POST'])
+def api_series_add():
+    data  = request.json or {}
+    title = data.get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'No title'}), 400
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    ensure_guide_db(db_path)
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            'INSERT OR REPLACE INTO series_recordings(title, created_at, active) VALUES(?,?,1)',
+            (title, datetime.now(timezone.utc).isoformat())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    scheduled = _schedule_series_airings(title, db_path,
+                    cfg.get('db_path', '/Volumes/EPG/Movies.db'),
+                    cfg.get('timezone', 'America/New_York'))
+    return jsonify({'ok': True, 'scheduled': scheduled})
+
+@app.route('/epg-web/api/record/series/cancel', methods=['POST'])
+def api_series_cancel():
+    data  = request.json or {}
+    title = data.get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'No title'}), 400
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute('UPDATE series_recordings SET active=0 WHERE title=?', (title,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    # Cancel any queued (not yet started) recordings for this title
+    cancelled = 0
+    with _rec_lock:
+        for rec_id, rec in _recs.items():
+            if rec.get('title','').lower() == title.lower() and rec.get('status') == 'queued':
+                rec['status'] = 'cancelled'
+                cancelled += 1
+    return jsonify({'ok': True, 'cancelled': cancelled})
+
 @app.route('/epg-web/api/record', methods=['POST'])
 def api_record():
     data       = request.json or {}
@@ -1476,6 +1614,11 @@ tr:hover td{background:#141414;}
     <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">🔴 Active Recordings</h3>
     <div id="rec-list"></div>
   </div>
+  <!-- Series Recordings panel -->
+  <div style="margin-top:24px;">
+    <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">📺 Series Recordings</h3>
+    <div id="series-list" style="max-height:300px;overflow-y:auto;"></div>
+  </div>
 </div>
 
 <!-- Programme detail modal -->
@@ -1520,7 +1663,10 @@ tr:hover td{background:#141414;}
       </div>
       <!-- All future airings -->
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
-        <div style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px;">📅 All Future Airings</div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+          <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📅 All Future Airings</span>
+          <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Series</button>
+        </div>
         <div id="pm-airings-list" style="max-height:160px;overflow-y:auto;"></div>
       </div>
       <!-- Footer -->
@@ -1710,7 +1856,7 @@ function switchTab(name) {
   document.getElementById('pane-'+name).classList.add('active');
   if (name === 'recommendations') loadRecs();
   if (name === 'channels') loadChannels();
-  if (name === 'schedule') loadSchedule();
+  if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
 }
 
@@ -2110,6 +2256,56 @@ async function stopStream() {
 async function recordNext() {
   if (!_nextAiring) return;
   await recordAiring(_nextAiring, _nextAiring._title);
+}
+
+async function recordSeries() {
+  const title = _currentProg && _currentProg.title;
+  if (!title) return;
+  const btn = document.getElementById('pm-series-btn');
+  btn.disabled = true; btn.textContent = '⏳ Scheduling…';
+  const r = await post('/epg-web/api/record/series', {title});
+  if (r.ok) {
+    btn.textContent = `✅ Series (${r.scheduled} queued)`;
+    document.getElementById('pm-status').textContent = `📺 Series recording set for "${title}" — ${r.scheduled} airings queued`;
+    document.getElementById('pm-status').className = 'status-msg ok';
+    loadSeriesRecordings();
+  } else {
+    btn.disabled = false; btn.textContent = '📺 Record Series';
+    document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
+    document.getElementById('pm-status').className = 'status-msg err';
+  }
+}
+
+async function cancelSeries(title) {
+  if (!confirm(`Stop recording series "${title}"?`)) return;
+  const r = await post('/epg-web/api/record/series/cancel', {title});
+  if (r.ok) loadSeriesRecordings();
+}
+
+async function loadSeriesRecordings() {
+  try {
+    const d = await (await fetch('/epg-web/api/record/series')).json();
+    const el = document.getElementById('series-list');
+    if (!el) return;
+    const active = (d.series || []).filter(s => s.active);
+    const inactive = (d.series || []).filter(s => !s.active);
+    if (!d.series || !d.series.length) {
+      el.innerHTML = '<div style="color:#64748b;font-size:13px;">No series recordings set up.</div>';
+      return;
+    }
+    const renderRow = (s) => `
+      <div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #1e293b;">
+        <span style="flex:1;font-size:13px;color:${s.active?'#e2e8f0':'#64748b'};">${esc(s.title)}</span>
+        <span style="font-size:11px;color:#94a3b8;min-width:90px;">${s.upcoming} upcoming</span>
+        ${s.active
+          ? `<button class="btn btn-ghost btn-sm" onclick="cancelSeries(${JSON.stringify(s.title).replace(/"/g,'&quot;')})" style="font-size:11px;color:#ef4444;border-color:#ef4444;">❌ Cancel</button>`
+          : `<span style="font-size:11px;color:#64748b;">Cancelled</span>`
+        }
+      </div>`;
+    el.innerHTML =
+      (active.length ? '<div style="font-size:11px;color:#3b82f6;font-weight:600;margin-bottom:6px;">ACTIVE</div>' + active.map(renderRow).join('') : '') +
+      (inactive.length ? '<div style="font-size:11px;color:#64748b;font-weight:600;margin:12px 0 6px;">CANCELLED</div>' + inactive.map(renderRow).join('') : '');
+  } catch(e) {}
 }
 
 function closeProg() {
