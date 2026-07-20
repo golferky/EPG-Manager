@@ -650,7 +650,8 @@ def api_guide():
         if ps_only and not fav_only and not movie_only:
             allowed_ch_ids = get_ps_channel_ids(guide_db_path, movies_db_path)
         else:
-            # Start with direct guide_channel matches
+            # Get the display names of favorite/movie channels from guide.db
+            # by looking up what name each Movies.db guide_channel appears as
             where_parts = []
             if fav_only:   where_parts.append('favorite = 1')
             if movie_only: where_parts.append('is_movie_channel = 1')
@@ -658,44 +659,35 @@ def api_guide():
                     'guide_channel IS NOT NULL AND guide_channel != ""'
             rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
             direct_ids = {r['guide_channel'] for r in rows}
-            # Also include SD channel_ids that name-match these Movies.db entries
-            # (e.g. 'hbo.us' → numeric SD id for HBO)
-            ps_all = get_ps_channel_ids(guide_db_path, movies_db_path)
-            # get_ps_channel_ids returns ALL ps channel_ids; intersect with direct_ids' ps subset
-            # Build name-map for just the direct_ids channels
-            import re as _re4
-            try:
-                mconn = sqlite3.connect(movies_db_path)
-                mconn.row_factory = sqlite3.Row
-                fav_gc = direct_ids  # guide_channels that are favorites/movie
-                mconn.close()
-            except Exception:
-                fav_gc = set()
-            # From ps_all, keep only those whose guide_channel (via prefix match) is in direct_ids
-            # Simpler: run get_ps_channel_ids but restrict to direct_ids
-            allowed_ch_ids = direct_ids.copy()  # direct matches
-            # Add name-matched SD ids: channels in guide.db whose name prefix-matches a direct_id
+            allowed_ch_ids = set(direct_ids)  # always include direct IDs
+
             try:
                 gconn = sqlite3.connect(guide_db_path)
-                grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
+                # Get names for the direct_ids (from guide table or guide_channels)
+                fav_names = set()
+                for cid in direct_ids:
+                    r = gconn.execute(
+                        'SELECT channel_name FROM guide WHERE channel_id=? LIMIT 1', (cid,)
+                    ).fetchone()
+                    if r and r[0]:
+                        fav_names.add(r[0].upper().strip())
+                    # Also try guide_channels table
+                    r2 = gconn.execute(
+                        'SELECT channel_name FROM guide_channels WHERE channel_id=? LIMIT 1', (cid,)
+                    ).fetchone()
+                    if r2 and r2[0]:
+                        fav_names.add(r2[0].upper().strip())
+
+                # Now find ALL channel_ids in guide that have any of these display names
+                if fav_names:
+                    placeholders = ','.join('?' * len(fav_names))
+                    extra = gconn.execute(
+                        f'SELECT DISTINCT channel_id FROM guide WHERE upper(channel_name) IN ({placeholders})',
+                        list(fav_names)
+                    ).fetchall()
+                    for e in extra:
+                        allowed_ch_ids.add(e[0])
                 gconn.close()
-                name_map = {}
-                for cid, cname in grows:
-                    key = _re4.sub(r'[^a-z0-9]', '', cname.lower())
-                    name_map.setdefault(key, set()).add(cid)
-                for gc in direct_ids:
-                    norm = _re4.sub(r'[^a-z0-9]', '', gc.lower())
-                    base = norm
-                    for sfx in ('us','uk','za','ca','au','sd','hd','west','east'):
-                        if norm.endswith(sfx):
-                            base = norm[:-len(sfx)]; break
-                    if base in name_map:
-                        allowed_ch_ids.update(name_map[base])
-                        continue
-                    for cname_norm, cids in name_map.items():
-                        if len(cname_norm) >= 3 and len(base) >= 3:
-                            if base.startswith(cname_norm) or cname_norm.startswith(base):
-                                allowed_ch_ids.update(cids)
             except Exception as e:
                 print(f'[fav filter] {e}')
 

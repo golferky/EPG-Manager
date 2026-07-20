@@ -113,7 +113,7 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
             sid = mapping['stationID']
             if sid in stations:
                 st = stations[sid]
-                name = st.get('callsign') or st.get('name', sid)
+                name = st.get('name') or st.get('callsign') or sid
                 icon = ''
                 if st.get('stationLogo'):
                     icon = st['stationLogo'][0].get('URL', '')
