@@ -62,9 +62,18 @@ def ensure_guide_db(db_path):
             start_utc TEXT,
             end_utc TEXT,
             desc TEXT,
-            category TEXT
+            category TEXT,
+            episode_title TEXT,
+            season_num INTEGER,
+            episode_num INTEGER
         )
     ''')
+    # Migrate existing DBs — safe: ADD COLUMN is a no-op if column already exists
+    for col, typedef in [('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'), ('prog_type', 'TEXT')]:
+        try:
+            conn.execute(f'ALTER TABLE guide ADD COLUMN {col} {typedef}')
+        except Exception:
+            pass  # column already exists
     conn.execute('''
         CREATE UNIQUE INDEX IF NOT EXISTS idx_guide_unique
         ON guide(channel_id, start_utc, title)
@@ -196,7 +205,15 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
                         break
                 if desc:
                     break
-            prog_details[pid] = {'title': title, 'category': cat, 'desc': desc}
+            # Episode metadata
+            ep_title   = (p.get('episodeTitle150') or '').strip()
+            gracenote  = next((m.get('Gracenote', {}) for m in p.get('metadata', []) if 'Gracenote' in m), {})
+            season_num = gracenote.get('season')    # int or None
+            ep_num     = gracenote.get('episode')   # int or None
+            prog_type  = pid[:2] if len(pid) >= 2 else ''  # MV/EP/SH/SP/DD
+            prog_details[pid] = {'title': title, 'category': cat, 'desc': desc,
+                                 'episode_title': ep_title, 'season_num': season_num, 'episode_num': ep_num,
+                                 'prog_type': prog_type}
 
     # 7. Insert into guide.db
     log('Writing to guide.db…')
@@ -215,12 +232,20 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
             except Exception:
                 continue
             cur = conn.execute('''
-                INSERT OR IGNORE INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category)
-                VALUES (?,?,?,?,?,?,?)
+                INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category,
+                                  episode_title, season_num, episode_num, prog_type)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(channel_id, start_utc, title) DO UPDATE SET
+                    desc=excluded.desc, category=excluded.category,
+                    episode_title=excluded.episode_title,
+                    season_num=excluded.season_num, episode_num=excluded.episode_num,
+                    prog_type=excluded.prog_type
             ''', (
                 detail['title'], sid, ch_name,
                 start_utc, end_utc,
-                detail['desc'], detail['category']
+                detail['desc'], detail['category'],
+                detail['episode_title'], detail['season_num'], detail['episode_num'],
+                detail.get('prog_type', '')
             ))
             inserted += cur.rowcount
 

@@ -1,12 +1,36 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260720"
+VERSION = "v20260804g"
 
 import json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
+
+# Always create the recordings table on startup, regardless of how Flask is launched
+def _bootstrap():
+    try:
+        import sqlite3 as _sq3, os as _os, json as _js
+        _cfg = _js.load(open(_os.path.join(_os.path.dirname(__file__), 'epg_config.json')))
+        _db  = _cfg.get('guide_db_path', _os.path.join(_os.path.dirname(__file__), 'guide.db'))
+        _c   = _sq3.connect(_db)
+        _c.execute('''CREATE TABLE IF NOT EXISTS recordings (
+            rec_id TEXT PRIMARY KEY, title TEXT, channel TEXT, channel_id TEXT,
+            start_ts REAL, stop_ts REAL, start_time TEXT,
+            status TEXT DEFAULT "queued", failure_reason TEXT, file TEXT,
+            created_at TEXT)''')
+        # Migrate guide table — add episode columns if missing (safe no-op if already present)
+        for _col, _typedef in [('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'), ('prog_type', 'TEXT')]:
+            try:
+                _c.execute(f'ALTER TABLE guide ADD COLUMN {_col} {_typedef}')
+            except Exception:
+                pass
+        _c.commit(); _c.close()
+        print('[bootstrap] recordings table ready')
+    except Exception as _e:
+        print(f'[bootstrap] recordings table ERROR: {_e}')
+_bootstrap()
 app.secret_key = os.urandom(24)
 
 BASE_DIR         = os.path.expanduser('~/epg')
@@ -130,32 +154,36 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         gconn.close()
 
         result = set()
-        # Build a normalised-name → SET of channel_ids map for fallback
+        # Build lookup dicts
+        id_to_norm = {cid: _re.sub(r'[^a-z0-9]', '', cname.lower()) for cid, cname in grows}
         name_map = {}
         for cid, cname in grows:
-            key = _re.sub(r'[^a-z0-9]', '', cname.lower())
+            key = id_to_norm[cid]
             name_map.setdefault(key, set()).add(cid)
             if cid in ps_guide_channels:
                 result.add(cid)   # direct match
 
+        def _pick_best(cids, target_norm):
+            """When multiple guide channels match one PS stream, pick the closest by name length."""
+            return min(cids, key=lambda cid: abs(len(id_to_norm.get(cid, '')) - len(target_norm)))
+
         # Fallback: normalise Movies.db guide_channel and look up in name_map
         for gc in ps_guide_channels:
-            norm = _re.sub(r'[^a-z0-9]', '', gc.lower())  # e.g. cinemaxus
-            # Strip common country/quality suffixes to get base name
+            norm = _re.sub(r'[^a-z0-9]', '', gc.lower())
             base = norm
             for suffix in ('us','uk','za','ca','au','sd','hd','west','east'):
                 if norm.endswith(suffix):
                     base = norm[:-len(suffix)]
                     break
-            # Exact match on base
+            # Exact match on base — pick single best to avoid East/West duplicates
             if base in name_map:
-                result.update(name_map[base])
+                result.add(_pick_best(name_map[base], base))
                 continue
-            # Prefix match: guide channel name is a prefix of base (TASTE → tastemade)
+            # Prefix match
             for cname_norm, cids in name_map.items():
                 if len(cname_norm) >= 3 and len(base) >= 3:
                     if base.startswith(cname_norm) or cname_norm.startswith(base):
-                        result.update(cids)
+                        result.add(_pick_best(cids, base))
         return result
     except Exception as e:
         print(f'[ps_channel_ids] {e}')
@@ -268,7 +296,7 @@ def load_epg_from_db(db_path, tz_str='America/New_York'):
         channel_map[cid] = name
 
     programmes = []
-    for row in conn.execute('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category FROM guide ORDER BY start_utc'):
+    for row in conn.execute('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category, episode_title, season_num, episode_num, prog_type FROM guide ORDER BY start_utc'):
         try:
             su = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             eu = datetime.strptime(row['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -286,11 +314,48 @@ def load_epg_from_db(db_path, tz_str='America/New_York'):
             'stop_iso':   el.isoformat(),
             'start_fmt':  sl.strftime('%Y-%m-%d %H:%M'),
             'stop_fmt':   el.strftime('%H:%M'),
-            'desc':       row['desc'] or '',
-            'category':   row['category'] or '',
+            'desc':          row['desc'] or '',
+            'category':      row['category'] or '',
+            'episode_title': row['episode_title'] or '',
+            'season_num':    row['season_num'],
+            'episode_num':   row['episode_num'],
+            'prog_type':     row['prog_type'] or '',
         })
 
     conn.close()
+
+    # Propagate prog_type + episode data from SD rows to XMLTV rows
+    # SD rows have numeric channel_ids; XMLTV rows have domain-style channel_ids
+    # Match by title (for prog_type) and title+start_ts±15min (for episode details)
+    title_pt   = {}   # title → prog_type
+    # title → list of (start_ts, season_num, episode_num, episode_title)
+    title_eps  = {}
+    for p in programmes:
+        if p['prog_type']:
+            title_pt[p['title']] = p['prog_type']
+        if p.get('season_num') is not None or p.get('episode_title'):
+            title_eps.setdefault(p['title'], []).append({
+                'ts':  p['start_ts'],
+                'sn':  p.get('season_num'),
+                'en':  p.get('episode_num'),
+                'et':  p.get('episode_title', ''),
+            })
+    filled_pt = 0; filled_ep = 0
+    TOLERANCE = 900  # 15 minutes in seconds
+    for p in programmes:
+        if not p['prog_type'] and p['title'] in title_pt:
+            p['prog_type'] = title_pt[p['title']]
+            filled_pt += 1
+        if p.get('season_num') is None and not p.get('episode_title'):
+            for ep in title_eps.get(p['title'], []):
+                if abs(ep['ts'] - p['start_ts']) <= TOLERANCE:
+                    p['season_num']    = ep['sn']
+                    p['episode_num']   = ep['en']
+                    p['episode_title'] = ep['et']
+                    filled_ep += 1
+                    break
+    print(f'[startup] Propagated prog_type={filled_pt}, episode info={filled_ep} XMLTV programmes')
+
     _epg['channels']    = channels
     _epg['channel_map'] = channel_map
     _epg['programmes']  = programmes
@@ -361,6 +426,7 @@ def load_epg(path, tz_str='America/New_York'):
 
 _convs = {}   # conv_id -> {file, status, progress, log, pid}
 _conv_lock = threading.Lock()
+_plex_info_cache = {}  # norm_title -> ffprobe result dict
 
 def _run_conv(conv_id, inp, out):
     cmd = ['ffmpeg', '-y', '-i', inp,
@@ -407,40 +473,172 @@ def _run_conv(conv_id, inp, out):
 _recs      = {}   # rec_id → {title, channel, start_ts, stop_ts, status, progress, log, pid, file}
 _rec_lock  = threading.Lock()
 
+def _guide_db_path():
+    cfg = load_config()
+    return cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+
+def _init_recordings_table():
+    """Create recordings table in guide.db if it doesn't exist."""
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        conn.execute('''CREATE TABLE IF NOT EXISTS recordings (
+            rec_id      TEXT PRIMARY KEY,
+            title       TEXT,
+            channel     TEXT,
+            channel_id  TEXT,
+            start_ts    REAL,
+            stop_ts     REAL,
+            start_time  TEXT,
+            status      TEXT DEFAULT "queued",
+            failure_reason TEXT,
+            file        TEXT,
+            created_at  TEXT
+        )''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[recdb] init error: {e}')
+
+def _db_upsert_rec(rec_id, rec):
+    """Insert or update a recording row in guide.db."""
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        conn.execute('''INSERT INTO recordings
+            (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time, status, failure_reason, file, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(rec_id) DO UPDATE SET
+              status=excluded.status,
+              failure_reason=excluded.failure_reason,
+              file=excluded.file
+        ''', (
+            rec_id,
+            rec.get('title',''),
+            rec.get('channel', rec.get('channel_id','')),
+            rec.get('channel_id',''),
+            rec.get('start_ts', 0),
+            rec.get('stop_ts', 0),
+            datetime.fromtimestamp(rec.get('start_ts', 0)).strftime('%Y-%m-%d %H:%M:%S') if rec.get('start_ts') else '',
+            rec.get('status','queued'),
+            rec.get('failure_reason',''),
+            rec.get('file',''),
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[recdb] upsert error: {e}')
+
+def _db_update_rec_status(rec_id, status, failure_reason='', file=''):
+    """Update just the status/file of a recording in guide.db."""
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        conn.execute(
+            'UPDATE recordings SET status=?, failure_reason=?, file=? WHERE rec_id=?',
+            (status, failure_reason, file, rec_id)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[recdb] status update error: {e}')
+
+def _load_pending_recs():
+    """On startup, reload queued/scheduled recs from guide.db that haven't aired yet."""
+    _init_recordings_table()
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM recordings WHERE status IN ('queued','scheduled') AND stop_ts > ?",
+            (time.time() + 60,)
+        ).fetchall()
+        conn.close()
+        for r in rows:
+            rec_id = r['rec_id']
+            rec = {
+                'title':      r['title'],
+                'channel_id': r['channel_id'],
+                'channel':    r['channel'],
+                'start_ts':   r['start_ts'],
+                'stop_ts':    r['stop_ts'],
+                'status':     'queued',
+                'progress':   0,
+                'log':        [],
+                'pid':        None,
+                'file':       r['file'] or None,
+            }
+            with _rec_lock:
+                _recs[rec_id] = rec
+            t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
+            t.start()
+        if rows:
+            print(f'[recdb] reloaded {len(rows)} pending recording(s)')
+    except Exception as e:
+        print(f'[recdb] load error: {e}')
+
 def _stream_url(channel_id):
-    """Look up stream_id from Movies.db and build the stream URL."""
+    """Look up stream_id from Movies.db and build the stream URL.
+    Returns (url, error, debug_info) where debug_info is a dict."""
+    import re as _re2
     cfg  = load_config()
+    debug = {'channel_id': channel_id, 'matched_guide_channel': None, 'stream_id': None, 'method': None}
     rows = db_rows(
-        'SELECT stream_id FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
+        'SELECT stream_id, guide_channel FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
         (channel_id,)
     )
-    if not rows:
-        # Fallback: look up channel_name from guide.db, then prefix-match Movies.db
+    if rows:
+        debug['method'] = 'direct'
+        debug['matched_guide_channel'] = rows[0]['guide_channel']
+    else:
+        # Fallback: look up ALL channel_names for this channel_id from guide.db,
+        # then try prefix-matching each against Movies.db guide_channel values.
+        # Using all names matters — e.g. channel_id 18086 has both "SHOWX" (short,
+        # won't match) and "Showtime Extreme" (long, matches "showtimeextreme.us").
         try:
-            import re as _re2
             gdb_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
             gconn = sqlite3.connect(gdb_path)
-            gr = gconn.execute('SELECT channel_name FROM guide WHERE channel_id=? LIMIT 1', (channel_id,)).fetchone()
+            gnames = [r[0] for r in gconn.execute(
+                'SELECT DISTINCT channel_name FROM guide WHERE channel_id=?', (channel_id,)
+            ).fetchall()]
             gconn.close()
-            if gr:
-                ch_norm = _re2.sub(r'[^a-z0-9]', '', gr[0].lower())
+            debug['guide_names'] = gnames
+            if gnames:
                 mrows = db_rows('SELECT guide_channel, stream_id FROM channels WHERE stream_id IS NOT NULL AND stream_id!=""')
-                for mr in mrows:
-                    gc_norm = _re2.sub(r'[^a-z0-9]', '', mr['guide_channel'].lower())
-                    base = gc_norm
+                def _norm(s):
+                    return _re2.sub(r'[^a-z0-9]', '', s.lower())
+                def _base(gc_norm):
                     for sfx in ('us','uk','za','ca','au','sd','hd'):
                         if gc_norm.endswith(sfx):
-                            base = gc_norm[:-len(sfx)]; break
-                    if len(ch_norm) >= 3 and len(base) >= 3:
+                            return gc_norm[:-len(sfx)]
+                    return gc_norm
+                mc = [(mr, _base(_norm(mr['guide_channel']))) for mr in mrows]
+                best_row = None
+                best_diff = float('inf')
+                best_name = None
+                for name in sorted(gnames, key=len, reverse=True):
+                    ch_norm = _norm(name)
+                    if len(ch_norm) < 3:
+                        continue
+                    for mr, base in mc:
+                        if len(base) < 3:
+                            continue
                         if base.startswith(ch_norm) or ch_norm.startswith(base):
-                            rows = [mr]; break
-        except Exception:
-            pass
+                            diff = abs(len(base) - len(ch_norm))
+                            if diff < best_diff:
+                                best_diff = diff
+                                best_row = mr
+                                best_name = name
+                if best_row:
+                    rows = [best_row]
+                    debug['method'] = f'fuzzy ({best_name})'
+                    debug['matched_guide_channel'] = best_row['guide_channel']
+        except Exception as ex:
+            debug['fuzzy_error'] = str(ex)
     if not rows:
-        return None, 'No stream_id found for channel'
+        return None, 'No stream_id found for channel', debug
     sid = rows[0]['stream_id']
+    debug['stream_id'] = sid
     url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
-    return url, None
+    return url, None, debug
 
 def _safe_filename(title):
     return re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:60]
@@ -465,18 +663,28 @@ def _run_recording(rec_id):
             _recs[rec_id]['status'] = f'scheduled ({int(wait//60)}m away)'
         time.sleep(wait)
 
-    url, err = _stream_url(ch_id)
+    # If stop_ts is already past (or less than 60s away), nothing useful to record
+    if stop_ts - time.time() < 60:
+        with _rec_lock:
+            _recs[rec_id].update({'status': 'skipped_too_short',
+                                  'log': ['Recording skipped — stop time already passed']})
+        _db_update_rec_status(rec_id, 'skipped_too_short', 'Stop time already passed')
+        return
+
+    url, err, _dbg = _stream_url(ch_id)
     if err:
         with _rec_lock:
             _recs[rec_id].update({'status': 'error', 'log': [err]})
+        _db_update_rec_status(rec_id, 'error', err)
         return
 
-    duration = int(stop_ts - max(start_ts, time.time())) + 30  # 30s buffer
+    duration = int(stop_ts - time.time()) + 30  # always relative to now, not scheduled start
     ts_file  = os.path.join(rec_dir, f'{_safe_filename(title)}_{int(start_ts)}.ts')
     mp4_file = ts_file.replace('.ts', '.mp4')
 
     with _rec_lock:
         _recs[rec_id].update({'status': 'recording', 'file': ts_file})
+    _db_update_rec_status(rec_id, 'recording', file=ts_file)
 
     try:
         cmd = [
@@ -499,6 +707,7 @@ def _run_recording(rec_id):
         if proc.returncode != 0:
             with _rec_lock:
                 _recs[rec_id]['status'] = 'error'
+            _db_update_rec_status(rec_id, 'error', 'ffmpeg non-zero exit')
             return
 
         with _rec_lock:
@@ -515,26 +724,52 @@ def _run_recording(rec_id):
             os.remove(ts_file)
             with _rec_lock:
                 _recs[rec_id].update({'status': 'copying', 'file': mp4_file})
-            # Copy to Plex
+            # Look up proper title + year via OMDB
+            plex_title = title
+            year = ''
+            try:
+                omdb_key = cfg.get('omdb_key', '')
+                if omdb_key:
+                    import urllib.request as _ur, urllib.parse as _up
+                    q = _up.quote(title)
+                    r = _ur.urlopen(f'http://www.omdbapi.com/?apikey={omdb_key}&t={q}&type=movie', timeout=8)
+                    od = json.loads(r.read())
+                    if od.get('Response') == 'True':
+                        plex_title = od.get('Title', title)
+                        year = od.get('Year', '')[:4]
+            except Exception:
+                pass
+            folder_name = f'{plex_title} ({year})' if year else plex_title
+            safe_folder = re.sub(r'[<>:"/\\|?*]', '', folder_name)
+            # Copy to Plex with folder structure
             if os.path.isdir(plex_dir):
                 import shutil
-                dest = os.path.join(plex_dir, os.path.basename(mp4_file))
+                movie_folder = os.path.join(plex_dir, safe_folder)
+                os.makedirs(movie_folder, exist_ok=True)
+                safe_title_only = re.sub(r'[<>:"/\\|?*]', '', plex_title)
+                dest = os.path.join(movie_folder, f'{safe_title_only}.mp4')
                 shutil.copy2(mp4_file, dest)
             with _rec_lock:
-                _recs[rec_id].update({'status': 'done', 'file': mp4_file})
+                _recs[rec_id].update({'status': 'done', 'file': mp4_file, 'plex_title': folder_name})
+            _db_update_rec_status(rec_id, 'done', file=mp4_file)
         else:
             with _rec_lock:
                 _recs[rec_id].update({'status': 'done_ts', 'file': ts_file})  # keep .ts if convert failed
+            _db_update_rec_status(rec_id, 'done_ts', 'Convert failed — kept .ts', file=ts_file)
 
     except Exception as e:
         with _rec_lock:
             _recs[rec_id].update({'status': 'error', 'error': str(e)})
+        _db_update_rec_status(rec_id, 'error', str(e))
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.route('/epg-web')
+@app.route('/epg-web', strict_slashes=False)
 def index():
-    return render_template_string(HTML, VERSION=VERSION)
+    from flask import make_response
+    resp = make_response(render_template_string(HTML, VERSION=VERSION))
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 @app.route('/epg-web/api/status')
 def api_status():
@@ -553,29 +788,39 @@ def api_status():
 @app.route('/epg-web/api/disk')
 def api_disk():
     cfg = load_config()
+    # Built-in paths from config
     checks = [
-        ('NAS (EPG)',    cfg.get('guide_path',   '/Volumes/EPG/guide/guide.xml')),
-        ('Recordings',   cfg.get('rec_path',      os.path.expanduser('~/Movies/Recordings'))),
-        ('Plex',         cfg.get('plex_path',     '/Volumes/Plex/Movies')),
+        ('Mac (recordings)', cfg.get('rec_path',  os.path.expanduser('~/Movies/Recordings'))),
+        ('NAS – Plex',       cfg.get('plex_path', '/Volumes/Plex/Movies')),
+        ('NAS – EPG',        cfg.get('guide_path','/Volumes/EPG/guide/guide.xml')),
     ]
+    # Add any custom monitored paths
+    for cp in cfg.get('disk_custom_paths', []):
+        checks.append((cp.get('label','Custom'), cp.get('path','')))
+    warn_yellow = int(cfg.get('disk_warn_yellow', 75))
+    warn_red    = int(cfg.get('disk_warn_red',    90))
     results = []
     seen = set()
     for label, path in checks:
-        # Walk up to find an existing ancestor
+        if not path:
+            continue
+        # For NAS paths (/Volumes/X/...) stop walking at /Volumes to avoid
+        # falling back to the Mac's root drive when the NAS isn't mounted.
+        # For local paths, walk all the way up normally.
+        is_nas = path.startswith('/Volumes/')
+        stop_at = {'/Volumes'} if is_nas else set()
         p = path
-        while p and p != '/' and not os.path.exists(p):
+        while p and p not in ('/',) and p not in stop_at and not os.path.exists(p):
             p = os.path.dirname(p)
-        if not p or p == '/':
+        if not p or p == '/' or p in stop_at or not os.path.exists(p):
             results.append({'label': label, 'error': 'Not mounted'})
             continue
         try:
             usage = shutil.disk_usage(p)
-            # Get the actual mount point via df
             df = subprocess.run(['df', p], capture_output=True, text=True)
             lines = df.stdout.strip().splitlines()
             mount = lines[-1].split()[-1] if len(lines) >= 2 else p
             if mount in seen:
-                # Same volume already listed — just note the label
                 for r in results:
                     if r.get('mount') == mount:
                         r['label'] += f' / {label}'
@@ -589,7 +834,8 @@ def api_disk():
             })
         except Exception as e:
             results.append({'label': label, 'error': str(e)})
-    return jsonify({'ok': True, 'disks': results})
+    return jsonify({'ok': True, 'disks': results,
+                    'warn_yellow': warn_yellow, 'warn_red': warn_red})
 
 @app.route('/epg-web/api/config', methods=['GET'])
 def api_get_config():
@@ -652,6 +898,39 @@ def api_load_guide():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/epg-web/api/fetch-guide', methods=['POST'])
+def api_fetch_guide():
+    """Fetch fresh XMLTV from PrimeStreams, save to NAS, then reimport."""
+    from urllib import request as urlreq
+    cfg      = load_config()
+    epg_url  = cfg.get('epg_url',  'http://primestreams.tv:826/').rstrip('/')
+    epg_user = cfg.get('epg_user', '')
+    epg_pass = cfg.get('epg_pass', '')
+    xml_path = cfg.get('guide_path', '/Volumes/EPG/guide/guide.xml')
+    db_path  = cfg.get('guide_db_path', '/Volumes/EPG/guide/guide.db')
+    tz_str   = cfg.get('timezone', 'America/New_York')
+    if not epg_user or not epg_pass:
+        return jsonify({'error': 'epg_user / epg_pass not configured'}), 400
+    # Save locally (NAS mount may be read-only); use local guide dir
+    local_xml = os.path.join(BASE_DIR, 'guide_fetched.xml')
+    xmltv_url = f'{epg_url}/xmltv.php?username={epg_user}&password={epg_pass}'
+    try:
+        print(f'[fetch-guide] Fetching {xmltv_url}')
+        req = urlreq.Request(xmltv_url, headers={'User-Agent': 'TiViMate/4.7.0 (Amazon AFTS; Android 9)'})
+        with urlreq.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+        print(f'[fetch-guide] Got {len(data):,} bytes, saving to {local_xml}')
+        with open(local_xml, 'wb') as f:
+            f.write(data)
+        xml_path = local_xml  # import from local copy
+        new_rows = import_xml_to_guide_db(xml_path, db_path)
+        count    = load_epg_from_db(db_path, tz_str)
+        print(f'[fetch-guide] Done: {count} programmes, {new_rows} new rows')
+        return jsonify({'ok': True, 'bytes': len(data), 'count': count, 'new_rows': new_rows})
+    except Exception as e:
+        print(f'[fetch-guide] Error: {e}')
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/epg-web/api/guide')
 def api_guide():
     """Return programmes in a time window for the grid."""
@@ -678,6 +957,7 @@ def api_guide():
     we_ts  = we.timestamp()
 
     ch_filter  = request.args.get('ch', '').lower()
+    ch_id_filter = request.args.get('ch_id', '').lower()  # exact channel_id match from search
     fav_only   = request.args.get('fav', '0') == '1'
     movie_only = request.args.get('movie', '0') == '1'
     ps_only    = request.args.get('ps',  '0') == '1'
@@ -700,37 +980,7 @@ def api_guide():
                     'guide_channel IS NOT NULL AND guide_channel != ""'
             rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
             direct_ids = {r['guide_channel'] for r in rows}
-            allowed_ch_ids = set(direct_ids)  # always include direct IDs
-
-            try:
-                gconn = sqlite3.connect(guide_db_path)
-                # Get names for the direct_ids (from guide table or guide_channels)
-                fav_names = set()
-                for cid in direct_ids:
-                    r = gconn.execute(
-                        'SELECT channel_name FROM guide WHERE channel_id=? LIMIT 1', (cid,)
-                    ).fetchone()
-                    if r and r[0]:
-                        fav_names.add(r[0].upper().strip())
-                    # Also try guide_channels table
-                    r2 = gconn.execute(
-                        'SELECT channel_name FROM guide_channels WHERE channel_id=? LIMIT 1', (cid,)
-                    ).fetchone()
-                    if r2 and r2[0]:
-                        fav_names.add(r2[0].upper().strip())
-
-                # Now find ALL channel_ids in guide that have any of these display names
-                if fav_names:
-                    placeholders = ','.join('?' * len(fav_names))
-                    extra = gconn.execute(
-                        f'SELECT DISTINCT channel_id FROM guide WHERE upper(channel_name) IN ({placeholders})',
-                        list(fav_names)
-                    ).fetchall()
-                    for e in extra:
-                        allowed_ch_ids.add(e[0])
-                gconn.close()
-            except Exception as e:
-                print(f'[fav filter] {e}')
+            allowed_ch_ids = set(direct_ids)
 
     # For SD-only: channels NOT in Movies.db (no stream_id)
     excluded_ch_ids = None
@@ -748,19 +998,25 @@ def api_guide():
             continue
         if excluded_ch_ids is not None and p['channel_id'] in excluded_ch_ids:
             continue
-        if ch_filter and ch_filter not in p['channel'].lower():
+        if ch_id_filter and p['channel_id'].lower() != ch_id_filter:
+            continue
+        if not ch_id_filter and ch_filter and ch_filter not in p['channel'].lower():
             continue
         ch_set.add(p['channel_id'])
         progs_in_window.append({
-            'title':      p['title'],
-            'channel_id': p['channel_id'],
-            'channel':    p['channel'],
-            'start_ts':   p['start_ts'],
-            'stop_ts':    p['stop_ts'],
-            'start_fmt':  p['start_fmt'],
-            'stop_fmt':   p['stop_fmt'],
-            'desc':       p['desc'],
-            'category':   p['category'],
+            'title':         p['title'],
+            'channel_id':    p['channel_id'],
+            'channel':       p['channel'],
+            'start_ts':      p['start_ts'],
+            'stop_ts':       p['stop_ts'],
+            'start_fmt':     p['start_fmt'],
+            'stop_fmt':      p['stop_fmt'],
+            'desc':          p['desc'],
+            'category':      p['category'],
+            'episode_title': p.get('episode_title', ''),
+            'season_num':    p.get('season_num'),
+            'episode_num':   p.get('episode_num'),
+            'prog_type':     p.get('prog_type', ''),
         })
 
     # Deduplicate channels with the same name — merge SD + primestreams rows into one
@@ -770,8 +1026,19 @@ def api_guide():
     id_to_canonical   = {}   # any channel_id → canonical channel_id
 
     ordered_channels_raw = [c for c in _epg['channels'] if c['id'] in ch_set]
-    if ch_filter:
+    if ch_id_filter:
+        ordered_channels_raw = [c for c in ordered_channels_raw if c['id'].lower() == ch_id_filter]
+    elif ch_filter:
         ordered_channels_raw = [c for c in ordered_channels_raw if ch_filter in c['name'].lower()]
+
+    # When a filter is active (fav/movie/ps), also include matching channels that
+    # have NO current programming — they show as empty rows (guide data expired)
+    if allowed_ch_ids is not None:
+        present_ids = {c['id'] for c in ordered_channels_raw}
+        for c in _epg['channels']:
+            if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
+                if not ch_filter or ch_filter in c['name'].lower():
+                    ordered_channels_raw.append(dict(c, no_data=True))
 
     for c in ordered_channels_raw:
         norm = _re5.sub(r'[^a-z0-9]', '', c['name'].lower())
@@ -793,7 +1060,7 @@ def api_guide():
         canon = id_to_canonical.get(c['id'], c['id'])
         if canon not in seen_ids:
             seen_ids.add(canon)
-            ordered_channels.append({'id': canon, 'name': c['name'], 'icon': c.get('icon','')})
+            ordered_channels.append({'id': canon, 'name': c['name'], 'icon': c.get('icon',''), 'no_data': c.get('no_data', False)})
 
     ch_offset = int(request.args.get('ch_offset', 0))
     ch_cap    = 200
@@ -815,7 +1082,8 @@ def api_guide():
 @app.route('/epg-web/api/search')
 def api_search():
     """Search channels and current/upcoming programs in guide.db."""
-    q = request.args.get('q', '').strip()
+    q       = request.args.get('q', '').strip()
+    ep_q    = request.args.get('episode', '').strip()  # optional episode title filter
     if len(q) < 2:
         return jsonify({'channels': [], 'programs': []})
     cfg      = load_config()
@@ -824,54 +1092,94 @@ def api_search():
     local_tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
     now_utc  = datetime.now(timezone.utc)
     now_str  = now_utc.strftime('%Y%m%d%H%M%S')
-    like     = f'%{q}%'
+    like      = f'%{q}%'          # substring match (for channels)
+    like_word = [f'{q}%', f'% {q}%']  # word-boundary: starts title OR follows a space
     results  = {'channels': [], 'programs': []}
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
 
-        # Channel name matches (only channels with current/future programming)
+        # Get channel_ids that have a PrimeStreams stream (uses name-based fallback matching)
+        playable_ids = get_ps_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
+
+        # Channel name matches (only channels with current/future programming AND a playable stream)
         ch_rows = conn.execute('''
             SELECT DISTINCT g.channel_id, g.channel_name
             FROM guide g
             WHERE g.channel_name LIKE ? AND g.end_utc > ?
-            ORDER BY g.channel_name LIMIT 20
+            ORDER BY g.channel_name LIMIT 40
         ''', (like, now_str)).fetchall()
-        ch_found = {r['channel_id']: {'id': r['channel_id'], 'name': r['channel_name']} for r in ch_rows}
+        ch_found = {r['channel_id']: {'id': r['channel_id'], 'name': r['channel_name'], 'fav': False}
+                    for r in ch_rows if not playable_ids or r['channel_id'] in playable_ids}
 
-        # Also search Movies.db guide_channel names (e.g. "tastemade.us") and map to guide.db channel_id
+        # Also search Movies.db guide_channel names and include favorite status
         try:
             mdb_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
             mconn = sqlite3.connect(mdb_path)
             mconn.row_factory = sqlite3.Row
             mrows = mconn.execute(
-                'SELECT guide_channel FROM channels WHERE guide_channel LIKE ? AND guide_channel IS NOT NULL LIMIT 20',
-                (like,)
+                '''SELECT guide_channel, nickname, favorite, type FROM channels
+                   WHERE (guide_channel LIKE ? OR nickname LIKE ?)
+                   AND guide_channel IS NOT NULL LIMIT 40''',
+                (like, like)
             ).fetchall()
-            mconn.close()
             for mr in mrows:
                 gc = mr['guide_channel']
-                # Find this channel_id in guide.db
-                grows = conn.execute(
-                    'SELECT DISTINCT channel_id, channel_name FROM guide WHERE channel_id=? AND end_utc > ? LIMIT 1',
-                    (gc, now_str)
-                ).fetchall()
-                for gr in grows:
-                    if gr['channel_id'] not in ch_found:
-                        ch_found[gr['channel_id']] = {'id': gr['channel_id'], 'name': gr['channel_name']}
+                fav = bool(mr['favorite'])
+                nick = mr['nickname'] or ''
+                ch_type = mr['type'] or ''
+                if gc in ch_found:
+                    ch_found[gc]['fav'] = fav
+                elif ch_type == '247' and nick:
+                    # 24/7 channels have no guide data — use nickname as display name
+                    ch_found[gc] = {'id': gc, 'name': nick, 'fav': fav}
+                else:
+                    grows = conn.execute(
+                        'SELECT DISTINCT channel_id, channel_name FROM guide WHERE channel_id=? AND end_utc > ? LIMIT 1',
+                        (gc, now_str)
+                    ).fetchall()
+                    for gr in grows:
+                        if gr['channel_id'] not in ch_found:
+                            ch_found[gr['channel_id']] = {'id': gr['channel_id'], 'name': gr['channel_name'], 'fav': fav}
+            mconn.close()
         except Exception:
             pass
 
-        results['channels'] = sorted(ch_found.values(), key=lambda x: x['name'])[:20]
+        # Deduplicate by display name — keep favorite if available, else shortest channel_id
+        deduped = {}
+        for ch in ch_found.values():
+            name = ch['name'].upper().strip()
+            if name not in deduped or (ch['fav'] and not deduped[name]['fav']) or \
+               (ch['fav'] == deduped[name]['fav'] and len(ch['id']) < len(deduped[name]['id'])):
+                deduped[name] = ch
+        results['channels'] = sorted(deduped.values(), key=lambda x: x['name'])[:20]
 
         # Program title matches — one row per channel airing it, current/upcoming only
-        prog_rows = conn.execute('''
-            SELECT title, channel_id, channel_name, start_utc, end_utc, category
+        season_filter = request.args.get('season', '').strip()
+        ep_filter     = request.args.get('ep', '').strip()
+
+        extra_where = ''
+        params = [like_word[0], like_word[1], now_str]
+        if ep_q:
+            extra_where += ' AND (episode_title LIKE ? OR episode_title IS NULL)'
+            params.append(f'%{ep_q}%')
+        if season_filter:
+            extra_where += ' AND (season_num=? OR season_num IS NULL)'
+            try: params.append(int(season_filter))
+            except ValueError: pass
+        if ep_filter:
+            extra_where += ' AND (episode_num=? OR episode_num IS NULL)'
+            try: params.append(int(ep_filter))
+            except ValueError: pass
+
+        prog_rows = conn.execute(f'''
+            SELECT title, channel_id, channel_name, start_utc, end_utc, category,
+                   episode_title, season_num, episode_num
             FROM guide
-            WHERE title LIKE ? AND end_utc > ?
+            WHERE (title LIKE ? OR title LIKE ?) AND end_utc > ?{extra_where}
             ORDER BY start_utc
             LIMIT 40
-        ''', (like, now_str)).fetchall()
+        ''', params).fetchall()
 
         programs = []
         for r in prog_rows:
@@ -879,22 +1187,190 @@ def api_search():
                 su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
                 eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
                 sl = su.astimezone(local_tz)
+                el = eu.astimezone(local_tz)
                 on_now = su <= now_utc < eu
                 programs.append({
-                    'title':        r['title'],
-                    'channel_id':   r['channel_id'],
-                    'channel_name': r['channel_name'],
+                    'title':          r['title'],
+                    'channel_id':     r['channel_id'],
+                    'channel':        r['channel_name'],
+                    'channel_name':   r['channel_name'],
                     'start_fmt':    ('ON NOW' if on_now else sl.strftime('%a %-I:%M %p')),
+                    'stop_fmt':     el.strftime('%a %-I:%M %p'),
+                    'start_ts':     su.timestamp(),
+                    'stop_ts':      eu.timestamp(),
                     'category':     r['category'] or '',
                     'on_now':       on_now,
+                    'episode_title': r['episode_title'] or '',
+                    'season_num':   r['season_num'],
+                    'episode_num':  r['episode_num'],
+                    'has_stream':   r['channel_id'] in playable_ids,
                 })
             except Exception:
                 continue
-        results['programs'] = programs
+        # Deduplicate: one result per (start_utc, channel_name) — prefer PS-streamable
+        seen = {}
+        for p in programs:
+            key = (p['start_ts'], p['channel_name'].upper().strip())
+            if key not in seen or (p['has_stream'] and not seen[key]['has_stream']):
+                seen[key] = p
+        results['programs'] = list(seen.values())
         conn.close()
     except Exception as e:
         print(f'[search] {e}')
     return jsonify(results)
+
+@app.route('/epg-web/api/channel/favorite', methods=['POST'])
+def api_toggle_favorite():
+    data = request.json or {}
+    channel_id = data.get('channel_id', '')
+    if not channel_id:
+        return jsonify({'error': 'no channel_id'}), 400
+    cfg = load_config()
+    mdb_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+    try:
+        mconn = sqlite3.connect(mdb_path)
+        row = mconn.execute('SELECT favorite FROM channels WHERE guide_channel=?', (channel_id,)).fetchone()
+        if row is None:
+            mconn.close()
+            return jsonify({'error': 'channel not found'}), 404
+        new_fav = 0 if row[0] else 1
+        mconn.execute('UPDATE channels SET favorite=? WHERE guide_channel=?', (new_fav, channel_id))
+        mconn.commit()
+        mconn.close()
+        return jsonify({'ok': True, 'favorite': bool(new_fav)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/channel/hide', methods=['POST'])
+def api_toggle_hide():
+    data = request.json or {}
+    channel_id = data.get('channel_id', '')
+    hide = data.get('hide')  # True=hide, False=restore, None=toggle
+    if not channel_id:
+        return jsonify({'error': 'no channel_id'}), 400
+    cfg = load_config()
+    mdb_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+    try:
+        mconn = sqlite3.connect(mdb_path)
+        row = mconn.execute('SELECT is_bad FROM channels WHERE channel_id=?', (channel_id,)).fetchone()
+        if row is None:
+            mconn.close()
+            return jsonify({'error': 'channel not found'}), 404
+        new_bad = 1 if (hide if hide is not None else not bool(row[0])) else 0
+        mconn.execute('UPDATE channels SET is_bad=? WHERE channel_id=?', (new_bad, channel_id))
+        mconn.commit()
+        mconn.close()
+        return jsonify({'ok': True, 'hidden': bool(new_bad)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/sync-streams', methods=['POST'])
+def api_sync_streams():
+    """Fetch current stream IDs from PrimeStreams and update Movies.db."""
+    import re as _re
+    from urllib import request as urlreq
+    cfg      = load_config()
+    base     = cfg['epg_url'].rstrip('/')
+    user     = cfg.get('epg_user', '')
+    passwd   = cfg.get('epg_pass', '')
+    mdb_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+
+    def _norm(s):
+        return _re.sub(r'[^a-z0-9]', '', s.lower())
+    def _base(norm):
+        for sfx in ('us','uk','za','ca','au','hd','sd','west','east','vip','uhd'):
+            if norm.endswith(sfx):
+                return norm[:-len(sfx)]
+        return norm
+
+    # 1. Fetch live streams from PrimeStreams
+    try:
+        api_url = f"{base}/player_api.php?username={user}&password={passwd}&action=get_live_streams"
+        with urlreq.urlopen(api_url, timeout=15) as r:
+            ps_streams = json.loads(r.read())
+    except Exception as e:
+        return jsonify({'error': f'PrimeStreams API error: {e}'}), 500
+
+    # Build normalized-name → (stream_id, name) map; prefer exact over prefix
+    ps_map = {}
+    for s in ps_streams:
+        sid  = str(s.get('stream_id',''))
+        name = s.get('name','').strip()
+        # Strip prefixes like "UK: ", "UHD: "
+        name = _re.sub(r'^(UK|UHD|HD|SD):\s*', '', name, flags=_re.IGNORECASE).strip()
+        # Strip suffixes like "| VIP", "UHD/4K", "4K"
+        name = _re.sub(r'\s*[\|]\s*VIP.*$', '', name).strip()
+        name = _re.sub(r'\s*(UHD/4K|4K|UHD)$', '', name).strip()
+        key  = _base(_norm(name))
+        if key and key not in ps_map:
+            ps_map[key] = (sid, name)
+
+    # 2. Load all channels from Movies.db
+    try:
+        mconn = sqlite3.connect(mdb_path)
+        mconn.row_factory = sqlite3.Row
+        ch_rows = mconn.execute('SELECT guide_channel, stream_id FROM channels WHERE guide_channel IS NOT NULL').fetchall()
+    except Exception as e:
+        return jsonify({'error': f'Movies.db error: {e}'}), 500
+
+    updated, not_found, unchanged = [], [], []
+    for row in ch_rows:
+        gc   = row['guide_channel']
+        old  = str(row['stream_id'] or '')
+        key  = _base(_norm(gc))
+        match = ps_map.get(key)
+        if not match:
+            # Try prefix match
+            for ps_key, (sid, pname) in ps_map.items():
+                if len(key) >= 4 and len(ps_key) >= 4:
+                    if key.startswith(ps_key) or ps_key.startswith(key):
+                        match = (sid, pname)
+                        break
+        if match:
+            new_sid, ps_name = match
+            if new_sid != old:
+                mconn.execute('UPDATE channels SET stream_id=? WHERE guide_channel=?', (new_sid, gc))
+                updated.append({'channel': gc, 'old': old, 'new': new_sid, 'ps_name': ps_name})
+            else:
+                unchanged.append(gc)
+        else:
+            not_found.append(gc)
+
+    mconn.commit()
+    mconn.close()
+    return jsonify({'ok': True, 'updated': updated, 'unchanged': len(unchanged), 'not_found': len(not_found)})
+
+@app.route('/epg-web/api/247channels')
+def api_247channels():
+    q = request.args.get('q', '').lower().strip()
+    fav_only = request.args.get('fav', '') == '1'
+    try:
+        cfg = load_config()
+        mdb_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+        mconn = sqlite3.connect(mdb_path)
+        mconn.row_factory = sqlite3.Row
+        show_hidden = request.args.get('show_hidden', '') == '1'
+        where = "type='247'" if show_hidden else "type='247' AND (is_bad=0 OR is_bad IS NULL)"
+        rows = mconn.execute(
+            f"SELECT channel_id, nickname, stream_id, favorite, is_bad, sd_station_id FROM channels WHERE {where} ORDER BY nickname"
+        ).fetchall()
+        mconn.close()
+    except Exception as e:
+        return jsonify({'error': str(e), 'channels': []})
+    channels = []
+    for r in rows:
+        name = r['nickname'] or r['channel_id']
+        if q and q not in name.lower():
+            continue
+        fav = bool(r['favorite'])
+        if fav_only and not fav:
+            continue
+        display = re.sub(r'^24/7\s+', '', name, flags=re.IGNORECASE)
+        subtype = r['sd_station_id'] or 'tv'
+        channels.append({'id': r['channel_id'], 'name': display, 'stream_id': r['stream_id'],
+                         'fav': fav, 'hidden': bool(r['is_bad']), 'subtype': subtype})
+    channels.sort(key=lambda c: (not c['fav'], c['name']))
+    return jsonify({'channels': channels, 'total': len(channels)})
 
 @app.route('/epg-web/api/channels')
 def api_channels():
@@ -927,13 +1403,31 @@ def api_channels():
 @app.route('/epg-web/api/schedule', methods=['GET'])
 def api_get_schedule():
     status_filter = request.args.get('status', '')
+    # Legacy scheduled_recordings from Movies.db (NAS)
     if status_filter:
-        rows = db_rows('SELECT * FROM scheduled_recordings WHERE status=? ORDER BY start_time DESC LIMIT 500', (status_filter,))
+        legacy = db_rows('SELECT * FROM scheduled_recordings WHERE status=? ORDER BY start_time DESC LIMIT 500', (status_filter,))
     else:
-        rows = db_rows('SELECT * FROM scheduled_recordings ORDER BY start_time DESC LIMIT 500')
-    # Also include any JSON-scheduled items
+        legacy = db_rows('SELECT * FROM scheduled_recordings ORDER BY start_time DESC LIMIT 500')
+    # Local recordings from guide.db (survive restarts)
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        conn.row_factory = sqlite3.Row
+        if status_filter:
+            local = [dict(r) for r in conn.execute(
+                'SELECT * FROM recordings WHERE status=? ORDER BY start_ts DESC LIMIT 500', (status_filter,)
+            ).fetchall()]
+        else:
+            local = [dict(r) for r in conn.execute(
+                'SELECT * FROM recordings ORDER BY start_ts DESC LIMIT 500'
+            ).fetchall()]
+        conn.close()
+    except Exception:
+        local = []
+    # Merge: local first (most recent/relevant), then legacy
+    seen = {r.get('title','') + str(r.get('start_ts','')) for r in local}
+    merged = local + [r for r in legacy if r.get('title','') + str(r.get('start_ts','')) not in seen]
     json_sched = load_schedule()
-    return jsonify({'schedule': rows, 'pending': json_sched})
+    return jsonify({'schedule': merged, 'pending': json_sched})
 
 @app.route('/epg-web/api/schedule', methods=['POST'])
 def api_post_schedule():
@@ -1037,6 +1531,108 @@ def api_library():
         rows = db_rows('SELECT * FROM master_titles ORDER BY title LIMIT 500')
     return jsonify({'library': rows, 'total': len(rows)})
 
+@app.route('/epg-web/api/plex/titles')
+def api_plex_titles():
+    cfg = load_config()
+    plex_dir = cfg.get('plex_path', '/Volumes/Plex-1/Movies')
+    if not os.path.isdir(plex_dir):
+        return jsonify({'titles': []})
+    titles = []
+    for name in os.listdir(plex_dir):
+        if os.path.isdir(os.path.join(plex_dir, name)):
+            clean = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
+            if clean:
+                titles.append(clean)
+    return jsonify({'titles': titles})
+
+@app.route('/epg-web/api/plex/info')
+def api_plex_info():
+    title = request.args.get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'no title'}), 400
+    def _norm(t):
+        return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
+    cache_key = _norm(title)
+    if cache_key in _plex_info_cache:
+        return jsonify(_plex_info_cache[cache_key])
+    cfg = load_config()
+    plex_dir = cfg.get('plex_path', '/Volumes/Plex-1/Movies')
+    if not os.path.isdir(plex_dir):
+        return jsonify({'found': False, 'error': 'plex not mounted'})
+    def _norm(t):
+        return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
+    norm_title = _norm(title)
+    matched_folder = None
+    for name in os.listdir(plex_dir):
+        fp = os.path.join(plex_dir, name)
+        if not os.path.isdir(fp):
+            continue
+        folder_title = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
+        if _norm(folder_title) == norm_title:
+            matched_folder = fp
+            break
+    if not matched_folder:
+        return jsonify({'found': False})
+    mp4_file = next((os.path.join(matched_folder, f)
+                     for f in os.listdir(matched_folder) if f.endswith('.mp4')), None)
+    if not mp4_file:
+        return jsonify({'found': True, 'error': 'no mp4'})
+    size_gb = os.path.getsize(mp4_file) / (1024**3)
+    result = {'found': True, 'size': f'{size_gb:.2f} GB', 'file': os.path.basename(mp4_file)}
+    try:
+        import subprocess as _sp
+        probe = _sp.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', mp4_file],
+            capture_output=True, text=True, timeout=10)
+        if probe.returncode == 0:
+            data = json.loads(probe.stdout)
+            for s in data.get('streams', []):
+                if s.get('codec_type') == 'video':
+                    fps = ''
+                    fs = s.get('avg_frame_rate') or s.get('r_frame_rate', '')
+                    if fs and '/' in fs:
+                        n, d = fs.split('/')
+                        if int(d): fps = f'{int(n)/int(d):.3f}'.rstrip('0').rstrip('.')
+                    result.update({'width': s.get('width'), 'height': s.get('height'),
+                                   'video_codec': s.get('codec_name','').upper(), 'fps': fps})
+                elif s.get('codec_type') == 'audio' and 'audio_codec' not in result:
+                    result['audio_codec'] = s.get('codec_name','').upper()
+                    result['channels'] = s.get('channels', '')
+    except Exception as e:
+        result['ffprobe_error'] = str(e)
+    _plex_info_cache[cache_key] = result
+    return jsonify(result)
+
+@app.route('/epg-web/api/plex/play', methods=['POST'])
+def api_plex_play():
+    title = (request.json or {}).get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'no title'}), 400
+    cfg = load_config()
+    plex_dir = cfg.get('plex_path', '/Volumes/Plex/Movies')
+    def _norm(t):
+        return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
+    norm_title = _norm(title)
+    mp4_file = None
+    for name in os.listdir(plex_dir):
+        fp = os.path.join(plex_dir, name)
+        if not os.path.isdir(fp):
+            continue
+        folder_title = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
+        if _norm(folder_title) == norm_title:
+            for f in os.listdir(fp):
+                if f.endswith('.mp4'):
+                    mp4_file = os.path.join(fp, f)
+                    break
+            break
+    if not mp4_file:
+        return jsonify({'error': 'file not found in Plex'}), 404
+    try:
+        subprocess.Popen(['open', '-a', 'VLC', mp4_file])
+        return jsonify({'ok': True, 'file': mp4_file})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ── Conversion routes ─────────────────────────────────────────────────────────
 
 @app.route('/epg-web/api/convert/list')
@@ -1094,11 +1690,18 @@ def api_conv_cancel():
 def api_prog_info():
     from urllib import request as urlreq
     from urllib.parse import quote
-    title = request.args.get('title', '').strip()
-    year  = request.args.get('year', '').strip()
-    desc  = request.args.get('desc', '').strip()
+    title    = request.args.get('title', '').strip()
+    year     = request.args.get('year', '').strip()
+    desc     = request.args.get('desc', '').strip()
+    category = request.args.get('category', '').strip().lower()
     if not title:
         return jsonify({'error': 'No title'}), 400
+
+    # Skip OMDB/TMDB for non-enrichable categories
+    _SKIP_CATS = {'news', 'sports', 'sport', 'sports event', 'sports talk',
+                  'talk', 'talk show', 'game show', 'reality', 'live', 'music',
+                  'weather', 'shopping', 'infomercial', 'documentary news'}
+    _skip_enrichment = any(s in category for s in _SKIP_CATS)
 
     # Strip trailing (YYYY) from titles like "Batman Returns (1992)"
     import re as _re
@@ -1135,18 +1738,14 @@ def api_prog_info():
     in_library  = lib_row is not None
     local_poster = lib_row['poster_url'] if lib_row and lib_row.get('poster_url') else ''
 
-    # 2. OMDB — primary enrichment source (best actor/director coverage)
-    if omdb_key:
+    # 2. OMDB lookup — if year known use direct ?t= ; otherwise search and score by actor match
+    if omdb_key and not _skip_enrichment:
         try:
-            q   = quote(title)
-            yr  = f'&y={year}' if year else ''
-            url = f'http://www.omdbapi.com/?t={q}{yr}&apikey={omdb_key}'
-            with urlreq.urlopen(url, timeout=5) as resp:
-                od = json.loads(resp.read())
-            if od.get('Response') == 'True':
+            q = quote(title)
+            def _omdb_result(od):
                 poster = od.get('Poster','')
                 if poster == 'N/A': poster = ''
-                return jsonify({
+                return {
                     'source':      'omdb',
                     'in_library':  in_library,
                     'title':       od.get('Title',''),
@@ -1159,64 +1758,53 @@ def api_prog_info():
                     'poster':      poster or local_poster,
                     'imdb_rating': od.get('imdbRating',''),
                     'imdb_votes':  od.get('imdbVotes',''),
-                })
+                    'imdb_id':     od.get('imdbID',''),
+                }
+
+            if year:
+                # Year known — direct lookup is reliable
+                url = f'http://www.omdbapi.com/?t={q}&y={year}&apikey={omdb_key}'
+                with urlreq.urlopen(url, timeout=5) as resp:
+                    od = json.loads(resp.read())
+                if od.get('Response') == 'True':
+                    return jsonify(_omdb_result(od))
+            else:
+                # No year — search for all versions, then pick best by description match
+                url = f'http://www.omdbapi.com/?s={q}&type=movie&apikey={omdb_key}'
+                with urlreq.urlopen(url, timeout=5) as resp:
+                    sr = json.loads(resp.read())
+                hits = sr.get('Search', [])
+                if not hits:
+                    # No search results — fall back to direct title lookup
+                    url = f'http://www.omdbapi.com/?t={q}&apikey={omdb_key}'
+                    with urlreq.urlopen(url, timeout=5) as resp:
+                        od = json.loads(resp.read())
+                    if od.get('Response') == 'True':
+                        return jsonify(_omdb_result(od))
+                else:
+                    # Score each candidate: fetch full details for top 4, pick best actor match
+                    desc_words = set(_re.findall(r'[A-Z][a-z]+', desc)) if desc else set()
+                    title_norm = title.lower().strip()
+                    best_od, best_score = None, -1
+                    for hit in hits[:4]:
+                        iid = hit.get('imdbID','')
+                        if not iid: continue
+                        with urlreq.urlopen(f'http://www.omdbapi.com/?i={iid}&apikey={omdb_key}', timeout=5) as r2:
+                            od2 = json.loads(r2.read())
+                        if od2.get('Response') != 'True': continue
+                        # Score: exact title match wins, then actor name words from desc
+                        actor_words = set(_re.findall(r'[A-Z][a-z]+', od2.get('Actors','')))
+                        exact_bonus = 20 if od2.get('Title','').lower().strip() == title_norm else 0
+                        score = exact_bonus + len(desc_words & actor_words)
+                        if score > best_score:
+                            best_score, best_od = score, od2
+                    if best_od:
+                        return jsonify(_omdb_result(best_od))
         except Exception as e:
             print(f'[OMDB] {e}')
 
-    # 2b. OMDB search fallback — if no year and title lookup returned wrong version,
-    #     do a search (?s=) to get all hits and pick the oldest one for classic titles
-    if omdb_key and not year:
-        try:
-            q   = quote(title)
-            url = f'http://www.omdbapi.com/?s={q}&type=movie&apikey={omdb_key}'
-            with urlreq.urlopen(url, timeout=5) as resp:
-                sd_r = json.loads(resp.read())
-            hits = sd_r.get('Search', [])
-            if len(hits) > 1:
-                # If desc mentions an actor name that appears in one hit's year, prefer it
-                # Otherwise pick the oldest hit (for classic movies airing on movie channels)
-                # Check if desc hints at a specific decade
-                decade_hint = None
-                if desc:
-                    dm = _re.search(r'\b(19[3-9]\d|20[0-2]\d)\b', desc)
-                    if dm:
-                        decade_hint = dm.group(1)
-                best = None
-                if decade_hint:
-                    for h in hits:
-                        hy = (h.get('Year') or '')[:4]
-                        if hy == decade_hint:
-                            best = h; break
-                if not best:
-                    best = hits[0]  # already returned above; skip re-lookup
-                # Fetch full details for best hit
-                imdb_id = best.get('imdbID','')
-                if imdb_id:
-                    url2 = f'http://www.omdbapi.com/?i={imdb_id}&apikey={omdb_key}'
-                    with urlreq.urlopen(url2, timeout=5) as resp2:
-                        od2 = json.loads(resp2.read())
-                    if od2.get('Response') == 'True':
-                        poster = od2.get('Poster','')
-                        if poster == 'N/A': poster = ''
-                        return jsonify({
-                            'source':      'omdb',
-                            'in_library':  in_library,
-                            'title':       od2.get('Title',''),
-                            'year':        od2.get('Year',''),
-                            'genre':       od2.get('Genre',''),
-                            'rated':       od2.get('Rated',''),
-                            'plot':        od2.get('Plot',''),
-                            'actors':      od2.get('Actors',''),
-                            'director':    od2.get('Director',''),
-                            'poster':      poster or local_poster,
-                            'imdb_rating': od2.get('imdbRating',''),
-                            'imdb_votes':  od2.get('imdbVotes',''),
-                        })
-        except Exception as e:
-            print(f'[OMDB-search] {e}')
-
     # 3. TMDB fallback
-    if tmdb_key:
+    if tmdb_key and not _skip_enrichment:
         try:
             q   = quote(title)
             yr_param = f'&year={year}' if year else ''
@@ -1345,49 +1933,99 @@ def api_airings():
 
 # ── VLC Play ──────────────────────────────────────────────────────────────────
 
-_vlc_pid = None
+MAX_STREAMS = 6
+# _vlc_streams: { channel_id: {'pid': int, 'ch_name': str, 'title': str} }
+_vlc_streams = {}
+_vlc_lock    = threading.Lock()
+
+def _proc_dead(pid):
+    """Return True if the process with this PID is no longer running."""
+    try:
+        os.kill(pid, 0)
+        return False
+    except (ProcessLookupError, OSError):
+        return True
 
 @app.route('/epg-web/api/play', methods=['POST'])
 def api_play():
-    global _vlc_pid
+    import signal as _sig
     data       = request.json or {}
-    channel_id = data.get('channel_id','')
-    cfg        = load_config()
-    url, err   = _stream_url(channel_id)
+    channel_id = data.get('channel_id', '')
+    title      = data.get('title', '')
+    ch_label   = data.get('ch_label', '')
+    ch_name    = data.get('ch_name', channel_id)
+    url, err, dbg = _stream_url(channel_id)
     if err:
-        return jsonify({'error': err}), 400
-    # Kill existing VLC if running
-    if _vlc_pid:
+        return jsonify({'error': err, 'debug': dbg}), 400
+    with _vlc_lock:
+        # Purge any VLC processes that have already exited
+        dead = [cid for cid, v in _vlc_streams.items()
+                if _proc_dead(v['pid'])]
+        for cid in dead:
+            del _vlc_streams[cid]
+        # If already playing this channel, stop it first
+        if channel_id in _vlc_streams:
+            try: os.kill(_vlc_streams[channel_id]['pid'], _sig.SIGTERM)
+            except Exception: pass
+            del _vlc_streams[channel_id]
+        # Enforce max streams
+        if len(_vlc_streams) >= MAX_STREAMS:
+            return jsonify({'error': f'Max {MAX_STREAMS} streams already playing'}), 400
         try:
-            import signal
-            os.kill(_vlc_pid, signal.SIGTERM)
-        except Exception:
-            pass
-        _vlc_pid = None
-    try:
-        vlc_paths = [
-            '/Applications/VLC.app/Contents/MacOS/VLC',
-            '/usr/bin/vlc',
-            'vlc',
-        ]
-        vlc_exe = next((p for p in vlc_paths if os.path.exists(p)), 'vlc')
-        proc = subprocess.Popen([vlc_exe, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _vlc_pid = proc.pid
-        return jsonify({'ok': True, 'pid': _vlc_pid})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+            vlc_paths = [
+                '/Applications/VLC.app/Contents/MacOS/VLC',
+                '/usr/bin/vlc',
+                'vlc',
+            ]
+            vlc_exe = next((p for p in vlc_paths if os.path.exists(p)), 'vlc')
+            parts = [p for p in [title, ch_label] if p]
+            display_title = '  —  '.join(parts) if parts else channel_id
+            cmd = [vlc_exe, url,
+                   '--meta-title', display_title,
+                   '--video-title', display_title,
+                   '--video-title-timeout', '5000']
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _vlc_streams[channel_id] = {'pid': proc.pid, 'ch_name': ch_name, 'title': title}
+            streams_snapshot = dict(_vlc_streams)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'streams': [
+        {'channel_id': cid, 'ch_name': v['ch_name'], 'title': v['title']}
+        for cid, v in streams_snapshot.items()
+    ]})
 
 @app.route('/epg-web/api/play/stop', methods=['POST'])
 def api_play_stop():
-    global _vlc_pid
-    if _vlc_pid:
-        try:
-            import signal
-            os.kill(_vlc_pid, signal.SIGTERM)
-        except Exception:
-            pass
-        _vlc_pid = None
-    return jsonify({'ok': True})
+    import signal as _sig
+    data       = request.json or {}
+    channel_id = data.get('channel_id', '')
+    with _vlc_lock:
+        if channel_id and channel_id in _vlc_streams:
+            try: os.kill(_vlc_streams[channel_id]['pid'], _sig.SIGTERM)
+            except Exception: pass
+            del _vlc_streams[channel_id]
+        elif not channel_id:
+            # Stop all
+            for v in _vlc_streams.values():
+                try: os.kill(v['pid'], _sig.SIGTERM)
+                except Exception: pass
+            _vlc_streams.clear()
+        streams_snapshot = dict(_vlc_streams)
+    return jsonify({'ok': True, 'streams': [
+        {'channel_id': cid, 'ch_name': v['ch_name'], 'title': v['title']}
+        for cid, v in streams_snapshot.items()
+    ]})
+
+@app.route('/epg-web/api/play/status')
+def api_play_status():
+    with _vlc_lock:
+        dead = [cid for cid, v in _vlc_streams.items() if _proc_dead(v['pid'])]
+        for cid in dead:
+            del _vlc_streams[cid]
+        return jsonify({'streams': [
+            {'channel_id': cid, 'ch_name': v['ch_name'], 'title': v['title']}
+            for cid, v in _vlc_streams.items()
+        ]})
 
 # ── Recording Routes ──────────────────────────────────────────────────────────
 
@@ -1408,11 +2046,11 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         conn = sqlite3.connect(guide_db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute('''
-            SELECT channel_id, channel_name, start_utc, end_utc
+            SELECT channel_id, channel_name, start_utc, end_utc, season_num, episode_num
             FROM guide
             WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
             AND start_utc > ? AND channel_id IN ({})
-            ORDER BY start_utc LIMIT 100
+            ORDER BY start_utc LIMIT 500
         '''.format(','.join('?' * len(recordable))),
             [title, clean_title, now_str] + list(recordable)
         ).fetchall()
@@ -1420,10 +2058,41 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     except Exception as e:
         print(f'[series] query error: {e}')
         return 0
+
+    # Deduplicate: one best airing per unique episode.
+    # Group by (season_num, episode_num) when available; prefer HD channels.
+    def _ch_quality(name):
+        n = (name or '').upper()
+        if 'UHD' in n or '4K' in n: return 3
+        if 'HD' in n:                return 2
+        return 1
+
+    ep_best = {}   # (sn, en) → row with best channel quality
+    no_ep   = []   # rows with no S/E info (record all, dedup by start_utc)
+    seen_starts = set()
+    for r in rows:
+        sn, en = r['season_num'], r['episode_num']
+        if sn is not None and en is not None:
+            key = (sn, en)
+            if key not in ep_best or _ch_quality(r['channel_name']) > _ch_quality(ep_best[key]['channel_name']):
+                ep_best[key] = r
+        else:
+            # No episode info — dedup by start time window (±5 min)
+            try:
+                ts = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
+                slot = round(ts / 300)  # 5-min bucket
+                if slot not in seen_starts:
+                    seen_starts.add(slot)
+                    no_ep.append(r)
+            except Exception:
+                pass
+
+    best_rows = list(ep_best.values()) + no_ep
+
     with _rec_lock:
         existing_keys = {(r['channel_id'], r['start_ts']) for r in _recs.values()
                          if r.get('status') in ('queued','scheduled','recording')}
-    for r in rows:
+    for r in best_rows:
         try:
             su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -1529,21 +2198,100 @@ def api_record():
     start_ts   = float(data.get('start_ts', time.time()))
     stop_ts    = float(data.get('stop_ts', time.time() + 3600))
     rec_id     = str(uuid.uuid4())[:8]
+    cfg2        = load_config()
+    guide_db    = cfg2.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    movies_db   = cfg2.get('db_path', '/Volumes/EPG/Movies.db')
+
+    # Check whether the requested channel has a PrimeStreams stream
+    has_stream = False
+    try:
+        mconn = sqlite3.connect(movies_db)
+        row = mconn.execute(
+            'SELECT stream_id FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
+            (channel_id,)
+        ).fetchone()
+        has_stream = bool(row)
+        mconn.close()
+    except Exception:
+        pass
+
+    # If no stream on requested channel, find the nearest upcoming PS airing of same title
+    if not has_stream:
+        ps_channel_id = None
+        ps_channel_name = None
+        ps_start_ts = None
+        ps_stop_ts = None
+        try:
+            # Get all PS-streamable channel IDs
+            ps_ids = get_ps_channel_ids(guide_db, movies_db)
+            if ps_ids:
+                now_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+                gconn = sqlite3.connect(guide_db)
+                gconn.row_factory = sqlite3.Row
+                airing = gconn.execute(
+                    '''SELECT channel_id, channel_name, start_utc, end_utc FROM guide
+                       WHERE lower(title)=lower(?) AND start_utc > ?
+                       AND channel_id IN ({})
+                       ORDER BY start_utc LIMIT 1'''.format(','.join('?'*len(ps_ids))),
+                    [title, now_str] + list(ps_ids)
+                ).fetchone()
+                gconn.close()
+                if airing:
+                    su = datetime.strptime(airing['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                    eu = datetime.strptime(airing['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                    ps_channel_id   = airing['channel_id']
+                    ps_channel_name = airing['channel_name']
+                    ps_start_ts     = su.timestamp()
+                    ps_stop_ts      = eu.timestamp()
+        except Exception as e:
+            print(f'[record] PS fallback error: {e}')
+
+        if ps_channel_id:
+            channel_id   = ps_channel_id
+            channel_name = ps_channel_name
+            start_ts     = ps_start_ts
+            stop_ts      = ps_stop_ts
+            print(f'[record] Remapped "{title}" → PS channel {channel_id} at {start_ts}')
+        else:
+            return jsonify({'ok': False, 'error': f'"{title}" is not airing on any PrimeStreams channel soon'}), 200
+    else:
+        # Channel has a stream — just look up its name
+        channel_name = channel_id
+        try:
+            gconn = sqlite3.connect(guide_db)
+            row = gconn.execute('SELECT channel_name FROM guide WHERE channel_id=? LIMIT 1', (channel_id,)).fetchone()
+            if row:
+                channel_name = row[0]
+            gconn.close()
+        except Exception:
+            pass
+
+    # Dedup: reject if same channel+start_ts already queued/scheduled/recording
     with _rec_lock:
-        _recs[rec_id] = {
-            'title':      title,
-            'channel_id': channel_id,
-            'start_ts':   start_ts,
-            'stop_ts':    stop_ts,
-            'status':     'queued',
-            'progress':   0,
-            'log':        [],
-            'pid':        None,
-            'file':       None,
-        }
+        for existing in _recs.values():
+            if (abs(existing.get('start_ts', 0) - start_ts) < 5 and
+                    existing.get('channel_id','') == channel_id and
+                    existing.get('status','') in ('queued','scheduled','recording')):
+                return jsonify({'ok': True, 'id': 'dup', 'dup': True})
+
+    rec = {
+        'title':      title,
+        'channel_id': channel_id,
+        'channel':    channel_name,
+        'start_ts':   start_ts,
+        'stop_ts':    stop_ts,
+        'status':     'queued',
+        'progress':   0,
+        'log':        [],
+        'pid':        None,
+        'file':       None,
+    }
+    with _rec_lock:
+        _recs[rec_id] = rec
+    _db_upsert_rec(rec_id, rec)
     t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
     t.start()
-    return jsonify({'ok': True, 'id': rec_id})
+    return jsonify({'ok': True, 'id': rec_id, 'channel': channel_name, 'start_ts': start_ts})
 
 @app.route('/epg-web/api/record/status')
 def api_rec_status():
@@ -1674,11 +2422,44 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
           text-overflow:ellipsis;}
 .prog-row{display:flex;flex:1;position:relative;height:42px;}
 .prog-block{position:absolute;top:2px;bottom:2px;border-radius:4px;
-            background:#1a2744;border:1px solid #243460;overflow:hidden;
+            background:#1a2744;border:1px solid #243460;border-left:3px solid #243460;overflow:hidden;
             cursor:pointer;transition:background .1s;padding:0 6px;
-            display:flex;align-items:center;min-width:4px;}
+            display:flex;flex-direction:column;justify-content:center;min-width:4px;}
+.prog-block .prog-row-top{display:flex;align-items:center;width:100%;overflow:hidden;}
+.prog-ep{font-size:9px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;line-height:1.2;margin-top:1px;}
 .prog-block:hover{background:#243460;border-color:#3b5bdb;}
 .prog-block.now{background:#1a3a2a;border-color:#2d5a3d;}
+.prog-block.in-plex{border-top:3px solid #a78bfa !important;box-shadow:inset 0 2px 0 #7c3aed44;}
+/* Category colour bands — left border + subtle tint (use .prog-block.cat-* for specificity over .prog-block.now) */
+.prog-block.cat-sports  {background:#0e1c35;border-left-color:#3b82f6;}
+.prog-block.cat-news    {background:#2a1212;border-left-color:#ef4444;}
+.prog-block.cat-kids    {background:#231f08;border-left-color:#f59e0b;}
+.prog-block.cat-doc     {background:#170f2e;border-left-color:#8b5cf6;}
+.prog-block.cat-reality {background:#25102a;border-left-color:#ec4899;}
+.prog-block.cat-talk    {background:#231808;border-left-color:#f97316;}
+.prog-block.cat-scripted{background:#0e2418;border-left-color:#22c55e;}
+.cat-badge{font-size:10px;font-weight:700;letter-spacing:.04em;padding:2px 5px;border-radius:3px;
+           margin-right:4px;flex-shrink:0;opacity:1;}
+.prog-block.cat-sports  .cat-badge{background:#1d4ed8;color:#bfdbfe;}
+.prog-block.cat-news    .cat-badge{background:#b91c1c;color:#fecaca;}
+.prog-block.cat-kids    .cat-badge{background:#b45309;color:#fef3c7;}
+.prog-block.cat-doc     .cat-badge{background:#6d28d9;color:#ede9fe;}
+.prog-block.cat-reality .cat-badge{background:#be185d;color:#fce7f3;}
+.prog-block.cat-talk    .cat-badge{background:#c2410c;color:#ffedd5;}
+.prog-block.cat-scripted .cat-badge{background:#15803d;color:#dcfce7;}
+.prog-block.cat-movie  {background:#1a1510;border-left-color:#f59e0b;}
+.prog-block.cat-movie  .cat-badge{background:#b45309;color:#fef3c7;}
+.prog-block.cat-series {background:#0f1e2e;border-left-color:#38bdf8;}
+.prog-block.cat-series .cat-badge{background:#0369a1;color:#e0f2fe;}
+.plex-play-btn{font-size:9px;color:#a78bfa;background:#2d1f5e;border:1px solid #7c3aed;border-radius:3px;padding:0 4px;margin-right:3px;flex-shrink:0;cursor:pointer;line-height:14px;}
+.plex-play-btn:hover{background:#7c3aed;color:#fff;}
+.rec-dot{font-size:9px;color:#ef4444;margin-right:3px;flex-shrink:0;animation:pulse-rec 1s infinite;}
+.sched-dot{font-size:9px;color:#f59e0b;margin-right:3px;flex-shrink:0;}
+.rec-btn{font-size:9px;color:#ef4444;background:rgba(239,68,68,.15);border:1px solid #ef4444;border-radius:3px;padding:0 4px;margin-right:3px;flex-shrink:0;cursor:pointer;line-height:14px;}
+.rec-btn:hover{background:#ef4444;color:#fff;}
+.rec-btn.pending{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,.15);cursor:default;}
+.plex-qual{font-size:9px;color:#7c3aed;margin-right:3px;flex-shrink:0;opacity:.8;}
+@keyframes pulse-rec{0%,100%{opacity:1;}50%{opacity:.3;}}
 .prog-title{font-size:11px;color:#c7d2e7;white-space:nowrap;overflow:hidden;
             text-overflow:ellipsis;}
 .now-line{position:absolute;top:0;bottom:0;width:2px;background:#ef4444;z-index:8;
@@ -1766,11 +2547,12 @@ tr:hover td{background:#141414;}
 
 <header>
   <span class="brand">📺 EPG Manager <span>Web</span></span>
-  <span style="font-size:11px;color:#333;">{{ VERSION }}</span>
+  <span style="font-size:11px;color:#888;">{{ VERSION }}</span>
   <span class="badge-live" id="live-badge">● Server live</span>
   <span id="clock">--:-- --</span>
   <div class="spacer"></div>
   <button class="btn btn-ghost btn-sm" id="btn-refresh" onclick="loadGuide()">↻ Refresh</button>
+  <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">⬇ Fetch Guide</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
 
@@ -1778,8 +2560,10 @@ tr:hover td{background:#141414;}
   <div class="tab active" onclick="switchTab('guide')">📺 Guide</div>
   <div class="tab" onclick="switchTab('recommendations')">⭐ Recommendations</div>
   <div class="tab" onclick="switchTab('channels')">📡 Channels</div>
+  <div class="tab" onclick="switchTab('247')">🔁 24/7</div>
   <div class="tab" onclick="switchTab('schedule')">📅 Schedule</div>
   <div class="tab" onclick="switchTab('conversions')">🔄 Conversions</div>
+  <div class="tab" onclick="switchTab('storage')">💾 Storage</div>
 </nav>
 
 <!-- GUIDE -->
@@ -1788,7 +2572,8 @@ tr:hover td{background:#141414;}
     <button class="btn btn-ghost btn-sm" onclick="guideNav(-4)">◀ Earlier</button>
     <span id="guide-window" style="font-size:13px;color:#555;"></span>
     <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
-    <select id="guide-ch-mode" onchange="fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
+    <button class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;">⬤ Now</button>
+    <select id="guide-ch-mode" onchange="localStorage.setItem('epg_guide_mode',this.value);fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
       <option value="all">All Channels</option>
       <option value="fav">★ Favorites</option>
       <option value="movie">🎬 Movie Channels</option>
@@ -1802,9 +2587,11 @@ tr:hover td{background:#141414;}
     <button id="ch-page-prev" class="btn btn-ghost btn-sm" onclick="chPagePrev()" style="display:none;">◀ Prev 200</button>
     <span id="ch-page-info" style="font-size:12px;color:#64748b;"></span>
     <button id="ch-page-next" class="btn btn-ghost btn-sm" onclick="chPageNext()" style="display:none;">Next 200 ▶</button>
-    <button class="btn btn-primary btn-sm" onclick="loadGuide()">Load Guide</button>
     <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 14 days from Schedules Direct">📡 Fetch SD</button>
   </div>
+  <!-- Compact storage bar -->
+  <div id="storage-bar" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:6px 4px;font-size:12px;color:#64748b;border-bottom:1px solid #1e293b;margin-bottom:6px;"></div>
+  <div id="now-playing-bar" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 4px;border-bottom:1px solid #1e293b;margin-bottom:4px;"></div>
   <div id="guide-status" class="status-msg"></div>
   <div id="sd-status" class="status-msg" style="display:none;"></div>
   <div class="guide-wrap" id="guide-wrap" style="display:none;">
@@ -1823,7 +2610,7 @@ tr:hover td{background:#141414;}
 </div>
 
 <!-- Programme detail modal -->
-<div id="prog-modal-overlay" onclick="if(event.target===this)closeProg()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;">
+<div id="prog-modal-overlay" onclick="if(event.target===this)closeProg()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center;">
   <div style="background:#111827;border:1px solid #1e2d3d;border-radius:14px;width:90%;max-width:620px;box-shadow:0 24px 80px rgba(0,0,0,.7);overflow:hidden;position:relative;">
     <!-- Close -->
     <button onclick="closeProg()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#64748b;font-size:20px;cursor:pointer;line-height:1;">✕</button>
@@ -1841,17 +2628,24 @@ tr:hover td{background:#141414;}
               <h3 id="pm-title" style="font-size:18px;font-weight:700;color:#f1f5f9;margin:0;line-height:1.3;"></h3>
               <span id="pm-library-badge" style="display:none;background:#166534;color:#86efac;font-size:10px;font-weight:600;padding:2px 7px;border-radius:99px;white-space:nowrap;margin-top:3px;">IN LIBRARY</span>
             </div>
-            <div id="pm-air" style="font-size:12px;color:#3b82f6;margin-bottom:8px;font-weight:500;"></div>
+            <div id="pm-air" style="font-size:12px;color:#3b82f6;margin-bottom:4px;font-weight:500;"></div>
+            <div id="pm-ep"  style="font-size:12px;color:#94a3b8;margin-bottom:8px;display:none;"></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
               <span id="pm-year"  style="font-size:12px;color:#94a3b8;"></span>
               <span id="pm-rated" style="font-size:11px;background:#1e293b;color:#94a3b8;padding:1px 6px;border-radius:4px;"></span>
               <span id="pm-genre" style="font-size:12px;color:#94a3b8;"></span>
               <span id="pm-imdb"  style="font-size:12px;color:#fbbf24;font-weight:600;"></span>
+              <a id="pm-imdb-link" href="#" target="_blank" style="font-size:11px;color:#3b82f6;display:none;">IMDb ↗</a>
             </div>
             <div id="pm-actors" style="font-size:12px;color:#94a3b8;margin-bottom:3px;"></div>
             <div id="pm-director" style="font-size:12px;color:#94a3b8;margin-bottom:10px;"></div>
             <p id="pm-plot" style="font-size:13px;color:#94a3b8;line-height:1.6;margin:0;"></p>
         </div>
+      </div>
+      <!-- Plex file info -->
+      <div id="pm-plex-wrap" style="display:none;border-top:1px solid #2d1f5e;padding:9px 20px;background:#0d0d1f;">
+        <span style="font-size:10px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">▶ PLEX</span>
+        <span id="pm-plex-info" style="font-size:12px;color:#a78bfa;font-family:monospace;"></span>
       </div>
       <!-- Next primestreams airing (featured) -->
       <div id="pm-next-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;background:#0f1923;">
@@ -1867,6 +2661,7 @@ tr:hover td{background:#141414;}
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
           <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📅 All Future Airings</span>
           <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Series</button>
+          <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unrecorded Only</button>
         </div>
         <div id="pm-airings-list" style="max-height:160px;overflow-y:auto;"></div>
       </div>
@@ -1901,7 +2696,10 @@ tr:hover td{background:#141414;}
 <!-- CHANNELS -->
 <div id="pane-channels" class="pane">
   <div class="card">
-    <h2>All Channels</h2>
+    <h2 style="display:flex;align-items:center;justify-content:space-between;">All Channels
+      <button class="btn btn-ghost btn-sm" onclick="syncStreams()" id="btn-sync-streams" style="font-size:12px;">🔄 Sync Streams</button>
+    </h2>
+    <div id="sync-status" style="display:none;font-size:12px;padding:6px 0;"></div>
     <div class="search-row">
       <input id="ch-search" placeholder="Search channels…" oninput="loadChannels()">
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#64748b;white-space:nowrap;cursor:pointer;">
@@ -1913,18 +2711,46 @@ tr:hover td{background:#141414;}
   </div>
 </div>
 
+<!-- 24/7 CHANNELS -->
+<div id="pane-247" class="pane">
+  <div class="card">
+    <h2>🔁 24/7 Channels</h2>
+    <div class="search-row">
+      <input id="c247-search" placeholder="Search 24/7 channels…" oninput="load247()">
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#f59e0b;white-space:nowrap;cursor:pointer;">
+        <input type="checkbox" id="c247-show-fav" checked onchange="load247()"> ★ Favorites
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#60a5fa;white-space:nowrap;cursor:pointer;">
+        <input type="checkbox" id="c247-show-tv" checked onchange="load247()"> 📺 TV
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#c084fc;white-space:nowrap;cursor:pointer;">
+        <input type="checkbox" id="c247-show-movies" checked onchange="load247()"> 🎬 Movies
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#34d399;white-space:nowrap;cursor:pointer;">
+        <input type="checkbox" id="c247-show-kids" checked onchange="load247()"> 🧒 Kids
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#fb923c;white-space:nowrap;cursor:pointer;">
+        <input type="checkbox" id="c247-show-sports" checked onchange="load247()"> 🏆 Sports
+      </label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#475569;white-space:nowrap;cursor:pointer;">
+        <input type="checkbox" id="c247-show-hidden" onchange="load247()"> ✕ Hidden
+      </label>
+    </div>
+    <div id="c247-status" class="status-msg"></div>
+    <div id="c247-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-top:10px;"></div>
+  </div>
+</div>
+
 <!-- SCHEDULE -->
 <div id="pane-schedule" class="pane">
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
       <h2 style="margin:0;">Recording Schedule</h2>
-      <select id="sched-filter" onchange="loadSchedule()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 8px;font-size:12px;">
-        <option value="">All statuses</option>
-        <option value="scheduled">Scheduled</option>
-        <option value="completed">Completed</option>
-        <option value="failed">Failed</option>
-        <option value="cancelled">Cancelled</option>
-      </select>
+      <label style="font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-scheduled" checked onchange="loadSchedule()"> Scheduled</label>
+      <label style="font-size:12px;color:#22c55e;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-completed" checked onchange="loadSchedule()"> Completed</label>
+      <label style="font-size:12px;color:#ef4444;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-failed" checked onchange="loadSchedule()"> Failed</label>
+      <label style="font-size:12px;color:#64748b;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-skipped" onchange="loadSchedule()"> Skipped</label>
+      <label style="font-size:12px;color:#64748b;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-all-time" onchange="loadSchedule()"> All time</label>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadSchedule()">↻ Refresh</button>
     </div>
     <div id="sched-empty" class="empty" style="display:none;">
@@ -1947,13 +2773,6 @@ tr:hover td{background:#141414;}
     </div>
     <div id="rec-files-empty" style="display:none;color:#64748b;font-size:13px;">No recording files found.</div>
     <div id="rec-files-list" style="max-height:320px;overflow-y:auto;"></div>
-  </div>
-  <div class="card" style="margin-top:12px;">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
-      <h2 style="margin:0;">💾 Storage</h2>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadDiskUsage()">↻ Refresh</button>
-    </div>
-    <div id="disk-list"></div>
   </div>
 </div>
 
@@ -1978,6 +2797,54 @@ tr:hover td{background:#141414;}
   <div class="tt-title" id="tt-title"></div>
   <div class="tt-time" id="tt-time"></div>
   <div class="tt-desc" id="tt-desc"></div>
+  <div class="tt-imdb" id="tt-imdb" style="display:none;margin-top:4px;font-size:11px;color:#fbbf24;"></div>
+  <div class="tt-plex" id="tt-plex" style="display:none;margin-top:5px;padding-top:5px;border-top:1px solid #2d1f5e;font-size:10px;color:#a78bfa;font-family:monospace;"></div>
+</div>
+
+<!-- STORAGE -->
+<div id="pane-storage" class="pane">
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+      <h2 style="margin:0;">💾 Storage</h2>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadStorageTab()">↻ Refresh</button>
+    </div>
+    <div id="storage-tab-list"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
+    <h2 style="margin:0 0 14px;">⚠ Warning Thresholds</h2>
+    <p style="font-size:13px;color:#64748b;margin:0 0 16px;">Set the % used at which the storage bar turns yellow or red.</p>
+    <div style="display:flex;gap:24px;align-items:flex-end;flex-wrap:wrap;">
+      <div>
+        <label style="display:block;font-size:12px;color:#94a3b8;margin-bottom:4px;">🟡 Yellow warning at</label>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <input id="thresh-yellow" type="number" min="1" max="99" style="width:70px;padding:6px 8px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;font-size:14px;">
+          <span style="color:#64748b;font-size:13px;">%</span>
+        </div>
+      </div>
+      <div>
+        <label style="display:block;font-size:12px;color:#94a3b8;margin-bottom:4px;">🔴 Red warning at</label>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <input id="thresh-red" type="number" min="1" max="99" style="width:70px;padding:6px 8px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;font-size:14px;">
+          <span style="color:#64748b;font-size:13px;">%</span>
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="saveThresholds()">Save Thresholds</button>
+    </div>
+    <div id="thresh-status" class="status-msg" style="margin-top:10px;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
+    <h2 style="margin:0 0 14px;">📁 Monitored Paths</h2>
+    <p style="font-size:13px;color:#64748b;margin:0 0 16px;">These paths are read from Settings. Change them there to monitor different volumes.</p>
+    <div id="storage-paths-list"></div>
+    <div style="margin-top:14px;padding-top:14px;border-top:1px solid #1e293b;">
+      <label style="display:block;font-size:12px;color:#94a3b8;margin-bottom:8px;">Add custom path to monitor</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input id="custom-path-label" placeholder="Label (e.g. Downloads)" style="width:160px;padding:6px 8px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;font-size:13px;">
+        <input id="custom-path-val" placeholder="/path/to/folder" style="flex:1;min-width:200px;padding:6px 8px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;font-size:13px;">
+        <button class="btn btn-ghost btn-sm" onclick="addCustomPath()">+ Add</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- Settings modal -->
@@ -2010,6 +2877,21 @@ let _guideWindowStart = null;   // ISO string
 let _guideHours = 4;
 let _chOffset = 0;
 const PX_PER_MIN = 4;           // 1 min = 4px → 30min = 120px, 1hr = 240px
+const CH_NAME_W  = 160;         // channel label column width in px
+
+function _calcGuideHours() {
+  // Fill available width at PX_PER_MIN; minimum 4h, maximum 12h, snap to whole hours
+  const avail = window.innerWidth - CH_NAME_W - 20; // 20 for scrollbar/padding
+  return Math.min(12, Math.max(4, Math.floor(avail / (PX_PER_MIN * 60))));
+}
+_guideHours = _calcGuideHours();
+
+// Refetch when window is resized to a different hour count
+let _lastGuideHours = _guideHours;
+window.addEventListener('resize', () => {
+  const h = _calcGuideHours();
+  if (h !== _lastGuideHours) { _lastGuideHours = h; _guideHours = h; fetchAndRenderGuide(); }
+});
 
 // ── Clock + live status ───────────────────────────────────────────────────────
 function tickClock() {
@@ -2033,12 +2915,16 @@ refreshStatus();
 
 // Auto-render guide on page load; if SD is running, poll until done then render
 async function autoLoad() {
-  const s = await (await fetch('/epg-web/api/status')).json();
-  if (s.programmes > 0) {
-    await fetchAndRenderGuide();
-  }
-  // If SD fetch is running in background, show progress and re-render when done
-  const sd = await (await fetch('/epg-web/api/fetch-sd/status')).json();
+  try {
+    const s = await (await fetch('/epg-web/api/status')).json();
+    if (s.programmes > 0) {
+      await fetchAndRenderGuide();
+    }
+  } catch(e) { console.warn('[autoLoad] status fetch failed:', e.message); return; }
+  let sd;
+  try {
+    sd = await (await fetch('/epg-web/api/fetch-sd/status')).json();
+  } catch(e) { console.warn('[autoLoad] fetch-sd/status failed:', e.message); return; }
   if (sd.running) {
     const sdEl = document.getElementById('sd-status');
     sdEl.style.display = '';
@@ -2055,27 +2941,35 @@ async function autoLoad() {
         clearInterval(_sdPoll);
       } else if (s2.result) {
         const r = s2.result;
-        sdEl.textContent = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total`;
+        sdEl.innerHTML = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total &nbsp;<button class="btn btn-ghost btn-sm" onclick="fetchAndRenderGuide()">↻ Reload Guide</button>`;
         sdEl.className = 'status-msg ok';
         clearInterval(_sdPoll);
-        await fetchAndRenderGuide();
       }
     }, 2000);
   }
 }
+// Restore saved guide mode before first render
+(function() {
+  const saved = localStorage.getItem('epg_guide_mode');
+  if (saved) { const el = document.getElementById('guide-ch-mode'); if (el) el.value = saved; }
+})();
 autoLoad();
+loadStorageBar();
+setInterval(loadStorageBar, 5 * 60 * 1000); // refresh every 5 min
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  const names = ['guide','recommendations','channels','schedule','conversions'];
+  const names = ['guide','recommendations','channels','247','schedule','conversions','storage'];
   document.querySelectorAll('.tab').forEach((t,i) =>
     t.classList.toggle('active', names[i] === name));
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
   document.getElementById('pane-'+name).classList.add('active');
   if (name === 'recommendations') loadRecs();
   if (name === 'channels') loadChannels();
-  if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); loadRecFiles(); loadDiskUsage(); }
+  if (name === '247') load247();
+  if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
+  if (name === 'storage') loadStorageTab();
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -2103,19 +2997,19 @@ async function saveSettings() {
 }
 
 // ── Guide ─────────────────────────────────────────────────────────────────────
-async function loadGuide() {
-  const btn = document.getElementById('btn-refresh');
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
-  setGS('Loading guide…');
+async function fetchGuide() {
+  const btn = document.getElementById('btn-fetch-guide');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Fetching…';
+  setGS('Fetching XMLTV from PrimeStreams — this may take 30-60s…');
   try {
-    const r = await fetch('/epg-web/api/load-guide', {method:'POST'});
+    const r = await fetch('/epg-web/api/fetch-guide', {method:'POST'});
     const d = await r.json();
-    if (d.error) { setGS('Error: '+d.error, 'err'); return; }
-    const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new data)';
-    setGS(`${d.count.toLocaleString()} programmes loaded${newInfo} · ${d.loaded}`, 'ok');
+    if (d.error) { setGS('Fetch error: '+d.error, 'err'); return; }
+    const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new rows)';
+    setGS(`Fetched ${(d.bytes/1024).toFixed(0)} KB · ${d.count.toLocaleString()} programmes${newInfo}`, 'ok');
     await fetchAndRenderGuide();
-  } catch(e) { setGS('Failed: '+e.message,'err'); }
-  finally { btn.disabled=false; btn.textContent='↻ Refresh'; }
+  } catch(e) { setGS('Fetch failed: '+e.message,'err'); }
+  finally { btn.disabled=false; btn.textContent='\\u2B07 Fetch Guide'; }
 }
 function setGS(msg,cls='') {
   const el=document.getElementById('guide-status');
@@ -2143,10 +3037,9 @@ async function fetchSD() {
       clearInterval(_sdPoll); btn.disabled = false;
     } else if (s.result) {
       const r = s.result;
-      sdEl.textContent = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total · reload guide to see`;
+      sdEl.innerHTML = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total &nbsp;<button class="btn btn-ghost btn-sm" onclick="fetchAndRenderGuide()">↻ Reload Guide</button>`;
       sdEl.className = 'status-msg ok';
       clearInterval(_sdPoll); btn.disabled = false;
-      await loadGuide();
     }
   }, 2000);
 }
@@ -2157,19 +3050,29 @@ function guideNav(hours) {
   _guideWindowStart = d.toISOString();
   fetchAndRenderGuide();
 }
-let _searchTimer = null;
+function guideJumpNow() {
+  _guideWindowStart = new Date().toISOString();
+  fetchAndRenderGuide();
+}
+let _searchTimer = null, _searchSeq = 0;
 function onSearchInput(val) {
   clearTimeout(_searchTimer);
+  _chIdFilter = '';  // clear exact-id filter when user is typing a new search
   const dd = document.getElementById('search-dropdown');
   if (val.length < 2) { dd.style.display = 'none'; fetchAndRenderGuide(); return; }
+  const seq = ++_searchSeq;
   _searchTimer = setTimeout(async () => {
     const r = await fetch('/epg-web/api/search?q=' + encodeURIComponent(val));
     const d = await r.json();
+    if (seq !== _searchSeq) return; // stale response — a newer search is in flight
     let html = '';
     if (d.channels && d.channels.length) {
       html += '<div style="padding:6px 12px;font-size:11px;color:#3b82f6;font-weight:600;text-transform:uppercase;letter-spacing:.05em;">📺 Channels</div>';
       html += d.channels.map(c =>
-        `<div class="sr" onclick="jumpToChannel(${JSON.stringify(c.id)},${JSON.stringify(c.name)})" style="padding:8px 14px;cursor:pointer;font-size:13px;color:#e2e8f0;border-bottom:1px solid #1e293b;">${esc(c.name)}</div>`
+        `<div class="sr" style="padding:8px 14px;cursor:pointer;font-size:13px;color:#e2e8f0;border-bottom:1px solid #1e293b;display:flex;align-items:center;justify-content:space-between;">
+          <span onclick='jumpToChannel(${JSON.stringify(c.id).replace(/'/g,"\\'")},"${c.name.replace(/"/g,'&quot;')}")'style="flex:1">${esc(c.name)}</span>
+          <span onclick='toggleFav(${JSON.stringify(c.id).replace(/'/g,"\\'")},this)' title="Toggle favorite" style="padding:0 4px;color:${c.fav?'#f59e0b':'#475569'};font-size:16px;">${c.fav?'★':'☆'}</span>
+        </div>`
       ).join('');
     }
     if (d.programs && d.programs.length) {
@@ -2178,7 +3081,7 @@ function onSearchInput(val) {
         `<div class="sr" onclick="searchOpenProg(${JSON.stringify(p.title).replace(/"/g,'&quot;')})" style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:10px;">
           <span style="font-size:12px;min-width:70px;color:${p.on_now?'#22c55e':'#94a3b8'};font-weight:${p.on_now?'600':'400'};">${esc(p.start_fmt)}</span>
           <span style="flex:1;font-size:13px;color:#e2e8f0;">${esc(p.title)}</span>
-          <span style="font-size:11px;color:#64748b;text-align:right;">${esc(p.channel_name)}</span>
+          <span style="font-size:11px;color:#64748b;text-align:right;">${p.has_stream ? '📡 ' : ''}${esc(p.channel_name)}</span>
         </div>`
       ).join('');
     }
@@ -2195,32 +3098,167 @@ function onSearchInput(val) {
 function clearSearch() {
   document.getElementById('ch-filter').value = '';
   document.getElementById('search-dropdown').style.display = 'none';
+  _chIdFilter = '';
   _chOffset = 0; fetchAndRenderGuide();
 }
 function jumpToChannel(id, name) {
   document.getElementById('search-dropdown').style.display = 'none';
   document.getElementById('ch-filter').value = name;
+  _chIdFilter = id;
   _chOffset = 0; fetchAndRenderGuide();
 }
-async function searchOpenProg(title) {
-  document.getElementById('search-dropdown').style.display = 'none';
-  document.getElementById('ch-filter').value = '';
-  // Open programme modal directly via prog-info
-  const p = { title, channel:'', channel_id:'', start_fmt:'', stop_fmt:'', desc:'' };
-  openProg(p);
+async function syncStreams() {
+  const btn = document.getElementById('btn-sync-streams');
+  const status = document.getElementById('sync-status');
+  btn.disabled = true; btn.textContent = '⏳ Syncing…';
+  status.style.display = ''; status.style.color = '#94a3b8';
+  status.textContent = 'Fetching latest stream IDs from PrimeStreams…';
+  try {
+    const r = await fetch('/epg-web/api/sync-streams', {method:'POST'});
+    const d = await r.json();
+    if (d.error) { status.style.color='#ef4444'; status.textContent = '❌ ' + d.error; }
+    else {
+      const lines = d.updated.map(u => `${u.channel}: ${u.old} → ${u.new} (${u.ps_name})`);
+      status.style.color = '#22c55e';
+      status.innerHTML = `✅ Updated ${d.updated.length} stream IDs, ${d.unchanged} unchanged, ${d.not_found} not found in PrimeStreams.` +
+        (lines.length ? '<br><small style="color:#94a3b8">' + lines.join('<br>') + '</small>' : '');
+    }
+  } catch(e) { status.style.color='#ef4444'; status.textContent = '❌ ' + e.message; }
+  btn.disabled = false; btn.textContent = '🔄 Sync Streams';
 }
-// Close dropdown when clicking outside
+async function toggleFav(channelId, starEl) {
+  const r = await fetch('/epg-web/api/channel/favorite', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel_id: channelId})});
+  const d = await r.json();
+  if (d.ok) {
+    starEl.textContent = d.favorite ? '★' : '☆';
+    starEl.style.color = d.favorite ? '#f59e0b' : '#475569';
+  }
+}
+async function searchOpenProg(title, episodeTitle, seasonNum, episodeNum) {
+  // Strip year suffix e.g. "Minority Report (2002)" → "Minority Report"
+  const baseTitle = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+  // Build query — include episode title if available
+  let url = '/epg-web/api/search?q=' + encodeURIComponent(baseTitle);
+  if (episodeTitle) url += '&episode=' + encodeURIComponent(episodeTitle);
+  if (seasonNum)    url += '&season='  + encodeURIComponent(seasonNum);
+  if (episodeNum)   url += '&ep='      + encodeURIComponent(episodeNum);
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    const progs = (d.programs || []).filter(p => p.start_ts && p.stop_ts);
+    if (progs.length) {
+      // If episode info given, prefer exact episode match; fall back to first result
+      let match = progs[0];
+      if (episodeTitle) {
+        const epNorm = episodeTitle.toLowerCase();
+        const exact = progs.find(p => (p.episode_title||'').toLowerCase() === epNorm);
+        if (exact) match = exact;
+      }
+      openProg(match);
+      if (episodeTitle && !(progs.find(p => (p.episode_title||'').toLowerCase() === episodeTitle.toLowerCase()))) {
+        // Warn that exact episode wasn't found — showing next available airing instead
+        document.getElementById('pm-status').textContent =
+          `⚠ Exact episode not found — showing next airing of "${baseTitle}"`;
+        document.getElementById('pm-status').className = 'status-msg';
+        document.getElementById('pm-status').style.display = '';
+      }
+      return;
+    }
+  } catch(e) {}
+  // Fallback: switch to Guide tab, trigger the search dropdown
+  switchTab('guide');
+  const el = document.getElementById('ch-filter');
+  if (el) { el.value = baseTitle; el.focus(); onSearchInput(baseTitle); }
+}
+// Close dropdown when clicking outside (but not when interacting with the prog modal)
 document.addEventListener('click', e => {
-  if (!e.target.closest('#ch-filter') && !e.target.closest('#search-dropdown'))
+  if (!e.target.closest('#ch-filter') &&
+      !e.target.closest('#search-dropdown') &&
+      !e.target.closest('#prog-modal-overlay'))
     document.getElementById('search-dropdown').style.display = 'none';
 });
 
+let _plexTitles = new Set();
+function _normTitle(t) {
+  return (t||'').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+}
+// Strip trailing (YYYY) before normalizing — Plex folders have year stripped already
+function _plexNorm(t) { return _normTitle((t||'').replace(/\s*\(\d{4}\)\s*$/,'')); }
+let _plexTitlesReady = false;
+let _plexTitlesPromise = null;
+async function loadPlexTitles() {
+  try {
+    const r = await fetch('/epg-web/api/plex/titles');
+    const d = await r.json();
+    _plexTitles = new Set((d.titles||[]).map(_normTitle));
+    _plexTitlesReady = true;
+  } catch(e) { _plexTitlesReady = true; }
+}
+_plexTitlesPromise = loadPlexTitles();
+
+// key: channel_id+'|'+start_ts → 'recording'|'queued'|'scheduled'|...
+let _guideRecMap = {};
+async function refreshGuideRecMap() {
+  try {
+    const d = await (await fetch('/epg-web/api/record/status')).json();
+    const m = {};
+    for (const r of Object.values(d.recordings || {})) {
+      const k = (r.channel_id||'') + '|' + Math.round(r.start_ts);
+      m[k] = (r.status||'').toLowerCase();
+    }
+    _guideRecMap = m;
+  } catch(e) {}
+}
+
+let _progMap = {};
+
+async function quickRecord(key, btnEl) {
+  const p = _progMap[key];
+  if (!p) return;
+  btnEl.textContent = '⏱';
+  btnEl.className = 'rec-btn pending';
+  btnEl.onclick = null;  // prevent double-click immediately
+  try {
+    const r = await fetch('/epg-web/api/record', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({title: p.title, channel_id: p.channel_id,
+                            start_ts: p.start_ts, stop_ts: p.stop_ts})
+    });
+    const d = await r.json();
+    if (d.ok && !d.error) {
+      btnEl.textContent = '⏱';
+      _guideRecMap[key] = 'queued';
+    } else {
+      btnEl.textContent = '⏺';
+      btnEl.className = 'rec-btn';
+      btnEl.onclick = e => { e.stopPropagation(); quickRecord(key, btnEl); };
+      if (d.error) alert(d.error);
+    }
+  } catch(e) {
+    btnEl.textContent = '⏺';
+    btnEl.className = 'rec-btn';
+    btnEl.onclick = ev => { ev.stopPropagation(); quickRecord(key, btnEl); };
+  }
+}
+
+async function playPlex(title) {
+  const r = await fetch('/epg-web/api/plex/play', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({title})
+  });
+  const d = await r.json();
+  if (!d.ok) alert('Could not open in VLC: ' + (d.error||'unknown error'));
+}
+
+let _chIdFilter = '';
 async function fetchAndRenderGuide() {
+  if (!_plexTitlesReady && _plexTitlesPromise) await _plexTitlesPromise;
   const params = new URLSearchParams();
   if (_guideWindowStart) params.set('start', _guideWindowStart);
   params.set('hours', _guideHours);
   const ch = document.getElementById('ch-filter').value.trim();
-  if (ch) params.set('ch', ch);
+  if (_chIdFilter) params.set('ch_id', _chIdFilter);
+  else if (ch) params.set('ch', ch);
   const mode = document.getElementById('guide-ch-mode').value;
   if (mode === 'fav')   params.set('fav',   '1');
   if (mode === 'movie') params.set('movie', '1');
@@ -2228,12 +3266,16 @@ async function fetchAndRenderGuide() {
   if (mode === 'sd')    params.set('sd',    '1');
   params.set('ch_offset', _chOffset);
   try {
-    const r = await fetch('/epg-web/api/guide?' + params);
+    const [r] = await Promise.all([
+      fetch('/epg-web/api/guide?' + params),
+      refreshGuideRecMap()
+    ]);
     const d = await r.json();
     if (d.error) { setGS(d.error,'err'); return; }
     _guideData = d;
     if (!_guideWindowStart) _guideWindowStart = d.window_start;
     renderGuide();
+    updatePlexQuality();
     // Update channel page nav
     const total = d.total_channels || 0;
     const offset = d.ch_offset || 0;
@@ -2254,6 +3296,7 @@ function chPagePrev() { _chOffset = Math.max(0, _chOffset - 200); fetchAndRender
 function chPageNext() { _chOffset += 200; fetchAndRenderGuide(); }
 function renderGuide() {
   if (!_guideData) return;
+  _progMap = {};
   const d = _guideData;
   const wsTs = d.window_start_ts;
   const weTs = d.window_end_ts;
@@ -2291,6 +3334,9 @@ function renderGuide() {
     if (nowTs > wsTs && nowTs < weTs) {
       progHTML += `<div class="now-line" style="left:${nowOffPx}px;"></div>`;
     }
+    if (ch.no_data && chProgs.length === 0) {
+      progHTML += `<div class="prog-block" style="left:0;width:${totalPx - 2}px;opacity:0.35;font-style:italic;cursor:default;background:#555;">No guide data</div>`;
+    }
     for (const p of chProgs) {
       const pStart = Math.max(p.start_ts, wsTs);
       const pEnd   = Math.min(p.stop_ts,  weTs);
@@ -2298,12 +3344,38 @@ function renderGuide() {
       const width  = Math.max(2, (pEnd - pStart) / 60 * PX_PER_MIN - 2);
       const isNow  = p.start_ts <= nowTs && p.stop_ts > nowTs;
       const pd = JSON.stringify(p).replace(/'/g, "\\'");
-      progHTML += `<div class="prog-block${isNow?' now':''}"
+      const hasPlex   = _plexTitles.has(_plexNorm(p.title));
+      const recKey    = (p.channel_id||'') + '|' + Math.round(p.start_ts);
+      const recSt     = _guideRecMap[recKey] || '';
+      const isRecording = recSt === 'recording';
+      const isScheduled = recSt === 'queued' || recSt === 'scheduled' || recSt === 'to_record';
+      const recKey2   = (p.channel_id||'') + '|' + Math.round(p.start_ts);
+      _progMap[recKey2] = p;
+      const normKey   = _normTitle(p.title);
+      const cachedQ   = hasPlex && _plexInfoCache[normKey] ? _resLabel(_plexInfoCache[normKey]) : '';
+      const plexBtn   = hasPlex ? `<span class="plex-play-btn" title="Play in VLC" data-ptitle="${esc(p.title)}" onclick="event.stopPropagation();playPlex(this.dataset.ptitle)">▶</span><span class="plex-qual" data-qtitle="${esc(p.title)}" id="pq-${normKey.replace(/[^a-z0-9]/g,'')}">${cachedQ}</span>` : '';
+      const recBtnEl  = (!hasPlex && !isRecording && !isScheduled)
+                        ? `<span class="rec-btn" title="Record" data-rkey="${esc(recKey2)}" onclick="event.stopPropagation();quickRecord(this.dataset.rkey,this)">⏺</span>` : '';
+      const isMovie  = p.prog_type === 'MV' || (!p.prog_type && /\(\d{4}\)\s*$/.test(p.title));
+      const isSeries = !isMovie && (p.prog_type === 'EP' || p.prog_type === 'SH' || p.season_num != null || (p.episode_title && p.episode_title.length > 0));
+      const catI    = isMovie  ? {cls:'cat-movie',  badge:'MOVIE'}
+                    : isSeries ? {cls:'cat-series', badge:'SERIES'}
+                    : _catInfo(p.category || '');
+      const catBadge = catI.badge ? `<span class="cat-badge">${catI.badge}</span>` : '';
+      const badges    = (isRecording ? '<span class="rec-dot" title="Recording now">⏺</span>' : '')
+                      + (isScheduled ? '<span class="sched-dot" title="Scheduled to record">⏱</span>' : '')
+                      + plexBtn + recBtnEl;
+      const epParts = [];
+      if (p.season_num != null) epParts.push(`S${p.season_num}${p.episode_num != null ? 'E'+p.episode_num : ''}`);
+      if (p.episode_title) epParts.push(p.episode_title);
+      const epLine = epParts.join(' · ');
+      progHTML += `<div class="prog-block${isNow?' now':''}${hasPlex?' in-plex':''}${catI.cls?' '+catI.cls:''}"
         style="left:${left}px;width:${width}px;"
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <span class="prog-title">${esc(p.title)}</span>
+        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span></div>
+        ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
     progHTML += '</div>';
@@ -2317,15 +3389,121 @@ function renderGuide() {
   document.getElementById('guide-wrap').style.display = 'block';
 }
 
+function _catInfo(cat) {
+  if (!cat) return {cls:'', badge:''};
+  const c = cat.toLowerCase();
+  const sports = ['baseball','basketball','football','soccer','hockey','golf','tennis','boxing','wrestling','motor','cycling','swimming','track','racing','volleyball','martial','lacrosse','rugby','cricket','skiing','curling','softball','sport'];
+  const news   = ['news','newsmagazine','public affairs','weather'];
+  const kids   = ['animated','children','kids'];
+  const talk   = ['talk','game show','variety','cooking','consumer','home shopping','infomercial'];
+  const scripted = ['drama','sitcom','comedy','crime','thriller','mystery','romance','sci-fi','horror','adventure','fantasy','western','action'];
+  if (sports.some(s => c.includes(s)))   return {cls:'cat-sports',   badge:'SPORT'};
+  if (news.some(s => c.includes(s)))     return {cls:'cat-news',     badge:'NEWS'};
+  if (kids.some(s => c.includes(s)))     return {cls:'cat-kids',     badge:'KIDS'};
+  if (c.includes('documentary'))         return {cls:'cat-doc',      badge:'DOC'};
+  if (c.includes('reality'))             return {cls:'cat-reality',  badge:'REAL'};
+  if (talk.some(s => c.includes(s)))     return {cls:'cat-talk',     badge:'TALK'};
+  if (scripted.some(s => c.includes(s))) return {cls:'cat-scripted', badge:'SERIES'};
+  return {cls:'', badge:''};
+}
+
+function _resLabel(infoStr) {
+  if (!infoStr) return '';
+  const m = (infoStr||'').match(/(\d+)×(\d+)/);
+  if (!m) return '';
+  const h = parseInt(m[2]);
+  if (h >= 2160) return '4K';
+  if (h >= 1080) return '1080p';
+  if (h >= 720)  return '720p';
+  return h + 'p';
+}
+
+async function updatePlexQuality() {
+  const spans = document.querySelectorAll('.plex-qual[data-qtitle]');
+  const seen = new Set();
+  for (const span of spans) {
+    const title = span.dataset.qtitle;
+    if (!title || seen.has(title)) { if (seen.has(title) && _plexInfoCache[_normTitle(title)]) span.textContent = _resLabel(_plexInfoCache[_normTitle(title)]); continue; }
+    seen.add(title);
+    const key = _normTitle(title);
+    if (_plexInfoCache[key]) { span.textContent = _resLabel(_plexInfoCache[key]); continue; }
+    fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(title)}`)
+      .then(r => r.json()).then(pi => {
+        if (!pi.found) return;
+        const parts = [];
+        if (pi.width && pi.height) parts.push(`${pi.width}×${pi.height}`);
+        if (pi.fps)         parts.push(`${pi.fps} fps`);
+        if (pi.video_codec) parts.push(pi.video_codec);
+        if (pi.audio_codec) parts.push(pi.audio_codec + (pi.channels ? ` ${pi.channels}ch` : ''));
+        if (pi.size)        parts.push(pi.size);
+        _plexInfoCache[key] = parts.join(' · ');
+        document.querySelectorAll(`.plex-qual[data-qtitle="${title.replace(/"/g,'\\"')}"]`)
+          .forEach(el => el.textContent = _resLabel(_plexInfoCache[key]));
+      }).catch(()=>{});
+  }
+}
+
 // Tooltip
+const _plexInfoCache = {};
+const _imdbCache     = {};
 function showTip(e, p) {
-  const tt = document.getElementById('tooltip');
+  const tt      = document.getElementById('tooltip');
+  const ttPlex  = document.getElementById('tt-plex');
+  const ttImdb  = document.getElementById('tt-imdb');
   document.getElementById('tt-title').textContent = p.title;
   document.getElementById('tt-time').textContent  = p.start_fmt + ' – ' + p.stop_fmt;
   document.getElementById('tt-desc').textContent  = p.desc || p.category || '';
+  ttPlex.style.display = 'none';
+  ttImdb.style.display = 'none';
   tt.style.display = 'block';
   tt.style.left    = Math.min(e.clientX + 12, window.innerWidth - 320) + 'px';
   tt.style.top     = Math.min(e.clientY + 12, window.innerHeight - 150) + 'px';
+
+  const key = _normTitle(p.title);
+
+  // IMDb info (all titles)
+  if (_imdbCache[key] !== undefined) {
+    if (_imdbCache[key]) { ttImdb.textContent = _imdbCache[key]; ttImdb.style.display = 'block'; }
+  } else {
+    _imdbCache[key] = '';
+    fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}&desc=${encodeURIComponent(p.desc||'')}`)
+      .then(r => r.json()).then(info => {
+        const parts = [];
+        if (info.imdb_rating) parts.push(`★ ${info.imdb_rating}`);
+        if (info.year)        parts.push(info.year);
+        if (info.genre)       parts.push(info.genre.split(',')[0].trim());
+        if (info.rated && info.rated !== 'N/A') parts.push(info.rated);
+        const txt = parts.join(' · ');
+        _imdbCache[key] = txt;
+        if (tt.style.display !== 'none' && txt) {
+          ttImdb.textContent = txt; ttImdb.style.display = 'block';
+        }
+      }).catch(()=>{});
+  }
+
+  // Plex file specs (Plex titles only)
+  const plexKey = _plexNorm(p.title);
+  if (_plexTitles.has(plexKey)) {
+    if (_plexInfoCache[plexKey]) {
+      ttPlex.textContent = _plexInfoCache[plexKey]; ttPlex.style.display = 'block';
+    } else {
+      fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}`)
+        .then(r => r.json()).then(pi => {
+          if (!pi.found) return;
+          const parts = [];
+          if (pi.width && pi.height) parts.push(`${pi.width}×${pi.height}`);
+          if (pi.fps)         parts.push(`${pi.fps} fps`);
+          if (pi.video_codec) parts.push(pi.video_codec);
+          if (pi.audio_codec) parts.push(pi.audio_codec + (pi.channels ? ` ${pi.channels}ch` : ''));
+          if (pi.size)        parts.push(pi.size);
+          const txt = parts.join(' · ');
+          _plexInfoCache[plexKey] = txt;
+          if (tt.style.display !== 'none' && txt) {
+            ttPlex.textContent = txt; ttPlex.style.display = 'block';
+          }
+        }).catch(()=>{});
+    }
+  }
 }
 function hideTip() { document.getElementById('tooltip').style.display='none'; }
 
@@ -2350,12 +3528,13 @@ async function openProg(p) {
     ['queued','scheduled','recording'].includes(r.status)
   );
 
-  // Fetch enriched info
+  // Fetch enriched info (skip OMDB/TMDB for news/sports/talk/live)
   let info = {};
   try {
     const params = new URLSearchParams({title: p.title});
-    if (p.desc)  params.set('desc', p.desc);
-    if (p.year)  params.set('year', p.year);
+    if (p.desc)     params.set('desc', p.desc);
+    if (p.year)     params.set('year', p.year);
+    if (p.category) params.set('category', p.category);
     const r  = await fetch(`/epg-web/api/prog-info?${params}`);
     if (r.ok) info = await r.json();
   } catch(e) {}
@@ -2363,6 +3542,12 @@ async function openProg(p) {
   // Populate modal
   document.getElementById('pm-title').textContent = info.title || p.title;
   document.getElementById('pm-air').textContent   = (p.channel || p.channel_id) + '  ·  ' + p.start_fmt + ' – ' + p.stop_fmt;
+  const epEl = document.getElementById('pm-ep');
+  const epParts = [];
+  if (p.season_num != null) epParts.push(`S${p.season_num}${p.episode_num != null ? 'E'+p.episode_num : ''}`);
+  if (p.episode_title) epParts.push(p.episode_title);
+  if (epParts.length) { epEl.textContent = epParts.join(' · '); epEl.style.display = ''; }
+  else { epEl.style.display = 'none'; }
   document.getElementById('pm-plot').textContent  = info.plot || p.desc || p.category || '';
   document.getElementById('pm-year').textContent  = info.year || '';
   document.getElementById('pm-rated').textContent = info.rated || '';
@@ -2370,9 +3555,18 @@ async function openProg(p) {
   document.getElementById('pm-imdb').textContent  = info.imdb_rating ? '★ ' + info.imdb_rating : '';
   document.getElementById('pm-actors').textContent   = info.actors  ? '🎭 ' + info.actors  : '';
   document.getElementById('pm-director').textContent = info.director ? '🎬 ' + info.director : '';
+  const imdbLink = document.getElementById('pm-imdb-link');
+  if (info.imdb_id) {
+    imdbLink.href = 'https://www.imdb.com/title/' + info.imdb_id + '/';
+    imdbLink.style.display = '';
+  } else { imdbLink.style.display = 'none'; }
 
   const libBadge = document.getElementById('pm-library-badge');
-  libBadge.style.display = info.in_library ? 'inline-block' : 'none';
+  if (_plexTitles.has(_plexNorm(p.title))) {
+    libBadge.textContent = '▶ IN PLEX';
+    libBadge.style.background = '#2d1f5e'; libBadge.style.color = '#a78bfa';
+    libBadge.style.display = '';
+  } else { libBadge.style.display = 'none'; }
 
   const posterEl = document.getElementById('pm-poster');
   const posterWrap = document.getElementById('pm-poster-wrap');
@@ -2387,6 +3581,26 @@ async function openProg(p) {
 
   document.getElementById('pm-loading').style.display = 'none';
   document.getElementById('pm-content').style.display = 'block';
+
+  // Plex file info
+  const plexWrap = document.getElementById('pm-plex-wrap');
+  plexWrap.style.display = 'none';
+  if (_plexTitles.has(_plexNorm(p.title))) {
+    try {
+      const pr = await fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}`);
+      const pi = await pr.json();
+      if (pi.found) {
+        const parts = [];
+        if (pi.width && pi.height) parts.push(`${pi.width}×${pi.height}`);
+        if (pi.fps)         parts.push(`${pi.fps} fps`);
+        if (pi.video_codec) parts.push(pi.video_codec);
+        if (pi.audio_codec) parts.push(pi.audio_codec + (pi.channels ? ` ${pi.channels}ch` : ''));
+        if (pi.size)        parts.push(pi.size);
+        document.getElementById('pm-plex-info').textContent = parts.join(' · ') || pi.file;
+        plexWrap.style.display = 'block';
+      }
+    } catch(e) {}
+  }
 
   // Fetch future airings
   document.getElementById('pm-next-wrap').style.display    = 'none';
@@ -2413,9 +3627,14 @@ async function openProg(p) {
           : `${featPS.start_fmt} – ${featPS.stop_fmt}  ·  ${featPS.channel_name}`;
         document.getElementById('pm-next-info').textContent = label;
 
-        // Play button: only when currently airing
+        // Play button: only when currently airing; reflect current playing state
         const pBtn = document.getElementById('pm-play-btn');
         pBtn.style.display = featPS.on_now ? '' : 'none';
+        if (featPS.on_now) {
+          const alreadyPlaying = !!_activeStreams[featPS.channel_id];
+          pBtn.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
+          pBtn.onclick     = alreadyPlaying ? () => stopStream(featPS.channel_id) : playStream;
+        }
 
         // Record button: only for future airings
         const rBtn = document.getElementById('pm-rec-next-btn');
@@ -2431,47 +3650,115 @@ async function openProg(p) {
       }
 
       // Full airings list
-      document.getElementById('pm-airings-list').innerHTML = ar.airings.map(a => {
-        const key = a.channel_id + '|' + a.start_ts;
-        const scheduled = recMap[key];
-        return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;">
-          <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-          <span style="color:#64748b;flex:1;">${esc(a.channel_name)}</span>
-          ${scheduled
-            ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
-            : a.can_record
-              ? `<button class="btn btn-primary btn-sm" onclick="recordAiring(${JSON.stringify(a).replace(/"/g,'&quot;')},${JSON.stringify(p.title).replace(/"/g,'&quot;')})">⏱</button>`
-              : ``
-          }
-        </div>`;
-      }).join('');
+      window._allAirings = ar.airings;
+      window._airingsRecMap = recMap;
+      window._showUnrecordedOnly = false;
+      const unrecBtn = document.getElementById('pm-unrecorded-btn');
+      const hasUnrecorded = ar.airings.some(a => !recMap[a.channel_id+'|'+a.start_ts] && a.can_record && !a.on_now);
+      unrecBtn.style.display = hasUnrecorded ? '' : 'none';
+      function renderAiringsList() {
+        const list = window._showUnrecordedOnly
+          ? window._allAirings.filter(a => !window._airingsRecMap[a.channel_id+'|'+a.start_ts] && a.can_record && !a.on_now)
+          : window._allAirings;
+        document.getElementById('pm-airings-list').innerHTML = list.map(a => {
+          const key = a.channel_id + '|' + a.start_ts;
+          const scheduled = window._airingsRecMap[key];
+          const epInfo = (a.season_num != null ? `S${a.season_num}${a.episode_num != null ? 'E'+a.episode_num : ''}` : '') +
+                         (a.episode_title ? (a.season_num != null ? ' · ' : '') + a.episode_title : '');
+          return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;">
+            <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
+            <span style="color:#64748b;flex:1;">${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : ''}</span>
+            ${scheduled
+              ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
+              : (a.can_record && !a.on_now)
+                ? `<button class="btn btn-primary btn-sm" onclick="recordAiring(${JSON.stringify(a).replace(/"/g,'&quot;')},${JSON.stringify(p.title).replace(/"/g,'&quot;')})">⏱</button>`
+                : ``
+            }
+          </div>`;
+        }).join('') || '<div style="color:#64748b;font-size:12px;padding:8px 0;">No airings match</div>';
+      }
+      window.toggleUnrecorded = function() {
+        window._showUnrecordedOnly = !window._showUnrecordedOnly;
+        unrecBtn.textContent = window._showUnrecordedOnly ? '📋 Show All' : '🔲 Unrecorded Only';
+        renderAiringsList();
+      };
+      renderAiringsList();
       document.getElementById('pm-airings-wrap').style.display = 'block';
     }
   } catch(e) {}
 }
 
 let _nextAiring = null;
+let _activeStreams = {};  // { channel_id: {ch_name, title} }
+
+function _updateNowPlaying(streams) {
+  _activeStreams = {};
+  (streams || []).forEach(s => { _activeStreams[s.channel_id] = s; });
+  const bar = document.getElementById('now-playing-bar');
+  if (!streams || !streams.length) {
+    bar.style.display = 'none'; bar.innerHTML = ''; return;
+  }
+  bar.style.display = 'flex';
+  bar.innerHTML = '<span style="font-size:11px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.05em;">▶ Now Playing:</span>'
+    + streams.map(s => `
+    <span style="display:inline-flex;align-items:center;gap:6px;background:#0f2037;border:1px solid #22c55e44;border-radius:20px;padding:3px 10px;font-size:12px;color:#e2e8f0;">
+      <span style="color:#22c55e;">▶</span>
+      <span>${esc(s.ch_name)}${s.title ? " &middot; " + esc(s.title) : ""}</span>
+      <button onclick="stopStream('${s.channel_id}')" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:13px;padding:0 0 0 4px;line-height:1;" title="Stop">✕</button>
+    </span>`).join('');
+  // Update play button state in open modal
+  const pBtn = document.getElementById('pm-play-btn');
+  if (pBtn && _nextAiring) {
+    const playing = !!_activeStreams[_nextAiring.channel_id];
+    pBtn.textContent = playing ? '■ Stop' : '▶ Play';
+    pBtn.onclick     = playing ? () => stopStream(_nextAiring.channel_id) : playStream;
+  }
+}
 
 async function playStream() {
   if (!_nextAiring) return;
   const btn = document.getElementById('pm-play-btn');
+  if (Object.keys(_activeStreams).length >= 6) {
+    document.getElementById('pm-status').textContent = '❌ Max 6 streams already playing';
+    document.getElementById('pm-status').className = 'status-msg err';
+    return;
+  }
   btn.disabled = true; btn.textContent = '▶ Playing…';
-  const r = await post('/epg-web/api/play', {channel_id: _nextAiring.channel_id});
-  if (r.ok) {
-    btn.textContent = '■ Stop'; btn.disabled = false;
-    btn.onclick = stopStream;
-  } else {
+  try {
+    const chLabel  = document.getElementById('pm-next-info').textContent || '';
+    const progTitle = (_currentProg && _currentProg.title) || '';
+    const r = await post('/epg-web/api/play', {
+      channel_id: _nextAiring.channel_id,
+      ch_name:    _nextAiring.channel_name || _nextAiring.channel_id,
+      title:      progTitle,
+      ch_label:   chLabel
+    });
+    btn.disabled = false;
+    if (r.ok) {
+      _updateNowPlaying(r.streams);
+      btn.textContent = '■ Stop';
+      btn.onclick = () => stopStream(_nextAiring.channel_id);
+    } else {
+      btn.textContent = '▶ Play';
+      document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'VLC failed');
+      document.getElementById('pm-status').className = 'status-msg err';
+    }
+  } catch(e) {
     btn.disabled = false; btn.textContent = '▶ Play';
-    document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'VLC failed');
+    document.getElementById('pm-status').textContent = '❌ ' + e.message;
     document.getElementById('pm-status').className = 'status-msg err';
   }
 }
 
-async function stopStream() {
-  await post('/epg-web/api/play/stop', {});
-  const btn = document.getElementById('pm-play-btn');
-  btn.textContent = '▶ Play'; btn.disabled = false;
-  btn.onclick = playStream;
+async function stopStream(channelId) {
+  const cid = channelId || (_nextAiring && _nextAiring.channel_id) || '';
+  const r = await post('/epg-web/api/play/stop', {channel_id: cid});
+  if (r.ok) _updateNowPlaying(r.streams);
+  // Reset modal play button if stopped channel matches open modal
+  if (_nextAiring && cid === _nextAiring.channel_id) {
+    const btn = document.getElementById('pm-play-btn');
+    if (btn) { btn.textContent = '▶ Play'; btn.disabled = false; btn.onclick = playStream; }
+  }
 }
 
 async function recordNext() {
@@ -2568,7 +3855,7 @@ function updateRecDeleteBtn() {
   const btn = document.getElementById('rec-delete-btn');
   if (!btn) return;
   btn.style.display = checked > 0 ? '' : 'none';
-  btn.textContent = `🗑 Delete Selected (${checked})`;
+  btn.textContent = `\\u{1F5D1} Delete Selected (${checked})`;
 }
 
 async function deleteSelectedRecordings() {
@@ -2576,44 +3863,144 @@ async function deleteSelectedRecordings() {
   if (!checked.length) return;
   if (!confirm(`Delete ${checked.length} file(s)? This cannot be undone.`)) return;
   const btn = document.getElementById('rec-delete-btn');
-  btn.disabled = true; btn.textContent = 'Deleting…';
+  btn.disabled = true; btn.textContent = 'Deleting...';
   const r = await post('/epg-web/api/recordings/delete', {files: checked});
-  if (r.errors && r.errors.length) alert('Errors:\n' + r.errors.join('\n'));
+  if (r.errors && r.errors.length) alert('Errors:\\n' + r.errors.join('\\n'));
   await loadRecFiles();
   loadDiskUsage();
 }
 
-async function loadDiskUsage() {
-  const el = document.getElementById('disk-list');
+let _diskWarnYellow = 75;
+let _diskWarnRed    = 90;
+
+function _diskColor(pct) {
+  return pct >= _diskWarnRed ? '#ef4444' : pct >= _diskWarnYellow ? '#f59e0b' : '#22c55e';
+}
+
+async function loadStorageBar() {
+  const bar = document.getElementById('storage-bar');
+  if (!bar) return;
+  try {
+    const d = await (await fetch('/epg-web/api/disk')).json();
+    if (!d.ok || !d.disks.length) { bar.innerHTML = ''; return; }
+    _diskWarnYellow = d.warn_yellow || 75;
+    _diskWarnRed    = d.warn_red    || 90;
+    bar.innerHTML = d.disks.map(disk => {
+      if (disk.error) return `<span style="color:#64748b;">💾 ${esc(disk.label)}: <span style="color:#ef4444;">not mounted</span></span>`;
+      const color = _diskColor(disk.pct);
+      const freeGB = (disk.free / 1e9).toFixed(1);
+      return `<span title="${esc(disk.mount)}" style="display:flex;align-items:center;gap:6px;">
+        <span style="color:#94a3b8;">💾 ${esc(disk.label)}</span>
+        <span style="display:inline-block;width:60px;height:5px;background:#1e293b;border-radius:3px;overflow:hidden;">
+          <span style="display:block;height:100%;width:${disk.pct}%;background:${color};border-radius:3px;"></span>
+        </span>
+        <span style="color:${color};font-weight:600;">${freeGB} GB free</span>
+        <span style="color:#475569;">(${disk.pct}% used)</span>
+      </span>`;
+    }).join('<span style="color:#1e293b;">│</span>');
+  } catch(e) { bar.innerHTML = ''; }
+}
+
+function loadDiskUsage() { loadStorageTab(); }  // legacy alias
+
+async function loadStorageTab() {
+  const el = document.getElementById('storage-tab-list');
   if (!el) return;
   el.innerHTML = '<div style="color:#64748b;font-size:13px;">Checking…</div>';
   try {
     const d = await (await fetch('/epg-web/api/disk')).json();
+    _diskWarnYellow = d.warn_yellow || 75;
+    _diskWarnRed    = d.warn_red    || 90;
+    // Populate threshold inputs
+    const yi = document.getElementById('thresh-yellow');
+    const ri = document.getElementById('thresh-red');
+    if (yi) yi.value = _diskWarnYellow;
+    if (ri) ri.value = _diskWarnRed;
+    // Populate paths list
+    const cfg2 = await (await fetch('/epg-web/api/config')).json();
+    const pl = document.getElementById('storage-paths-list');
+    if (pl) {
+      const builtIn = [
+        {label: 'Mac (recordings)', key: 'rec_path',  val: cfg2.rec_path  || ''},
+        {label: 'NAS – Plex',       key: 'plex_path', val: cfg2.plex_path || ''},
+        {label: 'NAS – EPG',        key: 'guide_path',val: cfg2.guide_path|| ''},
+      ];
+      const custom = cfg2.disk_custom_paths || [];
+      pl.innerHTML = builtIn.map(b => `
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e293b;font-size:13px;">
+          <span style="min-width:140px;color:#94a3b8;">${esc(b.label)}</span>
+          <span style="color:#64748b;flex:1;">${esc(b.val)}</span>
+          <span style="font-size:11px;color:#475569;">from Settings</span>
+        </div>`).join('')
+        + custom.map((c,i) => `
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e293b;font-size:13px;">
+          <span style="min-width:140px;color:#e2e8f0;">${esc(c.label)}</span>
+          <span style="color:#64748b;flex:1;">${esc(c.path)}</span>
+          <button class="btn btn-ghost btn-sm" style="color:#ef4444;" onclick="removeCustomPath(${i})">✕ Remove</button>
+        </div>`).join('');
+    }
     if (!d.ok || !d.disks.length) { el.innerHTML = '<div style="color:#64748b;">No volumes found.</div>'; return; }
     el.innerHTML = d.disks.map(disk => {
       if (disk.error) return `
         <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #1e293b;">
-          <span style="min-width:120px;font-size:13px;color:#94a3b8;">${esc(disk.label)}</span>
+          <span style="min-width:140px;font-size:13px;color:#94a3b8;">${esc(disk.label)}</span>
           <span style="font-size:12px;color:#ef4444;">⚠ ${esc(disk.error)}</span>
         </div>`;
-      const pct = disk.pct;
-      const color = pct >= 90 ? '#ef4444' : pct >= 75 ? '#f59e0b' : '#22c55e';
-      const freeGB = (disk.free / 1e9).toFixed(1);
+      const color = _diskColor(disk.pct);
+      const freeGB  = (disk.free  / 1e9).toFixed(1);
       const totalGB = (disk.total / 1e9).toFixed(1);
       return `
         <div style="padding:10px 0;border-bottom:1px solid #1e293b;">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-            <span style="min-width:120px;font-size:13px;color:#e2e8f0;font-weight:500;">${esc(disk.label)}</span>
+            <span style="min-width:140px;font-size:13px;color:#e2e8f0;font-weight:500;">${esc(disk.label)}</span>
             <span style="font-size:12px;color:#64748b;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(disk.mount)}</span>
-            <span style="font-size:13px;font-weight:600;color:${color};">${pct}%</span>
+            <span style="font-size:13px;font-weight:600;color:${color};">${disk.pct}%</span>
             <span style="font-size:12px;color:#64748b;">${freeGB} GB free of ${totalGB} GB</span>
           </div>
-          <div style="height:6px;background:#1e293b;border-radius:3px;overflow:hidden;">
-            <div style="height:100%;width:${pct}%;background:${color};border-radius:3px;transition:width .4s;"></div>
+          <div style="height:8px;background:#1e293b;border-radius:4px;overflow:hidden;">
+            <div style="height:100%;width:${disk.pct}%;background:${color};border-radius:4px;transition:width .4s;"></div>
           </div>
         </div>`;
     }).join('');
   } catch(e) { el.innerHTML = '<div style="color:#ef4444;">Error loading disk info.</div>'; }
+}
+
+async function saveThresholds() {
+  const y = parseInt(document.getElementById('thresh-yellow').value);
+  const r = parseInt(document.getElementById('thresh-red').value);
+  const st = document.getElementById('thresh-status');
+  if (isNaN(y) || isNaN(r) || y <= 0 || r <= 0 || y >= r) {
+    st.textContent = '❌ Yellow must be less than Red, both between 1-99';
+    st.className = 'status-msg err'; return;
+  }
+  const cfg = await (await fetch('/epg-web/api/config')).json();
+  cfg.disk_warn_yellow = y;
+  cfg.disk_warn_red    = r;
+  await post('/epg-web/api/config', cfg);
+  _diskWarnYellow = y; _diskWarnRed = r;
+  st.textContent = '✅ Saved — storage bar will update on next refresh';
+  st.className = 'status-msg ok';
+  loadStorageBar();
+}
+
+async function addCustomPath() {
+  const label = document.getElementById('custom-path-label').value.trim();
+  const path  = document.getElementById('custom-path-val').value.trim();
+  if (!label || !path) return;
+  const cfg = await (await fetch('/epg-web/api/config')).json();
+  cfg.disk_custom_paths = cfg.disk_custom_paths || [];
+  cfg.disk_custom_paths.push({label, path});
+  await post('/epg-web/api/config', cfg);
+  document.getElementById('custom-path-label').value = '';
+  document.getElementById('custom-path-val').value   = '';
+  loadStorageTab();
+}
+
+async function removeCustomPath(idx) {
+  const cfg = await (await fetch('/epg-web/api/config')).json();
+  (cfg.disk_custom_paths || []).splice(idx, 1);
+  await post('/epg-web/api/config', cfg);
+  loadStorageTab();
 }
 
 function closeProg() {
@@ -2638,6 +4025,7 @@ async function recordAiring(airing, title) {
     document.getElementById('pm-status').textContent = `✅ "${title}" queued`;
     document.getElementById('pm-status').className = 'status-msg ok';
     startRecPoll();
+    refreshGuideRecMap().then(() => renderGuide());
   } else {
     btn.disabled = false; btn.textContent = '⏱ Record';
     document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
@@ -2741,6 +4129,64 @@ async function loadChannels() {
   } catch(e) { setEl('ch-status','Failed','err'); }
 }
 
+// ── 24/7 Channels ─────────────────────────────────────────────────────────────
+async function load247() {
+  const q          = document.getElementById('c247-search').value.trim();
+  const showFav    = document.getElementById('c247-show-fav').checked;
+  const showTV     = document.getElementById('c247-show-tv').checked;
+  const showMovies = document.getElementById('c247-show-movies').checked;
+  const showKids   = document.getElementById('c247-show-kids').checked;
+  const showSports = document.getElementById('c247-show-sports').checked;
+  const showHidden = document.getElementById('c247-show-hidden').checked;
+  try {
+    const d = await (await fetch(`/epg-web/api/247channels?q=${encodeURIComponent(q)}&show_hidden=${showHidden?'1':'0'}`)).json();
+    if (d.error) { setEl('c247-status', d.error, 'err'); return; }
+    const visible = d.channels.filter(c => {
+      if (c.hidden) return showHidden;
+      if (c.fav)    return showFav;
+      if (c.subtype === 'movies')  return showMovies;
+      if (c.subtype === 'kids')    return showKids;
+      if (c.subtype === 'sports')  return showSports;
+      return showTV;
+    });
+    setEl('c247-status', `${visible.length} of ${d.total} channels`, '');
+    document.getElementById('c247-grid').innerHTML = visible.map(c => `
+      <div style="background:${c.hidden?'#0f172a':'#1e293b'};border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:8px;${c.hidden?'opacity:0.45;':''}cursor:pointer;"
+           onclick='${c.hidden ? '' : `play247(${JSON.stringify(c.id)},${JSON.stringify(c.name)})`}'>
+        <span style="flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+              title="${esc(c.name)}">${esc(c.name)}</span>
+        ${c.hidden
+          ? `<span onclick='event.stopPropagation();hide247(${JSON.stringify(c.id)},false,this)' title="Restore" style="font-size:13px;cursor:pointer;color:#22c55e;flex-shrink:0;">↩</span>`
+          : `<span onclick='event.stopPropagation();toggle247Fav(${JSON.stringify(c.id)},this)' title="Toggle favorite" style="font-size:16px;cursor:pointer;color:${c.fav?'#f59e0b':'#475569'};flex-shrink:0;">${c.fav?'★':'☆'}</span>
+             <span onclick='event.stopPropagation();hide247(${JSON.stringify(c.id)},true,this)' title="Hide" style="font-size:13px;cursor:pointer;color:#475569;flex-shrink:0;">✕</span>
+             <span style="font-size:18px;flex-shrink:0;" title="Play">▶</span>`
+        }
+      </div>`).join('');
+  } catch(e) { setEl('c247-status', 'Failed', 'err'); }
+}
+async function play247(channelId, name) {
+  const r = await fetch('/epg-web/api/play', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({channel_id: channelId, title: name, ch_name: name})});
+  const d = await r.json();
+  if (d.error) setEl('c247-status', '❌ ' + d.error, 'err');
+  else setEl('c247-status', `▶ Playing: ${name}`, 'ok');
+}
+async function hide247(channelId, hide, el) {
+  const r = await fetch('/epg-web/api/channel/hide', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel_id: channelId, hide})});
+  const d = await r.json();
+  if (d.ok) load247();
+}
+async function toggle247Fav(channelId, starEl) {
+  const r = await fetch('/epg-web/api/channel/favorite', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel_id: channelId})});
+  const d = await r.json();
+  if (d.ok) {
+    starEl.textContent = d.favorite ? '★' : '☆';
+    starEl.style.color = d.favorite ? '#f59e0b' : '#475569';
+  }
+}
+
 // ── Schedule ──────────────────────────────────────────────────────────────────
 async function addToSchedule(prog) {
   await post('/epg-web/api/schedule', {action:'add', programme:prog});
@@ -2748,30 +4194,93 @@ async function addToSchedule(prog) {
   setGS(msg,'ok');
 }
 async function loadSchedule() {
-  const statusFilter = document.getElementById('sched-filter') ? document.getElementById('sched-filter').value : '';
-  const url = '/epg-web/api/schedule' + (statusFilter ? '?status='+statusFilter : '');
-  const d   = await (await fetch(url)).json();
-  const sched = d.schedule || [];
-  const tbl = document.getElementById('sched-table');
-  const emp = document.getElementById('sched-empty');
+  const showScheduled = document.getElementById('sf-scheduled')?.checked ?? true;
+  const showCompleted = document.getElementById('sf-completed')?.checked ?? true;
+  const showFailed    = document.getElementById('sf-failed')?.checked ?? true;
+  const showSkipped   = document.getElementById('sf-skipped')?.checked ?? false;
+
+  const showAllTime = document.getElementById('sf-all-time')?.checked ?? false;
+  const cutoffMs   = showAllTime ? 0 : Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+  const [d, recD] = await Promise.all([
+    (await fetch('/epg-web/api/schedule')).json(),
+    (await fetch('/epg-web/api/record/status')).json(),
+  ]);
+  // Convert in-memory _recs to schedule row format and prepend
+  const memRecs = Object.entries(recD.recordings || {}).map(([id, r]) => ({
+    title:      r.title || '',
+    channel:    r.channel || r.channel_id || '',
+    start_time: r.start_ts ? new Date(r.start_ts * 1000).toLocaleString() : '',
+    status:     (r.status||'queued').split('(')[0].trim(),  // strip "(Xm away)" verbose part
+    _mem:       true,
+    _id:        id,
+  }));
+  // Filter DB rows: only hide old MISSED/STALE noise; always show completed, failed, and active
+  const dbRows = (d.schedule || []).filter(r => {
+    if (!cutoffMs) return true;
+    const s = (r.status||'').toLowerCase();
+    const alwaysShow = s === 'completed' || s === 'recorded' || s === 'complete' ||
+                       s === 'done' || s === 'done_ts' ||
+                       s === 'failed' || s === 'timeout' || s === 'error' ||
+                       s === 'queued' || s === 'scheduled' || s === 'recording';
+    if (alwaysShow) return true;
+    // Only apply 30-day cutoff to missed/stale/skipped/cancelled
+    const t = r.start_time ? new Date(r.start_time).getTime() : 0;
+    return !t || t >= cutoffMs;
+  });
+  const all = [...memRecs, ...dbRows];
+  const tbl   = document.getElementById('sched-table');
+  const emp   = document.getElementById('sched-empty');
+
+  const SB = {
+    scheduled:'badge-record',  to_record:'badge-record',   queued:'badge-record',
+    recording:'badge-wl',
+    completed:'badge-recorded', recorded:'badge-recorded', complete:'badge-recorded',
+    failed:'badge-skipped',    timeout:'badge-skipped',
+    cancelled:'badge-skipped', skipped:'badge-skipped'
+  };
+
+  const now = Date.now();
+  const sched = all.filter(r => {
+    const s = (r.status||'').toLowerCase();
+    const startMs = r.start_time ? new Date(r.start_time).getTime() : 0;
+    const isPast  = startMs > 0 && startMs < now;
+    if (s === 'scheduled' || s === 'to_record' || s === 'queued') return showScheduled;
+    if (s === 'recording' && isPast)                               return showScheduled;
+    if (s === 'recording' && !isPast)                              return showScheduled;
+    if (s === 'completed' || s === 'recorded' || s === 'complete') return showCompleted;
+    if (s === 'failed'    || s === 'timeout')                      return showFailed;
+    if (s === 'skipped' || s === 'cancelled' || s.startsWith('skipped')) return showSkipped;
+    return true;  // unknown statuses always show
+  });
+
   if (!sched.length) { tbl.style.display='none'; emp.style.display='block'; return; }
   tbl.style.display='table'; emp.style.display='none';
-  const SB = {
-    scheduled:'badge-record', recording:'badge-wl',
-    completed:'badge-recorded', failed:'badge-skipped',
-    cancelled:'badge-skipped', to_record:'badge-record',
-    recorded:'badge-recorded', skipped:'badge-skipped'
-  };
-  document.getElementById('sched-body').innerHTML = sched.map((r,i) => `
-    <tr>
+
+  document.getElementById('sched-body').innerHTML = sched.map((r,i) => {
+    const s = (r.status||'').toLowerCase();
+    const isFailed  = s === 'failed' || s === 'timeout';
+    const startMs   = r.start_time ? new Date(r.start_time).getTime() : 0;
+    const isPast    = startMs > 0 && startMs < now;
+    const isMissed  = (s === 'scheduled' || s === 'to_record' || s === 'queued') && isPast;
+    const isStale   = s === 'recording' && isPast;
+    const isSkipped = !isMissed && !isStale && s.startsWith('skipped');
+    const badge     = (isMissed || isStale || isSkipped) ? 'badge-skipped' : (SB[s] || SB[r.status] || '');
+    const rawLabel  = (r.status||'').replace(/_/g,' ').toUpperCase();
+    const label     = isMissed ? 'MISSED' : isStale ? 'STALE' : isSkipped ? rawLabel : rawLabel;
+    return `<tr>
       <td class="title-cell">${esc(r.title)}
         ${r.episode_title?`<br><span style="font-size:11px;color:#555;">S${r.season_number||'?'}E${r.episode_number||'?'} ${esc(r.episode_title)}</span>`:''}
       </td>
       <td class="ch-cell">${esc(r.channel)}</td>
       <td class="time-cell">${esc(r.start_time||r.start_fmt||'')}</td>
-      <td><span class="badge ${SB[r.status]||''}">${esc(r.status||'')}</span></td>
-      <td style="font-size:11px;color:#555;">${esc(r.failure_reason||'')}</td>
-    </tr>`).join('');
+      <td><span class="badge ${badge}">${esc(label)}</span></td>
+      <td style="font-size:11px;color:#64748b;max-width:200px;">${esc(r.failure_reason||'')}
+        ${(isFailed || isMissed || isStale || isSkipped) ? `<button class="btn btn-ghost btn-sm" style="margin-left:6px;font-size:11px;" onclick='searchOpenProg(${JSON.stringify(r.title)},${JSON.stringify(r.episode_title||"")},${JSON.stringify(r.season_number||"")},${JSON.stringify(r.episode_number||"")})'>🔄 Re-record</button>` : ''}
+        ${(r._mem && r._id && (s==='queued'||s==='scheduled'||s==='recording')) ? `<button class="btn btn-danger btn-sm" style="margin-left:6px;font-size:11px;" onclick="cancelRec('${r._id}');loadSchedule()">✕ Cancel</button>` : ''}
+      </td>
+    </tr>`;
+  }).join('');
 }
 async function schedUpdate(i,s){await post('/epg-web/api/schedule',{action:'update',index:i,status:s});loadSchedule();}
 async function schedRemove(i){await post('/epg-web/api/schedule',{action:'remove',index:i});loadSchedule();}
@@ -2832,21 +4341,7 @@ async function post(url,body) {
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function setEl(id,msg,cls){const e=document.getElementById(id);e.textContent=msg;e.className='status-msg '+(cls||'');}
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-window.onload = async () => {
-  // Try to load guide data if already in memory
-  try {
-    const d = await (await fetch('/epg-web/api/guide')).json();
-    if (!d.error && d.channels && d.channels.length) {
-      _guideData = d;
-      _guideWindowStart = d.window_start;
-      renderGuide();
-      setGS(`Guide loaded · ${d.programmes ? d.programmes.length : ''} programmes in window`, 'ok');
-    } else {
-      setGS('Click "Load Guide" to load the XMLTV data.');
-    }
-  } catch(e) {}
-};
+// ── Init handled by autoLoad() above ──────────────────────────────────────────
 </script>
 </body>
 </html>"""
@@ -2903,8 +4398,8 @@ _startup_load()
 
 if __name__ == '__main__':
     import webbrowser
+    _load_pending_recs()
     print(f'\n  EPG Manager Web {VERSION}')
     print(  '  ──────────────────────')
     print(  '  Open: http://localhost:5001/epg-web\n')
-    threading.Timer(1.5, lambda: webbrowser.open('http://localhost:5001/epg-web')).start()
-    app.run(host='127.0.0.1', port=5001, debug=False)
+    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
