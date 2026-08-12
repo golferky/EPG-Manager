@@ -33,6 +33,77 @@ class RecordingTests(unittest.TestCase):
     def test_agent_transfer_status_is_active(self):
         self.assertTrue(server._rec_is_active({"status": "awaiting_transfer"}))
 
+    def test_unsuffixed_stream_maps_to_hd_guide_sibling(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            movies_db = os.path.join(temp, "movies.db")
+            server.ensure_guide_db(guide_db)
+            guide = sqlite3.connect(guide_db)
+            guide.executemany(
+                """INSERT INTO guide
+                   (title,channel_id,channel_name,start_utc,end_utc)
+                   VALUES (?,?,?,?,?)""",
+                [
+                    ("F/X", "mgmhits.us", "MGM+ HITS", "20260812145500", "20260812164500"),
+                    ("F/X", "67929", "MGM+ Hits HD", "20260812145500", "20260812164500"),
+                ],
+            )
+            guide.commit()
+            guide.close()
+            movies = sqlite3.connect(movies_db)
+            movies.execute(
+                "CREATE TABLE channels (guide_channel TEXT, stream_id TEXT)"
+            )
+            movies.execute(
+                "INSERT INTO channels VALUES (?,?)", ("mgmhits.us", "98755")
+            )
+            movies.commit()
+            movies.close()
+
+            mapped = server.get_ps_channel_ids(guide_db, movies_db)
+            self.assertIn("mgmhits.us", mapped)
+            self.assertIn("67929", mapped)
+
+    def test_airings_merge_hd_duplicate_and_identify_movie(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            conn = sqlite3.connect(guide_db)
+            for column, typedef in (
+                ("episode_title", "TEXT"), ("season_num", "INTEGER"),
+                ("episode_num", "INTEGER"), ("prog_type", "TEXT"),
+            ):
+                conn.execute(f"ALTER TABLE guide ADD COLUMN {column} {typedef}")
+            conn.executemany(
+                """INSERT INTO guide
+                   (title,channel_id,channel_name,start_utc,end_utc,prog_type)
+                   VALUES (?,?,?,?,?,?)""",
+                [
+                    ("F/X", "mgmhits.us", "MGM+ HITS", "20990812145500", "20990812164500", ""),
+                    ("F/X", "67929", "MGM+ Hits HD", "20990812145500", "20990812164500", "MV"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            with mock.patch.object(server, "load_config", return_value={
+                "guide_db_path": guide_db, "timezone": "America/New_York"
+            }), mock.patch.object(server, "_stream_url", return_value=(
+                "private-url", None,
+                {"matched_guide_channel": "mgmhits.us"},
+            )):
+                response = server.app.test_client().get(
+                    "/epg-web/api/airings?title=F%2FX"
+                )
+            data = response.get_json()
+            self.assertEqual(data["prog_type"], "MV")
+            self.assertEqual(len(data["airings"]), 1)
+            self.assertEqual(data["airings"][0]["channel_name"], "MGM+ Hits HD")
+            self.assertTrue(data["airings"][0]["can_record"])
+
+    def test_movie_ui_hides_recurring_batch_action(self):
+        self.assertIn("batchBtn.style.display = isMovie ? 'none' : '';", server.HTML)
+        self.assertNotIn("Record Series", server.HTML)
+
     def test_active_in_memory_recording_is_not_marked_stale(self):
         self.assertIn(
             "const isStale   = !r._mem && s === 'recording' && isPast;",
