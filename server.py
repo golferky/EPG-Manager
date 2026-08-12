@@ -479,6 +479,16 @@ def _run_conv(conv_id, inp, out):
 
 _recs      = {}   # rec_id → {title, channel, start_ts, stop_ts, status, progress, log, pid, file}
 _rec_lock  = threading.Lock()
+_rec_cancel_events = {}  # rec_id → threading.Event
+
+def _rec_status_base(status):
+    """Normalize verbose states such as 'scheduled (12m away)'."""
+    return (status or '').split('(', 1)[0].strip().lower()
+
+def _rec_is_active(rec):
+    return _rec_status_base(rec.get('status')) in {
+        'queued', 'scheduled', 'recording', 'converting', 'copying'
+    }
 
 def _guide_db_path():
     cfg = load_config()
@@ -509,7 +519,8 @@ def _init_recordings_table():
 def _db_upsert_rec(rec_id, rec):
     """Insert or update a recording row in guide.db."""
     try:
-        conn = sqlite3.connect(_guide_db_path())
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
         conn.execute('''INSERT INTO recordings
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time, status, failure_reason, file, created_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -532,25 +543,51 @@ def _db_upsert_rec(rec_id, rec):
         ))
         conn.commit()
         conn.close()
+        return True
     except Exception as e:
         print(f'[recdb] upsert error: {e}')
+        return False
 
 def _db_update_rec_status(rec_id, status, failure_reason='', file=''):
     """Update just the status/file of a recording in guide.db."""
     try:
-        conn = sqlite3.connect(_guide_db_path())
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
         conn.execute(
             'UPDATE recordings SET status=?, failure_reason=?, file=? WHERE rec_id=?',
             (status, failure_reason, file, rec_id)
         )
         conn.commit()
         conn.close()
+        return True
     except Exception as e:
         print(f'[recdb] status update error: {e}')
+        return False
+
+def _reconcile_stale_recordings():
+    """Mark jobs that could not have survived a prior server stop."""
+    try:
+        now = time.time()
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
+        conn.execute('''UPDATE recordings
+                        SET status='queued', failure_reason='Resuming after server restart'
+                        WHERE status='recording' AND stop_ts > ?''', (now,))
+        conn.execute('''UPDATE recordings
+                        SET status='failed', failure_reason='Recording interrupted by server stop'
+                        WHERE status='recording' AND stop_ts <= ?''', (now,))
+        conn.execute('''UPDATE recordings
+                        SET status='skipped_too_short', failure_reason='Recording window passed while server was stopped'
+                        WHERE status IN ('queued','scheduled') AND stop_ts <= ?''', (now,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[recdb] stale reconciliation error: {e}')
 
 def _load_pending_recs():
     """On startup, reload queued/scheduled recs from guide.db that haven't aired yet."""
     _init_recordings_table()
+    _reconcile_stale_recordings()
     try:
         conn = sqlite3.connect(_guide_db_path())
         conn.row_factory = sqlite3.Row
@@ -575,6 +612,7 @@ def _load_pending_recs():
             }
             with _rec_lock:
                 _recs[rec_id] = rec
+                _rec_cancel_events[rec_id] = threading.Event()
             t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
             t.start()
         if rows:
@@ -652,7 +690,10 @@ def _safe_filename(title):
 
 def _run_recording(rec_id):
     with _rec_lock:
-        rec = _recs[rec_id]
+        rec = _recs.get(rec_id)
+        if not rec:
+            return
+        cancel_event = _rec_cancel_events.setdefault(rec_id, threading.Event())
     cfg      = load_config()
     rec_dir  = cfg.get('rec_path', os.path.expanduser('~/Movies/Recordings'))
     plex_dir = cfg.get('plex_path', '/Volumes/Plex/Movies')
@@ -668,7 +709,12 @@ def _run_recording(rec_id):
     if wait > 0:
         with _rec_lock:
             _recs[rec_id]['status'] = f'scheduled ({int(wait//60)}m away)'
-        time.sleep(wait)
+        _db_update_rec_status(rec_id, 'scheduled')
+        if cancel_event.wait(wait):
+            return
+
+    if cancel_event.is_set():
+        return
 
     # If stop_ts is already past (or less than 60s away), nothing useful to record
     if stop_ts - time.time() < 60:
@@ -710,6 +756,12 @@ def _run_recording(rec_id):
                 if len(_recs[rec_id]['log']) > 50:
                     _recs[rec_id]['log'] = _recs[rec_id]['log'][-30:]
         proc.wait()
+        with _rec_lock:
+            _recs[rec_id]['pid'] = None
+
+        if cancel_event.is_set():
+            _db_update_rec_status(rec_id, 'cancelled', 'Cancelled by user', file=ts_file)
+            return
 
         if proc.returncode != 0:
             with _rec_lock:
@@ -2098,7 +2150,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
 
     with _rec_lock:
         existing_keys = {(r['channel_id'], r['start_ts']) for r in _recs.values()
-                         if r.get('status') in ('queued','scheduled','recording')}
+                         if _rec_is_active(r)}
     for r in best_rows:
         try:
             su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -2107,13 +2159,18 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             if key in existing_keys:
                 continue
             rec_id = f"rec_{int(time.time()*1000)}_{r['channel_id'][:8]}"
+            rec = {
+                'title': title, 'channel_id': r['channel_id'],
+                'channel': r['channel_name'],
+                'start_ts': su.timestamp(), 'stop_ts': eu.timestamp(),
+                'status': 'queued', 'progress': 0, 'log': [], 'pid': None, 'file': None,
+            }
+            if not _db_upsert_rec(rec_id, rec):
+                print(f'[series] could not persist recording {rec_id}; not scheduling')
+                continue
             with _rec_lock:
-                _recs[rec_id] = {
-                    'title': title, 'channel_id': r['channel_id'],
-                    'channel': r['channel_name'],
-                    'start_ts': su.timestamp(), 'stop_ts': eu.timestamp(),
-                    'status': 'queued', 'progress': 0, 'log': [], 'pid': None, 'file': None,
-                }
+                _recs[rec_id] = rec
+                _rec_cancel_events[rec_id] = threading.Event()
                 existing_keys.add(key)
             t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
             t.start()
@@ -2190,11 +2247,17 @@ def api_series_cancel():
         return jsonify({'error': str(e)}), 500
     # Cancel any queued (not yet started) recordings for this title
     cancelled = 0
+    cancelled_ids = []
     with _rec_lock:
         for rec_id, rec in _recs.items():
-            if rec.get('title','').lower() == title.lower() and rec.get('status') == 'queued':
+            if (rec.get('title','').lower() == title.lower() and
+                    _rec_status_base(rec.get('status')) in ('queued', 'scheduled')):
+                _rec_cancel_events.setdefault(rec_id, threading.Event()).set()
                 rec['status'] = 'cancelled'
                 cancelled += 1
+                cancelled_ids.append(rec_id)
+    for rec_id in cancelled_ids:
+        _db_update_rec_status(rec_id, 'cancelled', 'Series recording cancelled by user')
     return jsonify({'ok': True, 'cancelled': cancelled})
 
 @app.route('/epg-web/api/record', methods=['POST'])
@@ -2278,7 +2341,7 @@ def api_record():
         for existing in _recs.values():
             if (abs(existing.get('start_ts', 0) - start_ts) < 5 and
                     existing.get('channel_id','') == channel_id and
-                    existing.get('status','') in ('queued','scheduled','recording')):
+                    _rec_is_active(existing)):
                 return jsonify({'ok': True, 'id': 'dup', 'dup': True})
 
     rec = {
@@ -2293,9 +2356,11 @@ def api_record():
         'pid':        None,
         'file':       None,
     }
+    if not _db_upsert_rec(rec_id, rec):
+        return jsonify({'ok': False, 'error': 'Could not save recording to guide database'}), 500
     with _rec_lock:
         _recs[rec_id] = rec
-    _db_upsert_rec(rec_id, rec)
+        _rec_cancel_events[rec_id] = threading.Event()
     t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
     t.start()
     return jsonify({'ok': True, 'id': rec_id, 'channel': channel_name, 'start_ts': start_ts})
@@ -2349,16 +2414,33 @@ def api_recordings_delete():
 @app.route('/epg-web/api/record/cancel', methods=['POST'])
 def api_rec_cancel():
     rec_id = (request.json or {}).get('id','')
+    pid = None
+    file_path = ''
     with _rec_lock:
         r = _recs.get(rec_id)
-        if r and r.get('pid') and 'recording' in r.get('status',''):
-            try:
-                import signal
-                os.kill(r['pid'], signal.SIGTERM)
-                r['status'] = 'cancelled'
-            except Exception:
-                pass
-    return jsonify({'ok': True})
+        if not r:
+            return jsonify({'ok': False, 'error': 'Recording not found'}), 404
+        status = _rec_status_base(r.get('status'))
+        if status not in ('queued', 'scheduled', 'recording'):
+            return jsonify({'ok': False, 'error': f'Recording cannot be cancelled while {status}'}), 409
+        cancel_event = _rec_cancel_events.setdefault(rec_id, threading.Event())
+        cancel_event.set()
+        pid = r.get('pid')
+        file_path = r.get('file') or ''
+        r['status'] = 'cancelled'
+        r.setdefault('log', []).append('Cancelled by user')
+
+    if pid:
+        try:
+            import signal
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'Could not stop FFmpeg: {e}'}), 500
+
+    _db_update_rec_status(rec_id, 'cancelled', 'Cancelled by user', file=file_path)
+    return jsonify({'ok': True, 'cancelled': True, 'id': rec_id})
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
@@ -4060,8 +4142,9 @@ async function updateRecPanel() {
     copying:'📤', done:'✅', done_ts:'✅', error:'❌', cancelled:'🚫'
   };
   document.getElementById('rec-list').innerHTML = recs.map(([id, r]) => {
-    const icon = statusIcons[r.status] || '•';
-    const active = ['queued','scheduled','recording','converting','copying'].includes(r.status);
+    const baseStatus = (r.status||'').split('(')[0].trim();
+    const icon = statusIcons[baseStatus] || '•';
+    const active = ['queued','scheduled','recording','converting','copying'].includes(baseStatus);
     return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e1e1e;font-size:13px;">
       <span style="font-size:16px;">${icon}</span>
       <span style="flex:1;color:#c7d2e7;">${esc(r.title)}</span>
@@ -4070,10 +4153,19 @@ async function updateRecPanel() {
     </div>`;
   }).join('');
   // Stop polling when nothing active
-  const anyActive = recs.some(([,r]) => ['queued','scheduled','recording','converting','copying'].includes(r.status));
+  const anyActive = recs.some(([,r]) => {
+    const s = (r.status||'').split('(')[0].trim();
+    return ['queued','scheduled','recording','converting','copying'].includes(s);
+  });
   if (!anyActive) { clearInterval(_recPoll); _recPoll = null; }
 }
-async function cancelRec(id) { await post('/epg-web/api/record/cancel', {id}); }
+async function cancelRec(id, refreshSchedule=false) {
+  const result = await post('/epg-web/api/record/cancel', {id});
+  await updateRecPanel();
+  if (refreshSchedule) await loadSchedule();
+  if (!result.ok && result.error) setGS(result.error, 'err');
+  return result;
+}
 
 // ── Recommendations ───────────────────────────────────────────────────────────
 async function loadRecs() {
@@ -4222,8 +4314,9 @@ async function loadSchedule() {
     _mem:       true,
     _id:        id,
   }));
+  const memIds = new Set(memRecs.map(r => r._id));
   // Filter DB rows: only hide old MISSED/STALE noise; always show completed, failed, and active
-  const dbRows = (d.schedule || []).filter(r => {
+  const dbRows = (d.schedule || []).filter(r => !r.rec_id || !memIds.has(r.rec_id)).filter(r => {
     if (!cutoffMs) return true;
     const s = (r.status||'').toLowerCase();
     const alwaysShow = s === 'completed' || s === 'recorded' || s === 'complete' ||
@@ -4256,7 +4349,7 @@ async function loadSchedule() {
     if (s === 'recording' && isPast)                               return showScheduled;
     if (s === 'recording' && !isPast)                              return showScheduled;
     if (s === 'completed' || s === 'recorded' || s === 'complete') return showCompleted;
-    if (s === 'failed'    || s === 'timeout')                      return showFailed;
+    if (s === 'failed'    || s === 'timeout' || s === 'error')     return showFailed;
     if (s === 'skipped' || s === 'cancelled' || s.startsWith('skipped')) return showSkipped;
     return true;  // unknown statuses always show
   });
@@ -4266,7 +4359,7 @@ async function loadSchedule() {
 
   document.getElementById('sched-body').innerHTML = sched.map((r,i) => {
     const s = (r.status||'').toLowerCase();
-    const isFailed  = s === 'failed' || s === 'timeout';
+    const isFailed  = s === 'failed' || s === 'timeout' || s === 'error';
     const startMs   = r.start_time ? new Date(r.start_time).getTime() : 0;
     const isPast    = startMs > 0 && startMs < now;
     const isMissed  = (s === 'scheduled' || s === 'to_record' || s === 'queued') && isPast;
@@ -4284,7 +4377,7 @@ async function loadSchedule() {
       <td><span class="badge ${badge}">${esc(label)}</span></td>
       <td style="font-size:11px;color:#64748b;max-width:200px;">${esc(r.failure_reason||'')}
         ${(isFailed || isMissed || isStale || isSkipped) ? `<button class="btn btn-ghost btn-sm" style="margin-left:6px;font-size:11px;" onclick='searchOpenProg(${JSON.stringify(r.title)},${JSON.stringify(r.episode_title||"")},${JSON.stringify(r.season_number||"")},${JSON.stringify(r.episode_number||"")})'>🔄 Re-record</button>` : ''}
-        ${(r._mem && r._id && (s==='queued'||s==='scheduled'||s==='recording')) ? `<button class="btn btn-danger btn-sm" style="margin-left:6px;font-size:11px;" onclick="cancelRec('${r._id}');loadSchedule()">✕ Cancel</button>` : ''}
+        ${(r._mem && r._id && (s==='queued'||s==='scheduled'||s==='recording')) ? `<button class="btn btn-danger btn-sm" style="margin-left:6px;font-size:11px;" onclick="cancelRec('${r._id}',true)">✕ Cancel</button>` : ''}
       </td>
     </tr>`;
   }).join('');
