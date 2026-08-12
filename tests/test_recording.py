@@ -24,6 +24,12 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(server._rec_status_base(rec["status"]), "scheduled")
         self.assertTrue(server._rec_is_active(rec))
 
+    def test_active_in_memory_recording_is_not_marked_stale(self):
+        self.assertIn(
+            "const isStale   = !r._mem && s === 'recording' && isPast;",
+            server.HTML,
+        )
+
     @mock.patch.object(server, "_db_update_rec_status", return_value=True)
     def test_scheduled_recording_can_be_cancelled(self, update_status):
         rec_id = "test1234"

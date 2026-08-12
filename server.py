@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260804g"
+VERSION = "v20260812a"
 
 import json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4363,7 +4363,9 @@ async function loadSchedule() {
     const startMs   = r.start_time ? new Date(r.start_time).getTime() : 0;
     const isPast    = startMs > 0 && startMs < now;
     const isMissed  = (s === 'scheduled' || s === 'to_record' || s === 'queued') && isPast;
-    const isStale   = s === 'recording' && isPast;
+    // A live in-memory recording naturally has a start time in the past.
+    // Only a database-only recording can be stale after a server restart.
+    const isStale   = !r._mem && s === 'recording' && isPast;
     const isSkipped = !isMissed && !isStale && s.startsWith('skipped');
     const badge     = (isMissed || isStale || isSkipped) ? 'badge-skipped' : (SB[s] || SB[r.status] || '');
     const rawLabel  = (r.status||'').replace(/_/g,' ').toUpperCase();
