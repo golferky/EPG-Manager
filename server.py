@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260812b"
+VERSION = "v20260812c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -197,6 +197,11 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
             # Exact match on base — pick single best to avoid East/West duplicates
             if base in name_map:
                 result.add(_pick_best(name_map[base], base))
+                # Schedules Direct often carries a numeric HD/SD sibling while
+                # PrimeStreams uses the unsuffixed canonical channel name.
+                for quality_variant in (base + 'hd', base + 'sd', base + 'uhd'):
+                    if quality_variant in name_map:
+                        result.add(_pick_best(name_map[quality_variant], quality_variant))
                 continue
             # Prefix match
             for cname_norm, cids in name_map.items():
@@ -2033,7 +2038,8 @@ def api_airings():
         conn.row_factory = sqlite3.Row
         # Search both full title and cleaned title
         rows = conn.execute('''
-            SELECT channel_id, channel_name, start_utc, end_utc
+            SELECT channel_id, channel_name, start_utc, end_utc, prog_type,
+                   category, episode_title, season_num, episode_num
             FROM guide
             WHERE (lower(title) = lower(?) OR lower(title) = lower(?))
             AND end_utc > ?
@@ -2044,9 +2050,6 @@ def api_airings():
     except Exception:
         return jsonify({'airings': []})
 
-    # Build set of guide.db channel_ids that have a primestreams stream (incl. name-match fallback)
-    recordable = get_ps_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
-
     airings = []
     for r in rows:
         try:
@@ -2055,6 +2058,10 @@ def api_airings():
             sl = su.astimezone(local_tz)
             el = eu.astimezone(local_tz)
             now_ts = datetime.now(timezone.utc).timestamp()
+            # Resolve each listing with the same lookup used when recording. This
+            # catches SD numeric rows such as "MGM+ Hits HD" that map to a
+            # PrimeStreams channel named simply "MGM+ HITS".
+            _url, stream_error, stream_debug = _stream_url(r['channel_id'])
             airings.append({
                 'channel_id':   r['channel_id'],
                 'channel_name': r['channel_name'],
@@ -2062,12 +2069,39 @@ def api_airings():
                 'stop_ts':      eu.timestamp(),
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
-                'can_record':   r['channel_id'] in recordable,
+                'can_record':   not stream_error,
+                'stream_channel': stream_debug.get('matched_guide_channel') or '',
                 'on_now':       su.timestamp() <= now_ts < eu.timestamp(),
+                'prog_type':    r['prog_type'] or '',
+                'category':     r['category'] or '',
+                'episode_title': r['episode_title'] or '',
+                'season_num':   r['season_num'],
+                'episode_num':  r['episode_num'],
             })
         except Exception:
             continue
-    return jsonify({'airings': airings})
+
+    # Collapse duplicate SD/XMLTV rows for the same channel family and time.
+    # Prefer a playable row, then the HD-labelled guide row for display.
+    def _family(name):
+        normalized = re.sub(r'[^a-z0-9]', '', (name or '').lower())
+        return re.sub(r'(uhd|hd|sd)$', '', normalized)
+
+    prog_type = next((a['prog_type'] for a in airings if a['prog_type']), '')
+    deduped = {}
+    for airing in airings:
+        key = (airing['start_ts'], airing['stop_ts'], _family(airing['channel_name']))
+        score = (1 if airing['can_record'] else 0,
+                 1 if re.search(r'\b(?:UHD|HD)\b', airing['channel_name'], re.I) else 0)
+        current = deduped.get(key)
+        current_score = current and (
+            1 if current['can_record'] else 0,
+            1 if re.search(r'\b(?:UHD|HD)\b', current['channel_name'], re.I) else 0,
+        )
+        if current is None or score > current_score:
+            deduped[key] = airing
+    airings = sorted(deduped.values(), key=lambda item: item['start_ts'])
+    return jsonify({'airings': airings, 'prog_type': prog_type})
 
 # ── VLC Play ──────────────────────────────────────────────────────────────────
 
@@ -2938,7 +2972,7 @@ tr:hover td{background:#141414;}
   </div>
   <!-- Series Recordings panel -->
   <div style="margin-top:24px;">
-    <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">📺 Series Recordings</h3>
+    <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">📺 Recurring Recordings</h3>
     <div id="series-list" style="max-height:300px;overflow-y:auto;"></div>
   </div>
 </div>
@@ -2994,8 +3028,8 @@ tr:hover td{background:#141414;}
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
           <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📅 All Future Airings</span>
-          <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Series</button>
-          <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unrecorded Only</button>
+          <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record All</button>
+          <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unscheduled Only</button>
         </div>
         <div id="pm-airings-list" style="max-height:160px;overflow-y:auto;"></div>
       </div>
@@ -3943,6 +3977,11 @@ async function openProg(p) {
   try {
     const ar = await (await fetch(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`)).json();
     if (ar.airings && ar.airings.length > 0) {
+      const isMovie = ar.prog_type === 'MV' || ar.airings.some(a => a.prog_type === 'MV');
+      const batchBtn = document.getElementById('pm-series-btn');
+      batchBtn.style.display = isMovie ? 'none' : '';
+      batchBtn.disabled = false;
+      batchBtn.textContent = '📺 Record All';
       const recMap = {};
       Object.values(recStatus.recordings || {}).forEach(r => {
         if (['queued','scheduled','recording'].includes(r.status))
@@ -4013,7 +4052,7 @@ async function openProg(p) {
       }
       window.toggleUnrecorded = function() {
         window._showUnrecordedOnly = !window._showUnrecordedOnly;
-        unrecBtn.textContent = window._showUnrecordedOnly ? '📋 Show All' : '🔲 Unrecorded Only';
+        unrecBtn.textContent = window._showUnrecordedOnly ? '📋 Show All' : '🔲 Unscheduled Only';
         renderAiringsList();
       };
       renderAiringsList();
@@ -4107,12 +4146,12 @@ async function recordSeries() {
   btn.disabled = true; btn.textContent = '⏳ Scheduling…';
   const r = await post('/epg-web/api/record/series', {title});
   if (r.ok) {
-    btn.textContent = `✅ Series (${r.scheduled} queued)`;
-    document.getElementById('pm-status').textContent = `📺 Series recording set for "${title}" — ${r.scheduled} airings queued`;
+    btn.textContent = `✅ All (${r.scheduled})`;
+    document.getElementById('pm-status').textContent = `📺 Recurring recording set for "${title}" — ${r.scheduled} airings queued`;
     document.getElementById('pm-status').className = 'status-msg ok';
     loadSeriesRecordings();
   } else {
-    btn.disabled = false; btn.textContent = '📺 Record Series';
+    btn.disabled = false; btn.textContent = '📺 Record All';
     document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
     document.getElementById('pm-status').className = 'status-msg err';
   }
@@ -4132,7 +4171,7 @@ async function loadSeriesRecordings() {
     const active = (d.series || []).filter(s => s.active);
     const inactive = (d.series || []).filter(s => !s.active);
     if (!d.series || !d.series.length) {
-      el.innerHTML = '<div style="color:#64748b;font-size:13px;">No series recordings set up.</div>';
+      el.innerHTML = '<div style="color:#64748b;font-size:13px;">No recurring recordings set up.</div>';
       return;
     }
     const renderRow = (s) => `
