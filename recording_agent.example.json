@@ -1,0 +1,19 @@
+{
+  "server_url": "http://qnap.local:5001",
+  "agent_token": "replace-with-a-long-random-token",
+  "agent_id": "mac-mini-recorder",
+  "epg_url": "https://provider.example",
+  "epg_user": "",
+  "epg_pass": "",
+  "local_recordings": "/Users/yourname/Movies/Recordings",
+  "plex_path": "/Volumes/Plex/Movies",
+  "plex_mount_marker": "",
+  "ffmpeg": "/opt/homebrew/bin/ffmpeg",
+  "ffprobe": "/opt/homebrew/bin/ffprobe",
+  "poll_seconds": 10,
+  "heartbeat_seconds": 20,
+  "lease_seconds": 90,
+  "claim_ahead_seconds": 300,
+  "transfer_retry_seconds": 30,
+  "transfer_wait_timeout": 86400
+}

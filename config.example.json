@@ -13,5 +13,7 @@
   "omdb_key": "",
   "tmdb_key": "",
   "plex_path": "/path/to/Plex/Movies",
-  "rec_path": "/path/to/recordings"
+  "rec_path": "/path/to/recordings",
+  "recording_backend": "local",
+  "recording_agent_token": ""
 }

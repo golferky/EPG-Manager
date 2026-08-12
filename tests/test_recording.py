@@ -18,11 +18,20 @@ class RecordingTests(unittest.TestCase):
         with server._rec_lock:
             server._recs.clear()
             server._rec_cancel_events.clear()
+        server._init_recordings_table()
+        self.db_path = server._guide_db_path()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM recordings")
+        conn.commit()
+        conn.close()
 
     def test_verbose_scheduled_status_is_active(self):
         rec = {"status": "scheduled (12m away)"}
         self.assertEqual(server._rec_status_base(rec["status"]), "scheduled")
         self.assertTrue(server._rec_is_active(rec))
+
+    def test_agent_transfer_status_is_active(self):
+        self.assertTrue(server._rec_is_active({"status": "awaiting_transfer"}))
 
     def test_active_in_memory_recording_is_not_marked_stale(self):
         self.assertIn(
@@ -118,6 +127,98 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(statuses["oldrec"], "failed")
         self.assertEqual(statuses["oldqueue"], "skipped_too_short")
         self.assertEqual(statuses["resume"], "queued")
+
+    @mock.patch.object(server, "load_config")
+    def test_agent_claim_and_heartbeat(self, load_config):
+        load_config.return_value = {
+            "guide_db_path": self.db_path,
+            "recording_backend": "agent",
+            "recording_agent_token": "test-secret",
+        }
+        rec = {
+            "title": "Agent Test", "channel": "Test Channel",
+            "channel_id": "test.channel", "stream_id": "12345",
+            "start_ts": time.time() + 60, "stop_ts": time.time() + 3600,
+            "status": "queued", "backend": "agent", "file": "",
+        }
+        self.assertTrue(server._db_upsert_rec("agentjob", rec))
+        client = server.app.test_client()
+        headers = {"Authorization": "Bearer test-secret"}
+
+        claim = client.post("/epg-web/api/agent/jobs/claim", headers=headers, json={
+            "agent_id": "mac-test", "claim_ahead_seconds": 300,
+            "lease_seconds": 90,
+        })
+        self.assertEqual(claim.status_code, 200)
+        job = claim.get_json()["job"]
+        self.assertEqual(job["id"], "agentjob")
+        self.assertEqual(job["stream_id"], "12345")
+
+        heartbeat = client.post(
+            "/epg-web/api/agent/jobs/agentjob/heartbeat",
+            headers=headers,
+            json={"agent_id": "mac-test", "status": "recording", "progress": 12},
+        )
+        self.assertEqual(heartbeat.status_code, 200)
+        self.assertFalse(heartbeat.get_json()["cancel_requested"])
+        conn = sqlite3.connect(server._guide_db_path())
+        status = conn.execute(
+            "SELECT status FROM recordings WHERE rec_id='agentjob'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(status, "recording")
+
+        cancel = client.post(
+            "/epg-web/api/record/cancel", json={"id": "agentjob"}
+        )
+        self.assertEqual(cancel.status_code, 200)
+        heartbeat = client.post(
+            "/epg-web/api/agent/jobs/agentjob/heartbeat",
+            headers=headers,
+            json={"agent_id": "mac-test", "status": "recording"},
+        )
+        self.assertEqual(heartbeat.status_code, 200)
+        self.assertTrue(heartbeat.get_json()["cancel_requested"])
+
+    @mock.patch.object(server, "load_config")
+    def test_agent_api_rejects_bad_token(self, load_config):
+        load_config.return_value = {
+            "recording_backend": "agent", "recording_agent_token": "test-secret"
+        }
+        response = server.app.test_client().get(
+            "/epg-web/api/agent/health",
+            headers={"Authorization": "Bearer wrong-secret"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    @mock.patch.object(server, "load_config")
+    def test_config_api_does_not_return_secrets(self, load_config):
+        load_config.return_value = {
+            "guide_path": "/guide.xml", "epg_pass": "provider-secret",
+            "sd_pass": "schedule-secret", "omdb_key": "movie-secret",
+            "tmdb_key": "other-secret", "recording_agent_token": "agent-secret",
+        }
+        data = server.app.test_client().get("/epg-web/api/config").get_json()
+        self.assertEqual(data["guide_path"], "/guide.xml")
+        self.assertNotIn("epg_pass", data)
+        self.assertNotIn("recording_agent_token", data)
+        self.assertTrue(data["secrets_configured"]["recording_agent_token"])
+
+    @mock.patch.object(server, "save_config")
+    @mock.patch.object(server, "load_config")
+    def test_config_partial_update_preserves_secrets(self, load_config, save_config):
+        load_config.return_value = {
+            "guide_path": "/old.xml", "epg_pass": "provider-secret",
+            "recording_agent_token": "agent-secret",
+        }
+        response = server.app.test_client().post(
+            "/epg-web/api/config", json={"guide_path": "/new.xml"}
+        )
+        self.assertEqual(response.status_code, 200)
+        saved = save_config.call_args.args[0]
+        self.assertEqual(saved["guide_path"], "/new.xml")
+        self.assertEqual(saved["epg_pass"], "provider-secret")
+        self.assertEqual(saved["recording_agent_token"], "agent-secret")
 
 
 if __name__ == "__main__":
