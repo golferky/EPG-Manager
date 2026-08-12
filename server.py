@@ -110,6 +110,26 @@ def save_watchlist(wl):
 
 # ── Movies.db ────────────────────────────────────────────────────────────────
 
+def _channel_match_base(value):
+    """Normalize provider/guide channel names, including known rebrands."""
+    base = re.sub(r'[^a-z0-9]', '', (value or '').lower())
+    base = base.replace('paramountwithshowtime', 'showtime')
+    if base.startswith('sho2'):
+        base = 'showtime2' + base[4:]
+    geographic = ''
+    if base.endswith('pacific'):
+        base = base[:-7]
+        geographic = 'west'
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ('us', 'uk', 'za', 'ca', 'au', 'uhd', 'hd', 'sd'):
+            if base.endswith(suffix) and len(base) > len(suffix) + 2:
+                base = base[:-len(suffix)]
+                changed = True
+                break
+    return base + geographic
+
 def get_db():
     cfg = load_config()
     path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
@@ -174,7 +194,7 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
 
         result = set()
         # Build lookup dicts
-        id_to_norm = {cid: _re.sub(r'[^a-z0-9]', '', cname.lower()) for cid, cname in grows}
+        id_to_norm = {cid: _channel_match_base(cname) for cid, cname in grows}
         name_map = {}
         for cid, cname in grows:
             key = id_to_norm[cid]
@@ -188,12 +208,7 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
 
         # Fallback: normalise Movies.db guide_channel and look up in name_map
         for gc in ps_guide_channels:
-            norm = _re.sub(r'[^a-z0-9]', '', gc.lower())
-            base = norm
-            for suffix in ('us','uk','za','ca','au','sd','hd','west','east'):
-                if norm.endswith(suffix):
-                    base = norm[:-len(suffix)]
-                    break
+            base = _channel_match_base(gc)
             # Exact match on base — pick single best to avoid East/West duplicates
             if base in name_map:
                 result.add(_pick_best(name_map[base], base))
@@ -720,19 +735,12 @@ def _stream_url(channel_id):
             debug['guide_names'] = gnames
             if gnames:
                 mrows = db_rows('SELECT guide_channel, stream_id FROM channels WHERE stream_id IS NOT NULL AND stream_id!=""')
-                def _norm(s):
-                    return _re2.sub(r'[^a-z0-9]', '', s.lower())
-                def _base(gc_norm):
-                    for sfx in ('us','uk','za','ca','au','sd','hd'):
-                        if gc_norm.endswith(sfx):
-                            return gc_norm[:-len(sfx)]
-                    return gc_norm
-                mc = [(mr, _base(_norm(mr['guide_channel']))) for mr in mrows]
+                mc = [(mr, _channel_match_base(mr['guide_channel'])) for mr in mrows]
                 best_row = None
                 best_diff = float('inf')
                 best_name = None
                 for name in sorted(gnames, key=len, reverse=True):
-                    ch_norm = _norm(name)
+                    ch_norm = _channel_match_base(name)
                     if len(ch_norm) < 3:
                         continue
                     for mr, base in mc:
@@ -2084,8 +2092,7 @@ def api_airings():
     # Collapse duplicate SD/XMLTV rows for the same channel family and time.
     # Prefer a playable row, then the HD-labelled guide row for display.
     def _family(name):
-        normalized = re.sub(r'[^a-z0-9]', '', (name or '').lower())
-        return re.sub(r'(uhd|hd|sd)$', '', normalized)
+        return _channel_match_base(name)
 
     prog_type = next((a['prog_type'] for a in airings if a['prog_type']), '')
     deduped = {}
