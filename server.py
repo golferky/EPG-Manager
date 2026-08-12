@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260812a"
+VERSION = "v20260812b"
 
-import json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
+import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
@@ -26,7 +26,19 @@ def _bootstrap():
             rec_id TEXT PRIMARY KEY, title TEXT, channel TEXT, channel_id TEXT,
             start_ts REAL, stop_ts REAL, start_time TEXT,
             status TEXT DEFAULT "queued", failure_reason TEXT, file TEXT,
-            created_at TEXT)''')
+            created_at TEXT, backend TEXT DEFAULT "local", stream_id TEXT,
+            agent_id TEXT, lease_until REAL, heartbeat_at REAL, updated_at TEXT,
+            quality_decision TEXT, result_json TEXT)''')
+        for _col, _typedef in [
+                ('backend', 'TEXT DEFAULT "local"'), ('stream_id', 'TEXT'),
+                ('agent_id', 'TEXT'), ('lease_until', 'REAL'),
+                ('heartbeat_at', 'REAL'), ('updated_at', 'TEXT'),
+                ('quality_decision', 'TEXT'), ('result_json', 'TEXT')]:
+            try:
+                _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
+            except _sq3.OperationalError as _e:
+                if 'duplicate column name' not in str(_e).lower():
+                    raise
         # Migrate guide table — add episode columns if missing (safe no-op if already present)
         for _col, _typedef in [('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'), ('prog_type', 'TEXT')]:
             try:
@@ -63,6 +75,8 @@ def load_config():
         'epg_pass':      '',
         'plex_path':     '/Volumes/Plex/Movies',
         'rec_path':      os.path.expanduser('~/Movies/Recordings'),
+        'recording_backend': 'local',
+        'recording_agent_token': '',
     }
 
 def save_config(cfg):
@@ -487,8 +501,13 @@ def _rec_status_base(status):
 
 def _rec_is_active(rec):
     return _rec_status_base(rec.get('status')) in {
-        'queued', 'scheduled', 'recording', 'converting', 'copying'
+        'queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting',
+        'recording', 'converting', 'awaiting_transfer', 'transferring', 'copying'
     }
+
+def _recording_backend():
+    backend = str(load_config().get('recording_backend', 'local')).strip().lower()
+    return backend if backend in ('local', 'agent') else 'local'
 
 def _guide_db_path():
     cfg = load_config()
@@ -511,6 +530,22 @@ def _init_recordings_table():
             file        TEXT,
             created_at  TEXT
         )''')
+        migrations = [
+            ('backend', "TEXT DEFAULT 'local'"),
+            ('stream_id', 'TEXT'),
+            ('agent_id', 'TEXT'),
+            ('lease_until', 'REAL'),
+            ('heartbeat_at', 'REAL'),
+            ('updated_at', 'TEXT'),
+            ('quality_decision', 'TEXT'),
+            ('result_json', 'TEXT'),
+        ]
+        for column, typedef in migrations:
+            try:
+                conn.execute(f'ALTER TABLE recordings ADD COLUMN {column} {typedef}')
+            except sqlite3.OperationalError as e:
+                if 'duplicate column name' not in str(e).lower():
+                    raise
         conn.commit()
         conn.close()
     except Exception as e:
@@ -522,12 +557,16 @@ def _db_upsert_rec(rec_id, rec):
         conn = sqlite3.connect(_guide_db_path(), timeout=30)
         conn.execute('PRAGMA busy_timeout=30000')
         conn.execute('''INSERT INTO recordings
-            (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time, status, failure_reason, file, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
+             status, failure_reason, file, created_at, backend, stream_id, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
-              file=excluded.file
+              file=excluded.file,
+              backend=excluded.backend,
+              stream_id=excluded.stream_id,
+              updated_at=excluded.updated_at
         ''', (
             rec_id,
             rec.get('title',''),
@@ -540,6 +579,9 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('failure_reason',''),
             rec.get('file',''),
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            rec.get('backend', 'local'),
+            rec.get('stream_id', ''),
+            datetime.now(timezone.utc).isoformat(),
         ))
         conn.commit()
         conn.close()
@@ -572,13 +614,16 @@ def _reconcile_stale_recordings():
         conn.execute('PRAGMA busy_timeout=30000')
         conn.execute('''UPDATE recordings
                         SET status='queued', failure_reason='Resuming after server restart'
-                        WHERE status='recording' AND stop_ts > ?''', (now,))
+                        WHERE COALESCE(backend,'local')='local'
+                        AND status='recording' AND stop_ts > ?''', (now,))
         conn.execute('''UPDATE recordings
                         SET status='failed', failure_reason='Recording interrupted by server stop'
-                        WHERE status='recording' AND stop_ts <= ?''', (now,))
+                        WHERE COALESCE(backend,'local')='local'
+                        AND status='recording' AND stop_ts <= ?''', (now,))
         conn.execute('''UPDATE recordings
                         SET status='skipped_too_short', failure_reason='Recording window passed while server was stopped'
-                        WHERE status IN ('queued','scheduled') AND stop_ts <= ?''', (now,))
+                        WHERE COALESCE(backend,'local')='local'
+                        AND status IN ('queued','scheduled') AND stop_ts <= ?''', (now,))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -592,8 +637,17 @@ def _load_pending_recs():
         conn = sqlite3.connect(_guide_db_path())
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM recordings WHERE status IN ('queued','scheduled') AND stop_ts > ?",
+            """SELECT * FROM recordings
+               WHERE status IN ('queued','scheduled') AND stop_ts > ?
+               AND COALESCE(backend,'local')='local'""",
             (time.time() + 60,)
+        ).fetchall()
+        agent_rows = conn.execute(
+            """SELECT * FROM recordings
+               WHERE COALESCE(backend,'local')='agent'
+               AND status NOT IN ('done','done_ts','cancelled','failed','error',
+                                  'skipped_existing_better','skipped_too_short')
+               AND stop_ts > ?""", (time.time(),)
         ).fetchall()
         conn.close()
         for r in rows:
@@ -609,12 +663,25 @@ def _load_pending_recs():
                 'log':        [],
                 'pid':        None,
                 'file':       r['file'] or None,
+                'backend':    'local',
+                'stream_id':  r['stream_id'] or '',
             }
             with _rec_lock:
                 _recs[rec_id] = rec
                 _rec_cancel_events[rec_id] = threading.Event()
             t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
             t.start()
+        for r in agent_rows:
+            rec_id = r['rec_id']
+            with _rec_lock:
+                _recs[rec_id] = {
+                    'title': r['title'], 'channel_id': r['channel_id'],
+                    'channel': r['channel'], 'start_ts': r['start_ts'],
+                    'stop_ts': r['stop_ts'], 'status': r['status'],
+                    'progress': 0, 'log': [], 'pid': None,
+                    'file': r['file'] or None, 'backend': 'agent',
+                    'stream_id': r['stream_id'] or '',
+                }
         if rows:
             print(f'[recdb] reloaded {len(rows)} pending recording(s)')
     except Exception as e:
@@ -898,11 +965,23 @@ def api_disk():
 
 @app.route('/epg-web/api/config', methods=['GET'])
 def api_get_config():
-    return jsonify(load_config())
+    cfg = load_config()
+    secret_keys = ('sd_pass', 'epg_pass', 'omdb_key', 'tmdb_key',
+                   'recording_agent_token')
+    safe = {key: value for key, value in cfg.items() if key not in secret_keys}
+    safe['secrets_configured'] = {
+        key: bool(cfg.get(key)) for key in secret_keys
+    }
+    return jsonify(safe)
 
 @app.route('/epg-web/api/config', methods=['POST'])
 def api_post_config():
-    save_config(request.json or {})
+    # Partial updates preserve credentials and settings not represented by the UI.
+    cfg = load_config()
+    updates = request.json or {}
+    updates.pop('secrets_configured', None)
+    cfg.update(updates)
+    save_config(cfg)
     return jsonify({'ok': True})
 
 @app.route('/epg-web/api/fetch-sd', methods=['POST'])
@@ -2159,11 +2238,17 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             if key in existing_keys:
                 continue
             rec_id = f"rec_{int(time.time()*1000)}_{r['channel_id'][:8]}"
+            _url, stream_error, stream_debug = _stream_url(r['channel_id'])
+            if stream_error:
+                print(f'[series] stream lookup failed for {r["channel_id"]}: {stream_error}')
+                continue
+            backend = _recording_backend()
             rec = {
                 'title': title, 'channel_id': r['channel_id'],
                 'channel': r['channel_name'],
                 'start_ts': su.timestamp(), 'stop_ts': eu.timestamp(),
                 'status': 'queued', 'progress': 0, 'log': [], 'pid': None, 'file': None,
+                'backend': backend, 'stream_id': str(stream_debug.get('stream_id') or ''),
             }
             if not _db_upsert_rec(rec_id, rec):
                 print(f'[series] could not persist recording {rec_id}; not scheduling')
@@ -2172,8 +2257,9 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 _recs[rec_id] = rec
                 _rec_cancel_events[rec_id] = threading.Event()
                 existing_keys.add(key)
-            t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
-            t.start()
+            if backend == 'local':
+                t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
+                t.start()
             scheduled += 1
         except Exception as e:
             print(f'[series] airing error: {e}')
@@ -2355,14 +2441,21 @@ def api_record():
         'log':        [],
         'pid':        None,
         'file':       None,
+        'backend':    _recording_backend(),
+        'stream_id':  '',
     }
+    _url, stream_error, stream_debug = _stream_url(channel_id)
+    if stream_error:
+        return jsonify({'ok': False, 'error': stream_error}), 400
+    rec['stream_id'] = str(stream_debug.get('stream_id') or '')
     if not _db_upsert_rec(rec_id, rec):
         return jsonify({'ok': False, 'error': 'Could not save recording to guide database'}), 500
     with _rec_lock:
         _recs[rec_id] = rec
         _rec_cancel_events[rec_id] = threading.Event()
-    t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
-    t.start()
+    if rec['backend'] == 'local':
+        t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
+        t.start()
     return jsonify({'ok': True, 'id': rec_id, 'channel': channel_name, 'start_ts': start_ts})
 
 @app.route('/epg-web/api/record/status')
@@ -2421,7 +2514,8 @@ def api_rec_cancel():
         if not r:
             return jsonify({'ok': False, 'error': 'Recording not found'}), 404
         status = _rec_status_base(r.get('status'))
-        if status not in ('queued', 'scheduled', 'recording'):
+        if status not in ('queued', 'scheduled', 'agent_claimed', 'preflight',
+                          'waiting', 'recording', 'awaiting_transfer', 'transferring'):
             return jsonify({'ok': False, 'error': f'Recording cannot be cancelled while {status}'}), 409
         cancel_event = _rec_cancel_events.setdefault(rec_id, threading.Event())
         cancel_event.set()
@@ -2441,6 +2535,157 @@ def api_rec_cancel():
 
     _db_update_rec_status(rec_id, 'cancelled', 'Cancelled by user', file=file_path)
     return jsonify({'ok': True, 'cancelled': True, 'id': rec_id})
+
+# ── Recording Agent API ──────────────────────────────────────────────────────
+
+_AGENT_ACTIVE_STATES = {
+    'agent_claimed', 'preflight', 'waiting', 'recording', 'converting',
+    'awaiting_transfer', 'transferring'
+}
+_AGENT_TERMINAL_STATES = {
+    'done', 'done_ts', 'cancelled', 'failed', 'error',
+    'skipped_existing_better', 'skipped_too_short'
+}
+
+def _agent_authorized():
+    cfg = load_config()
+    expected = os.environ.get('EPG_AGENT_TOKEN') or cfg.get('recording_agent_token', '')
+    supplied = request.headers.get('Authorization', '')
+    if supplied.lower().startswith('bearer '):
+        supplied = supplied[7:].strip()
+    else:
+        supplied = request.headers.get('X-EPG-Agent-Token', '')
+    return bool(expected and supplied and hmac.compare_digest(str(expected), str(supplied)))
+
+def _agent_auth_failure():
+    return jsonify({'ok': False, 'error': 'Unauthorized recording agent'}), 401
+
+def _agent_job_dict(row):
+    return {
+        'id': row['rec_id'], 'title': row['title'], 'channel': row['channel'],
+        'channel_id': row['channel_id'], 'stream_id': row['stream_id'] or '',
+        'start_ts': row['start_ts'], 'stop_ts': row['stop_ts'],
+        'status': row['status'], 'agent_id': row['agent_id'],
+        'lease_until': row['lease_until'],
+    }
+
+@app.route('/epg-web/api/agent/health')
+def api_agent_health():
+    if not _agent_authorized():
+        return _agent_auth_failure()
+    return jsonify({'ok': True, 'server_time': time.time(),
+                    'recording_backend': _recording_backend()})
+
+@app.route('/epg-web/api/agent/jobs/claim', methods=['POST'])
+def api_agent_claim():
+    if not _agent_authorized():
+        return _agent_auth_failure()
+    data = request.json or {}
+    agent_id = str(data.get('agent_id', '')).strip()[:100]
+    if not agent_id:
+        return jsonify({'ok': False, 'error': 'agent_id is required'}), 400
+    lease_seconds = max(30, min(int(data.get('lease_seconds', 90)), 300))
+    claim_ahead = max(30, min(int(data.get('claim_ahead_seconds', 300)), 1800))
+    now = time.time()
+    conn = sqlite3.connect(_guide_db_path(), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute('PRAGMA busy_timeout=30000')
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('''UPDATE recordings
+                        SET status='queued', agent_id=NULL, lease_until=NULL,
+                            failure_reason='Agent lease expired; job requeued'
+                        WHERE COALESCE(backend,'local')='agent'
+                        AND status IN ('agent_claimed','preflight','waiting')
+                        AND lease_until IS NOT NULL AND lease_until < ?''', (now,))
+        conn.execute('''UPDATE recordings
+                        SET status='failed', lease_until=NULL,
+                            failure_reason='Recording agent heartbeat expired'
+                        WHERE COALESCE(backend,'local')='agent'
+                        AND status IN ('recording','converting','awaiting_transfer','transferring')
+                        AND lease_until IS NOT NULL AND lease_until < ?''', (now,))
+        row = conn.execute('''SELECT * FROM recordings
+                              WHERE COALESCE(backend,'local')='agent'
+                              AND status IN ('queued','scheduled')
+                              AND stop_ts > ? AND start_ts <= ?
+                              ORDER BY start_ts LIMIT 1''',
+                           (now + 30, now + claim_ahead)).fetchone()
+        if row:
+            lease_until = now + lease_seconds
+            conn.execute('''UPDATE recordings
+                            SET status='agent_claimed', agent_id=?, lease_until=?,
+                                heartbeat_at=?, updated_at=? WHERE rec_id=?''',
+                         (agent_id, lease_until, now, datetime.now(timezone.utc).isoformat(),
+                          row['rec_id']))
+            row = conn.execute('SELECT * FROM recordings WHERE rec_id=?',
+                               (row['rec_id'],)).fetchone()
+        conn.execute('COMMIT')
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    if not row:
+        return jsonify({'ok': True, 'job': None, 'server_time': now})
+    job = _agent_job_dict(row)
+    with _rec_lock:
+        rec = _recs.setdefault(row['rec_id'], {})
+        rec.update({'title': row['title'], 'channel': row['channel'],
+                    'channel_id': row['channel_id'], 'stream_id': row['stream_id'] or '',
+                    'start_ts': row['start_ts'], 'stop_ts': row['stop_ts'],
+                    'status': 'agent_claimed', 'backend': 'agent', 'pid': None,
+                    'file': row['file'] or None, 'progress': 0, 'log': []})
+    return jsonify({'ok': True, 'job': job, 'server_time': now})
+
+@app.route('/epg-web/api/agent/jobs/<rec_id>/heartbeat', methods=['POST'])
+def api_agent_heartbeat(rec_id):
+    if not _agent_authorized():
+        return _agent_auth_failure()
+    data = request.json or {}
+    agent_id = str(data.get('agent_id', '')).strip()[:100]
+    status = str(data.get('status', 'agent_claimed')).strip().lower()
+    if status not in _AGENT_ACTIVE_STATES | _AGENT_TERMINAL_STATES:
+        return jsonify({'ok': False, 'error': f'Invalid agent status: {status}'}), 400
+    lease_seconds = max(30, min(int(data.get('lease_seconds', 90)), 300))
+    now = time.time()
+    conn = sqlite3.connect(_guide_db_path(), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA busy_timeout=30000')
+    row = conn.execute('SELECT * FROM recordings WHERE rec_id=?', (rec_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'ok': False, 'error': 'Recording job not found'}), 404
+    if row['status'] == 'cancelled':
+        conn.close()
+        return jsonify({'ok': True, 'cancel_requested': True, 'status': 'cancelled'})
+    if row['agent_id'] and row['agent_id'] != agent_id:
+        conn.close()
+        return jsonify({'ok': False, 'error': 'Job is leased to another agent'}), 409
+    terminal = status in _AGENT_TERMINAL_STATES
+    result = data.get('result') if isinstance(data.get('result'), dict) else {}
+    file_path = str(data.get('file', row['file'] or ''))
+    failure_reason = str(data.get('message', ''))[:1000]
+    quality_decision = str(data.get('quality_decision', ''))[:1000]
+    conn.execute('''UPDATE recordings SET status=?, agent_id=?, lease_until=?,
+                    heartbeat_at=?, updated_at=?, file=?, failure_reason=?,
+                    quality_decision=?, result_json=? WHERE rec_id=?''',
+                 (status, agent_id, None if terminal else now + lease_seconds,
+                  now, datetime.now(timezone.utc).isoformat(), file_path,
+                  failure_reason, quality_decision, json.dumps(result), rec_id))
+    conn.commit()
+    conn.close()
+    with _rec_lock:
+        rec = _recs.setdefault(rec_id, {})
+        rec.update({'status': status, 'file': file_path or None,
+                    'progress': data.get('progress', rec.get('progress', 0)),
+                    'backend': 'agent'})
+        if failure_reason:
+            rec.setdefault('log', []).append(failure_reason)
+    return jsonify({'ok': True, 'cancel_requested': False, 'status': status,
+                    'lease_until': None if terminal else now + lease_seconds})
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
@@ -4139,12 +4384,16 @@ async function updateRecPanel() {
   document.getElementById('rec-panel').style.display = 'block';
   const statusIcons = {
     queued:'⏳', scheduled:'⏱', recording:'🔴', converting:'⚙️',
-    copying:'📤', done:'✅', done_ts:'✅', error:'❌', cancelled:'🚫'
+    agent_claimed:'🤝', preflight:'🔎', waiting:'⏳',
+    awaiting_transfer:'💾', transferring:'📤', copying:'📤',
+    done:'✅', done_ts:'✅', skipped_existing_better:'⏭️',
+    error:'❌', failed:'❌', cancelled:'🚫'
   };
   document.getElementById('rec-list').innerHTML = recs.map(([id, r]) => {
     const baseStatus = (r.status||'').split('(')[0].trim();
     const icon = statusIcons[baseStatus] || '•';
-    const active = ['queued','scheduled','recording','converting','copying'].includes(baseStatus);
+    const active = ['queued','scheduled','agent_claimed','preflight','waiting',
+                    'recording','awaiting_transfer','transferring','copying'].includes(baseStatus);
     return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e1e1e;font-size:13px;">
       <span style="font-size:16px;">${icon}</span>
       <span style="flex:1;color:#c7d2e7;">${esc(r.title)}</span>
@@ -4155,7 +4404,8 @@ async function updateRecPanel() {
   // Stop polling when nothing active
   const anyActive = recs.some(([,r]) => {
     const s = (r.status||'').split('(')[0].trim();
-    return ['queued','scheduled','recording','converting','copying'].includes(s);
+    return ['queued','scheduled','agent_claimed','preflight','waiting','recording',
+            'converting','awaiting_transfer','transferring','copying'].includes(s);
   });
   if (!anyActive) { clearInterval(_recPoll); _recPoll = null; }
 }
@@ -4322,7 +4572,9 @@ async function loadSchedule() {
     const alwaysShow = s === 'completed' || s === 'recorded' || s === 'complete' ||
                        s === 'done' || s === 'done_ts' ||
                        s === 'failed' || s === 'timeout' || s === 'error' ||
-                       s === 'queued' || s === 'scheduled' || s === 'recording';
+                       ['queued','scheduled','agent_claimed','preflight','waiting',
+                        'recording','converting','awaiting_transfer','transferring',
+                        'copying'].includes(s);
     if (alwaysShow) return true;
     // Only apply 30-day cutoff to missed/stale/skipped/cancelled
     const t = r.start_time ? new Date(r.start_time).getTime() : 0;
@@ -4334,10 +4586,13 @@ async function loadSchedule() {
 
   const SB = {
     scheduled:'badge-record',  to_record:'badge-record',   queued:'badge-record',
-    recording:'badge-wl',
+    agent_claimed:'badge-record', preflight:'badge-record', waiting:'badge-record',
+    recording:'badge-wl', converting:'badge-wl', awaiting_transfer:'badge-wl',
+    transferring:'badge-wl', copying:'badge-wl',
     completed:'badge-recorded', recorded:'badge-recorded', complete:'badge-recorded',
+    done:'badge-recorded', done_ts:'badge-recorded',
     failed:'badge-skipped',    timeout:'badge-skipped',
-    cancelled:'badge-skipped', skipped:'badge-skipped'
+    cancelled:'badge-skipped', skipped:'badge-skipped', skipped_existing_better:'badge-skipped'
   };
 
   const now = Date.now();
@@ -4345,10 +4600,9 @@ async function loadSchedule() {
     const s = (r.status||'').toLowerCase();
     const startMs = r.start_time ? new Date(r.start_time).getTime() : 0;
     const isPast  = startMs > 0 && startMs < now;
-    if (s === 'scheduled' || s === 'to_record' || s === 'queued') return showScheduled;
-    if (s === 'recording' && isPast)                               return showScheduled;
-    if (s === 'recording' && !isPast)                              return showScheduled;
-    if (s === 'completed' || s === 'recorded' || s === 'complete') return showCompleted;
+    if (['scheduled','to_record','queued','agent_claimed','preflight','waiting',
+         'recording','converting','awaiting_transfer','transferring','copying'].includes(s)) return showScheduled;
+    if (['completed','recorded','complete','done','done_ts'].includes(s)) return showCompleted;
     if (s === 'failed'    || s === 'timeout' || s === 'error')     return showFailed;
     if (s === 'skipped' || s === 'cancelled' || s.startsWith('skipped')) return showSkipped;
     return true;  // unknown statuses always show
@@ -4379,7 +4633,8 @@ async function loadSchedule() {
       <td><span class="badge ${badge}">${esc(label)}</span></td>
       <td style="font-size:11px;color:#64748b;max-width:200px;">${esc(r.failure_reason||'')}
         ${(isFailed || isMissed || isStale || isSkipped) ? `<button class="btn btn-ghost btn-sm" style="margin-left:6px;font-size:11px;" onclick='searchOpenProg(${JSON.stringify(r.title)},${JSON.stringify(r.episode_title||"")},${JSON.stringify(r.season_number||"")},${JSON.stringify(r.episode_number||"")})'>🔄 Re-record</button>` : ''}
-        ${(r._mem && r._id && (s==='queued'||s==='scheduled'||s==='recording')) ? `<button class="btn btn-danger btn-sm" style="margin-left:6px;font-size:11px;" onclick="cancelRec('${r._id}',true)">✕ Cancel</button>` : ''}
+        ${(r._mem && r._id && ['queued','scheduled','agent_claimed','preflight','waiting',
+          'recording','awaiting_transfer','transferring'].includes(s)) ? `<button class="btn btn-danger btn-sm" style="margin-left:6px;font-size:11px;" onclick="cancelRec('${r._id}',true)">✕ Cancel</button>` : ''}
       </td>
     </tr>`;
   }).join('');

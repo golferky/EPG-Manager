@@ -8,6 +8,7 @@ __pycache__/
 # Credentials and machine-specific configuration
 *.json
 !config.example.json
+!recording_agent.example.json
 
 # Runtime data
 *.db
