@@ -104,6 +104,20 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("batchBtn.style.display = isMovie ? 'none' : '';", server.HTML)
         self.assertNotIn("Record Series", server.HTML)
 
+    def test_showtime_rebrand_channel_aliases(self):
+        self.assertEqual(
+            server._channel_match_base("Paramount+ with Showtime HD"),
+            server._channel_match_base("showtime.us"),
+        )
+        self.assertEqual(
+            server._channel_match_base("Paramount+ with Showtime HD (Pacific)"),
+            server._channel_match_base("showtimewest.us"),
+        )
+        self.assertEqual(
+            server._channel_match_base("SHO 2 HD"),
+            server._channel_match_base("showtime2.us"),
+        )
+
     def test_active_in_memory_recording_is_not_marked_stale(self):
         self.assertIn(
             "const isStale   = !r._mem && s === 'recording' && isPast;",
