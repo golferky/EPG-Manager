@@ -8,12 +8,19 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
+BASE_DIR = os.path.abspath(
+    os.environ.get('EPG_BASE_DIR', os.path.expanduser('~/epg'))
+)
+
 # Always create the recordings table on startup, regardless of how Flask is launched
 def _bootstrap():
     try:
         import sqlite3 as _sq3, os as _os, json as _js
-        _cfg = _js.load(open(_os.path.join(_os.path.dirname(__file__), 'epg_config.json')))
-        _db  = _cfg.get('guide_db_path', _os.path.join(_os.path.dirname(__file__), 'guide.db'))
+        _cfg_path = _os.path.join(BASE_DIR, 'epg_config.json')
+        _cfg = _js.load(open(_cfg_path)) if _os.path.exists(_cfg_path) else {}
+        _db  = _cfg.get('guide_db_path', _os.path.join(BASE_DIR, 'guide.db'))
+        _os.makedirs(_os.path.dirname(_db), exist_ok=True)
+        ensure_guide_db(_db)
         _c   = _sq3.connect(_db)
         _c.execute('''CREATE TABLE IF NOT EXISTS recordings (
             rec_id TEXT PRIMARY KEY, title TEXT, channel TEXT, channel_id TEXT,
@@ -30,10 +37,8 @@ def _bootstrap():
         print('[bootstrap] recordings table ready')
     except Exception as _e:
         print(f'[bootstrap] recordings table ERROR: {_e}')
-_bootstrap()
 app.secret_key = os.urandom(24)
 
-BASE_DIR         = os.path.expanduser('~/epg')
 CONFIG_FILE      = os.path.join(BASE_DIR, 'epg_config.json')
 SCHEDULE_FILE    = os.path.join(BASE_DIR, 'epg_schedule.json')
 WATCHLIST_FILE   = os.path.join(BASE_DIR, 'epg_watchlist.json')
@@ -225,6 +230,8 @@ def ensure_guide_db(db_path):
     ''')
     conn.commit()
     conn.close()
+
+_bootstrap()
 
 def import_xml_to_guide_db(xml_path, db_path):
     """Parse XMLTV and INSERT OR IGNORE into guide.db. Returns new rows inserted."""

@@ -1,0 +1,17 @@
+{
+  "guide_path": "/path/to/guide.xml",
+  "guide_db_path": "/path/to/guide.db",
+  "db_path": "/path/to/Movies.db",
+  "timezone": "America/New_York",
+  "ts_input": "/path/to/input",
+  "ts_output": "/path/to/output",
+  "sd_user": "",
+  "sd_pass": "",
+  "epg_url": "",
+  "epg_user": "",
+  "epg_pass": "",
+  "omdb_key": "",
+  "tmdb_key": "",
+  "plex_path": "/path/to/Plex/Movies",
+  "rec_path": "/path/to/recordings"
+}

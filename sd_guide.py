@@ -261,10 +261,9 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
 
 
 if __name__ == '__main__':
-    import sys
-    cfg_path = os.path.join(os.path.dirname(__file__), 'config.json.bak_20260619_054214_before_localize')
+    cfg_path = os.path.join(os.path.dirname(__file__), 'epg_config.json')
     with open(cfg_path) as f:
         cfg = json.load(f)
-    db = os.path.join(os.path.dirname(__file__), 'guide.db')
-    result = fetch_sd_guide(cfg['SD_USER'], cfg['SD_PASS'], db, days=14)
+    db = cfg.get('guide_db_path', os.path.join(os.path.dirname(__file__), 'guide.db'))
+    result = fetch_sd_guide(cfg['sd_user'], cfg['sd_pass'], db, days=14)
     print(result)
