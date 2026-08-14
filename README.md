@@ -1,5 +1,14 @@
 # EPG Manager
 
+## Plex library filing
+
+Movie recordings are copied to the configured movie library. Series recordings with
+guide season and episode data are copied to the configured TV library as:
+
+`TV Shows/Show Name/Season 01/Show Name - S01E02 - Episode Title.mp4`
+
+Set `plex_tv_path` in `recording_agent.json` (normally `/Volumes/Plex/TV Shows`).
+
 A local Flask web application for browsing electronic program guide data, managing channels and recommendations, scheduling recordings, and converting recorded transport streams.
 
 ## Requirements

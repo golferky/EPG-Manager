@@ -43,6 +43,7 @@ def load_config(path):
     cfg.setdefault('max_concurrent_recordings', 6)
     cfg.setdefault('local_recordings', os.path.expanduser('~/Movies/Recordings'))
     cfg.setdefault('plex_path', '/Volumes/Plex/Movies')
+    cfg.setdefault('plex_tv_path', '/Volumes/Plex/TV Shows')
     cfg.setdefault('ffmpeg', 'ffmpeg')
     cfg.setdefault('ffprobe', 'ffprobe')
     cfg.setdefault('transfer_retry_seconds', 30)
@@ -212,6 +213,36 @@ def find_plex_candidates(plex_root, title):
     return candidates
 
 
+def episode_metadata(job):
+    """Return validated TV episode data, or None when this is a movie job."""
+    try:
+        season = int(job.get('season_num'))
+        episode = int(job.get('episode_num'))
+    except (TypeError, ValueError):
+        return None
+    if season < 0 or episode < 0:
+        return None
+    return {
+        'season': season,
+        'episode': episode,
+        'title': safe_filename(job.get('episode_title') or ''),
+    }
+
+
+def find_tv_episode_candidates(tv_root, show_title, season, episode):
+    """Find only the matching SxxExx episode within this show's Plex folder."""
+    show_dir = Path(tv_root) / safe_filename(show_title)
+    if not show_dir.is_dir():
+        return []
+    pattern = re.compile(rf'\bS{season:02d}E{episode:02d}\b', re.IGNORECASE)
+    try:
+        return [path for path in show_dir.rglob('*')
+                if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+                and pattern.search(path.stem)]
+    except OSError:
+        return []
+
+
 def best_existing_copy(paths, ffprobe):
     probed = []
     for path in paths:
@@ -281,14 +312,9 @@ def plex_mount_available(plex_root, marker=''):
     return not marker or (root / marker).exists()
 
 
-def verified_transfer(source, plex_root, title, existing_path=None, progress_callback=None, year=''):
-    title_name, title_year = split_title_year(title)
-    year = year or title_year
-    if existing_path and Path(existing_path).suffix.lower() == '.mp4':
-        destination = Path(existing_path)
-    else:
-        folder = safe_filename(f'{title_name} ({year})' if year else title_name)
-        destination = Path(plex_root) / folder / f'{safe_filename(title_name)}.mp4'
+def _verified_copy(source, destination, progress_callback=None):
+    """Copy source to destination atomically, verifying its final byte count."""
+    destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.name + '.partial')
     source = Path(source)
@@ -322,6 +348,30 @@ def verified_transfer(source, plex_root, title, existing_path=None, progress_cal
     return destination
 
 
+def verified_transfer(source, plex_root, title, existing_path=None, progress_callback=None, year=''):
+    title_name, title_year = split_title_year(title)
+    year = year or title_year
+    if existing_path and Path(existing_path).suffix.lower() == '.mp4':
+        destination = Path(existing_path)
+    else:
+        folder = safe_filename(f'{title_name} ({year})' if year else title_name)
+        destination = Path(plex_root) / folder / f'{safe_filename(title_name)}.mp4'
+    return _verified_copy(source, destination, progress_callback)
+
+
+def verified_episode_transfer(source, tv_root, show_title, season, episode,
+                              episode_title='', existing_path=None,
+                              progress_callback=None):
+    if existing_path and Path(existing_path).suffix.lower() == '.mp4':
+        destination = Path(existing_path)
+    else:
+        show = safe_filename(show_title)
+        episode_suffix = f' - {safe_filename(episode_title)}' if episode_title else ''
+        filename = f'{show} - S{season:02d}E{episode:02d}{episode_suffix}.mp4'
+        destination = Path(tv_root) / show / f'Season {season:02d}' / filename
+    return _verified_copy(source, destination, progress_callback)
+
+
 def process_job(api, job, cfg):
     local_dir = Path(os.path.expanduser(cfg['local_recordings']))
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -330,9 +380,13 @@ def process_job(api, job, cfg):
     mp4_path = ts_path.with_suffix('.mp4')
     log_path = local_dir / f'{title_slug}_{int(job["start_ts"])}.ffmpeg.log'
     url = stream_url(cfg, job['stream_id'])
+    episode = episode_metadata(job)
+    library_root = cfg['plex_tv_path'] if episode else cfg['plex_path']
 
     api.heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
-    candidates = find_plex_candidates(cfg['plex_path'], job['title'])
+    candidates = (find_tv_episode_candidates(
+        library_root, job['title'], episode['season'], episode['episode'])
+        if episode else find_plex_candidates(library_root, job['title']))
     existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
     try:
         incoming_probe = probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
@@ -387,7 +441,7 @@ def process_job(api, job, cfg):
         return
 
     transfer_deadline = time.time() + float(cfg['transfer_wait_timeout'])
-    while not plex_mount_available(cfg['plex_path'], cfg.get('plex_mount_marker', '')):
+    while not plex_mount_available(library_root, cfg.get('plex_mount_marker', '')):
         if time.time() >= transfer_deadline:
             api.heartbeat(job['id'], 'failed', message='Timed out waiting for Plex mount',
                           file=str(mp4_path), result=quality)
@@ -399,7 +453,9 @@ def process_job(api, job, cfg):
 
     # Recheck the library after recording. The share may have been unavailable
     # during preflight, or Plex may have received a better copy in the meantime.
-    final_candidates = find_plex_candidates(cfg['plex_path'], job['title'])
+    final_candidates = (find_tv_episode_candidates(
+        library_root, job['title'], episode['season'], episode['episode'])
+        if episode else find_plex_candidates(library_root, job['title']))
     final_existing_path, final_existing_probe = best_existing_copy(
         final_candidates, cfg['ffprobe']
     )
@@ -439,17 +495,25 @@ def process_job(api, job, cfg):
         if response.get('cancel_requested'):
             raise RuntimeError('Transfer cancelled by user')
 
-    try:
-        movie_year = api.movie_year(job['title'])
-    except Exception as exc:
-        print(f'[metadata] no year for {job["title"]}: {exc}', file=sys.stderr, flush=True)
-        movie_year = ''
-    destination = verified_transfer(
-        mp4_path, cfg['plex_path'], job['title'], existing_path,
-        progress_callback=transfer_progress, year=movie_year,
-    )
+    if episode:
+        destination = verified_episode_transfer(
+            mp4_path, library_root, job['title'], episode['season'],
+            episode['episode'], episode['title'], existing_path,
+            progress_callback=transfer_progress,
+        )
+    else:
+        try:
+            movie_year = api.movie_year(job['title'])
+        except Exception as exc:
+            print(f'[metadata] no year for {job["title"]}: {exc}', file=sys.stderr, flush=True)
+            movie_year = ''
+        destination = verified_transfer(
+            mp4_path, library_root, job['title'], existing_path,
+            progress_callback=transfer_progress, year=movie_year,
+        )
     api.heartbeat(job['id'], 'done', file=str(mp4_path), quality_decision=decision,
-                  result={**quality, 'plex_path': str(destination)})
+                  result={**quality, 'plex_path': str(destination),
+                          'content_type': 'episode' if episode else 'movie'})
     try:
         ts_path.unlink()
     except FileNotFoundError:
