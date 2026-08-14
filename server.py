@@ -1861,6 +1861,9 @@ def api_prog_info():
     year     = request.args.get('year', '').strip()
     desc     = request.args.get('desc', '').strip()
     category = request.args.get('category', '').strip().lower()
+    content_type = request.args.get('content_type', '').strip().lower()
+    if content_type not in ('movie', 'series'):
+        content_type = ''
     if not title:
         return jsonify({'error': 'No title'}), 400
 
@@ -1879,7 +1882,7 @@ def api_prog_info():
             year = m.group(2)
 
     # Try to extract year from description (e.g. "Steve McQueen stars in this 1968 thriller")
-    if not year and desc:
+    if not year and desc and content_type != 'series':
         ym = _re.search(r'\b(19[3-9]\d|20[0-2]\d)\b', desc)
         if ym:
             year = ym.group(1)
@@ -1926,9 +1929,16 @@ def api_prog_info():
                     'imdb_rating': od.get('imdbRating',''),
                     'imdb_votes':  od.get('imdbVotes',''),
                     'imdb_id':     od.get('imdbID',''),
+                    'media_type':  od.get('Type',''),
                 }
 
-            if year:
+            if content_type == 'series':
+                url = f'http://www.omdbapi.com/?t={q}&type=series&apikey={omdb_key}'
+                with urlreq.urlopen(url, timeout=5) as resp:
+                    od = json.loads(resp.read())
+                if od.get('Response') == 'True':
+                    return jsonify(_omdb_result(od))
+            elif year:
                 # Year known — direct lookup is reliable
                 url = f'http://www.omdbapi.com/?t={q}&y={year}&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
@@ -1937,7 +1947,8 @@ def api_prog_info():
                     return jsonify(_omdb_result(od))
             else:
                 # No year — search for all versions, then pick best by description match
-                url = f'http://www.omdbapi.com/?s={q}&type=movie&apikey={omdb_key}'
+                kind = content_type or 'movie'
+                url = f'http://www.omdbapi.com/?s={q}&type={kind}&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     sr = json.loads(resp.read())
                 hits = sr.get('Search', [])
@@ -2070,6 +2081,41 @@ def api_airings():
             ORDER BY start_utc
             LIMIT 30
         ''', (title, clean_title, now_utc)).fetchall()
+        # A PrimeStreams/XMLTV listing can omit episode data while its matching
+        # Schedules Direct row has it.  Carry that detail across by title and
+        # nearby start time so the visible, recordable airing is correctly
+        # labelled and can be filed in Plex as a TV episode.
+        enriched_rows = []
+        for row in rows:
+            item = dict(row)
+            if item['season_num'] is None or item['episode_num'] is None:
+                airing_time = datetime.strptime(
+                    item['start_utc'], '%Y%m%d%H%M%S'
+                ).replace(tzinfo=timezone.utc)
+                window_start = (airing_time - timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+                window_end = (airing_time + timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+                details = conn.execute('''
+                    SELECT episode_title, season_num, episode_num, start_utc, prog_type
+                    FROM guide
+                    WHERE lower(title)=lower(?)
+                      AND season_num IS NOT NULL AND episode_num IS NOT NULL
+                      AND start_utc BETWEEN ? AND ?
+                ''', (clean_title, window_start, window_end)).fetchall()
+                detail = min(
+                    details,
+                    key=lambda candidate: abs(
+                        datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S')
+                        .replace(tzinfo=timezone.utc).timestamp() - airing_time.timestamp()
+                    ),
+                    default=None,
+                )
+                if detail:
+                    item['episode_title'] = detail['episode_title'] or item['episode_title']
+                    item['season_num'] = detail['season_num']
+                    item['episode_num'] = detail['episode_num']
+                    item['prog_type'] = item['prog_type'] or detail['prog_type'] or ''
+            enriched_rows.append(item)
+        rows = enriched_rows
         conn.close()
     except Exception:
         return jsonify({'airings': []})
@@ -4044,6 +4090,32 @@ async function openProg(p) {
     const ar = await (await fetch(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`)).json();
     if (ar.airings && ar.airings.length > 0) {
       const isSeries = !!ar.is_series;
+      // A title can be both a movie and a TV series (for example Bewitched).
+      // Once the guide confirms this is a series, refresh the artwork/details
+      // explicitly as a series instead of leaving a same-named movie selected.
+      if (isSeries && info.media_type !== 'series') {
+        try {
+          const seriesParams = new URLSearchParams({title: p.title, content_type: 'series'});
+          const seriesResponse = await fetch(`/epg-web/api/prog-info?${seriesParams}`);
+          if (seriesResponse.ok) {
+            info = await seriesResponse.json();
+            document.getElementById('pm-title').textContent = info.title || p.title;
+            document.getElementById('pm-plot').textContent = info.plot || p.desc || p.category || '';
+            document.getElementById('pm-year').textContent = info.year || '';
+            document.getElementById('pm-rated').textContent = info.rated || '';
+            document.getElementById('pm-genre').textContent = info.genre || '';
+            document.getElementById('pm-imdb').textContent = info.imdb_rating ? '★ ' + info.imdb_rating : '';
+            document.getElementById('pm-actors').textContent = info.actors ? '🎭 ' + info.actors : '';
+            document.getElementById('pm-director').textContent = info.director ? '🎬 ' + info.director : '';
+            if (info.imdb_id) { imdbLink.href = 'https://www.imdb.com/title/' + info.imdb_id + '/'; imdbLink.style.display = ''; }
+            if (info.poster) { posterEl.src = info.poster; posterEl.style.display = 'block'; posterWrap.style.display = 'block'; }
+          }
+        } catch(e) {}
+      }
+      if (isSeries && !epParts.length) {
+        epEl.textContent = 'Episode detail not provided for this airing';
+        epEl.style.display = '';
+      }
       const batchBtn = document.getElementById('pm-series-btn');
       batchBtn.style.display = isSeries ? '' : 'none';
       batchBtn.disabled = false;

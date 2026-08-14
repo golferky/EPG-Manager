@@ -101,6 +101,42 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(data["airings"][0]["channel_name"], "MGM+ Hits HD")
             self.assertTrue(data["airings"][0]["can_record"])
 
+    def test_airings_inherit_episode_data_from_matching_sd_listing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            conn = sqlite3.connect(guide_db)
+            for column, typedef in (
+                ("episode_title", "TEXT"), ("season_num", "INTEGER"),
+                ("episode_num", "INTEGER"), ("prog_type", "TEXT"),
+            ):
+                conn.execute(f"ALTER TABLE guide ADD COLUMN {column} {typedef}")
+            conn.executemany(
+                """INSERT INTO guide
+                   (title,channel_id,channel_name,start_utc,end_utc,episode_title,
+                    season_num,episode_num,prog_type)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                [
+                    ("Bewitched", "fetv.us", "FAMILY ENTERTAINMENT TELEVISION",
+                     "20990812165000", "20990812172500", "", None, None, ""),
+                    ("Bewitched", "93195", "Family Entertainment Television",
+                     "20990812165000", "20990812172500",
+                     "The Short Happy Circuit of Aunt Clara", 3, 9, "EP"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            with mock.patch.object(server, "load_config", return_value={
+                "guide_db_path": guide_db, "timezone": "America/New_York"
+            }), mock.patch.object(server, "_stream_url", return_value=(
+                "private-url", None, {"matched_guide_channel": "fetv.us"}
+            )):
+                response = server.app.test_client().get("/epg-web/api/airings?title=Bewitched")
+            data = response.get_json()
+            self.assertTrue(data["is_series"])
+            self.assertEqual(data["airings"][0]["season_num"], 3)
+            self.assertEqual(data["airings"][0]["episode_num"], 9)
+
     def test_movie_ui_hides_recurring_batch_action(self):
         self.assertIn("batchBtn.style.display = isSeries ? '' : 'none';", server.HTML)
         self.assertNotIn("Record Series", server.HTML)
