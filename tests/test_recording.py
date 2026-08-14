@@ -64,6 +64,18 @@ class RecordingTests(unittest.TestCase):
             self.assertIn("mgmhits.us", mapped)
             self.assertIn("67929", mapped)
 
+    def test_plex_episode_index_uses_show_season_episode_filename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            episode = os.path.join(
+                temp, "Dutton Ranch", "Season 01",
+                "Dutton Ranch - S01E02 - Earn Another Day.mp4",
+            )
+            os.makedirs(os.path.dirname(episode))
+            open(episode, "wb").close()
+            server._plex_episode_cache.update({"root": "", "loaded_at": 0, "episodes": set()})
+            episodes = server._plex_episode_keys(temp)
+            self.assertIn("duttonranch|1|2", episodes)
+
     def test_airings_merge_hd_duplicate_and_identify_movie(self):
         with tempfile.TemporaryDirectory() as temp:
             guide_db = os.path.join(temp, "guide.db")

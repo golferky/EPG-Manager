@@ -476,6 +476,7 @@ def load_epg(path, tz_str='America/New_York'):
 _convs = {}   # conv_id -> {file, status, progress, log, pid}
 _conv_lock = threading.Lock()
 _plex_info_cache = {}  # norm_title -> ffprobe result dict
+_plex_episode_cache = {'root': '', 'loaded_at': 0, 'episodes': set()}
 
 def _run_conv(conv_id, inp, out):
     cmd = ['ffmpeg', '-y', '-i', inp,
@@ -1767,6 +1768,45 @@ def api_plex_titles():
                 titles.append(clean)
     return jsonify({'titles': titles})
 
+def _plex_tv_path(cfg):
+    return cfg.get('plex_tv_path') or os.path.join(
+        os.path.dirname(cfg.get('plex_path', '/Volumes/Plex/Movies')), 'TV Shows'
+    )
+
+def _norm_plex_show(value):
+    return re.sub(r'[^a-z0-9]', '', (value or '').lower())
+
+def _plex_episode_keys(tv_root):
+    """Return cached show|season|episode keys from Plex's TV Shows layout."""
+    now = time.time()
+    if (_plex_episode_cache['root'] == tv_root and
+            now - _plex_episode_cache['loaded_at'] < 300):
+        return _plex_episode_cache['episodes']
+    episodes = set()
+    if os.path.isdir(tv_root):
+        ep_re = re.compile(r'\bS(\d{1,2})E(\d{1,3})\b', re.I)
+        try:
+            for show in os.scandir(tv_root):
+                if not show.is_dir() or show.name.startswith('.'):
+                    continue
+                show_key = _norm_plex_show(show.name)
+                for root, _dirs, files in os.walk(show.path):
+                    for filename in files:
+                        if os.path.splitext(filename)[1].lower() not in {'.mp4', '.mkv', '.m4v'}:
+                            continue
+                        match = ep_re.search(filename)
+                        if match:
+                            episodes.add(f'{show_key}|{int(match.group(1))}|{int(match.group(2))}')
+        except OSError:
+            pass
+    _plex_episode_cache.update({'root': tv_root, 'loaded_at': now, 'episodes': episodes})
+    return episodes
+
+@app.route('/epg-web/api/plex/episodes')
+def api_plex_episodes():
+    cfg = load_config()
+    return jsonify({'episodes': sorted(_plex_episode_keys(_plex_tv_path(cfg)))})
+
 @app.route('/epg-web/api/plex/info')
 def api_plex_info():
     title = request.args.get('title', '').strip()
@@ -2542,6 +2582,14 @@ def api_record():
     channel_id = data.get('channel_id', '')
     start_ts   = float(data.get('start_ts', time.time()))
     stop_ts    = float(data.get('stop_ts', time.time() + 3600))
+    episode_title = str(data.get('episode_title', '') or '').strip()
+    season_num = data.get('season_num')
+    episode_num = data.get('episode_num')
+    try:
+        season_num = int(season_num) if season_num is not None else None
+        episode_num = int(episode_num) if episode_num is not None else None
+    except (TypeError, ValueError):
+        season_num = episode_num = None
     rec_id     = str(uuid.uuid4())[:8]
     cfg2        = load_config()
     guide_db    = cfg2.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
@@ -2632,6 +2680,9 @@ def api_record():
         'file':       None,
         'backend':    _recording_backend(),
         'stream_id':  '',
+        'episode_title': episode_title,
+        'season_num': season_num,
+        'episode_num': episode_num,
     }
     _url, stream_error, stream_debug = _stream_url(channel_id)
     if stream_error:
@@ -3728,6 +3779,7 @@ document.addEventListener('click', e => {
 });
 
 let _plexTitles = new Set();
+let _plexEpisodes = new Set();
 function _normTitle(t) {
   return (t||'').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
 }
@@ -3744,6 +3796,14 @@ async function loadPlexTitles() {
   } catch(e) { _plexTitlesReady = true; }
 }
 _plexTitlesPromise = loadPlexTitles();
+async function loadPlexEpisodes() {
+  try {
+    const r = await fetch('/epg-web/api/plex/episodes');
+    const d = await r.json();
+    _plexEpisodes = new Set(d.episodes || []);
+  } catch(e) {}
+}
+const _plexEpisodesPromise = loadPlexEpisodes();
 
 // key: channel_id+'|'+start_ts → 'recording'|'queued'|'scheduled'|...
 let _guideRecMap = {};
@@ -3771,7 +3831,9 @@ async function quickRecord(key, btnEl) {
     const r = await fetch('/epg-web/api/record', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({title: p.title, channel_id: p.channel_id,
-                            start_ts: p.start_ts, stop_ts: p.stop_ts})
+                            start_ts: p.start_ts, stop_ts: p.stop_ts,
+                            episode_title: p.episode_title || '',
+                            season_num: p.season_num, episode_num: p.episode_num})
     });
     const d = await r.json();
     if (d.ok && !d.error) {
@@ -3802,6 +3864,7 @@ async function playPlex(title) {
 let _chIdFilter = '';
 async function fetchAndRenderGuide() {
   if (!_plexTitlesReady && _plexTitlesPromise) await _plexTitlesPromise;
+  if (_plexEpisodesPromise) await _plexEpisodesPromise;
   const params = new URLSearchParams();
   if (_guideWindowStart) params.set('start', _guideWindowStart);
   params.set('hours', _guideHours);
@@ -3895,6 +3958,9 @@ function renderGuide() {
       const isNow  = p.start_ts <= nowTs && p.stop_ts > nowTs;
       const pd = JSON.stringify(p).replace(/'/g, "\\'");
       const hasPlex   = _plexTitles.has(_plexNorm(p.title));
+      const plexEpisodeKey = (p.season_num != null && p.episode_num != null)
+        ? `${_normTitle(p.title).replace(/\s/g,'')}|${p.season_num}|${p.episode_num}` : '';
+      const hasPlexEpisode = !!plexEpisodeKey && _plexEpisodes.has(plexEpisodeKey);
       const recKey    = (p.channel_id||'') + '|' + Math.round(p.start_ts);
       const recSt     = _guideRecMap[recKey] || '';
       const isRecording = recSt === 'recording';
@@ -3905,21 +3971,22 @@ function renderGuide() {
       const cachedQ   = hasPlex && _plexInfoCache[normKey] ? _resLabel(_plexInfoCache[normKey]) : '';
       const plexBtn   = hasPlex ? `<span class="plex-play-btn" title="Play in VLC" data-ptitle="${esc(p.title)}" onclick="event.stopPropagation();playPlex(this.dataset.ptitle)">▶</span><span class="plex-qual" data-qtitle="${esc(p.title)}" id="pq-${normKey.replace(/[^a-z0-9]/g,'')}">${cachedQ}</span>` : '';
       const recBtnEl  = (!hasPlex && !isRecording && !isScheduled)
-                        ? `<span class="rec-btn" title="Record" data-rkey="${esc(recKey2)}" onclick="event.stopPropagation();quickRecord(this.dataset.rkey,this)">⏺</span>` : '';
+                        ? `<span class="rec-btn" title="${hasPlexEpisode?'Re-record this Plex episode':'Record'}" data-rkey="${esc(recKey2)}" onclick="event.stopPropagation();quickRecord(this.dataset.rkey,this)">${hasPlexEpisode?'↻':'⏺'}</span>` : '';
       const isMovie  = p.prog_type === 'MV' || (!p.prog_type && /\(\d{4}\)\s*$/.test(p.title));
       const isSeries = !isMovie && (p.prog_type === 'EP' || p.prog_type === 'SH' || p.season_num != null || (p.episode_title && p.episode_title.length > 0));
       const catI    = isMovie  ? {cls:'cat-movie',  badge:'MOV', title:'Movie'}
                     : isSeries ? {cls:'cat-series', badge:'TV', title:'Series'}
                     : _catInfo(p.category || '');
       const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
-      const badges    = (isRecording ? '<span class="rec-dot" title="Recording now">⏺</span>' : '')
+      const badges    = (hasPlexEpisode ? '<span class="plex-qual" title="Episode already in Plex" style="color:#a78bfa;">IN PLEX</span>' : '')
+                      + (isRecording ? '<span class="rec-dot" title="Recording now">⏺</span>' : '')
                       + (isScheduled ? '<span class="sched-dot" title="Scheduled to record">⏱</span>' : '')
                       + plexBtn + recBtnEl;
       const epParts = [];
       if (p.season_num != null) epParts.push(`S${p.season_num}${p.episode_num != null ? 'E'+p.episode_num : ''}`);
       if (p.episode_title) epParts.push(p.episode_title);
       const epLine = epParts.join(' · ');
-      progHTML += `<div class="prog-block${isNow?' now':''}${hasPlex?' in-plex':''}${catI.cls?' '+catI.cls:''}"
+      progHTML += `<div class="prog-block${isNow?' now':''}${(hasPlex || hasPlexEpisode)?' in-plex':''}${catI.cls?' '+catI.cls:''}"
         style="left:${left}px;width:${width}px;"
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
@@ -4251,13 +4318,16 @@ async function openProg(p) {
           const scheduled = window._airingsRecMap[key];
           const epInfo = (a.season_num != null ? `S${a.season_num}${a.episode_num != null ? 'E'+a.episode_num : ''}` : '') +
                          (a.episode_title ? (a.season_num != null ? ' · ' : '') + a.episode_title : '');
+          const episodeKey = (a.season_num != null && a.episode_num != null)
+            ? `${_normTitle(p.title).replace(/\s/g,'')}|${a.season_num}|${a.episode_num}` : '';
+          const inPlex = !!episodeKey && _plexEpisodes.has(episodeKey);
           return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
             <span style="color:#64748b;flex:1;">${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)
-                ? `<button class="btn btn-primary btn-sm" onclick="recordAiring(${JSON.stringify(a).replace(/"/g,'&quot;')},${JSON.stringify(p.title).replace(/"/g,'&quot;')})">⏱</button>`
+                ? `<button class="btn btn-primary btn-sm" title="${inPlex?'Re-record this Plex episode':'Record'}" onclick="recordAiring(${JSON.stringify(a).replace(/"/g,'&quot;')},${JSON.stringify(p.title).replace(/"/g,'&quot;')})">${inPlex?'↻ Re-record':'⏱'}</button>`
                 : ``
             }
           </div>`;
@@ -4618,6 +4688,9 @@ async function recordAiring(airing, title) {
     channel_id: airing.channel_id,
     start_ts:   airing.start_ts,
     stop_ts:    airing.stop_ts,
+    episode_title: airing.episode_title || '',
+    season_num: airing.season_num,
+    episode_num: airing.episode_num,
   });
   if (r.ok) {
     btn.textContent = '✅ Scheduled';
