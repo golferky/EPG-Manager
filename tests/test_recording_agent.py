@@ -91,6 +91,25 @@ class QualityDecisionTests(unittest.TestCase):
         self.assertEqual(result, 0)
         process.terminate.assert_not_called()
 
+    @mock.patch("recording_agent.process_job")
+    @mock.patch("recording_agent.AgentAPI")
+    def test_agent_claims_multiple_jobs_up_to_worker_limit(self, agent_class, process_job):
+        api = agent_class.return_value
+        api.health.return_value = {"recording_backend": "agent"}
+        api.claim.side_effect = [
+            {"id": "one", "title": "First"},
+            {"id": "two", "title": "Second"},
+            None,
+        ]
+        cfg = {
+            "claim_ahead_seconds": 300,
+            "max_concurrent_recordings": 2,
+            "poll_seconds": 0,
+        }
+        recording_agent.run_agent(cfg, once=True)
+        self.assertEqual(process_job.call_count, 2)
+        self.assertEqual(api.claim.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
