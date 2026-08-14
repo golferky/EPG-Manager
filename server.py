@@ -1128,7 +1128,9 @@ def api_guide():
     fav_only   = request.args.get('fav', '0') == '1'
     movie_only = request.args.get('movie', '0') == '1'
     ps_only    = request.args.get('ps',  '0') == '1'
+    ps_episode_only = request.args.get('ps_episode', '0') == '1'
     sd_only    = request.args.get('sd',  '0') == '1'
+    ps_only = ps_only or ps_episode_only
 
     # Build allowed channel set from Movies.db if filtering
     allowed_ch_ids = None
@@ -1162,6 +1164,8 @@ def api_guide():
         if p['stop_ts'] <= ws_ts or p['start_ts'] >= we_ts:
             continue
         if allowed_ch_ids is not None and p['channel_id'] not in allowed_ch_ids:
+            continue
+        if ps_episode_only and (p.get('season_num') is None or p.get('episode_num') is None):
             continue
         if excluded_ch_ids is not None and p['channel_id'] in excluded_ch_ids:
             continue
@@ -3048,6 +3052,7 @@ tr:hover td{background:#141414;}
       <option value="fav">★ Favorites</option>
       <option value="movie">🎬 Movie Channels</option>
       <option value="ps">📡 PrimeStreams Only</option>
+      <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
     </select>
     <div style="position:relative;display:inline-block;">
@@ -3733,6 +3738,7 @@ async function fetchAndRenderGuide() {
   if (mode === 'fav')   params.set('fav',   '1');
   if (mode === 'movie') params.set('movie', '1');
   if (mode === 'ps')    params.set('ps',    '1');
+  if (mode === 'ps_episode') params.set('ps_episode', '1');
   if (mode === 'sd')    params.set('sd',    '1');
   params.set('ch_offset', _chOffset);
   try {
