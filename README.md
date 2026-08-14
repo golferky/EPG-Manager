@@ -91,6 +91,9 @@ Run continuously:
 python recording_agent.py --config recording_agent.json
 ```
 
+`max_concurrent_recordings` defaults to 6. Each claimed job has its own FFmpeg
+worker, so overlapping and back-to-back programs can record at the same time.
+
 Before recording, the agent probes the incoming stream and any matching Plex
 copy. It records when Plex has no copy or the incoming stream is materially
 better. Completed MP4 files are copied as `.partial`, size-verified, and renamed

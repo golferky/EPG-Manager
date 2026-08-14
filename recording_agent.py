@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,12 +40,19 @@ def load_config(path):
     cfg.setdefault('heartbeat_seconds', 20)
     cfg.setdefault('lease_seconds', 90)
     cfg.setdefault('claim_ahead_seconds', 300)
+    cfg.setdefault('max_concurrent_recordings', 6)
     cfg.setdefault('local_recordings', os.path.expanduser('~/Movies/Recordings'))
     cfg.setdefault('plex_path', '/Volumes/Plex/Movies')
     cfg.setdefault('ffmpeg', 'ffmpeg')
     cfg.setdefault('ffprobe', 'ffprobe')
     cfg.setdefault('transfer_retry_seconds', 30)
     cfg.setdefault('transfer_wait_timeout', 86400)
+    try:
+        cfg['max_concurrent_recordings'] = max(
+            1, min(int(cfg['max_concurrent_recordings']), 16)
+        )
+    except (TypeError, ValueError):
+        cfg['max_concurrent_recordings'] = 6
     return cfg
 
 
@@ -449,24 +457,45 @@ def process_job(api, job, cfg):
     print(f'[done] {job["title"]} → {destination}', flush=True)
 
 
+def _run_claimed_job(api, job, cfg):
+    """Run one independent recording lifecycle in its own worker thread."""
+    try:
+        process_job(api, job, cfg)
+    except Exception as exc:
+        try:
+            api.heartbeat(job['id'], 'failed', message=str(exc))
+        except Exception:
+            pass
+        print(f'[error] {job["title"]}: {exc}', file=sys.stderr, flush=True)
+
+
 def run_agent(cfg, once=False):
     api = AgentAPI(cfg)
     health = api.health()
-    print(f'[agent] connected; server backend={health.get("recording_backend")}', flush=True)
+    max_workers = cfg['max_concurrent_recordings']
+    print(f'[agent] connected; server backend={health.get("recording_backend")}; '
+          f'max recordings={max_workers}', flush=True)
+    active = {}
     while True:
         try:
-            job = api.claim(cfg['claim_ahead_seconds'])
-            if job:
-                print(f'[claim] {job["title"]} ({job["id"]})', flush=True)
-                try:
-                    process_job(api, job, cfg)
-                except Exception as exc:
-                    try:
-                        api.heartbeat(job['id'], 'failed', message=str(exc))
-                    except Exception:
-                        pass
-                    print(f'[error] {job["title"]}: {exc}', file=sys.stderr, flush=True)
-            elif once:
+            # Drop completed workers, then fill every available recording slot.
+            active = {job_id: worker for job_id, worker in active.items()
+                      if worker.is_alive()}
+            while len(active) < max_workers:
+                job = api.claim(cfg['claim_ahead_seconds'])
+                if not job:
+                    break
+                job_id = job['id']
+                print(f'[claim] {job["title"]} ({job_id})', flush=True)
+                worker = threading.Thread(
+                    target=_run_claimed_job, args=(api, job, cfg), daemon=True,
+                    name=f'epg-record-{job_id}',
+                )
+                active[job_id] = worker
+                worker.start()
+            if once:
+                for worker in list(active.values()):
+                    worker.join()
                 return
         except Exception as exc:
             print(f'[agent] poll error: {exc}', file=sys.stderr, flush=True)
