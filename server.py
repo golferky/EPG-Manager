@@ -2347,26 +2347,16 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         return 1
 
     ep_best = {}   # (sn, en) → row with best channel quality
-    no_ep   = []   # rows with no S/E info (record all, dedup by start_utc)
-    seen_starts = set()
     for r in rows:
         sn, en = r['season_num'], r['episode_num']
         if sn is not None and en is not None:
             key = (sn, en)
             if key not in ep_best or _ch_quality(r['channel_name']) > _ch_quality(ep_best[key]['channel_name']):
                 ep_best[key] = r
-        else:
-            # No episode info — dedup by start time window (±5 min)
-            try:
-                ts = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
-                slot = round(ts / 300)  # 5-min bucket
-                if slot not in seen_starts:
-                    seen_starts.add(slot)
-                    no_ep.append(r)
-            except Exception:
-                pass
-
-    best_rows = list(ep_best.values()) + no_ep
+    # Batch series recording is deliberately limited to identified episodes.
+    # Airings without S/E data remain visible for an intentional one-off
+    # recording, but are never silently filed as a generic movie.
+    best_rows = list(ep_best.values())
 
     with _rec_lock:
         existing_keys = {(r['channel_id'], r['start_ts']) for r in _recs.values()
@@ -3140,7 +3130,7 @@ tr:hover td{background:#141414;}
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
           <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📡 PrimeStreams Airings</span>
-          <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record All</button>
+          <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Identified Episodes</button>
           <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unscheduled Only</button>
         </div>
         <div id="pm-airings-list" style="max-height:160px;overflow-y:auto;"></div>
@@ -4119,7 +4109,7 @@ async function openProg(p) {
       const batchBtn = document.getElementById('pm-series-btn');
       batchBtn.style.display = isSeries ? '' : 'none';
       batchBtn.disabled = false;
-      batchBtn.textContent = '📺 Record All';
+      batchBtn.textContent = '📺 Record Identified Episodes';
       const recMap = {};
       Object.values(recStatus.recordings || {}).forEach(r => {
         if (['queued','scheduled','recording'].includes(r.status))
@@ -4173,14 +4163,14 @@ async function openProg(p) {
         const list = window._showUnrecordedOnly
           ? window._allAirings.filter(a => !window._airingsRecMap[a.channel_id+'|'+a.start_ts] && !a.on_now)
           : window._allAirings;
-        document.getElementById('pm-airings-list').innerHTML = list.map(a => {
+        const renderRows = (items, unidentified=false) => items.map(a => {
           const key = a.channel_id + '|' + a.start_ts;
           const scheduled = window._airingsRecMap[key];
           const epInfo = (a.season_num != null ? `S${a.season_num}${a.episode_num != null ? 'E'+a.episode_num : ''}` : '') +
                          (a.episode_title ? (a.season_num != null ? ' · ' : '') + a.episode_title : '');
           return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-            <span style="color:#64748b;flex:1;">${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : ''}</span>
+            <span style="color:#64748b;flex:1;">${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)
@@ -4188,7 +4178,21 @@ async function openProg(p) {
                 : ``
             }
           </div>`;
-        }).join('') || '<div style="color:#64748b;font-size:12px;padding:8px 0;">No airings match</div>';
+        }).join('');
+        if (!list.length) {
+          document.getElementById('pm-airings-list').innerHTML = '<div style="color:#64748b;font-size:12px;padding:8px 0;">No airings match</div>';
+          return;
+        }
+        if (!isSeries) {
+          document.getElementById('pm-airings-list').innerHTML = renderRows(list);
+          return;
+        }
+        const identified = list.filter(a => a.season_num != null && a.episode_num != null);
+        const unidentified = list.filter(a => !(a.season_num != null && a.episode_num != null));
+        const heading = label => `<div style="padding:10px 0 4px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;">${label}</div>`;
+        document.getElementById('pm-airings-list').innerHTML =
+          (identified.length ? heading('Episodes with S/E data') + renderRows(identified) : '') +
+          (unidentified.length ? heading('Airings without S/E data') + renderRows(unidentified, true) : '');
       }
       window.toggleUnrecorded = function() {
         window._showUnrecordedOnly = !window._showUnrecordedOnly;
@@ -4286,12 +4290,12 @@ async function recordSeries() {
   btn.disabled = true; btn.textContent = '⏳ Scheduling…';
   const r = await post('/epg-web/api/record/series', {title});
   if (r.ok) {
-    btn.textContent = `✅ All (${r.scheduled})`;
-    document.getElementById('pm-status').textContent = `📺 Recurring recording set for "${title}" — ${r.scheduled} airings queued`;
+    btn.textContent = `✅ Episodes (${r.scheduled})`;
+    document.getElementById('pm-status').textContent = `📺 Recurring recording set for "${title}" — ${r.scheduled} identified episodes queued`;
     document.getElementById('pm-status').className = 'status-msg ok';
     loadSeriesRecordings();
   } else {
-    btn.disabled = false; btn.textContent = '📺 Record All';
+    btn.disabled = false; btn.textContent = '📺 Record Identified Episodes';
     document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
     document.getElementById('pm-status').className = 'status-msg err';
   }
