@@ -257,6 +257,12 @@ def ensure_guide_db(db_path):
         )
     ''')
     conn.execute('''
+        CREATE TABLE IF NOT EXISTS channel_favorites (
+            channel_id TEXT PRIMARY KEY,
+            favorite INTEGER NOT NULL DEFAULT 1
+        )
+    ''')
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS series_recordings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT UNIQUE,
@@ -1136,6 +1142,15 @@ def api_guide():
     allowed_ch_ids = None
     guide_db_path  = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
     movies_db_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+    try:
+        gconn = sqlite3.connect(guide_db_path)
+        guide_favorites = {r[0] for r in gconn.execute(
+            'SELECT channel_id FROM channel_favorites WHERE favorite=1'
+        ).fetchall()}
+        gconn.close()
+    except Exception:
+        guide_favorites = set()
+    movie_favorites = set()
     if fav_only or movie_only or ps_only:
         if ps_only and not fav_only and not movie_only:
             allowed_ch_ids = get_ps_channel_ids(guide_db_path, movies_db_path)
@@ -1149,7 +1164,19 @@ def api_guide():
                     'guide_channel IS NOT NULL AND guide_channel != ""'
             rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
             direct_ids = {r['guide_channel'] for r in rows}
-            allowed_ch_ids = set(direct_ids)
+            if fav_only:
+                movie_favorites = set(direct_ids)
+                allowed_ch_ids = set(direct_ids) | guide_favorites
+            else:
+                allowed_ch_ids = set(direct_ids)
+    elif guide_favorites:
+        # Needed only to annotate normal guide rows with their star state.
+        movie_favorites = set()
+
+    if not movie_favorites:
+        movie_favorites = {r['guide_channel'] for r in db_rows(
+            'SELECT guide_channel FROM channels WHERE favorite=1 AND guide_channel IS NOT NULL'
+        )}
 
     # For SD-only: channels NOT in Movies.db (no stream_id)
     excluded_ch_ids = None
@@ -1231,7 +1258,11 @@ def api_guide():
         canon = id_to_canonical.get(c['id'], c['id'])
         if canon not in seen_ids:
             seen_ids.add(canon)
-            ordered_channels.append({'id': canon, 'name': c['name'], 'icon': c.get('icon',''), 'no_data': c.get('no_data', False)})
+            ordered_channels.append({
+                'id': canon, 'name': c['name'], 'icon': c.get('icon',''),
+                'no_data': c.get('no_data', False),
+                'favorite': canon in guide_favorites or canon in movie_favorites,
+            })
 
     ch_offset = int(request.args.get('ch_offset', 0))
     ch_cap    = 200
@@ -1393,21 +1424,41 @@ def api_search():
 @app.route('/epg-web/api/channel/favorite', methods=['POST'])
 def api_toggle_favorite():
     data = request.json or {}
-    channel_id = data.get('channel_id', '')
+    channel_id = str(data.get('channel_id', '')).strip()
     if not channel_id:
         return jsonify({'error': 'no channel_id'}), 400
     cfg = load_config()
+    guide_db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
     mdb_path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
     try:
-        mconn = sqlite3.connect(mdb_path)
-        row = mconn.execute('SELECT favorite FROM channels WHERE guide_channel=?', (channel_id,)).fetchone()
-        if row is None:
+        ensure_guide_db(guide_db_path)
+        gconn = sqlite3.connect(guide_db_path)
+        row = gconn.execute(
+            'SELECT favorite FROM channel_favorites WHERE channel_id=?', (channel_id,)
+        ).fetchone()
+        # Preserve the existing Movies.db favourite state when this is the
+        # first time a legacy channel is toggled from the guide.
+        legacy_fav = False
+        try:
+            mconn = sqlite3.connect(mdb_path)
+            mrow = mconn.execute(
+                'SELECT favorite FROM channels WHERE guide_channel=?', (channel_id,)
+            ).fetchone()
+            legacy_fav = bool(mrow and mrow[0])
+            new_fav = 0 if (bool(row and row[0]) or (row is None and legacy_fav)) else 1
+            if mrow is not None:
+                mconn.execute('UPDATE channels SET favorite=? WHERE guide_channel=?', (new_fav, channel_id))
+                mconn.commit()
             mconn.close()
-            return jsonify({'error': 'channel not found'}), 404
-        new_fav = 0 if row[0] else 1
-        mconn.execute('UPDATE channels SET favorite=? WHERE guide_channel=?', (new_fav, channel_id))
-        mconn.commit()
-        mconn.close()
+        except Exception:
+            new_fav = 0 if bool(row and row[0]) else 1
+        gconn.execute(
+            'INSERT INTO channel_favorites(channel_id, favorite) VALUES(?,?) '
+            'ON CONFLICT(channel_id) DO UPDATE SET favorite=excluded.favorite',
+            (channel_id, new_fav),
+        )
+        gconn.commit()
+        gconn.close()
         return jsonify({'ok': True, 'favorite': bool(new_fav)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2894,6 +2945,10 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
           color:#94a3b8;border-right:1px solid #1e1e1e;position:sticky;left:0;
           background:#0d0d0d;z-index:5;white-space:nowrap;overflow:hidden;
           text-overflow:ellipsis;}
+.ch-name-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;flex:1;}
+.ch-name-label:hover{color:#60a5fa;text-decoration:underline;}
+.guide-ch-star{background:none;border:0;color:#475569;cursor:pointer;font-size:15px;line-height:1;padding:0 5px 0 0;}
+.guide-ch-star.is-fav{color:#f59e0b;}
 .prog-row{display:flex;flex:1;position:relative;height:42px;}
 .prog-block{position:absolute;top:2px;bottom:2px;border-radius:4px;
             background:#1a2744;border:1px solid #243460;border-left:3px solid #243460;overflow:hidden;
@@ -3609,6 +3664,25 @@ async function toggleFav(channelId, starEl) {
     starEl.style.color = d.favorite ? '#f59e0b' : '#475569';
   }
 }
+async function toggleGuideFav(event, channelId) {
+  event.stopPropagation();
+  const r = await fetch('/epg-web/api/channel/favorite', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({channel_id: channelId})
+  });
+  const d = await r.json();
+  if (d.ok && _guideData) {
+    const ch = (_guideData.channels || []).find(c => c.id === channelId);
+    if (ch) ch.favorite = d.favorite;
+    renderGuide();
+  }
+}
+function focusGuideChannel(channelId, channelName) {
+  _chIdFilter = channelId;
+  document.getElementById('ch-filter').value = channelName;
+  _chOffset = 0;
+  fetchAndRenderGuide();
+}
 async function searchOpenProg(title, episodeTitle, seasonNum, episodeNum) {
   // Strip year suffix e.g. "Minority Report (2002)" → "Minority Report"
   const baseTitle = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
@@ -3856,7 +3930,10 @@ function renderGuide() {
     }
     progHTML += '</div>';
     rowsHTML += `<div class="guide-row">
-      <div class="ch-name" title="${esc(ch.name)}">${esc(ch.name)}</div>
+      <div class="ch-name" title="${esc(ch.name)}" style="display:flex;align-items:center;">
+        <button class="guide-ch-star${ch.favorite?' is-fav':''}" title="${ch.favorite?'Remove from favorites':'Add to favorites'}" onclick="toggleGuideFav(event,${JSON.stringify(ch.id).replace(/"/g,'&quot;')})">${ch.favorite?'★':'☆'}</button>
+        <span class="ch-name-label" onclick="focusGuideChannel(${JSON.stringify(ch.id).replace(/"/g,'&quot;')},${JSON.stringify(ch.name).replace(/"/g,'&quot;')})">${esc(ch.name)}</span>
+      </div>
       ${progHTML}
     </div>`;
   }
