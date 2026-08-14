@@ -28,12 +28,14 @@ def _bootstrap():
             status TEXT DEFAULT "queued", failure_reason TEXT, file TEXT,
             created_at TEXT, backend TEXT DEFAULT "local", stream_id TEXT,
             agent_id TEXT, lease_until REAL, heartbeat_at REAL, updated_at TEXT,
+            episode_title TEXT, season_num INTEGER, episode_num INTEGER,
             quality_decision TEXT, result_json TEXT)''')
         for _col, _typedef in [
                 ('backend', 'TEXT DEFAULT "local"'), ('stream_id', 'TEXT'),
                 ('agent_id', 'TEXT'), ('lease_until', 'REAL'),
                 ('heartbeat_at', 'REAL'), ('updated_at', 'TEXT'),
-                ('quality_decision', 'TEXT'), ('result_json', 'TEXT')]:
+                ('quality_decision', 'TEXT'), ('result_json', 'TEXT'),
+                ('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER')]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -559,6 +561,9 @@ def _init_recordings_table():
             ('updated_at', 'TEXT'),
             ('quality_decision', 'TEXT'),
             ('result_json', 'TEXT'),
+            ('episode_title', 'TEXT'),
+            ('season_num', 'INTEGER'),
+            ('episode_num', 'INTEGER'),
         ]
         for column, typedef in migrations:
             try:
@@ -578,15 +583,19 @@ def _db_upsert_rec(rec_id, rec):
         conn.execute('PRAGMA busy_timeout=30000')
         conn.execute('''INSERT INTO recordings
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
-             status, failure_reason, file, created_at, backend, stream_id, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             status, failure_reason, file, created_at, backend, stream_id, updated_at,
+             episode_title, season_num, episode_num)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
               file=excluded.file,
               backend=excluded.backend,
               stream_id=excluded.stream_id,
-              updated_at=excluded.updated_at
+              updated_at=excluded.updated_at,
+              episode_title=excluded.episode_title,
+              season_num=excluded.season_num,
+              episode_num=excluded.episode_num
         ''', (
             rec_id,
             rec.get('title',''),
@@ -602,6 +611,9 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('backend', 'local'),
             rec.get('stream_id', ''),
             datetime.now(timezone.utc).isoformat(),
+            rec.get('episode_title', ''),
+            rec.get('season_num'),
+            rec.get('episode_num'),
         ))
         conn.commit()
         conn.close()
@@ -685,6 +697,8 @@ def _load_pending_recs():
                 'file':       r['file'] or None,
                 'backend':    'local',
                 'stream_id':  r['stream_id'] or '',
+                'episode_title': r['episode_title'] or '',
+                'season_num': r['season_num'], 'episode_num': r['episode_num'],
             }
             with _rec_lock:
                 _recs[rec_id] = rec
@@ -701,6 +715,8 @@ def _load_pending_recs():
                     'progress': 0, 'log': [], 'pid': None,
                     'file': r['file'] or None, 'backend': 'agent',
                     'stream_id': r['stream_id'] or '',
+                    'episode_title': r['episode_title'] or '',
+                    'season_num': r['season_num'], 'episode_num': r['episode_num'],
                 }
         if rows:
             print(f'[recdb] reloaded {len(rows)} pending recording(s)')
@@ -2228,7 +2244,8 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         conn = sqlite3.connect(guide_db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute('''
-            SELECT channel_id, channel_name, start_utc, end_utc, season_num, episode_num
+            SELECT channel_id, channel_name, start_utc, end_utc,
+                   episode_title, season_num, episode_num
             FROM guide
             WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
             AND start_utc > ? AND channel_id IN ({})
@@ -2236,6 +2253,40 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         '''.format(','.join('?' * len(recordable))),
             [title, clean_title, now_str] + list(recordable)
         ).fetchall()
+        # Some provider rows omit episode details while a duplicate guide row
+        # for the same airing contains them.  Match the closest such row so a
+        # series recording gets a Plex-ready season/episode filename.
+        enriched = []
+        for row in rows:
+            item = dict(row)
+            if item['season_num'] is None or item['episode_num'] is None:
+                airing_time = datetime.strptime(
+                    item['start_utc'], '%Y%m%d%H%M%S'
+                ).replace(tzinfo=timezone.utc)
+                window_start = (airing_time - timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+                window_end = (airing_time + timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+                details = conn.execute('''
+                    SELECT episode_title, season_num, episode_num
+                           ,start_utc
+                    FROM guide
+                    WHERE lower(title)=lower(?)
+                      AND season_num IS NOT NULL AND episode_num IS NOT NULL
+                      AND start_utc BETWEEN ? AND ?
+                ''', (clean_title, window_start, window_end)).fetchall()
+                detail = min(
+                    details,
+                    key=lambda candidate: abs(
+                        datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S')
+                        .replace(tzinfo=timezone.utc).timestamp() - airing_time.timestamp()
+                    ),
+                    default=None,
+                )
+                if detail:
+                    item['episode_title'] = detail['episode_title'] or item['episode_title']
+                    item['season_num'] = detail['season_num']
+                    item['episode_num'] = detail['episode_num']
+            enriched.append(item)
+        rows = enriched
         conn.close()
     except Exception as e:
         print(f'[series] query error: {e}')
@@ -2293,6 +2344,9 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 'start_ts': su.timestamp(), 'stop_ts': eu.timestamp(),
                 'status': 'queued', 'progress': 0, 'log': [], 'pid': None, 'file': None,
                 'backend': backend, 'stream_id': str(stream_debug.get('stream_id') or ''),
+                'episode_title': r.get('episode_title') or '',
+                'season_num': r.get('season_num'),
+                'episode_num': r.get('episode_num'),
             }
             if not _db_upsert_rec(rec_id, rec):
                 print(f'[series] could not persist recording {rec_id}; not scheduling')
@@ -2611,6 +2665,8 @@ def _agent_job_dict(row):
         'start_ts': row['start_ts'], 'stop_ts': row['stop_ts'],
         'status': row['status'], 'agent_id': row['agent_id'],
         'lease_until': row['lease_until'],
+        'episode_title': row['episode_title'] or '',
+        'season_num': row['season_num'], 'episode_num': row['episode_num'],
     }
 
 @app.route('/epg-web/api/agent/health')

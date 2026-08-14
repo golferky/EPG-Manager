@@ -61,6 +61,31 @@ class QualityDecisionTests(unittest.TestCase):
             self.assertEqual(destination.parent.name, "FX (1986)")
             self.assertEqual(destination.name, "FX.mp4")
 
+    def test_episode_transfer_uses_plex_tv_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"episode-data")
+            destination = recording_agent.verified_episode_transfer(
+                source, root / "TV Shows", "Dutton Ranch", 1, 2,
+                "Earn Another Day",
+            )
+            self.assertEqual(
+                destination.relative_to(root).as_posix(),
+                "TV Shows/Dutton Ranch/Season 01/"
+                "Dutton Ranch - S01E02 - Earn Another Day.mp4",
+            )
+            self.assertEqual(destination.read_bytes(), b"episode-data")
+
+    def test_episode_metadata_requires_season_and_episode(self):
+        self.assertEqual(
+            recording_agent.episode_metadata({
+                "season_num": 3, "episode_num": 9, "episode_title": "Test",
+            }),
+            {"season": 3, "episode": 9, "title": "Test"},
+        )
+        self.assertIsNone(recording_agent.episode_metadata({"season_num": 3}))
+
     def test_title_normalization_ignores_punctuation_and_year(self):
         self.assertEqual(
             recording_agent.normalized_title("Crazy, Stupid, Love. (2011)"),
