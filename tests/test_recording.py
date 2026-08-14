@@ -96,12 +96,13 @@ class RecordingTests(unittest.TestCase):
                 )
             data = response.get_json()
             self.assertEqual(data["prog_type"], "MV")
+            self.assertFalse(data["is_series"])
             self.assertEqual(len(data["airings"]), 1)
             self.assertEqual(data["airings"][0]["channel_name"], "MGM+ Hits HD")
             self.assertTrue(data["airings"][0]["can_record"])
 
     def test_movie_ui_hides_recurring_batch_action(self):
-        self.assertIn("batchBtn.style.display = isMovie ? 'none' : '';", server.HTML)
+        self.assertIn("batchBtn.style.display = isSeries ? '' : 'none';", server.HTML)
         self.assertNotIn("Record Series", server.HTML)
 
     def test_showtime_rebrand_channel_aliases(self):
@@ -117,6 +118,10 @@ class RecordingTests(unittest.TestCase):
             server._channel_match_base("SHO 2 HD"),
             server._channel_match_base("showtime2.us"),
         )
+
+    def test_airings_ui_lists_playable_rows_and_uses_series_flag(self):
+        self.assertIn("const isSeries = !!ar.is_series;", server.HTML)
+        self.assertIn("window._allAirings = ar.airings.filter(a => a.can_record);", server.HTML)
 
     def test_active_in_memory_recording_is_not_marked_stale(self):
         self.assertIn(
