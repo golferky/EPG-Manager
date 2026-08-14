@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -86,6 +87,13 @@ class AgentAPI:
         return self._request(
             'POST', f'/epg-web/api/agent/jobs/{job_id}/heartbeat', payload
         )
+
+    def movie_year(self, title):
+        """Ask the EPG server's cached guide/OMDb lookup for a movie year."""
+        path = '/epg-web/api/prog-info?' + urllib.parse.urlencode({'title': title})
+        info = self._request('GET', path)
+        match = re.search(r'\b(19\d{2}|20\d{2})\b', str(info.get('year', '')))
+        return match.group(1) if match else ''
 
 
 def safe_filename(value):
@@ -265,8 +273,9 @@ def plex_mount_available(plex_root, marker=''):
     return not marker or (root / marker).exists()
 
 
-def verified_transfer(source, plex_root, title, existing_path=None, progress_callback=None):
-    title_name, year = split_title_year(title)
+def verified_transfer(source, plex_root, title, existing_path=None, progress_callback=None, year=''):
+    title_name, title_year = split_title_year(title)
+    year = year or title_year
     if existing_path and Path(existing_path).suffix.lower() == '.mp4':
         destination = Path(existing_path)
     else:
@@ -422,9 +431,14 @@ def process_job(api, job, cfg):
         if response.get('cancel_requested'):
             raise RuntimeError('Transfer cancelled by user')
 
+    try:
+        movie_year = api.movie_year(job['title'])
+    except Exception as exc:
+        print(f'[metadata] no year for {job["title"]}: {exc}', file=sys.stderr, flush=True)
+        movie_year = ''
     destination = verified_transfer(
         mp4_path, cfg['plex_path'], job['title'], existing_path,
-        progress_callback=transfer_progress,
+        progress_callback=transfer_progress, year=movie_year,
     )
     api.heartbeat(job['id'], 'done', file=str(mp4_path), quality_decision=decision,
                   result={**quality, 'plex_path': str(destination)})

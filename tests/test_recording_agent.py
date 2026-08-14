@@ -48,6 +48,19 @@ class QualityDecisionTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"recording-data")
             self.assertFalse(destination.with_name(destination.name + ".partial").exists())
 
+    def test_transfer_uses_resolved_year_when_title_has_none(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"recording-data")
+            plex = root / "plex"
+            plex.mkdir()
+            destination = recording_agent.verified_transfer(
+                source, plex, "F/X", year="1986"
+            )
+            self.assertEqual(destination.parent.name, "FX (1986)")
+            self.assertEqual(destination.name, "FX.mp4")
+
     def test_title_normalization_ignores_punctuation_and_year(self):
         self.assertEqual(
             recording_agent.normalized_title("Crazy, Stupid, Love. (2011)"),
