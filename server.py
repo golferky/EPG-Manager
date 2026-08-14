@@ -2908,7 +2908,7 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .prog-block.cat-reality {background:#25102a;border-left-color:#ec4899;}
 .prog-block.cat-talk    {background:#231808;border-left-color:#f97316;}
 .prog-block.cat-scripted{background:#0e2418;border-left-color:#22c55e;}
-.cat-badge{font-size:10px;font-weight:700;letter-spacing:.04em;padding:2px 5px;border-radius:3px;
+.cat-badge{font-size:8px;font-weight:700;letter-spacing:.02em;line-height:1.2;padding:1px 3px;border-radius:2px;
            margin-right:4px;flex-shrink:0;opacity:1;}
 .prog-block.cat-sports  .cat-badge{background:#1d4ed8;color:#bfdbfe;}
 .prog-block.cat-news    .cat-badge{background:#b91c1c;color:#fecaca;}
@@ -3828,10 +3828,10 @@ function renderGuide() {
                         ? `<span class="rec-btn" title="Record" data-rkey="${esc(recKey2)}" onclick="event.stopPropagation();quickRecord(this.dataset.rkey,this)">⏺</span>` : '';
       const isMovie  = p.prog_type === 'MV' || (!p.prog_type && /\(\d{4}\)\s*$/.test(p.title));
       const isSeries = !isMovie && (p.prog_type === 'EP' || p.prog_type === 'SH' || p.season_num != null || (p.episode_title && p.episode_title.length > 0));
-      const catI    = isMovie  ? {cls:'cat-movie',  badge:'MOVIE'}
-                    : isSeries ? {cls:'cat-series', badge:'SERIES'}
+      const catI    = isMovie  ? {cls:'cat-movie',  badge:'MOV', title:'Movie'}
+                    : isSeries ? {cls:'cat-series', badge:'TV', title:'Series'}
                     : _catInfo(p.category || '');
-      const catBadge = catI.badge ? `<span class="cat-badge">${catI.badge}</span>` : '';
+      const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
       const badges    = (isRecording ? '<span class="rec-dot" title="Recording now">⏺</span>' : '')
                       + (isScheduled ? '<span class="sched-dot" title="Scheduled to record">⏱</span>' : '')
                       + plexBtn + recBtnEl;
