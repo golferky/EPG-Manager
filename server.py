@@ -2095,6 +2095,9 @@ def api_airings():
         return _channel_match_base(name)
 
     prog_type = next((a['prog_type'] for a in airings if a['prog_type']), '')
+    is_series = (prog_type in ('EP', 'SH') or any(
+        a['season_num'] is not None or a['episode_title'] for a in airings
+    ))
     deduped = {}
     for airing in airings:
         key = (airing['start_ts'], airing['stop_ts'], _family(airing['channel_name']))
@@ -2108,7 +2111,7 @@ def api_airings():
         if current is None or score > current_score:
             deduped[key] = airing
     airings = sorted(deduped.values(), key=lambda item: item['start_ts'])
-    return jsonify({'airings': airings, 'prog_type': prog_type})
+    return jsonify({'airings': airings, 'prog_type': prog_type, 'is_series': is_series})
 
 # ── VLC Play ──────────────────────────────────────────────────────────────────
 
@@ -3034,7 +3037,7 @@ tr:hover td{background:#141414;}
       <!-- All future airings -->
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
-          <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📅 All Future Airings</span>
+          <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📡 PrimeStreams Airings</span>
           <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record All</button>
           <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unscheduled Only</button>
         </div>
@@ -3984,9 +3987,9 @@ async function openProg(p) {
   try {
     const ar = await (await fetch(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`)).json();
     if (ar.airings && ar.airings.length > 0) {
-      const isMovie = ar.prog_type === 'MV' || ar.airings.some(a => a.prog_type === 'MV');
+      const isSeries = !!ar.is_series;
       const batchBtn = document.getElementById('pm-series-btn');
-      batchBtn.style.display = isMovie ? 'none' : '';
+      batchBtn.style.display = isSeries ? '' : 'none';
       batchBtn.disabled = false;
       batchBtn.textContent = '📺 Record All';
       const recMap = {};
@@ -4030,15 +4033,17 @@ async function openProg(p) {
       }
 
       // Full airings list
-      window._allAirings = ar.airings;
+      // The modal is for recording, so omit guide-only channels with no
+      // PrimeStreams stream instead of showing unusable rows.
+      window._allAirings = ar.airings.filter(a => a.can_record);
       window._airingsRecMap = recMap;
       window._showUnrecordedOnly = false;
       const unrecBtn = document.getElementById('pm-unrecorded-btn');
-      const hasUnrecorded = ar.airings.some(a => !recMap[a.channel_id+'|'+a.start_ts] && a.can_record && !a.on_now);
+      const hasUnrecorded = window._allAirings.some(a => !recMap[a.channel_id+'|'+a.start_ts] && !a.on_now);
       unrecBtn.style.display = hasUnrecorded ? '' : 'none';
       function renderAiringsList() {
         const list = window._showUnrecordedOnly
-          ? window._allAirings.filter(a => !window._airingsRecMap[a.channel_id+'|'+a.start_ts] && a.can_record && !a.on_now)
+          ? window._allAirings.filter(a => !window._airingsRecMap[a.channel_id+'|'+a.start_ts] && !a.on_now)
           : window._allAirings;
         document.getElementById('pm-airings-list').innerHTML = list.map(a => {
           const key = a.channel_id + '|' + a.start_ts;
