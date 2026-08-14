@@ -132,6 +132,14 @@ def _channel_match_base(value):
                 break
     return base + geographic
 
+def _is_premium_channel(name):
+    """Networks normally treated as premium in the Favorites guide section."""
+    normalized = _channel_match_base(name)
+    premium_prefixes = (
+        'hbo', 'showtime', 'starz', 'encore', 'cinemax', 'mgm', 'epix',
+    )
+    return normalized.startswith(premium_prefixes)
+
 def get_db():
     cfg = load_config()
     path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
@@ -1264,6 +1272,16 @@ def api_guide():
                 'no_data': c.get('no_data', False),
                 'favorite': canon in guide_favorites or canon in movie_favorites,
             })
+
+    if fav_only:
+        ordered_channels.sort(key=lambda channel: (
+            not _is_premium_channel(channel['name']), channel['name'].lower()
+        ))
+        for channel in ordered_channels:
+            channel['favorite_group'] = (
+                'Premium favorites' if _is_premium_channel(channel['name'])
+                else 'Other favorites'
+            )
 
     ch_offset = int(request.args.get('ch_offset', 0))
     ch_cap    = 200
@@ -3940,7 +3958,15 @@ function renderGuide() {
 
   // Build rows
   let rowsHTML = '';
+  let favoriteGroup = '';
   for (const ch of channels) {
+    if (ch.favorite_group && ch.favorite_group !== favoriteGroup) {
+      favoriteGroup = ch.favorite_group;
+      rowsHTML += `<div class="guide-row" style="background:#111827;border-top:1px solid #334155;">
+        <div class="ch-name" style="width:160px;color:#fbbf24;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;">${esc(favoriteGroup)}</div>
+        <div style="width:${totalPx}px;"></div>
+      </div>`;
+    }
     const chProgs = d.programmes.filter(p => p.channel_id === ch.id);
     let progHTML = `<div class="prog-row" style="width:${totalPx}px;">`;
     // now line

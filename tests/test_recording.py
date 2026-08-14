@@ -30,6 +30,12 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(server._rec_status_base(rec["status"]), "scheduled")
         self.assertTrue(server._rec_is_active(rec))
 
+    def test_premium_channel_classifier(self):
+        self.assertTrue(server._is_premium_channel("HBO Movies"))
+        self.assertTrue(server._is_premium_channel("MGM+ Hits HD"))
+        self.assertTrue(server._is_premium_channel("Showtime Extreme"))
+        self.assertFalse(server._is_premium_channel("ANTENNA TV"))
+
     def test_agent_transfer_status_is_active(self):
         self.assertTrue(server._rec_is_active({"status": "awaiting_transfer"}))
 
