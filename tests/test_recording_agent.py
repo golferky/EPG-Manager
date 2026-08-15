@@ -86,6 +86,18 @@ class QualityDecisionTests(unittest.TestCase):
         )
         self.assertIsNone(recording_agent.episode_metadata({"season_num": 3}))
 
+    def test_unidentified_series_transfer_uses_tv_holding_area(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"episode-data")
+            destination = recording_agent.verified_unidentified_episode_transfer(
+                source, root / "TV Shows", "I Dream of Jeannie", 1_786_719_600,
+            )
+            self.assertIn("TV Shows/_Needs Episode Info/I Dream of Jeannie/",
+                          destination.as_posix())
+            self.assertEqual(destination.read_bytes(), b"episode-data")
+
     def test_title_normalization_ignores_punctuation_and_year(self):
         self.assertEqual(
             recording_agent.normalized_title("Crazy, Stupid, Love. (2011)"),

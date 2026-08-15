@@ -372,6 +372,16 @@ def verified_episode_transfer(source, tv_root, show_title, season, episode,
     return _verified_copy(source, destination, progress_callback)
 
 
+def verified_unidentified_episode_transfer(source, tv_root, show_title, start_ts,
+                                           progress_callback=None):
+    """Keep an identified-as-TV airing out of Movies until S/E data is available."""
+    show = safe_filename(show_title)
+    aired = time.strftime('%Y-%m-%d_%H%M', time.localtime(start_ts))
+    destination = (Path(tv_root) / '_Needs Episode Info' / show /
+                   f'{show} - {aired}.mp4')
+    return _verified_copy(source, destination, progress_callback)
+
+
 def process_job(api, job, cfg):
     local_dir = Path(os.path.expanduser(cfg['local_recordings']))
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -381,12 +391,13 @@ def process_job(api, job, cfg):
     log_path = local_dir / f'{title_slug}_{int(job["start_ts"])}.ffmpeg.log'
     url = stream_url(cfg, job['stream_id'])
     episode = episode_metadata(job)
-    library_root = cfg['plex_tv_path'] if episode else cfg['plex_path']
+    is_series = bool(job.get('is_series'))
+    library_root = cfg['plex_tv_path'] if (episode or is_series) else cfg['plex_path']
 
     api.heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
     candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'])
-        if episode else find_plex_candidates(library_root, job['title']))
+        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'])))
     existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
     try:
         incoming_probe = probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
@@ -455,7 +466,7 @@ def process_job(api, job, cfg):
     # during preflight, or Plex may have received a better copy in the meantime.
     final_candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'])
-        if episode else find_plex_candidates(library_root, job['title']))
+        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'])))
     final_existing_path, final_existing_probe = best_existing_copy(
         final_candidates, cfg['ffprobe']
     )
@@ -501,6 +512,11 @@ def process_job(api, job, cfg):
             episode['episode'], episode['title'], existing_path,
             progress_callback=transfer_progress,
         )
+    elif is_series:
+        destination = verified_unidentified_episode_transfer(
+            mp4_path, library_root, job['title'], job['start_ts'],
+            progress_callback=transfer_progress,
+        )
     else:
         try:
             movie_year = api.movie_year(job['title'])
@@ -513,7 +529,8 @@ def process_job(api, job, cfg):
         )
     api.heartbeat(job['id'], 'done', file=str(mp4_path), quality_decision=decision,
                   result={**quality, 'plex_path': str(destination),
-                          'content_type': 'episode' if episode else 'movie'})
+                          'content_type': ('episode' if episode else
+                                           'episode_needs_metadata' if is_series else 'movie')})
     try:
         ts_path.unlink()
     except FileNotFoundError:

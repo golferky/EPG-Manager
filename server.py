@@ -29,13 +29,15 @@ def _bootstrap():
             created_at TEXT, backend TEXT DEFAULT "local", stream_id TEXT,
             agent_id TEXT, lease_until REAL, heartbeat_at REAL, updated_at TEXT,
             episode_title TEXT, season_num INTEGER, episode_num INTEGER,
+            is_series INTEGER DEFAULT 0,
             quality_decision TEXT, result_json TEXT)''')
         for _col, _typedef in [
                 ('backend', 'TEXT DEFAULT "local"'), ('stream_id', 'TEXT'),
                 ('agent_id', 'TEXT'), ('lease_until', 'REAL'),
                 ('heartbeat_at', 'REAL'), ('updated_at', 'TEXT'),
                 ('quality_decision', 'TEXT'), ('result_json', 'TEXT'),
-                ('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER')]:
+                ('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'),
+                ('is_series', 'INTEGER DEFAULT 0')]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -579,6 +581,7 @@ def _init_recordings_table():
             ('episode_title', 'TEXT'),
             ('season_num', 'INTEGER'),
             ('episode_num', 'INTEGER'),
+            ('is_series', 'INTEGER DEFAULT 0'),
         ]
         for column, typedef in migrations:
             try:
@@ -599,8 +602,8 @@ def _db_upsert_rec(rec_id, rec):
         conn.execute('''INSERT INTO recordings
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
              status, failure_reason, file, created_at, backend, stream_id, updated_at,
-             episode_title, season_num, episode_num)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             episode_title, season_num, episode_num, is_series)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
@@ -610,7 +613,8 @@ def _db_upsert_rec(rec_id, rec):
               updated_at=excluded.updated_at,
               episode_title=excluded.episode_title,
               season_num=excluded.season_num,
-              episode_num=excluded.episode_num
+              episode_num=excluded.episode_num,
+              is_series=excluded.is_series
         ''', (
             rec_id,
             rec.get('title',''),
@@ -629,6 +633,7 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('episode_title', ''),
             rec.get('season_num'),
             rec.get('episode_num'),
+            1 if rec.get('is_series') else 0,
         ))
         conn.commit()
         conn.close()
@@ -714,6 +719,7 @@ def _load_pending_recs():
                 'stream_id':  r['stream_id'] or '',
                 'episode_title': r['episode_title'] or '',
                 'season_num': r['season_num'], 'episode_num': r['episode_num'],
+                'is_series': bool(r['is_series']),
             }
             with _rec_lock:
                 _recs[rec_id] = rec
@@ -732,6 +738,7 @@ def _load_pending_recs():
                     'stream_id': r['stream_id'] or '',
                     'episode_title': r['episode_title'] or '',
                     'season_num': r['season_num'], 'episode_num': r['episode_num'],
+                    'is_series': bool(r['is_series']),
                 }
         if rows:
             print(f'[recdb] reloaded {len(rows)} pending recording(s)')
@@ -1051,6 +1058,7 @@ def api_fetch_sd():
                 _sd_status['log'].append(msg)
             result = fetch_sd_guide(sd_user, sd_pass, db_path, days=days, log=log)
             count = load_epg_from_db(db_path, tz_str)
+            _schedule_active_series(db_path)
             _sd_status['result'] = {**result, 'total_loaded': count}
         except Exception as e:
             _sd_status['error'] = str(e)
@@ -1076,6 +1084,7 @@ def api_load_guide():
     try:
         new_rows = import_xml_to_guide_db(xml_path, db_path)
         count    = load_epg_from_db(db_path, tz_str)
+        _schedule_active_series(db_path)
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows, 'loaded': _epg['loaded']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1107,6 +1116,7 @@ def api_fetch_guide():
         xml_path = local_xml  # import from local copy
         new_rows = import_xml_to_guide_db(xml_path, db_path)
         count    = load_epg_from_db(db_path, tz_str)
+        _schedule_active_series(db_path)
         print(f'[fetch-guide] Done: {count} programmes, {new_rows} new rows')
         return jsonify({'ok': True, 'bytes': len(data), 'count': count, 'new_rows': new_rows})
     except Exception as e:
@@ -2460,20 +2470,33 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         return 1
 
     ep_best = {}   # (sn, en) → row with best channel quality
+    unknown_best = {}  # (channel, time) → unknown episode airing
     for r in rows:
         sn, en = r['season_num'], r['episode_num']
         if sn is not None and en is not None:
             key = (sn, en)
             if key not in ep_best or _ch_quality(r['channel_name']) > _ch_quality(ep_best[key]['channel_name']):
                 ep_best[key] = r
-    # Batch series recording is deliberately limited to identified episodes.
-    # Airings without S/E data remain visible for an intentional one-off
-    # recording, but are never silently filed as a generic movie.
-    best_rows = list(ep_best.values())
+        else:
+            # Keep unknown episodes distinct by the actual airing. They go to
+            # the TV holding area on the recording Mac, never Movies.
+            unknown_best[(r['channel_id'], r['start_utc'])] = r
+    best_rows = list(ep_best.values()) + list(unknown_best.values())
 
     with _rec_lock:
         existing_keys = {(r['channel_id'], r['start_ts']) for r in _recs.values()
                          if _rec_is_active(r)}
+    # The in-memory list is empty during early startup, so also consult the
+    # durable queue before adding work from an active series rule.
+    try:
+        conn = sqlite3.connect(guide_db_path)
+        db_existing = conn.execute('''SELECT channel_id, start_ts FROM recordings
+            WHERE status NOT IN ('done','done_ts','cancelled','failed','error',
+                                 'skipped_existing_better','skipped_too_short')''').fetchall()
+        conn.close()
+        existing_keys.update((row[0], row[1]) for row in db_existing)
+    except Exception as exc:
+        print(f'[series] queue dedupe lookup failed: {exc}')
     for r in best_rows:
         try:
             su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -2496,6 +2519,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 'episode_title': r.get('episode_title') or '',
                 'season_num': r.get('season_num'),
                 'episode_num': r.get('episode_num'),
+                'is_series': True,
             }
             if not _db_upsert_rec(rec_id, rec):
                 print(f'[series] could not persist recording {rec_id}; not scheduling')
@@ -2511,6 +2535,28 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         except Exception as e:
             print(f'[series] airing error: {e}')
     return scheduled
+
+
+def _schedule_active_series(guide_db_path=None):
+    """Queue newly available airings for every enabled series rule."""
+    cfg = load_config()
+    db_path = guide_db_path or cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    try:
+        conn = sqlite3.connect(db_path)
+        titles = [row[0] for row in conn.execute(
+            'SELECT title FROM series_recordings WHERE active=1'
+        ).fetchall()]
+        conn.close()
+    except Exception as exc:
+        print(f'[series] active rule lookup failed: {exc}')
+        return 0
+    total = sum(_schedule_series_airings(
+        title, db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'),
+        cfg.get('timezone', 'America/New_York')
+    ) for title in titles)
+    if total:
+        print(f'[series] queued {total} new airing(s) from active rules')
+    return total
 
 @app.route('/epg-web/api/record/series', methods=['GET'])
 def api_series_list():
@@ -2701,6 +2747,7 @@ def api_record():
         'episode_title': episode_title,
         'season_num': season_num,
         'episode_num': episode_num,
+        'is_series': bool(data.get('is_series', False)),
     }
     _url, stream_error, stream_debug = _stream_url(channel_id)
     if stream_error:
@@ -2827,6 +2874,7 @@ def _agent_job_dict(row):
         'lease_until': row['lease_until'],
         'episode_title': row['episode_title'] or '',
         'season_num': row['season_num'], 'episode_num': row['episode_num'],
+        'is_series': bool(row['is_series']),
     }
 
 @app.route('/epg-web/api/agent/health')
@@ -5081,6 +5129,7 @@ def _startup_load():
     if os.path.exists(db_path):
         try:
             count = load_epg_from_db(db_path, tz_str)
+            _schedule_active_series(db_path)
             print(f'[startup] Loaded {count} programmes from guide.db')
         except Exception as e:
             print(f'[startup] guide.db load failed: {e}')
