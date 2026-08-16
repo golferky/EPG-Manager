@@ -4913,7 +4913,7 @@ async function loadRecs() {
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
         <td class="act-cell">
           ${a ? `<button class="btn btn-success btn-sm" onclick='addToSchedule(${JSON.stringify(a)})'>+ Schedule</button>` : ''}
-          <button class="btn btn-ghost btn-sm" onclick='updateWanted(${r.id},"recorded")'>✅ Got it</button>
+          <button class="btn btn-ghost btn-sm" title="Mark this title as already obtained. It moves out of Wanted; it does not record or change Plex." onclick='updateWanted(${r.id},"recorded")'>✅ Got it</button>
           <button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button>
         </td>
       </tr>`;

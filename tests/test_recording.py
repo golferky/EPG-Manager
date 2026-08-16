@@ -184,6 +184,9 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("['WANTED', recs.filter", server.HTML)
         self.assertIn("['FOUND', recs.filter", server.HTML)
 
+    def test_wanted_got_it_button_explains_its_effect(self):
+        self.assertIn("Mark this title as already obtained", server.HTML)
+
     def test_showtime_rebrand_channel_aliases(self):
         self.assertEqual(
             server._channel_match_base("Paramount+ with Showtime HD"),
