@@ -499,7 +499,10 @@ _convs = {}   # conv_id -> {file, status, progress, log, pid}
 _conv_lock = threading.Lock()
 _plex_info_cache = {}  # norm_title -> ffprobe result dict
 _plex_episode_cache = {'root': '', 'loaded_at': 0, 'episodes': set()}
-_plex_title_cache = {'roots': (), 'loaded_at': 0, 'movies': set(), 'shows': set()}
+_plex_title_cache = {
+    'roots': (), 'loaded_at': 0, 'movies': set(), 'movie_versions': set(),
+    'unyearred_movies': set(), 'shows': set(),
+}
 
 def _run_conv(conv_id, inp, out):
     cmd = ['ffmpeg', '-y', '-i', inp,
@@ -1757,7 +1760,10 @@ def api_recommendations():
         airing = next((p for p in candidates if is_series_wanted or
                        _is_commercial_free_channel(p.get('channel', ''))), None)
         title_key = _norm_plex_show(w['title'])
-        in_movies = title_key in plex_titles['movies']
+        wanted_year = str(w['year'] or '').strip()
+        in_movies = (title_key in plex_titles['movies'] if not wanted_year else
+                     ((title_key, wanted_year) in plex_titles.get('movie_versions', set()) or
+                      title_key in plex_titles.get('unyearred_movies', set())))
         in_shows = title_key in plex_titles['shows']
         result.append({
             'id':         w['id'],
@@ -1781,6 +1787,7 @@ def api_recommendations():
 def api_recommendation_movie_upgrade():
     """Compare the next clean movie airing against its existing Plex copy."""
     title = request.args.get('title', '').strip()
+    year = request.args.get('year', '').strip()
     if not title:
         return jsonify({'error': 'title is required'}), 400
     cfg = load_config()
@@ -1790,9 +1797,12 @@ def api_recommendation_movie_upgrade():
     try:
         from recording_agent import (best_existing_copy, find_plex_candidates,
                                      probe_media, quality_decision)
-        existing_path, existing = best_existing_copy(
-            find_plex_candidates(movie_root, title), cfg.get('ffprobe', 'ffprobe')
-        )
+        plex_candidates = find_plex_candidates(movie_root, title)
+        if re.fullmatch(r'\d{4}', year):
+            plex_candidates = [path for path in plex_candidates if re.search(
+                rf'\({re.escape(year)}\)$', os.path.basename(os.path.dirname(path))
+            )]
+        existing_path, existing = best_existing_copy(plex_candidates, cfg.get('ffprobe', 'ffprobe'))
         if not existing:
             return jsonify({'error': 'No Plex movie copy found'}), 404
         conn = sqlite3.connect(db_path)
@@ -1836,15 +1846,22 @@ def _plex_wanted_title_index():
     now = time.time()
     if (_plex_title_cache['roots'] == roots and now - _plex_title_cache['loaded_at'] < 300):
         return _plex_title_cache
-    movies, shows = set(), set()
+    movies, movie_versions, unyearred_movies, shows = set(), set(), set(), set()
     try:
         for entry in os.scandir(movie_root):
             if entry.name.startswith('.'):
                 continue
             title = entry.name if entry.is_dir() else os.path.splitext(entry.name)[0]
-            title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
+            match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', title)
+            year = match.group(2) if match else ''
+            title = (match.group(1) if match else title).strip()
             if title:
-                movies.add(_norm_plex_show(title))
+                key = _norm_plex_show(title)
+                movies.add(key)
+                if year:
+                    movie_versions.add((key, year))
+                else:
+                    unyearred_movies.add(key)
     except OSError:
         pass
     try:
@@ -1854,7 +1871,9 @@ def _plex_wanted_title_index():
     except OSError:
         pass
     _plex_title_cache.update({
-        'roots': roots, 'loaded_at': now, 'movies': movies, 'shows': shows,
+        'roots': roots, 'loaded_at': now, 'movies': movies,
+        'movie_versions': movie_versions, 'unyearred_movies': unyearred_movies,
+        'shows': shows,
     })
     return _plex_title_cache
 
@@ -4960,7 +4979,7 @@ async function loadRecs() {
       const action = isSeries
         ? (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
         : r.in_plex
-          ? `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg})">Check upgrade</button>`
+          ? `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${JSON.stringify(r.year || '').replace(/"/g,'&quot;)})">Check upgrade</button>`
           : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg})">⏱ Record</button>` : '');
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
@@ -4982,10 +5001,11 @@ async function loadRecs() {
     ).join('');
   } catch(e) { setEl('rec-status','Failed: '+e.message,'err'); }
 }
-async function checkWantedMovieUpgrade(btn, title) {
+async function checkWantedMovieUpgrade(btn, title, year) {
   btn.disabled = true; btn.textContent = 'Checking…';
   try {
-    const d = await (await fetch(`/epg-web/api/recommendations/movie-upgrade?title=${encodeURIComponent(title)}`)).json();
+    const params = new URLSearchParams({title, year: year || ''});
+    const d = await (await fetch(`/epg-web/api/recommendations/movie-upgrade?${params}`)).json();
     if (d.better && d.airing) {
       btn.disabled = false; btn.textContent = '⏱ Record upgrade';
       btn.title = d.decision || 'A better commercial-free copy is available';

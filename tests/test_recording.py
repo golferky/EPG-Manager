@@ -90,12 +90,14 @@ class RecordingTests(unittest.TestCase):
             os.makedirs(os.path.join(shows, "Bewitched"))
             server._plex_title_cache.update({
                 "roots": (), "loaded_at": 0, "movies": set(), "shows": set(),
+                "movie_versions": set(), "unyearred_movies": set(),
             })
             with mock.patch.object(server, "load_config", return_value={
                 "plex_path": movies, "plex_tv_path": shows,
             }):
                 titles = server._plex_wanted_title_index()
             self.assertIn("fx", titles["movies"])
+            self.assertIn(("fx", "1986"), titles["movie_versions"])
             self.assertIn("bewitched", titles["shows"])
 
     def test_airings_merge_hd_duplicate_and_identify_movie(self):
