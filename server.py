@@ -4976,10 +4976,11 @@ async function loadRecs() {
       const isSeries = r.type === 'series';
       const titleArg = JSON.stringify(r.title).replace(/"/g,'&quot;');
       const airingArg = a ? JSON.stringify(a).replace(/"/g,'&quot;') : '';
+      const yearArg = JSON.stringify(r.year || '').replace(/"/g,'&quot;');
       const action = isSeries
         ? (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
         : r.in_plex
-          ? `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${JSON.stringify(r.year || '').replace(/"/g,'&quot;)})">Check upgrade</button>`
+          ? `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>`
           : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg})">⏱ Record</button>` : '');
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
