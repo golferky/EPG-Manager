@@ -142,6 +142,11 @@ def _is_premium_channel(name):
     )
     return normalized.startswith(premium_prefixes)
 
+
+def _is_commercial_free_channel(name):
+    """Channels we can reliably treat as commercial-free for movie recording."""
+    return _is_premium_channel(name)
+
 def get_db():
     cfg = load_config()
     path = cfg.get('db_path', '/Volumes/EPG/Movies.db')
@@ -1726,20 +1731,24 @@ def api_recommendations():
     wanted = db_rows('SELECT * FROM wanted_titles ORDER BY status, title')
     now_ts = datetime.now(timezone.utc).timestamp()
 
-    # Build quick lookup of next airing per title from guide
-    next_airing = {}
+    # Build all future airings by title. Movies only surface a known
+    # commercial-free channel; series keep every option for the user to choose.
+    future_airings = {}
     if _epg['programmes']:
         for p in _epg['programmes']:
             if p['stop_ts'] <= now_ts:
                 continue
             t = p['title'].lower()
-            if t not in next_airing:
-                next_airing[t] = p
+            future_airings.setdefault(t, []).append(p)
 
     plex_titles = _plex_wanted_title_index()
     result = []
     for w in wanted:
-        airing = next_airing.get(w['title'].lower()) or next_airing.get(w['normalized_title'].lower() if w['normalized_title'] else '')
+        candidates = (future_airings.get(w['title'].lower()) or
+                      future_airings.get(w['normalized_title'].lower() if w['normalized_title'] else '') or [])
+        is_series_wanted = w['type'] == 'series'
+        airing = next((p for p in candidates if is_series_wanted or
+                       _is_commercial_free_channel(p.get('channel', ''))), None)
         title_key = _norm_plex_show(w['title'])
         in_movies = title_key in plex_titles['movies']
         in_shows = title_key in plex_titles['shows']
@@ -1748,6 +1757,7 @@ def api_recommendations():
             'title':      w['title'],
             'year':       w['year'],
             'type':       w['type'],
+            'commercial_free_only': not is_series_wanted,
             'status':     w['status'],
             'notes':      w['notes'],
             'source':     w['source'],
@@ -2302,6 +2312,7 @@ def api_airings():
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
                 'can_record':   not stream_error,
+                'commercial_free': _is_commercial_free_channel(r['channel_name']),
                 'stream_channel': stream_debug.get('matched_guide_channel') or '',
                 'on_now':       su.timestamp() <= now_ts < eu.timestamp(),
                 'prog_type':    r['prog_type'] or '',
@@ -2335,7 +2346,12 @@ def api_airings():
         if current is None or score > current_score:
             deduped[key] = airing
     airings = sorted(deduped.values(), key=lambda item: item['start_ts'])
-    return jsonify({'airings': airings, 'prog_type': prog_type, 'is_series': is_series})
+    if not is_series:
+        airings = [airing for airing in airings if airing['commercial_free']]
+    return jsonify({
+        'airings': airings, 'prog_type': prog_type, 'is_series': is_series,
+        'commercial_free_only': not is_series,
+    })
 
 # ── VLC Play ──────────────────────────────────────────────────────────────────
 
@@ -3366,7 +3382,8 @@ tr:hover td{background:#141414;}
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
       <h2 style="margin:0;">Wanted Titles</h2>
       <div style="display:flex;gap:8px;">
-        <button class="btn btn-primary btn-sm" onclick="addWanted()">+ Add</button>
+        <button class="btn btn-primary btn-sm" onclick="addWanted('movie')">+ Movie</button>
+        <button class="btn btn-primary btn-sm" onclick="addWanted('series')">+ Series</button>
         <button class="btn btn-ghost btn-sm" onclick="loadRecs()">↻ Refresh</button>
       </div>
     </div>
@@ -4884,6 +4901,7 @@ async function loadRecs() {
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
+          <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${r.type === 'series' ? 'Series · all sources' : 'Movie · commercial-free only'}</span>
           <span class="badge ${STATUS_BADGE[r.status]||'badge-record'}" style="margin-left:5px;">${esc(r.status||'wanted')}</span>
         </td>
         <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>
@@ -4906,10 +4924,10 @@ async function removeWanted(id) {
   await post('/epg-web/api/wanted', {action:'remove', id});
   loadRecs();
 }
-async function addWanted() {
-  const title = prompt('Movie/show title:');
+async function addWanted(type) {
+  const title = prompt(type === 'series' ? 'Series title:' : 'Movie title:');
   if (!title) return;
-  await post('/epg-web/api/wanted', {action:'add', title, type:'movie'});
+  await post('/epg-web/api/wanted', {action:'add', title, type});
   loadRecs();
 }
 

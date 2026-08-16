@@ -134,6 +134,7 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(len(data["airings"]), 1)
             self.assertEqual(data["airings"][0]["channel_name"], "MGM+ Hits HD")
             self.assertTrue(data["airings"][0]["can_record"])
+            self.assertTrue(data["airings"][0]["commercial_free"])
 
     def test_airings_inherit_episode_data_from_matching_sd_listing(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -174,6 +175,10 @@ class RecordingTests(unittest.TestCase):
     def test_movie_ui_hides_recurring_batch_action(self):
         self.assertIn("batchBtn.style.display = isSeries ? '' : 'none';", server.HTML)
         self.assertNotIn("Record Series", server.HTML)
+
+    def test_wanted_ui_allows_movie_and_series_choices(self):
+        self.assertIn("addWanted('movie')", server.HTML)
+        self.assertIn("addWanted('series')", server.HTML)
 
     def test_showtime_rebrand_channel_aliases(self):
         self.assertEqual(
