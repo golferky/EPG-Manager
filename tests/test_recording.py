@@ -180,6 +180,10 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("addWanted('movie')", server.HTML)
         self.assertIn("addWanted('series')", server.HTML)
 
+    def test_wanted_ui_groups_found_and_wanted_titles(self):
+        self.assertIn("['WANTED', recs.filter", server.HTML)
+        self.assertIn("['FOUND', recs.filter", server.HTML)
+
     def test_showtime_rebrand_channel_aliases(self):
         self.assertEqual(
             server._channel_match_base("Paramount+ with Showtime HD"),

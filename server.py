@@ -212,6 +212,7 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         result = set()
         # Build lookup dicts
         id_to_norm = {cid: _channel_match_base(cname) for cid, cname in grows}
+        id_to_name = {cid: cname or '' for cid, cname in grows}
         name_map = {}
         for cid, cname in grows:
             key = id_to_norm[cid]
@@ -231,6 +232,12 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
                 result.add(_pick_best(name_map[base], base))
                 # Schedules Direct often carries a numeric HD/SD sibling while
                 # PrimeStreams uses the unsuffixed canonical channel name.
+                # _channel_match_base intentionally strips quality suffixes, so
+                # also inspect the original display name for those siblings.
+                result.update(
+                    cid for cid in name_map[base]
+                    if re.search(r'\b(?:UHD|HD|SD)\b', id_to_name.get(cid, ''), re.I)
+                )
                 for quality_variant in (base + 'hd', base + 'sd', base + 'uhd'):
                     if quality_variant in name_map:
                         result.add(_pick_best(name_map[quality_variant], quality_variant))
@@ -4894,15 +4901,13 @@ async function loadRecs() {
     if (d.error) { setEl('rec-status',d.error,'err'); return; }
     const recs = d.recommendations || [];
     setEl('rec-status', recs.length + ' wanted titles','');
-    const STATUS_BADGE = {wanted:'badge-record', found:'badge-wl', recorded:'badge-recorded', cancelled:'badge-skipped'};
     const tbody = document.getElementById('rec-body');
-    tbody.innerHTML = recs.map(r => {
+    const renderRow = r => {
       const a = r.next_airing;
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
           <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${r.type === 'series' ? 'Series · all sources' : 'Movie · commercial-free only'}</span>
-          <span class="badge ${STATUS_BADGE[r.status]||'badge-record'}" style="margin-left:5px;">${esc(r.status||'wanted')}</span>
         </td>
         <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
@@ -4912,7 +4917,16 @@ async function loadRecs() {
           <button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button>
         </td>
       </tr>`;
-    }).join('');
+    };
+    const groups = [
+      ['WANTED', recs.filter(r => (r.status || 'wanted') === 'wanted')],
+      ['FOUND', recs.filter(r => r.status === 'found')],
+      ['ARCHIVED', recs.filter(r => !['wanted','found'].includes(r.status || 'wanted'))],
+    ];
+    tbody.innerHTML = groups.filter(([, rows]) => rows.length).map(([label, rows]) =>
+      `<tr><td colspan="4" style="padding:14px 0 5px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.1em;">${label}</td></tr>` +
+      rows.map(renderRow).join('')
+    ).join('');
   } catch(e) { setEl('rec-status','Failed: '+e.message,'err'); }
 }
 async function updateWanted(id, status) {
