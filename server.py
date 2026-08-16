@@ -487,6 +487,7 @@ _convs = {}   # conv_id -> {file, status, progress, log, pid}
 _conv_lock = threading.Lock()
 _plex_info_cache = {}  # norm_title -> ffprobe result dict
 _plex_episode_cache = {'root': '', 'loaded_at': 0, 'episodes': set()}
+_plex_title_cache = {'roots': (), 'loaded_at': 0, 'movies': set(), 'shows': set()}
 
 def _run_conv(conv_id, inp, out):
     cmd = ['ffmpeg', '-y', '-i', inp,
@@ -1735,9 +1736,13 @@ def api_recommendations():
             if t not in next_airing:
                 next_airing[t] = p
 
+    plex_titles = _plex_wanted_title_index()
     result = []
     for w in wanted:
         airing = next_airing.get(w['title'].lower()) or next_airing.get(w['normalized_title'].lower() if w['normalized_title'] else '')
+        title_key = _norm_plex_show(w['title'])
+        in_movies = title_key in plex_titles['movies']
+        in_shows = title_key in plex_titles['shows']
         result.append({
             'id':         w['id'],
             'title':      w['title'],
@@ -1749,8 +1754,42 @@ def api_recommendations():
             'imdb_id':    w['imdb_id'],
             'updated_at': w['updated_at'],
             'next_airing': airing,
+            'in_plex': in_movies or in_shows,
+            'plex_kind': ('Movie' if in_movies else '') + (' & TV' if in_movies and in_shows else 'TV' if in_shows else ''),
         })
     return jsonify({'recommendations': result})
+
+
+def _plex_wanted_title_index():
+    """Cache top-level Plex movie/show names for the Wanted Titles badges."""
+    cfg = load_config()
+    movie_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
+    tv_root = _plex_tv_path(cfg)
+    roots = (movie_root, tv_root)
+    now = time.time()
+    if (_plex_title_cache['roots'] == roots and now - _plex_title_cache['loaded_at'] < 300):
+        return _plex_title_cache
+    movies, shows = set(), set()
+    try:
+        for entry in os.scandir(movie_root):
+            if entry.name.startswith('.'):
+                continue
+            title = entry.name if entry.is_dir() else os.path.splitext(entry.name)[0]
+            title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
+            if title:
+                movies.add(_norm_plex_show(title))
+    except OSError:
+        pass
+    try:
+        for entry in os.scandir(tv_root):
+            if entry.is_dir() and not entry.name.startswith(('.', '_')):
+                shows.add(_norm_plex_show(entry.name))
+    except OSError:
+        pass
+    _plex_title_cache.update({
+        'roots': roots, 'loaded_at': now, 'movies': movies, 'shows': shows,
+    })
+    return _plex_title_cache
 
 @app.route('/epg-web/api/wanted', methods=['POST'])
 def api_wanted():
@@ -4844,6 +4883,7 @@ async function loadRecs() {
       const a = r.next_airing;
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
+          ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
           <span class="badge ${STATUS_BADGE[r.status]||'badge-record'}" style="margin-left:5px;">${esc(r.status||'wanted')}</span>
         </td>
         <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>

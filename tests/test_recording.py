@@ -82,6 +82,22 @@ class RecordingTests(unittest.TestCase):
             episodes = server._plex_episode_keys(temp)
             self.assertIn("duttonranch|1|2", episodes)
 
+    def test_wanted_plex_index_includes_movies_and_tv_shows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = os.path.join(temp, "Movies")
+            shows = os.path.join(temp, "TV Shows")
+            os.makedirs(os.path.join(movies, "F X (1986)"))
+            os.makedirs(os.path.join(shows, "Bewitched"))
+            server._plex_title_cache.update({
+                "roots": (), "loaded_at": 0, "movies": set(), "shows": set(),
+            })
+            with mock.patch.object(server, "load_config", return_value={
+                "plex_path": movies, "plex_tv_path": shows,
+            }):
+                titles = server._plex_wanted_title_index()
+            self.assertIn("fx", titles["movies"])
+            self.assertIn("bewitched", titles["shows"])
+
     def test_airings_merge_hd_duplicate_and_identify_movie(self):
         with tempfile.TemporaryDirectory() as temp:
             guide_db = os.path.join(temp, "guide.db")
