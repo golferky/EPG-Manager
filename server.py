@@ -4993,7 +4993,8 @@ async function loadRecs() {
       </tr>`;
     };
     const groups = [
-      ['MOVIES', recs.filter(r => r.type !== 'series')],
+      ['MOVIES', recs.filter(r => r.type !== 'series' && !r.in_plex)],
+      ['MOVIES — IN PLEX', recs.filter(r => r.type !== 'series' && r.in_plex)],
       ['SERIES — EPISODE TRACKING', recs.filter(r => r.type === 'series')],
     ];
     tbody.innerHTML = groups.filter(([, rows]) => rows.length).map(([label, rows]) =>
