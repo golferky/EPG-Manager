@@ -40,6 +40,30 @@ python3 server.py
 
 Then open <http://localhost:5001/epg-web>.
 
+## Daily guide refresh (macOS)
+
+`fetch_guide_daily.sh` asks the local EPG Manager server to run its normal
+**Fetch Guide** action. That imports the fresh PrimeStreams guide and rescans
+active **Record All** series rules. The supplied launchd example runs at 3:00 AM.
+
+After installing an update, copy and personalize the launch agent once:
+
+```zsh
+cp com.gary.epg-guide-fetch.example.plist ~/Library/LaunchAgents/com.gary.epg-guide-fetch.plist
+sed -i '' "s|/Users/yourname|$HOME|g" ~/Library/LaunchAgents/com.gary.epg-guide-fetch.plist
+chmod +x fetch_guide_daily.sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gary.epg-guide-fetch.plist
+```
+
+To run it immediately for a test, use:
+
+```zsh
+launchctl kickstart -k gui/$(id -u)/com.gary.epg-guide-fetch
+```
+
+Its activity is written to `guide-fetch.log` and `guide-fetch.err.log` in the
+EPG Manager folder. Flask must be running at the scheduled time.
+
 ## DuckDNS updater
 
 `duckdns_update.sh` reads its settings from environment variables so the token is not stored in Git:
