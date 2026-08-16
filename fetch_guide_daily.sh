@@ -11,11 +11,11 @@ print "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] Starting scheduled guide refresh"
 /usr/bin/curl --fail --silent --show-error \
   --retry 3 --retry-delay 30 --connect-timeout 15 --max-time 900 \
   -X POST "$endpoint"
-status=$?
+curl_exit=$?
 
-if [[ $status -eq 0 ]]; then
+if [[ $curl_exit -eq 0 ]]; then
   print "\n[$(/bin/date '+%Y-%m-%d %H:%M:%S')] Scheduled guide refresh finished"
 else
-  print "\n[$(/bin/date '+%Y-%m-%d %H:%M:%S')] Scheduled guide refresh failed (curl $status)" >&2
+  print "\n[$(/bin/date '+%Y-%m-%d %H:%M:%S')] Scheduled guide refresh failed (curl $curl_exit)" >&2
 fi
-exit $status
+exit $curl_exit
