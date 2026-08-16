@@ -4907,7 +4907,7 @@ async function loadRecs() {
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
-          <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${r.type === 'series' ? 'Series · all sources' : 'Movie · commercial-free only'}</span>
+          <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${r.type === 'series' ? 'Series · all sources' : 'Movie'}</span>
         </td>
         <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
