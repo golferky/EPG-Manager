@@ -1777,6 +1777,56 @@ def api_recommendations():
     return jsonify({'recommendations': result})
 
 
+@app.route('/epg-web/api/recommendations/movie-upgrade')
+def api_recommendation_movie_upgrade():
+    """Compare the next clean movie airing against its existing Plex copy."""
+    title = request.args.get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'title is required'}), 400
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    movie_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
+    clean_title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
+    try:
+        from recording_agent import (best_existing_copy, find_plex_candidates,
+                                     probe_media, quality_decision)
+        existing_path, existing = best_existing_copy(
+            find_plex_candidates(movie_root, title), cfg.get('ffprobe', 'ffprobe')
+        )
+        if not existing:
+            return jsonify({'error': 'No Plex movie copy found'}), 404
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT channel_id, channel_name, start_utc, end_utc
+            FROM guide WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
+            AND end_utc>? ORDER BY start_utc LIMIT 60''', (
+                title, clean_title, datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+            )).fetchall()
+        conn.close()
+        candidate = next((row for row in rows if _is_commercial_free_channel(
+            row['channel_name'])), None)
+        if not candidate:
+            return jsonify({'better': False, 'decision': 'No future commercial-free airing found'})
+        url, stream_error, _debug = _stream_url(candidate['channel_id'])
+        if stream_error:
+            return jsonify({'better': False, 'decision': 'The next clean airing is not recordable'})
+        incoming = probe_media(url, ffprobe=cfg.get('ffprobe', 'ffprobe'), timeout=45)
+        better, decision = quality_decision(existing, incoming)
+        start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        return jsonify({
+            'better': better, 'decision': decision,
+            'airing': {
+                'channel_id': candidate['channel_id'],
+                'channel_name': candidate['channel_name'],
+                'start_ts': start.timestamp(), 'stop_ts': stop.timestamp(),
+                'episode_title': '', 'season_num': None, 'episode_num': None,
+            },
+        })
+    except Exception as exc:
+        return jsonify({'error': f'Unable to compare: {exc}'}), 502
+
+
 def _plex_wanted_title_index():
     """Cache top-level Plex movie/show names for the Wanted Titles badges."""
     cfg = load_config()
@@ -4817,8 +4867,8 @@ function closeProg() {
   btn.textContent = '▶ Play'; btn.disabled = false;
   btn.onclick = playStream;
 }
-async function recordAiring(airing, title) {
-  const btn = event.target;
+async function recordAiring(airing, title, button) {
+  const btn = button || event.target;
   btn.disabled = true; btn.textContent = '…';
   const r = await post('/epg-web/api/record', {
     title:      title,
@@ -4904,24 +4954,27 @@ async function loadRecs() {
     const tbody = document.getElementById('rec-body');
     const renderRow = r => {
       const a = r.next_airing;
+      const isSeries = r.type === 'series';
+      const titleArg = JSON.stringify(r.title).replace(/"/g,'&quot;');
+      const airingArg = a ? JSON.stringify(a).replace(/"/g,'&quot;') : '';
+      const action = isSeries
+        ? (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
+        : r.in_plex
+          ? `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg})">Check upgrade</button>`
+          : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg})">⏱ Record</button>` : '');
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
-          <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${r.type === 'series' ? 'Series · all sources' : 'Movie'}</span>
+          <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
         </td>
         <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
-        <td class="act-cell">
-          ${a ? `<button class="btn btn-success btn-sm" onclick='addToSchedule(${JSON.stringify(a)})'>+ Schedule</button>` : ''}
-          <button class="btn btn-ghost btn-sm" title="Mark this title as already obtained. It moves out of Wanted; it does not record or change Plex." onclick='updateWanted(${r.id},"recorded")'>✅ Got it</button>
-          <button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button>
-        </td>
+        <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button></td>
       </tr>`;
     };
     const groups = [
-      ['WANTED', recs.filter(r => (r.status || 'wanted') === 'wanted')],
-      ['FOUND', recs.filter(r => r.status === 'found')],
-      ['ARCHIVED', recs.filter(r => !['wanted','found'].includes(r.status || 'wanted'))],
+      ['MOVIES', recs.filter(r => r.type !== 'series')],
+      ['SERIES — EPISODE TRACKING', recs.filter(r => r.type === 'series')],
     ];
     tbody.innerHTML = groups.filter(([, rows]) => rows.length).map(([label, rows]) =>
       `<tr><td colspan="4" style="padding:14px 0 5px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.1em;">${label}</td></tr>` +
@@ -4929,9 +4982,22 @@ async function loadRecs() {
     ).join('');
   } catch(e) { setEl('rec-status','Failed: '+e.message,'err'); }
 }
-async function updateWanted(id, status) {
-  await post('/epg-web/api/wanted', {action:'update', id, status});
-  loadRecs();
+async function checkWantedMovieUpgrade(btn, title) {
+  btn.disabled = true; btn.textContent = 'Checking…';
+  try {
+    const d = await (await fetch(`/epg-web/api/recommendations/movie-upgrade?title=${encodeURIComponent(title)}`)).json();
+    if (d.better && d.airing) {
+      btn.disabled = false; btn.textContent = '⏱ Record upgrade';
+      btn.title = d.decision || 'A better commercial-free copy is available';
+      btn.onclick = () => recordAiring(d.airing, title, btn);
+    } else {
+      btn.textContent = d.decision || d.error || 'Plex copy is best';
+      btn.title = btn.textContent;
+    }
+  } catch (e) { btn.textContent = 'Could not compare'; btn.title = e.message; }
+}
+function openWantedSeries(title, airing) {
+  openProg({...airing, title, desc:'', year:'', category:''});
 }
 async function removeWanted(id) {
   if (!confirm('Remove from wanted list?')) return;

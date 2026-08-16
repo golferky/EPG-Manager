@@ -180,12 +180,13 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("addWanted('movie')", server.HTML)
         self.assertIn("addWanted('series')", server.HTML)
 
-    def test_wanted_ui_groups_found_and_wanted_titles(self):
-        self.assertIn("['WANTED', recs.filter", server.HTML)
-        self.assertIn("['FOUND', recs.filter", server.HTML)
+    def test_wanted_ui_separates_movies_and_series(self):
+        self.assertIn("['MOVIES', recs.filter", server.HTML)
+        self.assertIn("['SERIES — EPISODE TRACKING', recs.filter", server.HTML)
 
-    def test_wanted_got_it_button_explains_its_effect(self):
-        self.assertIn("Mark this title as already obtained", server.HTML)
+    def test_wanted_movies_can_check_for_a_better_copy(self):
+        self.assertIn("checkWantedMovieUpgrade", server.HTML)
+        self.assertIn("/epg-web/api/recommendations/movie-upgrade", server.HTML)
 
     def test_showtime_rebrand_channel_aliases(self):
         self.assertEqual(
