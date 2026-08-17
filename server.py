@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260817c"
+VERSION = "v20260817d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1204,9 +1204,28 @@ def api_load_guide():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/epg-web/api/refresh-guide', methods=['POST'])
+def api_refresh_downloaded_guide():
+    """Reimport the locally downloaded daily XML without contacting PrimeStreams."""
+    cfg = load_config()
+    xml_path = os.path.join(BASE_DIR, 'guide_fetched.xml')
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    tz_str = cfg.get('timezone', 'America/New_York')
+    if not os.path.exists(xml_path):
+        return jsonify({'error': 'No downloaded guide yet. The 3:00 AM guide download has not run.'}), 400
+    try:
+        new_rows = import_xml_to_guide_db(xml_path, db_path)
+        count = load_epg_from_db(db_path, tz_str)
+        _ps_channel_cache['loaded_at'] = 0
+        _schedule_active_series(db_path)
+        return jsonify({'ok': True, 'count': count, 'new_rows': new_rows,
+                        'source': 'saved XML'})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
 @app.route('/epg-web/api/fetch-guide', methods=['POST'])
 def api_fetch_guide():
-    """Fetch fresh XMLTV from PrimeStreams, save to NAS, then reimport."""
+    """Daily job: download fresh XMLTV from PrimeStreams, then reimport it."""
     from urllib import request as urlreq
     cfg      = load_config()
     epg_url  = cfg.get('epg_url',  'http://primestreams.tv:826/').rstrip('/')
@@ -3585,7 +3604,7 @@ tr:hover td{background:#141414;}
   <span id="clock">--:-- --</span>
   <div class="spacer"></div>
   <button class="btn btn-ghost btn-sm" id="btn-refresh" onclick="loadGuide()">↻ Refresh</button>
-  <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">⬇ Fetch Guide</button>
+  <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">↻ Refresh Guide</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
 
@@ -4067,20 +4086,20 @@ async function pollStreamQuality() {
 }
 async function fetchGuide() {
   const btn = document.getElementById('btn-fetch-guide');
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Fetching…';
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Refreshing…';
   if (_qualityPoll) { clearTimeout(_qualityPoll); _qualityPoll = null; }
-  setGuideProgress(8, 'Downloading and importing guide…');
-  setGS('Fetching XMLTV from PrimeStreams — this may take 30-60s…');
+  setGuideProgress(35, 'Importing saved XML into the guide database…');
+  setGS('Refreshing from the XML downloaded by the 3:00 AM job…');
   try {
-    const r = await fetch('/epg-web/api/fetch-guide', {method:'POST'});
+    const r = await fetch('/epg-web/api/refresh-guide', {method:'POST'});
     const d = await r.json();
     if (d.error) { setGS('Fetch error: '+d.error, 'err'); return; }
     const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new rows)';
-    setGS(`Fetched ${(d.bytes/1024).toFixed(0)} KB · ${d.count.toLocaleString()} programmes${newInfo}`, 'ok');
+    setGS(`Refreshed ${d.count.toLocaleString()} programmes from saved XML${newInfo}`, 'ok');
+    setGuideProgress(100, 'Guide database refreshed from saved XML.');
     await fetchAndRenderGuide();
-    pollStreamQuality();
   } catch(e) { setGS('Fetch failed: '+e.message,'err'); setGuideProgress(0, '', false); }
-  finally { btn.disabled=false; btn.textContent='\\u2B07 Fetch Guide'; }
+  finally { btn.disabled=false; btn.textContent='↻ Refresh Guide'; }
 }
 function setGS(msg,cls='') {
   const el=document.getElementById('guide-status');
