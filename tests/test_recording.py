@@ -124,6 +124,23 @@ class RecordingTests(unittest.TestCase):
                 )
             self.assertTrue(response.get_json()["found"])
 
+    def test_stream_info_returns_safe_incoming_quality(self):
+        server._stream_info_cache.clear()
+        media = {
+            "width": 1920, "height": 1080, "fps": 29.97,
+            "video_codec": "h264", "audio_codec": "aac", "audio_channels": 2,
+            "total_bitrate": 5500000, "video_bitrate": 0,
+        }
+        with mock.patch.object(server, "_stream_url", return_value=("https://private.example/live.ts", None, {})), \
+             mock.patch("recording_agent.probe_media", return_value=media):
+            response = server.app.test_client().get("/epg-web/api/stream-info?channel_id=test-channel")
+        data = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["width"], 1920)
+        self.assertEqual(data["fps"], 29.97)
+        self.assertEqual(data["video_codec"], "H264")
+        self.assertNotIn("private", str(data))
+
     def test_airings_merge_hd_duplicate_and_identify_movie(self):
         with tempfile.TemporaryDirectory() as temp:
             guide_db = os.path.join(temp, "guide.db")

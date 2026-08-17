@@ -498,6 +498,7 @@ def load_epg(path, tz_str='America/New_York'):
 _convs = {}   # conv_id -> {file, status, progress, log, pid}
 _conv_lock = threading.Lock()
 _plex_info_cache = {}  # norm_title -> ffprobe result dict
+_stream_info_cache = {}  # channel_id -> (timestamp, safe ffprobe result)
 _plex_episode_cache = {'root': '', 'loaded_at': 0, 'episodes': set()}
 _plex_title_cache = {
     'roots': (), 'loaded_at': 0, 'movies': set(), 'movie_versions': set(),
@@ -2023,6 +2024,40 @@ def api_plex_info():
     _plex_info_cache[cache_key] = result
     return jsonify(result)
 
+@app.route('/epg-web/api/stream-info')
+def api_stream_info():
+    """Return safe technical details for a recordable incoming channel.
+
+    The stream address contains credentials, so it is intentionally never
+    returned to the browser.  Results are cached briefly: opening several
+    programme windows on the same channel should not repeatedly probe it.
+    """
+    channel_id = request.args.get('channel_id', '').strip()
+    if not channel_id:
+        return jsonify({'error': 'no channel_id'}), 400
+    cached = _stream_info_cache.get(channel_id)
+    if cached and time.time() - cached[0] < 300:
+        return jsonify(cached[1])
+    url, error, _debug = _stream_url(channel_id)
+    if error:
+        return jsonify({'error': error}), 404
+    try:
+        from recording_agent import probe_media
+        cfg = load_config()
+        media = probe_media(url, ffprobe=cfg.get('ffprobe_path', 'ffprobe'), timeout=15)
+        result = {
+            'width': media.get('width', 0), 'height': media.get('height', 0),
+            'fps': media.get('fps', 0),
+            'video_codec': (media.get('video_codec') or '').upper(),
+            'audio_codec': (media.get('audio_codec') or '').upper(),
+            'audio_channels': media.get('audio_channels', 0),
+            'bitrate': media.get('total_bitrate') or media.get('video_bitrate') or 0,
+        }
+    except Exception as exc:
+        return jsonify({'error': 'Unable to inspect the incoming stream', 'detail': str(exc)}), 502
+    _stream_info_cache[channel_id] = (time.time(), result)
+    return jsonify(result)
+
 @app.route('/epg-web/api/plex/play', methods=['POST'])
 def api_plex_play():
     title = (request.json or {}).get('title', '').strip()
@@ -3430,6 +3465,11 @@ tr:hover td{background:#141414;}
         <span style="font-size:10px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">▶ PLEX</span>
         <span id="pm-plex-info" style="font-size:12px;color:#a78bfa;font-family:monospace;"></span>
       </div>
+      <!-- Actual incoming stream quality, sampled from the recordable channel -->
+      <div id="pm-stream-wrap" style="display:none;border-top:1px solid #17365d;padding:9px 20px;background:#0b1726;">
+        <span style="font-size:10px;font-weight:700;color:#60a5fa;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">📡 RECORDING STREAM</span>
+        <span id="pm-stream-info" style="font-size:12px;color:#93c5fd;font-family:monospace;"></span>
+      </div>
       <!-- Next primestreams airing (featured) -->
       <div id="pm-next-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;background:#0f1923;">
         <div style="font-size:11px;font-weight:600;color:#3b82f6;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">📡 Next on PrimeStreams</div>
@@ -4433,6 +4473,30 @@ async function openProg(p) {
     } catch(e) {}
   }
 
+  // This is not the guide's quality hint: it is a brief ffprobe of the exact
+  // PrimeStreams channel which FFmpeg will record.  It is deliberately
+  // asynchronous so opening programme details remains instant.
+  const streamWrap = document.getElementById('pm-stream-wrap');
+  streamWrap.style.display = 'none';
+  const modalTitle = p.title;
+  async function showIncomingStreamInfo(channelId) {
+    try {
+      const response = await fetch(`/epg-web/api/stream-info?channel_id=${encodeURIComponent(channelId)}`);
+      if (!response.ok || _currentProg?.title !== modalTitle) return;
+      const si = await response.json();
+      const parts = [];
+      if (si.width && si.height) parts.push(`${si.width}×${si.height}`);
+      if (si.fps) parts.push(`${si.fps} fps`);
+      if (si.video_codec) parts.push(si.video_codec);
+      if (si.audio_codec) parts.push(si.audio_codec + (si.audio_channels ? ` ${si.audio_channels}ch` : ''));
+      if (si.bitrate) parts.push(`${(si.bitrate / 1000000).toFixed(1)} Mbps`);
+      if (parts.length) {
+        document.getElementById('pm-stream-info').textContent = parts.join(' · ');
+        streamWrap.style.display = 'block';
+      }
+    } catch (e) { /* Quality information is optional; recording still works. */ }
+  }
+
   // Fetch future airings
   document.getElementById('pm-next-wrap').style.display    = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
@@ -4484,6 +4548,7 @@ async function openProg(p) {
       if (featPS) {
         _nextAiring = featPS;
         _nextAiring._title = p.title;
+        showIncomingStreamInfo(featPS.channel_id);
         const label = featPS.on_now
           ? `ON NOW  ·  ${featPS.channel_name}  (until ${featPS.stop_fmt})`
           : `${featPS.start_fmt} – ${featPS.stop_fmt}  ·  ${featPS.channel_name}`;
