@@ -112,6 +112,18 @@ class RecordingTests(unittest.TestCase):
                 )
             self.assertTrue(response.get_json()["found"])
 
+    def test_plex_info_tolerates_unyearred_folder_and_extra_spaces(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = os.path.join(temp, "Alvin and the Chipmunks  Chipwrecked")
+            os.makedirs(folder)
+            open(os.path.join(folder, "movie.mp4"), "wb").close()
+            server._plex_info_cache.clear()
+            with mock.patch.object(server, "load_config", return_value={"plex_path": temp}):
+                response = server.app.test_client().get(
+                    "/epg-web/api/plex/info?title=Alvin%20and%20the%20Chipmunks%3A%20Chipwrecked%20(2011)"
+                )
+            self.assertTrue(response.get_json()["found"])
+
     def test_airings_merge_hd_duplicate_and_identify_movie(self):
         with tempfile.TemporaryDirectory() as temp:
             guide_db = os.path.join(temp, "guide.db")

@@ -1971,7 +1971,7 @@ def api_plex_info():
     if not title:
         return jsonify({'error': 'no title'}), 400
     def _norm(t):
-        return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
+        return re.sub(r'[^a-z0-9]', '', t.lower())
     clean_title, requested_year = _plex_title_and_year(title)
     cache_key = _norm(title)
     if cache_key in _plex_info_cache:
@@ -1980,8 +1980,6 @@ def api_plex_info():
     plex_dir = cfg.get('plex_path', '/Volumes/Plex-1/Movies')
     if not os.path.isdir(plex_dir):
         return jsonify({'found': False, 'error': 'plex not mounted'})
-    def _norm(t):
-        return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
     norm_title = _norm(clean_title)
     matched_folder = None
     for name in os.listdir(plex_dir):
@@ -1990,7 +1988,7 @@ def api_plex_info():
             continue
         folder_title, folder_year = _plex_title_and_year(name)
         if (_norm(folder_title) == norm_title and
-                (not requested_year or folder_year == requested_year)):
+                (not requested_year or not folder_year or folder_year == requested_year)):
             matched_folder = fp
             break
     if not matched_folder:
