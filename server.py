@@ -4412,7 +4412,7 @@ async function updateGuideStreamQuality() {
   // channel for the rest of the browser session.
   const spans = [...document.querySelectorAll('.stream-qual[data-stream-channel]')];
   const channels = [...new Set(spans.map(s => s.dataset.streamChannel).filter(Boolean))].slice(0, 12);
-  for (const channelId of channels) {
+  async function probeChannel(channelId) {
     let info = _streamInfoCache[channelId];
     if (info === undefined) {
       try {
@@ -4421,7 +4421,7 @@ async function updateGuideStreamQuality() {
       } catch (e) { info = null; }
       _streamInfoCache[channelId] = info;
     }
-    if (!info || !info.height) continue;
+    if (!info || !info.height) return;
     const label = `${info.height >= 2160 ? '4K' : info.height + 'p'}${info.fps ? ' · ' + info.fps + 'fps' : ''}`;
     document.querySelectorAll('.stream-qual[data-stream-channel]').forEach(el => {
       if (el.dataset.streamChannel === channelId) {
@@ -4429,6 +4429,11 @@ async function updateGuideStreamQuality() {
         el.title = `Incoming recording stream: ${info.width}×${info.height}${info.fps ? ' at ' + info.fps + ' fps' : ''}`;
       }
     });
+  }
+  // Four parallel probes make the badges appear promptly, while keeping the
+  // incoming-stream checks gentle on PrimeStreams and on this Flask process.
+  for (let offset = 0; offset < channels.length; offset += 4) {
+    await Promise.all(channels.slice(offset, offset + 4).map(probeChannel));
   }
 }
 
