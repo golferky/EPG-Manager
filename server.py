@@ -178,6 +178,7 @@ def db_run(sql, params=()):
 # ── EPG Parsing ───────────────────────────────────────────────────────────────
 
 _epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'loaded': None}
+_ps_channel_cache = {'paths': (), 'loaded_at': 0, 'ids': set()}
 
 def _parse_dt(s):
     s = s.strip()
@@ -194,6 +195,10 @@ def _parse_dt(s):
 def get_ps_channel_ids(guide_db_path, movies_db_path):
     """Return set of guide.db channel_ids that have a primestreams stream_id in Movies.db.
     Handles both direct ID matches and name-based fallbacks."""
+    cache_paths = (guide_db_path, movies_db_path)
+    if (_ps_channel_cache['paths'] == cache_paths and
+            time.time() - _ps_channel_cache['loaded_at'] < 300):
+        return set(_ps_channel_cache['ids'])
     try:
         import re as _re
         # All Movies.db guide_channels with a stream
@@ -247,6 +252,7 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
                 if len(cname_norm) >= 3 and len(base) >= 3:
                     if base.startswith(cname_norm) or cname_norm.startswith(base):
                         result.add(_pick_best(cids, base))
+        _ps_channel_cache.update({'paths': cache_paths, 'loaded_at': time.time(), 'ids': set(result)})
         return result
     except Exception as e:
         print(f'[ps_channel_ids] {e}')
@@ -1101,6 +1107,7 @@ def api_load_guide():
     try:
         new_rows = import_xml_to_guide_db(xml_path, db_path)
         count    = load_epg_from_db(db_path, tz_str)
+        _ps_channel_cache['loaded_at'] = 0
         _schedule_active_series(db_path)
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows, 'loaded': _epg['loaded']})
     except Exception as e:
@@ -1133,6 +1140,7 @@ def api_fetch_guide():
         xml_path = local_xml  # import from local copy
         new_rows = import_xml_to_guide_db(xml_path, db_path)
         count    = load_epg_from_db(db_path, tz_str)
+        _ps_channel_cache['loaded_at'] = 0
         _schedule_active_series(db_path)
         # The comparison probes real streams, so keep it off the guide-fetch
         # request.  Wanted Plex movies are considered for an automatic upgrade
@@ -3366,7 +3374,9 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .rec-btn.pending{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,.15);cursor:default;}
 .plex-qual{font-size:9px;color:#7c3aed;margin-right:3px;flex-shrink:0;opacity:.8;}
 .stream-qual{font-size:8px;color:#67e8f9;background:#083344;border:1px solid #155e75;border-radius:3px;
-             padding:0 3px;margin-left:4px;flex-shrink:0;line-height:13px;font-family:monospace;}
+             width:76px;box-sizing:border-box;padding:0 3px;margin-right:4px;flex-shrink:0;line-height:13px;
+             font-family:monospace;opacity:0;transition:opacity .12s;}
+.stream-qual.ready{opacity:1;}
 @keyframes pulse-rec{0%,100%{opacity:1;}50%{opacity:.3;}}
 .prog-title{font-size:11px;color:#c7d2e7;white-space:nowrap;overflow:hidden;
             text-overflow:ellipsis;}
@@ -4333,7 +4343,7 @@ function renderGuide() {
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span>${p.can_record ? `<span class="stream-qual" data-stream-channel="${esc(p.channel_id)}"></span>` : ''}</div>
+        <div class="prog-row-top">${badges}${catBadge}${p.can_record ? `<span class="stream-qual" data-stream-channel="${esc(p.channel_id)}"></span>` : ''}<span class="prog-title">${esc(p.title)}</span></div>
         ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
@@ -4426,6 +4436,7 @@ async function updateGuideStreamQuality() {
     document.querySelectorAll('.stream-qual[data-stream-channel]').forEach(el => {
       if (el.dataset.streamChannel === channelId) {
         el.textContent = label;
+        el.classList.add('ready');
         el.title = `Incoming recording stream: ${info.width}×${info.height}${info.fps ? ' at ' + info.fps + ' fps' : ''}`;
       }
     });
