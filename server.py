@@ -1319,6 +1319,16 @@ def api_guide():
     ch_cap    = 200
     total_ch  = len(ordered_channels)
     page_chs  = ordered_channels[ch_offset:ch_offset + ch_cap]
+    # Mark channels that can be recorded, without exposing their stream URLs.
+    try:
+        source_recordable = get_ps_channel_ids(guide_db_path, movies_db_path)
+        recordable_ids = {id_to_canonical.get(channel_id, channel_id)
+                          for channel_id in source_recordable}
+        for prog in progs_in_window:
+            prog['can_record'] = prog['channel_id'] in recordable_ids
+    except Exception:
+        for prog in progs_in_window:
+            prog['can_record'] = False
 
     return jsonify({
         'window_start': ws.astimezone(local_tz).isoformat(),
@@ -2123,7 +2133,7 @@ def api_stream_info():
     try:
         from recording_agent import probe_media
         cfg = load_config()
-        media = probe_media(url, ffprobe=cfg.get('ffprobe_path', 'ffprobe'), timeout=15)
+        media = probe_media(url, ffprobe=cfg.get('ffprobe', cfg.get('ffprobe_path', 'ffprobe')), timeout=15)
         result = {
             'width': media.get('width', 0), 'height': media.get('height', 0),
             'fps': media.get('fps', 0),
@@ -3355,6 +3365,8 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .rec-btn:hover{background:#ef4444;color:#fff;}
 .rec-btn.pending{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,.15);cursor:default;}
 .plex-qual{font-size:9px;color:#7c3aed;margin-right:3px;flex-shrink:0;opacity:.8;}
+.stream-qual{font-size:8px;color:#67e8f9;background:#083344;border:1px solid #155e75;border-radius:3px;
+             padding:0 3px;margin-left:4px;flex-shrink:0;line-height:13px;font-family:monospace;}
 @keyframes pulse-rec{0%,100%{opacity:1;}50%{opacity:.3;}}
 .prog-title{font-size:11px;color:#c7d2e7;white-space:nowrap;overflow:hidden;
             text-overflow:ellipsis;}
@@ -4321,7 +4333,7 @@ function renderGuide() {
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span></div>
+        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span>${p.can_record ? `<span class="stream-qual" data-stream-channel="${esc(p.channel_id)}"></span>` : ''}</div>
         ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
@@ -4337,6 +4349,7 @@ function renderGuide() {
 
   document.getElementById('guide-inner').innerHTML = timeHTML + rowsHTML;
   document.getElementById('guide-wrap').style.display = 'block';
+  updateGuideStreamQuality();
 }
 
 function _catInfo(cat) {
@@ -4393,8 +4406,35 @@ async function updatePlexQuality() {
   }
 }
 
+async function updateGuideStreamQuality() {
+  // Probe a modest number of distinct channels at a time.  The result is the
+  // actual incoming stream quality, not a provider label, and is cached by
+  // channel for the rest of the browser session.
+  const spans = [...document.querySelectorAll('.stream-qual[data-stream-channel]')];
+  const channels = [...new Set(spans.map(s => s.dataset.streamChannel).filter(Boolean))].slice(0, 12);
+  for (const channelId of channels) {
+    let info = _streamInfoCache[channelId];
+    if (info === undefined) {
+      try {
+        const response = await fetch(`/epg-web/api/stream-info?channel_id=${encodeURIComponent(channelId)}`);
+        info = response.ok ? await response.json() : null;
+      } catch (e) { info = null; }
+      _streamInfoCache[channelId] = info;
+    }
+    if (!info || !info.height) continue;
+    const label = `${info.height >= 2160 ? '4K' : info.height + 'p'}${info.fps ? ' · ' + info.fps + 'fps' : ''}`;
+    document.querySelectorAll('.stream-qual[data-stream-channel]').forEach(el => {
+      if (el.dataset.streamChannel === channelId) {
+        el.textContent = label;
+        el.title = `Incoming recording stream: ${info.width}×${info.height}${info.fps ? ' at ' + info.fps + ' fps' : ''}`;
+      }
+    });
+  }
+}
+
 // Tooltip
 const _plexInfoCache = {};
+const _streamInfoCache = {};
 const _imdbCache     = {};
 function showTip(e, p) {
   const tt      = document.getElementById('tooltip');
