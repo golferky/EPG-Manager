@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260817b"
+VERSION = "v20260817c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2265,6 +2265,11 @@ def api_stream_info():
     _stream_info_cache[channel_id] = (time.time(), result)
     return jsonify(result)
 
+@app.route('/epg-web/api/stream-quality/status')
+def api_stream_quality_status():
+    with _stream_quality_scan_lock:
+        return jsonify(dict(_stream_quality_scan))
+
 @app.route('/epg-web/api/plex/play', methods=['POST'])
 def api_plex_play():
     title = (request.json or {}).get('title', '').strip()
@@ -3622,6 +3627,10 @@ tr:hover td{background:#141414;}
   <div id="storage-bar" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:6px 4px;font-size:12px;color:#64748b;border-bottom:1px solid #1e293b;margin-bottom:6px;"></div>
   <div id="now-playing-bar" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 4px;border-bottom:1px solid #1e293b;margin-bottom:4px;"></div>
   <div id="guide-status" class="status-msg"></div>
+  <div id="guide-progress" style="display:none;max-width:430px;margin:0 0 8px;">
+    <div style="height:5px;background:#1e293b;border-radius:99px;overflow:hidden;"><div id="guide-progress-bar" style="height:100%;width:0;background:#38bdf8;transition:width .25s;"></div></div>
+    <div id="guide-progress-text" style="font-size:11px;color:#94a3b8;margin-top:4px;"></div>
+  </div>
   <div id="sd-status" class="status-msg" style="display:none;"></div>
   <div class="guide-wrap" id="guide-wrap" style="display:none;">
     <div id="guide-inner"></div>
@@ -4032,9 +4041,35 @@ async function saveSettings() {
 }
 
 // ── Guide ─────────────────────────────────────────────────────────────────────
+let _qualityPoll = null;
+function setGuideProgress(pct, text, show=true) {
+  const wrap = document.getElementById('guide-progress');
+  wrap.style.display = show ? '' : 'none';
+  document.getElementById('guide-progress-bar').style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  document.getElementById('guide-progress-text').textContent = text || '';
+}
+async function pollStreamQuality() {
+  try {
+    const status = await (await fetch('/epg-web/api/stream-quality/status')).json();
+    const total = status.total || 0;
+    const done = status.completed || 0;
+    if (status.running || total) {
+      const pct = total ? Math.round(done / total * 100) : 8;
+      setGuideProgress(pct, total ? `Saving channel quality: ${done} of ${total}` : 'Starting channel-quality scan…');
+    }
+    if (status.running) {
+      _qualityPoll = setTimeout(pollStreamQuality, 1500);
+    } else if (total) {
+      setGuideProgress(100, `Channel quality saved: ${done} of ${total}`);
+      _qualityPoll = null;
+    }
+  } catch (e) { /* The guide fetch itself remains usable if status polling fails. */ }
+}
 async function fetchGuide() {
   const btn = document.getElementById('btn-fetch-guide');
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Fetching…';
+  if (_qualityPoll) { clearTimeout(_qualityPoll); _qualityPoll = null; }
+  setGuideProgress(8, 'Downloading and importing guide…');
   setGS('Fetching XMLTV from PrimeStreams — this may take 30-60s…');
   try {
     const r = await fetch('/epg-web/api/fetch-guide', {method:'POST'});
@@ -4043,7 +4078,8 @@ async function fetchGuide() {
     const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new rows)';
     setGS(`Fetched ${(d.bytes/1024).toFixed(0)} KB · ${d.count.toLocaleString()} programmes${newInfo}`, 'ok');
     await fetchAndRenderGuide();
-  } catch(e) { setGS('Fetch failed: '+e.message,'err'); }
+    pollStreamQuality();
+  } catch(e) { setGS('Fetch failed: '+e.message,'err'); setGuideProgress(0, '', false); }
   finally { btn.disabled=false; btn.textContent='\\u2B07 Fetch Guide'; }
 }
 function setGS(msg,cls='') {
