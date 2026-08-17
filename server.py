@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260817a"
+VERSION = "v20260817b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -179,6 +179,8 @@ def db_run(sql, params=()):
 
 _epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'loaded': None}
 _ps_channel_cache = {'paths': (), 'loaded_at': 0, 'ids': set()}
+_stream_quality_scan = {'running': False, 'completed': 0, 'total': 0}
+_stream_quality_scan_lock = threading.Lock()
 
 def _parse_dt(s):
     s = s.strip()
@@ -288,6 +290,14 @@ def ensure_guide_db(db_path):
         CREATE TABLE IF NOT EXISTS channel_favorites (
             channel_id TEXT PRIMARY KEY,
             favorite INTEGER NOT NULL DEFAULT 1
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS channel_stream_quality (
+            channel_id TEXT PRIMARY KEY,
+            width INTEGER, height INTEGER, fps REAL,
+            video_codec TEXT, audio_codec TEXT, audio_channels INTEGER,
+            bitrate INTEGER, sampled_at REAL, error TEXT
         )
     ''')
     conn.execute('''
@@ -826,6 +836,87 @@ def _stream_url(channel_id):
     url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
     return url, None, debug
 
+def _saved_stream_quality(channel_id):
+    """Read a safe cached channel-quality record from guide.db."""
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('''SELECT width,height,fps,video_codec,audio_codec,
+                              audio_channels,bitrate,sampled_at
+                              FROM channel_stream_quality WHERE channel_id=?''',
+                           (channel_id,)).fetchone()
+        conn.close()
+        return dict(row) if row and row['height'] else None
+    except Exception:
+        return None
+
+def _refresh_stream_quality_cache():
+    """Sample recordable channels in the background after a guide refresh."""
+    with _stream_quality_scan_lock:
+        if _stream_quality_scan['running']:
+            return
+        _stream_quality_scan.update({'running': True, 'completed': 0, 'total': 0})
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from recording_agent import probe_media
+        cfg = load_config()
+        guide_db = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+        movie_db = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+        channel_ids = list(get_ps_channel_ids(guide_db, movie_db))
+        # Favorite channels are useful first; the rest follow in the same job.
+        try:
+            favorite_ids = {r['guide_channel'] for r in db_rows(
+                'SELECT guide_channel FROM channels WHERE favorite=1 AND guide_channel IS NOT NULL')}
+            channel_ids.sort(key=lambda cid: (cid not in favorite_ids, cid))
+        except Exception:
+            pass
+        with _stream_quality_scan_lock:
+            _stream_quality_scan['total'] = len(channel_ids)
+        def sample(channel_id):
+            url, error, _debug = _stream_url(channel_id)
+            if error:
+                return channel_id, None
+            try:
+                media = probe_media(url, ffprobe=cfg.get('ffprobe', 'ffprobe'), timeout=15)
+                return channel_id, {
+                    'width': media.get('width', 0), 'height': media.get('height', 0),
+                    'fps': media.get('fps', 0), 'video_codec': (media.get('video_codec') or '').upper(),
+                    'audio_codec': (media.get('audio_codec') or '').upper(),
+                    'audio_channels': media.get('audio_channels', 0),
+                    'bitrate': media.get('total_bitrate') or media.get('video_bitrate') or 0,
+                }
+            except Exception:
+                return channel_id, None
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix='epg-quality') as pool:
+            futures = [pool.submit(sample, channel_id) for channel_id in channel_ids]
+            for future in as_completed(futures):
+                channel_id, quality = future.result()
+                if quality and quality['height']:
+                    try:
+                        conn = sqlite3.connect(guide_db, timeout=30)
+                        conn.execute('''INSERT INTO channel_stream_quality
+                            (channel_id,width,height,fps,video_codec,audio_codec,audio_channels,bitrate,sampled_at,error)
+                            VALUES (?,?,?,?,?,?,?,?,?,NULL)
+                            ON CONFLICT(channel_id) DO UPDATE SET
+                              width=excluded.width,height=excluded.height,fps=excluded.fps,
+                              video_codec=excluded.video_codec,audio_codec=excluded.audio_codec,
+                              audio_channels=excluded.audio_channels,bitrate=excluded.bitrate,
+                              sampled_at=excluded.sampled_at,error=NULL''',
+                            (channel_id, quality['width'], quality['height'], quality['fps'],
+                             quality['video_codec'], quality['audio_codec'], quality['audio_channels'],
+                             quality['bitrate'], time.time()))
+                        conn.commit(); conn.close()
+                    except Exception as exc:
+                        print(f'[stream-quality] save error: {exc}')
+                with _stream_quality_scan_lock:
+                    _stream_quality_scan['completed'] += 1
+        print(f'[stream-quality] refreshed {_stream_quality_scan["completed"]} channel(s)')
+    except Exception as exc:
+        print(f'[stream-quality] refresh error: {exc}')
+    finally:
+        with _stream_quality_scan_lock:
+            _stream_quality_scan['running'] = False
+
 def _safe_filename(title):
     return re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:60]
 
@@ -1147,6 +1238,8 @@ def api_fetch_guide():
         # only after the new guide is safely loaded.
         threading.Thread(target=_auto_schedule_wanted_movie_upgrades,
                          name='epg-auto-upgrades', daemon=True).start()
+        threading.Thread(target=_refresh_stream_quality_cache,
+                         name='epg-stream-quality', daemon=True).start()
         print(f'[fetch-guide] Done: {count} programmes, {new_rows} new rows')
         return jsonify({'ok': True, 'bytes': len(data), 'count': count, 'new_rows': new_rows})
     except Exception as e:
@@ -1332,8 +1425,21 @@ def api_guide():
         source_recordable = get_ps_channel_ids(guide_db_path, movies_db_path)
         recordable_ids = {id_to_canonical.get(channel_id, channel_id)
                           for channel_id in source_recordable}
+        quality_by_id = {}
+        try:
+            qconn = sqlite3.connect(guide_db_path)
+            qconn.row_factory = sqlite3.Row
+            for row in qconn.execute('''SELECT channel_id,width,height,fps,video_codec,
+                                        audio_codec,audio_channels,bitrate,sampled_at
+                                        FROM channel_stream_quality WHERE height > 0'''):
+                quality_by_id[id_to_canonical.get(row['channel_id'], row['channel_id'])] = dict(row)
+            qconn.close()
+        except Exception:
+            pass
         for prog in progs_in_window:
             prog['can_record'] = prog['channel_id'] in recordable_ids
+            if prog['can_record'] and prog['channel_id'] in quality_by_id:
+                prog['stream_quality'] = quality_by_id[prog['channel_id']]
     except Exception:
         for prog in progs_in_window:
             prog['can_record'] = False
@@ -2135,6 +2241,10 @@ def api_stream_info():
     cached = _stream_info_cache.get(channel_id)
     if cached and time.time() - cached[0] < 300:
         return jsonify(cached[1])
+    saved = _saved_stream_quality(channel_id)
+    if saved:
+        _stream_info_cache[channel_id] = (time.time(), saved)
+        return jsonify(saved)
     url, error, _debug = _stream_url(channel_id)
     if error:
         return jsonify({'error': error}), 404
@@ -4330,6 +4440,10 @@ function renderGuide() {
                     : isSeries ? {cls:'cat-series', badge:'TV', title:'Series'}
                     : _catInfo(p.category || '');
       const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
+      const sq = p.stream_quality || null;
+      const streamBadge = sq && sq.height
+        ? `<span class="stream-qual ready" title="Incoming recording stream: ${sq.width}×${sq.height}${sq.fps ? ' at '+sq.fps+' fps' : ''}">${sq.height >= 2160 ? '4K' : sq.height+'p'}${sq.fps ? ' · '+sq.fps+'fps' : ''}</span>`
+        : '';
       const badges    = (hasPlexEpisode ? '<span class="plex-qual" title="Episode already in Plex" style="color:#a78bfa;">IN PLEX</span>' : '')
                       + (isRecording ? '<span class="rec-dot" title="Recording now">⏺</span>' : '')
                       + (isScheduled ? '<span class="sched-dot" title="Scheduled to record">⏱</span>' : '')
@@ -4343,7 +4457,7 @@ function renderGuide() {
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <div class="prog-row-top">${badges}${catBadge}${p.can_record ? `<span class="stream-qual" data-stream-channel="${esc(p.channel_id)}"></span>` : ''}<span class="prog-title">${esc(p.title)}</span></div>
+        <div class="prog-row-top">${badges}${catBadge}${streamBadge}<span class="prog-title">${esc(p.title)}</span></div>
         ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
@@ -4359,7 +4473,6 @@ function renderGuide() {
 
   document.getElementById('guide-inner').innerHTML = timeHTML + rowsHTML;
   document.getElementById('guide-wrap').style.display = 'block';
-  updateGuideStreamQuality();
 }
 
 function _catInfo(cat) {
