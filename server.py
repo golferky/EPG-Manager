@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260817f"
+VERSION = "v20260817g"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3507,14 +3507,14 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .rec-btn:hover{background:#ef4444;color:#fff;}
 .rec-btn.pending{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,.15);cursor:default;}
 .plex-qual{font-size:9px;color:#7c3aed;margin-right:3px;flex-shrink:0;opacity:.8;}
-.prog-stream-meta{font-size:9px;color:#67e8f9;margin-left:5px;white-space:nowrap;font-family:monospace;opacity:.9;}
+.prog-stream-meta{font-size:9px;color:#67e8f9;margin-left:5px;white-space:nowrap;font-family:monospace;opacity:.9;flex-shrink:0;}
 .prog-stream-meta.q-480{color:#facc15;}
 .prog-stream-meta.q-720{color:#fb923c;}
 .prog-stream-meta.q-1080{color:#4ade80;}
 .prog-stream-meta.q-4k{color:#22c55e;font-weight:700;}
 @keyframes pulse-rec{0%,100%{opacity:1;}50%{opacity:.3;}}
 .prog-title{font-size:11px;color:#c7d2e7;white-space:nowrap;overflow:hidden;
-            text-overflow:ellipsis;}
+            text-overflow:ellipsis;min-width:0;flex:1;}
 .now-line{position:absolute;top:0;bottom:0;width:2px;background:#ef4444;z-index:8;
           pointer-events:none;}
 
@@ -4517,7 +4517,7 @@ function renderGuide() {
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}${streamMeta}</span></div>
+        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span>${streamMeta}</div>
         ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
