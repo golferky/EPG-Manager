@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260817d"
+VERSION = "v20260817e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3507,10 +3507,7 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .rec-btn:hover{background:#ef4444;color:#fff;}
 .rec-btn.pending{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,.15);cursor:default;}
 .plex-qual{font-size:9px;color:#7c3aed;margin-right:3px;flex-shrink:0;opacity:.8;}
-.stream-qual{font-size:8px;color:#67e8f9;background:#083344;border:1px solid #155e75;border-radius:3px;
-             width:76px;box-sizing:border-box;padding:0 3px;margin-right:4px;flex-shrink:0;line-height:13px;
-             font-family:monospace;opacity:0;transition:opacity .12s;}
-.stream-qual.ready{opacity:1;}
+.prog-stream-meta{font-size:9px;color:#67e8f9;margin-left:5px;white-space:nowrap;font-family:monospace;opacity:.9;}
 @keyframes pulse-rec{0%,100%{opacity:1;}50%{opacity:.3;}}
 .prog-title{font-size:11px;color:#c7d2e7;white-space:nowrap;overflow:hidden;
             text-overflow:ellipsis;}
@@ -4496,8 +4493,8 @@ function renderGuide() {
                     : _catInfo(p.category || '');
       const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
       const sq = p.stream_quality || null;
-      const streamBadge = sq && sq.height
-        ? `<span class="stream-qual ready" title="Incoming recording stream: ${sq.width}×${sq.height}${sq.fps ? ' at '+sq.fps+' fps' : ''}">${sq.height >= 2160 ? '4K' : sq.height+'p'}${sq.fps ? ' · '+sq.fps+'fps' : ''}</span>`
+      const streamMeta = sq && sq.height
+        ? `<span class="prog-stream-meta" title="Incoming recording stream: ${sq.width}×${sq.height}${sq.fps ? ' at '+sq.fps+' fps' : ''}">· ${sq.height >= 2160 ? '4K' : sq.height+'p'}${sq.fps ? ' · '+sq.fps+'fps' : ''}</span>`
         : '';
       const badges    = (hasPlexEpisode ? '<span class="plex-qual" title="Episode already in Plex" style="color:#a78bfa;">IN PLEX</span>' : '')
                       + (isRecording ? '<span class="rec-dot" title="Recording now">⏺</span>' : '')
@@ -4512,7 +4509,7 @@ function renderGuide() {
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <div class="prog-row-top">${badges}${catBadge}${streamBadge}<span class="prog-title">${esc(p.title)}</span></div>
+        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}${streamMeta}</span></div>
         ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
