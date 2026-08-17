@@ -1134,6 +1134,11 @@ def api_fetch_guide():
         new_rows = import_xml_to_guide_db(xml_path, db_path)
         count    = load_epg_from_db(db_path, tz_str)
         _schedule_active_series(db_path)
+        # The comparison probes real streams, so keep it off the guide-fetch
+        # request.  Wanted Plex movies are considered for an automatic upgrade
+        # only after the new guide is safely loaded.
+        threading.Thread(target=_auto_schedule_wanted_movie_upgrades,
+                         name='epg-auto-upgrades', daemon=True).start()
         print(f'[fetch-guide] Done: {count} programmes, {new_rows} new rows')
         return jsonify({'ok': True, 'bytes': len(data), 'count': count, 'new_rows': new_rows})
     except Exception as e:
@@ -1736,6 +1741,74 @@ def api_post_schedule():
 
     return jsonify({'error': 'Unknown action'}), 400
 
+def _auto_schedule_wanted_movie_upgrades():
+    """Queue objectively better clean-airing replacements for wanted movies.
+
+    This runs after a guide refresh.  It never records a title absent from the
+    user's Wanted list, never uses an ad-supported channel, and leaves the
+    recording agent to make the same comparison again immediately before both
+    recording and transfer.
+    """
+    try:
+        from recording_agent import best_existing_copy, find_plex_candidates, probe_media, quality_decision
+        cfg = load_config()
+        guide_db = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+        movie_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
+        if not os.path.isdir(movie_root):
+            print('[auto-upgrade] Plex Movies is not mounted; skipping')
+            return
+        wanted = [dict(r) for r in db_rows(
+            "SELECT title, year FROM wanted_titles WHERE type='movie' AND lower(COALESCE(status, '')) NOT IN ('removed', 'disabled')"
+        )]
+        if not wanted:
+            return
+        conn = sqlite3.connect(guide_db)
+        conn.row_factory = sqlite3.Row
+        now_key = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+        for item in wanted:
+            title, year = item['title'], str(item.get('year') or '').strip()
+            # Do not schedule a duplicate if this guide refresh is repeated.
+            with _rec_lock:
+                if any(_rec_is_active(r) and _norm_plex_show(r.get('title', '')) == _norm_plex_show(title)
+                       for r in _recs.values()):
+                    continue
+            candidates = find_plex_candidates(movie_root, title)
+            if re.fullmatch(r'\d{4}', year):
+                candidates = [p for p in candidates if re.search(
+                    rf'\({re.escape(year)}\)$', os.path.basename(os.path.dirname(p)))]
+            _existing_path, existing = best_existing_copy(candidates, cfg.get('ffprobe', 'ffprobe'))
+            if not existing:
+                continue
+            clean_title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
+            rows = conn.execute('''SELECT channel_id, channel_name, start_utc, end_utc
+                FROM guide WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
+                AND start_utc>? ORDER BY start_utc LIMIT 60''',
+                (title, clean_title, now_key)).fetchall()
+            candidate = next((row for row in rows if _is_commercial_free_channel(row['channel_name'])), None)
+            if not candidate:
+                continue
+            url, stream_error, _debug = _stream_url(candidate['channel_id'])
+            if stream_error:
+                continue
+            incoming = probe_media(url, ffprobe=cfg.get('ffprobe', 'ffprobe'), timeout=45)
+            better, decision = quality_decision(existing, incoming)
+            if not better:
+                continue
+            start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            # Reuse the normal queueing path so stream mapping, persistence,
+            # deduplication, and the recording backend all behave identically.
+            with app.test_request_context('/epg-web/api/record', method='POST', json={
+                'title': title, 'channel_id': candidate['channel_id'],
+                'start_ts': start.timestamp(), 'stop_ts': stop.timestamp(),
+            }):
+                queued = api_record().get_json()
+            if queued.get('ok') and not queued.get('dup'):
+                print(f'[auto-upgrade] Scheduled {title}: {decision}')
+        conn.close()
+    except Exception as exc:
+        print(f'[auto-upgrade] Error: {exc}')
+
 @app.route('/epg-web/api/recommendations')
 def api_recommendations():
     # Wanted titles from DB cross-referenced with guide
@@ -1753,6 +1826,11 @@ def api_recommendations():
             future_airings.setdefault(t, []).append(p)
 
     plex_titles = _plex_wanted_title_index()
+    with _rec_lock:
+        active_upgrade_titles = {
+            _norm_plex_show(r.get('title', '')) for r in _recs.values()
+            if _rec_is_active(r)
+        }
     result = []
     for w in wanted:
         candidates = (future_airings.get(w['title'].lower()) or
@@ -1779,6 +1857,7 @@ def api_recommendations():
             'updated_at': w['updated_at'],
             'next_airing': airing,
             'in_plex': in_movies or in_shows,
+            'upgrade_scheduled': bool(in_movies and title_key in active_upgrade_titles),
             'plex_kind': ('Movie' if in_movies else '') + (' & TV' if in_movies and in_shows else 'TV' if in_shows else ''),
         })
     return jsonify({'recommendations': result})
@@ -5050,7 +5129,9 @@ async function loadRecs() {
       const action = isSeries
         ? (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
         : r.in_plex
-          ? `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>`
+          ? (r.upgrade_scheduled
+              ? `<span class="badge badge-record" title="A better commercial-free airing was found and scheduled automatically">✓ Upgrade scheduled</span>`
+              : `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>`)
           : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg})">⏱ Record</button>` : '');
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
