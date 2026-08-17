@@ -1929,6 +1929,11 @@ def _plex_tv_path(cfg):
 def _norm_plex_show(value):
     return re.sub(r'[^a-z0-9]', '', (value or '').lower())
 
+
+def _plex_title_and_year(value):
+    match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', (value or '').strip())
+    return (match.group(1).strip(), match.group(2)) if match else ((value or '').strip(), '')
+
 def _plex_episode_keys(tv_root):
     """Return cached show|season|episode keys from Plex's TV Shows layout."""
     now = time.time()
@@ -1967,6 +1972,7 @@ def api_plex_info():
         return jsonify({'error': 'no title'}), 400
     def _norm(t):
         return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
+    clean_title, requested_year = _plex_title_and_year(title)
     cache_key = _norm(title)
     if cache_key in _plex_info_cache:
         return jsonify(_plex_info_cache[cache_key])
@@ -1976,14 +1982,15 @@ def api_plex_info():
         return jsonify({'found': False, 'error': 'plex not mounted'})
     def _norm(t):
         return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
-    norm_title = _norm(title)
+    norm_title = _norm(clean_title)
     matched_folder = None
     for name in os.listdir(plex_dir):
         fp = os.path.join(plex_dir, name)
         if not os.path.isdir(fp):
             continue
-        folder_title = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
-        if _norm(folder_title) == norm_title:
+        folder_title, folder_year = _plex_title_and_year(name)
+        if (_norm(folder_title) == norm_title and
+                (not requested_year or folder_year == requested_year)):
             matched_folder = fp
             break
     if not matched_folder:

@@ -100,6 +100,18 @@ class RecordingTests(unittest.TestCase):
             self.assertIn(("fx", "1986"), titles["movie_versions"])
             self.assertIn("bewitched", titles["shows"])
 
+    def test_plex_info_matches_movie_folder_when_guide_title_has_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = os.path.join(temp, "Ace Ventura Pet Detective (1994)")
+            os.makedirs(folder)
+            open(os.path.join(folder, "Ace Ventura Pet Detective.mp4"), "wb").close()
+            server._plex_info_cache.clear()
+            with mock.patch.object(server, "load_config", return_value={"plex_path": temp}):
+                response = server.app.test_client().get(
+                    "/epg-web/api/plex/info?title=Ace%20Ventura%20Pet%20Detective%20(1994)"
+                )
+            self.assertTrue(response.get_json()["found"])
+
     def test_airings_merge_hd_duplicate_and_identify_movie(self):
         with tempfile.TemporaryDirectory() as temp:
             guide_db = os.path.join(temp, "guide.db")
