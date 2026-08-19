@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260817g"
+VERSION = "v20260819a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -214,9 +214,15 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         gconn = sqlite3.connect(guide_db_path)
         # All distinct channel_id/channel_name pairs in guide.db
         grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
+        try:
+            discovered_ids = {r[0] for r in gconn.execute(
+                'SELECT channel_id FROM discovered_streams'
+            ).fetchall()}
+        except sqlite3.OperationalError:
+            discovered_ids = set()
         gconn.close()
 
-        result = set()
+        result = set(discovered_ids)
         # Build lookup dicts
         id_to_norm = {cid: _channel_match_base(cname) for cid, cname in grows}
         id_to_name = {cid: cname or '' for cid, cname in grows}
@@ -298,6 +304,17 @@ def ensure_guide_db(db_path):
             width INTEGER, height INTEGER, fps REAL,
             video_codec TEXT, audio_codec TEXT, audio_channels INTEGER,
             bitrate INTEGER, sampled_at REAL, error TEXT
+        )
+    ''')
+    # Mappings discovered from the provider itself.  These are local so an
+    # incomplete legacy Movies.db cannot hide otherwise-recordable channels.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS discovered_streams (
+            channel_id TEXT PRIMARY KEY,
+            channel_name TEXT,
+            stream_id TEXT NOT NULL,
+            provider_name TEXT,
+            discovered_at REAL NOT NULL
         )
     ''')
     conn.execute('''
@@ -784,6 +801,24 @@ def _stream_url(channel_id):
     import re as _re2
     cfg  = load_config()
     debug = {'channel_id': channel_id, 'matched_guide_channel': None, 'stream_id': None, 'method': None}
+    # A provider-discovered mapping is tied to this exact XMLTV channel ID and
+    # avoids relying on the older NAS-side channel table.
+    try:
+        gconn = sqlite3.connect(_guide_db_path())
+        discovered = gconn.execute(
+            'SELECT stream_id, channel_name FROM discovered_streams WHERE channel_id=?',
+            (channel_id,)
+        ).fetchone()
+        gconn.close()
+        if discovered:
+            sid, mapped_name = discovered
+            debug.update({'method': 'provider discovery',
+                          'matched_guide_channel': mapped_name or channel_id,
+                          'stream_id': str(sid)})
+            url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
+            return url, None, debug
+    except Exception as ex:
+        debug['discovery_error'] = str(ex)
     rows = db_rows(
         'SELECT stream_id, guide_channel FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
         (channel_id,)
@@ -1721,13 +1756,58 @@ def api_sync_streams():
         if key and key not in ps_map:
             ps_map[key] = (sid, name)
 
-    # 2. Load all channels from Movies.db
+    # 2. Discover mappings for every XMLTV guide channel, including channels
+    # that have never existed in the legacy Movies.db mapping table.
+    guide_db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    try:
+        ensure_guide_db(guide_db_path)
+        gconn = sqlite3.connect(guide_db_path)
+        guide_rows = gconn.execute(
+            'SELECT channel_id, channel_name FROM guide_channels'
+        ).fetchall()
+        discovered, unmatched_guide = [], []
+        for channel_id, channel_name in guide_rows:
+            key = _channel_match_base(channel_name)
+            match = ps_map.get(key)
+            if not match:
+                candidates = [(abs(len(ps_key) - len(key)), value)
+                              for ps_key, value in ps_map.items()
+                              if len(key) >= 5 and len(ps_key) >= 5
+                              and (key.startswith(ps_key) or ps_key.startswith(key))]
+                if candidates:
+                    _, match = min(candidates, key=lambda item: item[0])
+            if match:
+                sid, ps_name = match
+                gconn.execute('''INSERT INTO discovered_streams
+                                 (channel_id, channel_name, stream_id, provider_name, discovered_at)
+                                 VALUES (?,?,?,?,?)
+                                 ON CONFLICT(channel_id) DO UPDATE SET
+                                   channel_name=excluded.channel_name,
+                                   stream_id=excluded.stream_id,
+                                   provider_name=excluded.provider_name,
+                                   discovered_at=excluded.discovered_at''',
+                              (channel_id, channel_name, sid, ps_name, time.time()))
+                discovered.append({'channel': channel_name, 'provider_name': ps_name})
+            else:
+                unmatched_guide.append(channel_name)
+        gconn.commit()
+        gconn.close()
+    except Exception as e:
+        return jsonify({'error': f'Guide discovery error: {e}'}), 500
+
+    # 3. Keep the older Movies.db mappings current as well.
     try:
         mconn = sqlite3.connect(mdb_path)
         mconn.row_factory = sqlite3.Row
         ch_rows = mconn.execute('SELECT guide_channel, stream_id FROM channels WHERE guide_channel IS NOT NULL').fetchall()
     except Exception as e:
-        return jsonify({'error': f'Movies.db error: {e}'}), 500
+        # The local discovery mapping is already complete and usable without
+        # the NAS database; only the legacy-table refresh is unavailable.
+        mconn = None
+        ch_rows = []
+        legacy_error = str(e)
+    else:
+        legacy_error = ''
 
     updated, not_found, unchanged = [], [], []
     for row in ch_rows:
@@ -1752,9 +1832,14 @@ def api_sync_streams():
         else:
             not_found.append(gc)
 
-    mconn.commit()
-    mconn.close()
-    return jsonify({'ok': True, 'updated': updated, 'unchanged': len(unchanged), 'not_found': len(not_found)})
+    if mconn:
+        mconn.commit()
+        mconn.close()
+    _ps_channel_cache['loaded_at'] = 0
+    return jsonify({'ok': True, 'updated': updated, 'unchanged': len(unchanged),
+                    'not_found': len(not_found), 'discovered': discovered,
+                    'unmatched_guide': len(unmatched_guide),
+                    'legacy_error': legacy_error})
 
 @app.route('/epg-web/api/247channels')
 def api_247channels():
@@ -4211,7 +4296,8 @@ async function syncStreams() {
     else {
       const lines = d.updated.map(u => `${u.channel}: ${u.old} → ${u.new} (${u.ps_name})`);
       status.style.color = '#22c55e';
-      status.innerHTML = `✅ Updated ${d.updated.length} stream IDs, ${d.unchanged} unchanged, ${d.not_found} not found in PrimeStreams.` +
+      status.innerHTML = `✅ Mapped ${d.discovered?.length || 0} guide channels directly from PrimeStreams; updated ${d.updated.length} older IDs.` +
+        (d.unmatched_guide ? ` ${d.unmatched_guide} guide channels were not found at PrimeStreams.` : '') +
         (lines.length ? '<br><small style="color:#94a3b8">' + lines.join('<br>') + '</small>' : '');
     }
   } catch(e) { status.style.color='#ef4444'; status.textContent = '❌ ' + e.message; }
