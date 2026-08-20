@@ -139,6 +139,9 @@ def _is_premium_channel(name):
     normalized = _channel_match_base(name)
     premium_prefixes = (
         'hbo', 'showtime', 'starz', 'encore', 'cinemax', 'mgm', 'epix',
+        # Sky Cinema is a premium movie service too.  Treat it the same as
+        # HBO/Showtime so its ad-free movie airings can be recorded/upgraded.
+        'skycinema',
     )
     return normalized.startswith(premium_prefixes)
 

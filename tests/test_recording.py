@@ -34,6 +34,7 @@ class RecordingTests(unittest.TestCase):
         self.assertTrue(server._is_premium_channel("HBO Movies"))
         self.assertTrue(server._is_premium_channel("MGM+ Hits HD"))
         self.assertTrue(server._is_premium_channel("Showtime Extreme"))
+        self.assertTrue(server._is_premium_channel("Sky Cinema Greats"))
         self.assertFalse(server._is_premium_channel("ANTENNA TV"))
 
     def test_agent_transfer_status_is_active(self):
