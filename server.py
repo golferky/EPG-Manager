@@ -4654,16 +4654,21 @@ function _resLabel(infoStr) {
 }
 
 async function updatePlexQuality() {
-  const spans = document.querySelectorAll('.plex-qual[data-qtitle]');
+  // Do not launch an ffprobe request for every Plex title in a large guide.
+  // The modal supplies the full details on demand; these compact labels are
+  // merely a convenience and must never crowd out an interactive click.
+  const spans = [...document.querySelectorAll('.plex-qual[data-qtitle]')].slice(0, 10);
   const seen = new Set();
-  for (const span of spans) {
+  for (let offset = 0; offset < spans.length; offset += 2) {
+    await Promise.all(spans.slice(offset, offset + 2).map(async span => {
     const title = span.dataset.qtitle;
-    if (!title || seen.has(title)) { if (seen.has(title) && _plexInfoCache[_normTitle(title)]) span.textContent = _resLabel(_plexInfoCache[_normTitle(title)]); continue; }
+    if (!title || seen.has(title)) { if (seen.has(title) && _plexInfoCache[_normTitle(title)]) span.textContent = _resLabel(_plexInfoCache[_normTitle(title)]); return; }
     seen.add(title);
     const key = _normTitle(title);
-    if (_plexInfoCache[key]) { span.textContent = _resLabel(_plexInfoCache[key]); continue; }
-    fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(title)}`)
-      .then(r => r.json()).then(pi => {
+    if (_plexInfoCache[key]) { span.textContent = _resLabel(_plexInfoCache[key]); return; }
+    try {
+      const r = await fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(title)}`);
+      const pi = await r.json();
         if (!pi.found) return;
         const parts = [];
         if (pi.width && pi.height) parts.push(`${pi.width}×${pi.height}`);
@@ -4674,7 +4679,8 @@ async function updatePlexQuality() {
         _plexInfoCache[key] = parts.join(' · ');
         document.querySelectorAll(`.plex-qual[data-qtitle="${title.replace(/"/g,'\\"')}"]`)
           .forEach(el => el.textContent = _resLabel(_plexInfoCache[key]));
-      }).catch(()=>{});
+    } catch (_) {}
+    }));
   }
 }
 
@@ -4777,6 +4783,14 @@ function hideTip() { document.getElementById('tooltip').style.display='none'; }
 
 // ── Programme modal + recording ───────────────────────────────────────────────
 let _currentProg = null;
+async function fetchJsonWithin(url, milliseconds=6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), milliseconds);
+  try {
+    const response = await fetch(url, {signal: controller.signal});
+    return response.ok ? await response.json() : null;
+  } finally { clearTimeout(timer); }
+}
 async function openProg(p) {
   hideTip();
   _currentProg = p;
@@ -4789,7 +4803,7 @@ async function openProg(p) {
 
   // Check if already being recorded
   const now = Date.now() / 1000;
-  const recStatus = await (await fetch('/epg-web/api/record/status')).json();
+  const recStatus = await fetchJsonWithin('/epg-web/api/record/status') || {recordings:{}};
   const alreadyRec = Object.values(recStatus.recordings || {}).some(r =>
     r.title === p.title && r.channel_id === p.channel_id &&
     Math.abs(r.start_ts - p.start_ts) < 60 &&
@@ -4803,8 +4817,7 @@ async function openProg(p) {
     if (p.desc)     params.set('desc', p.desc);
     if (p.year)     params.set('year', p.year);
     if (p.category) params.set('category', p.category);
-    const r  = await fetch(`/epg-web/api/prog-info?${params}`);
-    if (r.ok) info = await r.json();
+    info = await fetchJsonWithin(`/epg-web/api/prog-info?${params}`) || {};
   } catch(e) {}
 
   // Populate modal
