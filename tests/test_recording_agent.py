@@ -35,6 +35,15 @@ class QualityDecisionTests(unittest.TestCase):
         )
         self.assertTrue(record)
 
+    def test_incomplete_movie_is_eligible_for_replacement(self):
+        # A provider cutoff left only 61 minutes of a scheduled 160-minute movie.
+        self.assertTrue(recording_agent.incomplete_for_scheduled_window(
+            {"duration": 61 * 60}, 0, 160 * 60
+        ))
+        self.assertFalse(recording_agent.incomplete_for_scheduled_window(
+            {"duration": 155 * 60}, 0, 160 * 60
+        ))
+
     def test_atomic_transfer_verifies_and_renames(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -191,6 +191,18 @@ def quality_decision(existing, incoming):
     return False, 'existing Plex copy is equal or better quality'
 
 
+def incomplete_for_scheduled_window(existing, start_ts, stop_ts):
+    """True when the Plex copy is plainly shorter than this scheduled airing.
+
+    Provider streams can end cleanly from FFmpeg's point of view even when the
+    provider stops sending them early.  A 60-minute file for a 160-minute movie
+    must be eligible for replacement even if both copies are 720p.
+    """
+    duration = float(existing.get('duration') or 0)
+    scheduled = float(stop_ts or 0) - float(start_ts or 0)
+    return scheduled >= 900 and duration > 0 and duration < scheduled * 0.80
+
+
 def find_plex_candidates(plex_root, title):
     root = Path(plex_root)
     if not root.is_dir():
@@ -405,7 +417,15 @@ def process_job(api, job, cfg):
         api.heartbeat(job['id'], 'failed', message=f'Incoming stream probe failed: {exc}')
         return
 
-    if existing_probe:
+    incomplete_copy = bool(existing_probe and incomplete_for_scheduled_window(
+        existing_probe, job['start_ts'], job['stop_ts']
+    ))
+    if incomplete_copy:
+        should_record, decision = True, (
+            f'replacing incomplete Plex copy ({existing_probe["duration"] / 60:.0f} min '
+            f'of {((job["stop_ts"] - job["start_ts"]) / 60):.0f} min scheduled)'
+        )
+    elif existing_probe:
         should_record, decision = quality_decision(existing_probe, incoming_probe)
     else:
         should_record, decision = True, 'recording because Plex has no copy'
@@ -471,7 +491,22 @@ def process_job(api, job, cfg):
         final_candidates, cfg['ffprobe']
     )
     recorded_probe = probe_media(mp4_path, ffprobe=cfg['ffprobe'])
-    if final_existing_probe:
+    final_incomplete_copy = bool(final_existing_probe and incomplete_for_scheduled_window(
+        final_existing_probe, job['start_ts'], job['stop_ts']
+    ))
+    if final_incomplete_copy:
+        should_transfer, final_decision = True, (
+            f'replacing incomplete Plex copy ({final_existing_probe["duration"] / 60:.0f} min)'
+        )
+        quality.update({
+            'decision': final_decision,
+            'existing': final_existing_probe,
+            'existing_path': str(final_existing_path or ''),
+            'recorded': recorded_probe,
+        })
+        decision = final_decision
+        existing_path = final_existing_path
+    elif final_existing_probe:
         should_transfer, final_decision = quality_decision(
             final_existing_probe, recorded_probe
         )
