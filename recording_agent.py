@@ -491,6 +491,18 @@ def process_job(api, job, cfg):
         final_candidates, cfg['ffprobe']
     )
     recorded_probe = probe_media(mp4_path, ffprobe=cfg['ffprobe'])
+    # FFmpeg can exit successfully when a live HTTP source simply stops
+    # sending data. Do not let a short fragment replace the Plex copy.
+    if incomplete_for_scheduled_window(recorded_probe, job['start_ts'], job['stop_ts']):
+        expected_minutes = (job['stop_ts'] - job['start_ts']) / 60
+        actual_minutes = recorded_probe['duration'] / 60
+        message = (f'Recording ended early: {actual_minutes:.0f} min captured '
+                   f'of {expected_minutes:.0f} min scheduled')
+        quality.update({'decision': 'incomplete recording', 'recorded': recorded_probe})
+        api.heartbeat(job['id'], 'failed', message=message, file=str(mp4_path),
+                      quality_decision='incomplete recording', result=quality)
+        print(f'[incomplete] {job["title"]}: {message}', flush=True)
+        return
     final_incomplete_copy = bool(final_existing_probe and incomplete_for_scheduled_window(
         final_existing_probe, job['start_ts'], job['stop_ts']
     ))

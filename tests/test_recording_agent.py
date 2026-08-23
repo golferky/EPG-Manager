@@ -40,6 +40,9 @@ class QualityDecisionTests(unittest.TestCase):
         self.assertTrue(recording_agent.incomplete_for_scheduled_window(
             {"duration": 61 * 60}, 0, 160 * 60
         ))
+        self.assertTrue(recording_agent.incomplete_for_scheduled_window(
+            {"duration": 126 * 60 + 44}, 0, 160 * 60
+        ))
         self.assertFalse(recording_agent.incomplete_for_scheduled_window(
             {"duration": 155 * 60}, 0, 160 * 60
         ))
