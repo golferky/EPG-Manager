@@ -574,10 +574,21 @@ def process_job(api, job, cfg):
             mp4_path, library_root, job['title'], existing_path,
             progress_callback=transfer_progress, year=movie_year,
         )
+    # The Plex file was copied atomically and byte-verified above.  Keep local
+    # recordings only when a recording/transfer failed; successful transfers
+    # should not silently fill the Mac's recording disk.
     api.heartbeat(job['id'], 'done', file=str(mp4_path), quality_decision=decision,
                   result={**quality, 'plex_path': str(destination),
                           'content_type': ('episode' if episode else
                                            'episode_needs_metadata' if is_series else 'movie')})
+    try:
+        mp4_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # Plex is already safe; retain the local copy rather than turn a good
+        # completed recording into a failed job because cleanup was blocked.
+        print(f'[cleanup] kept local MP4 {mp4_path}: {exc}', file=sys.stderr, flush=True)
     try:
         ts_path.unlink()
     except FileNotFoundError:
