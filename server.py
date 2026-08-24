@@ -3713,7 +3713,7 @@ tr:hover td{background:#141414;}
     <button class="btn btn-ghost btn-sm" onclick="guideNav(-4)">◀ Earlier</button>
     <span id="guide-window" style="font-size:13px;color:#555;"></span>
     <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
-    <button class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;">⬤ Now</button>
+    <button id="guide-now-btn" class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;" title="Jump to the current time in the guide">⬤ Now</button>
     <select id="guide-ch-mode" onchange="localStorage.setItem('epg_guide_mode',this.value);fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
       <option value="all">All Channels</option>
       <option value="fav">★ Favorites</option>
@@ -4230,8 +4230,22 @@ function guideNav(hours) {
   fetchAndRenderGuide();
 }
 function guideJumpNow() {
+  const btn = document.getElementById('guide-now-btn');
+  if (btn && btn.disabled) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    btn.textContent = '⌛ Loading…';
+    btn.style.color = '#fbbf24';
+  }
   _guideWindowStart = new Date().toISOString();
-  fetchAndRenderGuide();
+  fetchAndRenderGuide().finally(() => {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.removeAttribute('aria-busy');
+    btn.textContent = '⬤ Now';
+    btn.style.color = '#22c55e';
+  });
 }
 let _searchTimer = null, _searchSeq = 0;
 function onSearchInput(val) {
