@@ -1281,6 +1281,8 @@ def api_load_guide():
         count    = load_epg_from_db(db_path, tz_str)
         _ps_channel_cache['loaded_at'] = 0
         _schedule_active_series(db_path)
+        threading.Thread(target=_auto_schedule_movie_upgrades,
+                         name='epg-auto-upgrades', daemon=True).start()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows, 'loaded': _epg['loaded']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1299,6 +1301,8 @@ def api_refresh_downloaded_guide():
         count = load_epg_from_db(db_path, tz_str)
         _ps_channel_cache['loaded_at'] = 0
         _schedule_active_series(db_path)
+        threading.Thread(target=_auto_schedule_movie_upgrades,
+                         name='epg-auto-upgrades', daemon=True).start()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows,
                         'source': 'saved XML'})
     except Exception as exc:
@@ -5883,6 +5887,8 @@ def _startup_load():
         try:
             count = load_epg_from_db(db_path, tz_str)
             _schedule_active_series(db_path)
+            threading.Thread(target=_auto_schedule_movie_upgrades,
+                             name='epg-auto-upgrades', daemon=True).start()
             print(f'[startup] Loaded {count} programmes from guide.db')
         except Exception as e:
             print(f'[startup] guide.db load failed: {e}')
