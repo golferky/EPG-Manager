@@ -2027,9 +2027,9 @@ def _auto_schedule_movie_upgrades():
     """Queue a few clearly higher-resolution clean-airing Plex replacements.
 
     This deliberately considers resolution only: source FPS is not a reliable
-    measure of a film's quality.  It scans the next day; the recording agent
-    itself limits simultaneous recordings and keeps the Plex original until a
-    complete replacement has been byte-verified on the share.
+    measure of a film's quality. It scans the next day and selects the two
+    largest resolution jumps; the recording agent keeps the Plex original until
+    a complete replacement has been byte-verified on the share.
     """
     try:
         from recording_agent import best_existing_copy, find_plex_candidates
@@ -2054,6 +2054,16 @@ def _auto_schedule_movie_upgrades():
             title_key = _norm_plex_show(row['title'])
             if title_key in plex_movies and _is_commercial_free_channel(row['channel_name']):
                 candidates_by_title.setdefault(title_key, []).append(row)
+        with _rec_lock:
+            active_auto_upgrades = sum(
+                1 for rec in _recs.values()
+                if rec.get('auto_upgrade') and _rec_is_active(rec)
+            )
+        slots_remaining = max(0, 2 - active_auto_upgrades)
+        if not slots_remaining:
+            conn.close()
+            return
+        upgrade_options = []
         for title_key, airings in candidates_by_title.items():
             title = airings[0]['title']
             # Do not schedule a duplicate if this guide refresh is repeated.
@@ -2079,16 +2089,27 @@ def _auto_schedule_movie_upgrades():
             incoming = _saved_stream_quality(candidate['channel_id'])
             start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            existing_pixels = int(existing.get('width', 0)) * int(existing.get('height', 0))
+            incoming_pixels = int(incoming.get('width', 0)) * int(incoming.get('height', 0))
+            upgrade_options.append({
+                'title': title, 'candidate': candidate, 'start': start, 'stop': stop,
+                'existing': existing, 'incoming': incoming,
+                'gain': incoming_pixels - existing_pixels,
+            })
+
+        for option in sorted(upgrade_options, key=lambda item: item['gain'], reverse=True)[:slots_remaining]:
             # Reuse the normal queueing path so stream mapping, persistence,
             # deduplication, and the recording backend all behave identically.
             with app.test_request_context('/epg-web/api/record', method='POST', json={
-                'title': title, 'channel_id': candidate['channel_id'],
-                'start_ts': start.timestamp(), 'stop_ts': stop.timestamp(),
+                'title': option['title'], 'channel_id': option['candidate']['channel_id'],
+                'start_ts': option['start'].timestamp(), 'stop_ts': option['stop'].timestamp(),
                 'auto_upgrade': True,
             }):
                 queued = api_record().get_json()
             if queued.get('ok') and not queued.get('dup'):
-                print(f'[auto-upgrade] Scheduled {title}: {existing.get("height", 0)}p → {incoming.get("height", 0)}p')
+                print(f'[auto-upgrade] Scheduled {option["title"]}: '
+                      f'{option["existing"].get("height", 0)}p → '
+                      f'{option["incoming"].get("height", 0)}p')
         conn.close()
     except Exception as exc:
         print(f'[auto-upgrade] Error: {exc}')
@@ -5896,8 +5917,6 @@ def _startup_load():
         try:
             count = load_epg_from_db(db_path, tz_str)
             _schedule_active_series(db_path)
-            threading.Thread(target=_auto_schedule_movie_upgrades,
-                             name='epg-auto-upgrades', daemon=True).start()
             print(f'[startup] Loaded {count} programmes from guide.db')
         except Exception as e:
             print(f'[startup] guide.db load failed: {e}')
