@@ -3662,6 +3662,9 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .guide-legend-item{display:flex;align-items:center;gap:6px;white-space:nowrap;}
 .guide-legend-swatch{width:18px;height:12px;border-radius:3px;border-left:3px solid #64748b;background:#1a2744;flex-shrink:0;}
 .guide-legend-note{margin-top:9px;padding-top:8px;border-top:1px solid #1e293b;color:#94a3b8;line-height:1.45;}
+.guide-legend-bar{display:flex;align-items:center;gap:8px 13px;flex-wrap:wrap;
+  padding:6px 4px;margin-bottom:5px;border-bottom:1px solid #1e293b;color:#94a3b8;font-size:10px;}
+.guide-legend-bar .guide-legend-title{margin:0;color:#64748b;}
 @keyframes pulse-rec{0%,100%{opacity:1;}50%{opacity:.3;}}
 .prog-title{font-size:11px;color:#c7d2e7;white-space:nowrap;overflow:hidden;
             text-overflow:ellipsis;min-width:0;flex:1;}
@@ -3776,25 +3779,6 @@ tr:hover td{background:#141414;}
     <span id="guide-window" style="font-size:13px;color:#555;"></span>
     <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
     <button id="guide-now-btn" class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;" title="Jump to the current time in the guide">⬤ Now</button>
-    <details class="guide-legend">
-      <summary class="btn btn-ghost btn-sm" title="Explain guide colors">🎨 Colors</summary>
-      <div class="guide-legend-panel">
-        <div class="guide-legend-title">Program shading</div>
-        <div class="guide-legend-grid">
-          <div class="guide-legend-item"><i class="guide-legend-swatch"></i>General / unclassified</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#0f1e2e;border-left-color:#38bdf8;"></i>Series / TV</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#1a1510;border-left-color:#f59e0b;"></i>Movie</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#0e2418;border-left-color:#22c55e;"></i>Scripted</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#0e1c35;border-left-color:#3b82f6;"></i>Sports</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#2a1212;border-left-color:#ef4444;"></i>News</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#231f08;border-left-color:#f59e0b;"></i>Kids</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#170f2e;border-left-color:#8b5cf6;"></i>Documentary</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#25102a;border-left-color:#ec4899;"></i>Reality</div>
-          <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#231808;border-left-color:#f97316;"></i>Talk</div>
-        </div>
-        <div class="guide-legend-note">Purple line across the top = already in Plex. Red dot = recording now. Gold clock = scheduled to record. The red vertical line marks the current time.<br><br>Channel-name color reflects the last 30 days of recording results: green = reliable, orange = some failures, red = suspect/repeated failures.</div>
-      </div>
-    </details>
     <select id="guide-ch-mode" onchange="localStorage.setItem('epg_guide_mode',this.value);fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
       <option value="all">All Channels</option>
       <option value="fav">★ Favorites</option>
@@ -3811,6 +3795,18 @@ tr:hover td{background:#141414;}
     <span id="ch-page-info" style="font-size:12px;color:#64748b;"></span>
     <button id="ch-page-next" class="btn btn-ghost btn-sm" onclick="chPageNext()" style="display:none;">Next 200 ▶</button>
     <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 14 days from Schedules Direct">📡 Fetch SD</button>
+  </div>
+  <div class="guide-legend-bar" title="Program colors come from the guide's content classification">
+    <span class="guide-legend-title">Guide colors</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch"></i>General</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch" style="background:#0f1e2e;border-left-color:#38bdf8;"></i>TV</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch" style="background:#1a1510;border-left-color:#f59e0b;"></i>Movie</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch" style="background:#0e2418;border-left-color:#22c55e;"></i>Scripted</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch" style="background:#0e1c35;border-left-color:#3b82f6;"></i>Sports</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch" style="background:#2a1212;border-left-color:#ef4444;"></i>News</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch" style="background:#170f2e;border-left-color:#8b5cf6;"></i>Docs</span>
+    <span class="guide-legend-item"><i class="guide-legend-swatch" style="background:#25102a;border-left-color:#ec4899;"></i>Reality</span>
+    <span style="color:#a78bfa;">━━ Plex</span><span style="color:#ef4444;">● Recording</span><span style="color:#f59e0b;">◷ Scheduled</span>
   </div>
   <!-- Compact storage bar -->
   <div id="storage-bar" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:6px 4px;font-size:12px;color:#64748b;border-bottom:1px solid #1e293b;margin-bottom:6px;"></div>
