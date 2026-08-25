@@ -711,6 +711,44 @@ def _db_update_rec_status(rec_id, status, failure_reason='', file=''):
         print(f'[recdb] status update error: {e}')
         return False
 
+def _channel_recording_reliability(days=30):
+    """Summarize recent real recording outcomes by source channel.
+
+    Skipped/cancelled jobs are intentional choices, so they are excluded.  A
+    small sample gets a warning rather than a red label; red means a recurring
+    problem or a clearly poor failure rate.
+    """
+    since = time.time() - days * 86400
+    outcomes = {}
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT channel_id,status FROM recordings
+                               WHERE start_ts >= ? AND channel_id IS NOT NULL
+                                 AND TRIM(channel_id) != '' ''', (since,)).fetchall()
+        conn.close()
+    except Exception:
+        return outcomes
+    for row in rows:
+        status = _rec_status_base(row['status'])
+        if status == 'done':
+            key = row['channel_id']
+            outcomes.setdefault(key, {'ok': 0, 'failed': 0})['ok'] += 1
+        elif status in {'failed', 'error', 'done_ts', 'stale', 'missed'}:
+            key = row['channel_id']
+            outcomes.setdefault(key, {'ok': 0, 'failed': 0})['failed'] += 1
+    for stats in outcomes.values():
+        total = stats['ok'] + stats['failed']
+        rate = stats['failed'] / total if total else 0
+        if stats['failed'] >= 3 or (total >= 3 and rate >= 0.40):
+            level, label = 'suspect', 'Suspect'
+        elif stats['failed']:
+            level, label = 'warning', 'Some failures'
+        else:
+            level, label = 'reliable', 'Reliable'
+        stats.update({'total': total, 'rate': rate, 'level': level, 'label': label})
+    return outcomes
+
 def _reconcile_stale_recordings():
     """Mark jobs that could not have survived a prior server stop."""
     try:
@@ -1451,17 +1489,22 @@ def api_guide():
         canon = id_to_canonical.get(prog['channel_id'], prog['channel_id'])
         prog['channel_id'] = canon
 
+    reliability_by_id = _channel_recording_reliability()
     seen_ids = set()
     ordered_channels = []
     for c in ordered_channels_raw:
         canon = id_to_canonical.get(c['id'], c['id'])
         if canon not in seen_ids:
             seen_ids.add(canon)
-            ordered_channels.append({
-                'id': canon, 'name': c['name'], 'icon': c.get('icon',''),
-                'no_data': c.get('no_data', False),
-                'favorite': canon in guide_favorites or canon in movie_favorites,
-            })
+        reliability = (reliability_by_id.get(canon)
+                       or reliability_by_id.get(c['id'])
+                       or {})
+        ordered_channels.append({
+            'id': canon, 'name': c['name'], 'icon': c.get('icon',''),
+            'no_data': c.get('no_data', False),
+            'favorite': canon in guide_favorites or canon in movie_favorites,
+            'reliability': reliability,
+        })
 
     if fav_only:
         ordered_channels.sort(key=lambda channel: (
@@ -3554,6 +3597,13 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
           text-overflow:ellipsis;}
 .ch-name-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;flex:1;}
 .ch-name-label:hover{color:#60a5fa;text-decoration:underline;}
+.ch-name.reliability-reliable .ch-name-label{color:#86efac;}
+.ch-name.reliability-warning .ch-name-label{color:#fbbf24;}
+.ch-name.reliability-suspect .ch-name-label{color:#f87171;}
+.guide-channel-reliability{font-size:10px;margin-left:4px;flex-shrink:0;}
+.guide-channel-reliability.reliable{color:#4ade80;}
+.guide-channel-reliability.warning{color:#fbbf24;}
+.guide-channel-reliability.suspect{color:#f87171;}
 .guide-ch-star{background:none;border:0;color:#475569;cursor:pointer;font-size:15px;line-height:1;padding:0 5px 0 0;}
 .guide-ch-star.is-fav{color:#f59e0b;}
 .prog-row{display:flex;flex:1;position:relative;height:42px;}
@@ -3742,7 +3792,7 @@ tr:hover td{background:#141414;}
           <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#25102a;border-left-color:#ec4899;"></i>Reality</div>
           <div class="guide-legend-item"><i class="guide-legend-swatch" style="background:#231808;border-left-color:#f97316;"></i>Talk</div>
         </div>
-        <div class="guide-legend-note">Purple line across the top = already in Plex. Red dot = recording now. Gold clock = scheduled to record. The red vertical line marks the current time.</div>
+        <div class="guide-legend-note">Purple line across the top = already in Plex. Red dot = recording now. Gold clock = scheduled to record. The red vertical line marks the current time.<br><br>Channel-name color reflects the last 30 days of recording results: green = reliable, orange = some failures, red = suspect/repeated failures.</div>
       </div>
     </details>
     <select id="guide-ch-mode" onchange="localStorage.setItem('epg_guide_mode',this.value);fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
@@ -4586,6 +4636,13 @@ function renderGuide() {
   let rowsHTML = '';
   let favoriteGroup = '';
   for (const ch of channels) {
+    const reliability = ch.reliability || {};
+    const reliabilityLevel = reliability.level || '';
+    const reliabilityText = reliabilityLevel
+      ? `${reliability.label}: ${reliability.ok || 0} completed, ${reliability.failed || 0} failed in the last 30 days`
+      : 'No recent recording history for this channel';
+    const reliabilityIcon = reliabilityLevel === 'reliable' ? '●'
+      : reliabilityLevel === 'warning' ? '●' : reliabilityLevel === 'suspect' ? '●' : '';
     if (ch.favorite_group && ch.favorite_group !== favoriteGroup) {
       favoriteGroup = ch.favorite_group;
       rowsHTML += `<div class="guide-row" style="background:#111827;border-top:1px solid #334155;">
@@ -4657,9 +4714,10 @@ function renderGuide() {
     }
     progHTML += '</div>';
     rowsHTML += `<div class="guide-row">
-      <div class="ch-name" title="${esc(ch.name)}" style="display:flex;align-items:center;">
+      <div class="ch-name${reliabilityLevel ? ' reliability-'+reliabilityLevel : ''}" title="${esc(ch.name)} — ${esc(reliabilityText)}" style="display:flex;align-items:center;">
         <button class="guide-ch-star${ch.favorite?' is-fav':''}" title="${ch.favorite?'Remove from favorites':'Add to favorites'}" onclick="toggleGuideFav(event,${JSON.stringify(ch.id).replace(/"/g,'&quot;')})">${ch.favorite?'★':'☆'}</button>
         <span class="ch-name-label" onclick="focusGuideChannel(${JSON.stringify(ch.id).replace(/"/g,'&quot;')},${JSON.stringify(ch.name).replace(/"/g,'&quot;')})">${esc(ch.name)}</span>
+        ${reliabilityIcon ? `<span class="guide-channel-reliability ${reliabilityLevel}" title="${esc(reliabilityText)}">${reliabilityIcon}</span>` : ''}
       </div>
       ${progHTML}
     </div>`;
