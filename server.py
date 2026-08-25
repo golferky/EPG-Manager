@@ -2052,11 +2052,10 @@ def _auto_schedule_movie_upgrades():
         candidates_by_title = {}
         for row in rows:
             title_key = _norm_plex_show(row['title'])
-            if (title_key in plex_movies and title_key not in candidates_by_title and
-                    _is_commercial_free_channel(row['channel_name'])):
-                candidates_by_title[title_key] = row
-        for title_key, candidate in candidates_by_title.items():
-            title = candidate['title']
+            if title_key in plex_movies and _is_commercial_free_channel(row['channel_name']):
+                candidates_by_title.setdefault(title_key, []).append(row)
+        for title_key, airings in candidates_by_title.items():
+            title = airings[0]['title']
             # Do not schedule a duplicate if this guide refresh is repeated.
             with _rec_lock:
                 if any(_rec_is_active(r) and _norm_plex_show(r.get('title', '')) == _norm_plex_show(title)
@@ -2066,12 +2065,18 @@ def _auto_schedule_movie_upgrades():
                 find_plex_candidates(movie_root, title), cfg.get('ffprobe', 'ffprobe'))
             if not existing:
                 continue
+            # A title can have several simultaneous guide listings: an SD
+            # listing, an unmapped provider duplicate, and the recordable HD
+            # source.  Do not discard the title just because the first one has
+            # no cached source quality (the Quantum of Solace case).
+            candidate = next((airing for airing in airings
+                              if (quality := _saved_stream_quality(airing['channel_id'])) and
+                              quality.get('height') and
+                              int(quality.get('width', 0)) * int(quality.get('height', 0)) >
+                              int(existing.get('width', 0)) * int(existing.get('height', 0))), None)
+            if not candidate:
+                continue
             incoming = _saved_stream_quality(candidate['channel_id'])
-            if not incoming or not incoming.get('height'):
-                continue
-            if int(incoming.get('width', 0)) * int(incoming.get('height', 0)) <= (
-                    int(existing.get('width', 0)) * int(existing.get('height', 0))):
-                continue
             start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             # Reuse the normal queueing path so stream mapping, persistence,
