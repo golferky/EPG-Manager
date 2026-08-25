@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260825c"
+VERSION = "v20260825d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4513,15 +4513,22 @@ const _plexEpisodesPromise = loadPlexEpisodes();
 
 // key: channel_id+'|'+start_ts → recording status plus scheduling details
 let _guideRecMap = {};
+let _guideRecTitleMap = {};
 async function refreshGuideRecMap() {
   try {
     const d = await (await fetch('/epg-web/api/record/status')).json();
     const m = {};
+    const byTitle = {};
     for (const r of Object.values(d.recordings || {})) {
       const k = (r.channel_id||'') + '|' + Math.round(r.start_ts);
-      m[k] = {status:(r.status||'').toLowerCase(), autoUpgrade:!!r.auto_upgrade};
+      const info = {status:(r.status||'').toLowerCase(), autoUpgrade:!!r.auto_upgrade};
+      m[k] = info;
+      // Provider and XMLTV channel IDs can differ for the identical airing.
+      // The title/time fallback keeps its guide status visible in that case.
+      byTitle[_normTitle(r.title) + '|' + Math.round(r.start_ts)] = info;
     }
     _guideRecMap = m;
+    _guideRecTitleMap = byTitle;
   } catch(e) {}
 }
 
@@ -4683,7 +4690,8 @@ function renderGuide() {
         ? `${_normTitle(p.title).replace(/\s/g,'')}|${p.season_num}|${p.episode_num}` : '';
       const hasPlexEpisode = !!plexEpisodeKey && _plexEpisodes.has(plexEpisodeKey);
       const recKey    = (p.channel_id||'') + '|' + Math.round(p.start_ts);
-      const recInfo   = _guideRecMap[recKey] || {};
+      const recInfo   = _guideRecMap[recKey] ||
+                        _guideRecTitleMap[_normTitle(p.title) + '|' + Math.round(p.start_ts)] || {};
       const recSt     = recInfo.status || '';
       const isRecording = recSt === 'recording';
       const isScheduled = recSt === 'queued' || recSt === 'scheduled' || recSt === 'to_record';
