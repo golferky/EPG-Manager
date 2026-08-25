@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260819a"
+VERSION = "v20260825a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -29,7 +29,7 @@ def _bootstrap():
             created_at TEXT, backend TEXT DEFAULT "local", stream_id TEXT,
             agent_id TEXT, lease_until REAL, heartbeat_at REAL, updated_at TEXT,
             episode_title TEXT, season_num INTEGER, episode_num INTEGER,
-            is_series INTEGER DEFAULT 0,
+            is_series INTEGER DEFAULT 0, auto_upgrade INTEGER DEFAULT 0,
             quality_decision TEXT, result_json TEXT)''')
         for _col, _typedef in [
                 ('backend', 'TEXT DEFAULT "local"'), ('stream_id', 'TEXT'),
@@ -37,7 +37,7 @@ def _bootstrap():
                 ('heartbeat_at', 'REAL'), ('updated_at', 'TEXT'),
                 ('quality_decision', 'TEXT'), ('result_json', 'TEXT'),
                 ('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'),
-                ('is_series', 'INTEGER DEFAULT 0')]:
+                ('is_series', 'INTEGER DEFAULT 0'), ('auto_upgrade', 'INTEGER DEFAULT 0')]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -635,6 +635,7 @@ def _init_recordings_table():
             ('season_num', 'INTEGER'),
             ('episode_num', 'INTEGER'),
             ('is_series', 'INTEGER DEFAULT 0'),
+            ('auto_upgrade', 'INTEGER DEFAULT 0'),
         ]
         for column, typedef in migrations:
             try:
@@ -655,8 +656,8 @@ def _db_upsert_rec(rec_id, rec):
         conn.execute('''INSERT INTO recordings
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
              status, failure_reason, file, created_at, backend, stream_id, updated_at,
-             episode_title, season_num, episode_num, is_series)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             episode_title, season_num, episode_num, is_series, auto_upgrade)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
@@ -667,7 +668,8 @@ def _db_upsert_rec(rec_id, rec):
               episode_title=excluded.episode_title,
               season_num=excluded.season_num,
               episode_num=excluded.episode_num,
-              is_series=excluded.is_series
+              is_series=excluded.is_series,
+              auto_upgrade=excluded.auto_upgrade
         ''', (
             rec_id,
             rec.get('title',''),
@@ -687,6 +689,7 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('season_num'),
             rec.get('episode_num'),
             1 if rec.get('is_series') else 0,
+            1 if rec.get('auto_upgrade') else 0,
         ))
         conn.commit()
         conn.close()
@@ -811,6 +814,7 @@ def _load_pending_recs():
                 'episode_title': r['episode_title'] or '',
                 'season_num': r['season_num'], 'episode_num': r['episode_num'],
                 'is_series': bool(r['is_series']),
+                'auto_upgrade': bool(r['auto_upgrade']),
             }
             with _rec_lock:
                 _recs[rec_id] = rec
@@ -830,6 +834,7 @@ def _load_pending_recs():
                     'episode_title': r['episode_title'] or '',
                     'season_num': r['season_num'], 'episode_num': r['episode_num'],
                     'is_series': bool(r['is_series']),
+                    'auto_upgrade': bool(r['auto_upgrade']),
                 }
         if rows:
             print(f'[recdb] reloaded {len(rows)} pending recording(s)')
@@ -1328,10 +1333,9 @@ def api_fetch_guide():
         count    = load_epg_from_db(db_path, tz_str)
         _ps_channel_cache['loaded_at'] = 0
         _schedule_active_series(db_path)
-        # The comparison probes real streams, so keep it off the guide-fetch
-        # request.  Wanted Plex movies are considered for an automatic upgrade
-        # only after the new guide is safely loaded.
-        threading.Thread(target=_auto_schedule_wanted_movie_upgrades,
+        # Auto-upgrades use the already-saved stream-quality samples, so this
+        # stays off the guide-fetch request and never delays the UI.
+        threading.Thread(target=_auto_schedule_movie_upgrades,
                          name='epg-auto-upgrades', daemon=True).start()
         threading.Thread(target=_refresh_stream_quality_cache,
                          name='epg-stream-quality', daemon=True).start()
@@ -2015,58 +2019,57 @@ def api_post_schedule():
 
     return jsonify({'error': 'Unknown action'}), 400
 
-def _auto_schedule_wanted_movie_upgrades():
-    """Queue objectively better clean-airing replacements for wanted movies.
+def _auto_schedule_movie_upgrades():
+    """Queue a few clearly higher-resolution clean-airing Plex replacements.
 
-    This runs after a guide refresh.  It never records a title absent from the
-    user's Wanted list, never uses an ad-supported channel, and leaves the
-    recording agent to make the same comparison again immediately before both
-    recording and transfer.
+    This deliberately considers resolution only: source FPS is not a reliable
+    measure of a film's quality.  It scans the next day, schedules at most two
+    upgrades per refresh, and the recording agent keeps the Plex original until
+    a complete replacement has been byte-verified on the share.
     """
     try:
-        from recording_agent import best_existing_copy, find_plex_candidates, probe_media, quality_decision
+        from recording_agent import best_existing_copy, find_plex_candidates
         cfg = load_config()
         guide_db = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
         movie_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
         if not os.path.isdir(movie_root):
             print('[auto-upgrade] Plex Movies is not mounted; skipping')
             return
-        wanted = [dict(r) for r in db_rows(
-            "SELECT title, year FROM wanted_titles WHERE type='movie' AND lower(COALESCE(status, '')) NOT IN ('removed', 'disabled')"
-        )]
-        if not wanted:
+        plex_movies = _plex_wanted_title_index().get('movies', set())
+        if not plex_movies:
             return
         conn = sqlite3.connect(guide_db)
         conn.row_factory = sqlite3.Row
         now_key = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-        for item in wanted:
-            title, year = item['title'], str(item.get('year') or '').strip()
+        until_key = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y%m%d%H%M%S')
+        rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc
+            FROM guide WHERE prog_type='MV' AND start_utc>? AND start_utc<?
+            ORDER BY start_utc''', (now_key, until_key)).fetchall()
+        candidates_by_title = {}
+        for row in rows:
+            title_key = _norm_plex_show(row['title'])
+            if (title_key in plex_movies and title_key not in candidates_by_title and
+                    _is_commercial_free_channel(row['channel_name'])):
+                candidates_by_title[title_key] = row
+        scheduled = 0
+        for title_key, candidate in candidates_by_title.items():
+            if scheduled >= 2:
+                break
+            title = candidate['title']
             # Do not schedule a duplicate if this guide refresh is repeated.
             with _rec_lock:
                 if any(_rec_is_active(r) and _norm_plex_show(r.get('title', '')) == _norm_plex_show(title)
                        for r in _recs.values()):
                     continue
-            candidates = find_plex_candidates(movie_root, title)
-            if re.fullmatch(r'\d{4}', year):
-                candidates = [p for p in candidates if re.search(
-                    rf'\({re.escape(year)}\)$', os.path.basename(os.path.dirname(p)))]
-            _existing_path, existing = best_existing_copy(candidates, cfg.get('ffprobe', 'ffprobe'))
+            _existing_path, existing = best_existing_copy(
+                find_plex_candidates(movie_root, title), cfg.get('ffprobe', 'ffprobe'))
             if not existing:
                 continue
-            clean_title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
-            rows = conn.execute('''SELECT channel_id, channel_name, start_utc, end_utc
-                FROM guide WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
-                AND start_utc>? ORDER BY start_utc LIMIT 60''',
-                (title, clean_title, now_key)).fetchall()
-            candidate = next((row for row in rows if _is_commercial_free_channel(row['channel_name'])), None)
-            if not candidate:
+            incoming = _saved_stream_quality(candidate['channel_id'])
+            if not incoming or not incoming.get('height'):
                 continue
-            url, stream_error, _debug = _stream_url(candidate['channel_id'])
-            if stream_error:
-                continue
-            incoming = probe_media(url, ffprobe=cfg.get('ffprobe', 'ffprobe'), timeout=45)
-            better, decision = quality_decision(existing, incoming)
-            if not better:
+            if int(incoming.get('width', 0)) * int(incoming.get('height', 0)) <= (
+                    int(existing.get('width', 0)) * int(existing.get('height', 0))):
                 continue
             start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -2075,10 +2078,12 @@ def _auto_schedule_wanted_movie_upgrades():
             with app.test_request_context('/epg-web/api/record', method='POST', json={
                 'title': title, 'channel_id': candidate['channel_id'],
                 'start_ts': start.timestamp(), 'stop_ts': stop.timestamp(),
+                'auto_upgrade': True,
             }):
                 queued = api_record().get_json()
             if queued.get('ok') and not queued.get('dup'):
-                print(f'[auto-upgrade] Scheduled {title}: {decision}')
+                scheduled += 1
+                print(f'[auto-upgrade] Scheduled {title}: {existing.get("height", 0)}p → {incoming.get("height", 0)}p')
         conn.close()
     except Exception as exc:
         print(f'[auto-upgrade] Error: {exc}')
@@ -3281,6 +3286,7 @@ def api_record():
         'season_num': season_num,
         'episode_num': episode_num,
         'is_series': bool(data.get('is_series', False)),
+        'auto_upgrade': bool(data.get('auto_upgrade', False)),
     }
     _url, stream_error, stream_debug = _stream_url(channel_id)
     if stream_error:
@@ -3408,6 +3414,7 @@ def _agent_job_dict(row):
         'episode_title': row['episode_title'] or '',
         'season_num': row['season_num'], 'episode_num': row['episode_num'],
         'is_series': bool(row['is_series']),
+        'auto_upgrade': bool(row['auto_upgrade']),
     }
 
 @app.route('/epg-web/api/agent/health')
@@ -3478,7 +3485,8 @@ def api_agent_claim():
                     'channel_id': row['channel_id'], 'stream_id': row['stream_id'] or '',
                     'start_ts': row['start_ts'], 'stop_ts': row['stop_ts'],
                     'status': 'agent_claimed', 'backend': 'agent', 'pid': None,
-                    'file': row['file'] or None, 'progress': 0, 'log': []})
+                    'file': row['file'] or None, 'progress': 0, 'log': [],
+                    'auto_upgrade': bool(row['auto_upgrade'])})
     return jsonify({'ok': True, 'job': job, 'server_time': now})
 
 @app.route('/epg-web/api/agent/jobs/<rec_id>/heartbeat', methods=['POST'])
@@ -3650,6 +3658,9 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .prog-stream-meta.q-720{color:#fb923c;}
 .prog-stream-meta.q-1080{color:#4ade80;}
 .prog-stream-meta.q-4k{color:#22c55e;font-weight:700;}
+.upgrade-suggest{color:#86efac;font-size:9px;font-weight:700;white-space:nowrap;
+  animation:upgrade-pulse 1.4s ease-in-out infinite;flex-shrink:0;}
+@keyframes upgrade-pulse{0%,100%{opacity:1;}50%{opacity:.42;}}
 .guide-legend{position:relative;}
 .guide-legend summary{list-style:none;cursor:pointer;user-select:none;}
 .guide-legend summary::-webkit-details-marker{display:none;}
@@ -4495,7 +4506,7 @@ async function loadPlexEpisodes() {
 }
 const _plexEpisodesPromise = loadPlexEpisodes();
 
-// key: channel_id+'|'+start_ts → 'recording'|'queued'|'scheduled'|...
+// key: channel_id+'|'+start_ts → recording status plus scheduling details
 let _guideRecMap = {};
 async function refreshGuideRecMap() {
   try {
@@ -4503,7 +4514,7 @@ async function refreshGuideRecMap() {
     const m = {};
     for (const r of Object.values(d.recordings || {})) {
       const k = (r.channel_id||'') + '|' + Math.round(r.start_ts);
-      m[k] = (r.status||'').toLowerCase();
+      m[k] = {status:(r.status||'').toLowerCase(), autoUpgrade:!!r.auto_upgrade};
     }
     _guideRecMap = m;
   } catch(e) {}
@@ -4528,7 +4539,7 @@ async function quickRecord(key, btnEl) {
     const d = await r.json();
     if (d.ok && !d.error) {
       btnEl.textContent = '⏱';
-      _guideRecMap[key] = 'queued';
+      _guideRecMap[key] = {status:'queued', autoUpgrade:false};
     } else {
       btnEl.textContent = '⏺';
       btnEl.className = 'rec-btn';
@@ -4667,7 +4678,8 @@ function renderGuide() {
         ? `${_normTitle(p.title).replace(/\s/g,'')}|${p.season_num}|${p.episode_num}` : '';
       const hasPlexEpisode = !!plexEpisodeKey && _plexEpisodes.has(plexEpisodeKey);
       const recKey    = (p.channel_id||'') + '|' + Math.round(p.start_ts);
-      const recSt     = _guideRecMap[recKey] || '';
+      const recInfo   = _guideRecMap[recKey] || {};
+      const recSt     = recInfo.status || '';
       const isRecording = recSt === 'recording';
       const isScheduled = recSt === 'queued' || recSt === 'scheduled' || recSt === 'to_record';
       const recKey2   = (p.channel_id||'') + '|' + Math.round(p.start_ts);
@@ -4693,7 +4705,7 @@ function renderGuide() {
         : '';
       const badges    = (hasPlexEpisode ? '<span class="plex-qual" title="Episode already in Plex" style="color:#a78bfa;">IN PLEX</span>' : '')
                       + (isRecording ? '<span class="rec-dot" title="Recording now">⏺</span>' : '')
-                      + (isScheduled ? '<span class="sched-dot" title="Scheduled to record">⏱</span>' : '')
+                      + (isScheduled ? `<span class="sched-dot" title="${recInfo.autoUpgrade ? 'Automatic higher-resolution Plex replacement' : 'Scheduled to record'}">⏱</span>` : '')
                       + plexBtn + recBtnEl;
       const epParts = [];
       if (p.season_num != null) epParts.push(`S${p.season_num}${p.episode_num != null ? 'E'+p.episode_num : ''}`);
@@ -4704,7 +4716,7 @@ function renderGuide() {
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span>${streamMeta}</div>
+        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span>${recInfo.autoUpgrade ? '<span class="upgrade-suggest" title="Automatic higher-resolution Plex replacement">↑ UPGRADE</span>' : ''}${streamMeta}</div>
         ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
