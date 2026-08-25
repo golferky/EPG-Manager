@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260825e"
+VERSION = "v20260825f"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -326,6 +326,15 @@ def ensure_guide_db(db_path):
             title TEXT UNIQUE,
             created_at TEXT,
             active INTEGER DEFAULT 1
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS upgrade_opportunities (
+            title TEXT NOT NULL, channel_id TEXT NOT NULL, channel_name TEXT,
+            start_ts REAL NOT NULL, stop_ts REAL NOT NULL,
+            existing_height INTEGER, incoming_height INTEGER, gain INTEGER,
+            scanned_at REAL NOT NULL,
+            PRIMARY KEY(title, channel_id, start_ts)
         )
     ''')
     conn.commit()
@@ -2060,9 +2069,6 @@ def _auto_schedule_movie_upgrades():
                 if rec.get('auto_upgrade') and _rec_is_active(rec)
             )
         slots_remaining = max(0, 2 - active_auto_upgrades)
-        if not slots_remaining:
-            conn.close()
-            return
         upgrade_options = []
         for title_key, airings in candidates_by_title.items():
             title = airings[0]['title']
@@ -2097,6 +2103,17 @@ def _auto_schedule_movie_upgrades():
                 'gain': incoming_pixels - existing_pixels,
             })
 
+        conn.execute('DELETE FROM upgrade_opportunities')
+        conn.executemany('''INSERT INTO upgrade_opportunities
+            (title,channel_id,channel_name,start_ts,stop_ts,existing_height,incoming_height,gain,scanned_at)
+            VALUES (?,?,?,?,?,?,?,?,?)''', [
+                (item['title'], item['candidate']['channel_id'], item['candidate']['channel_name'],
+                 item['start'].timestamp(), item['stop'].timestamp(),
+                 item['existing'].get('height', 0), item['incoming'].get('height', 0),
+                 item['gain'], time.time())
+                for item in upgrade_options
+            ])
+        conn.commit()
         for option in sorted(upgrade_options, key=lambda item: item['gain'], reverse=True)[:slots_remaining]:
             # Reuse the normal queueing path so stream mapping, persistence,
             # deduplication, and the recording backend all behave identically.
@@ -2113,6 +2130,27 @@ def _auto_schedule_movie_upgrades():
         conn.close()
     except Exception as exc:
         print(f'[auto-upgrade] Error: {exc}')
+
+@app.route('/epg-web/api/upgrade-opportunities')
+def api_upgrade_opportunities():
+    """Return the latest non-scheduled Plex resolution upgrades for review."""
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT * FROM upgrade_opportunities
+            WHERE stop_ts>? ORDER BY gain DESC, start_ts LIMIT 100''', (time.time(),)).fetchall()
+        conn.close()
+        with _rec_lock:
+            active = {(r.get('title', '').lower(), round(r.get('start_ts', 0)))
+                      for r in _recs.values() if _rec_is_active(r)}
+        items = []
+        for row in rows:
+            item = dict(row)
+            item['scheduled'] = (item['title'].lower(), round(item['start_ts'])) in active
+            items.append(item)
+        return jsonify({'opportunities': items})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 @app.route('/epg-web/api/recommendations')
 def api_recommendations():
@@ -3941,6 +3979,14 @@ tr:hover td{background:#141414;}
 
 <!-- RECOMMENDATIONS -->
 <div id="pane-recommendations" class="pane">
+  <div class="card" style="margin-bottom:12px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+      <h2 style="margin:0;">↑ Upgrade Opportunities</h2>
+      <button class="btn btn-ghost btn-sm" onclick="loadUpgradeOpportunities()">↻ Refresh</button>
+    </div>
+    <div id="upgrade-status" class="status-msg"></div>
+    <div id="upgrade-list" style="font-size:13px;"></div>
+  </div>
   <div class="card">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
       <h2 style="margin:0;">Wanted Titles</h2>
@@ -5588,7 +5634,30 @@ async function cancelRec(id, refreshSchedule=false) {
 }
 
 // ── Recommendations ───────────────────────────────────────────────────────────
+async function loadUpgradeOpportunities() {
+  const status = document.getElementById('upgrade-status');
+  const list = document.getElementById('upgrade-list');
+  status.textContent = 'Loading…';
+  try {
+    const d = await (await fetch('/epg-web/api/upgrade-opportunities')).json();
+    if (d.error) { setEl('upgrade-status', d.error, 'err'); return; }
+    const rows = d.opportunities || [];
+    status.textContent = rows.length
+      ? `${rows.length} better-resolution opportunit${rows.length === 1 ? 'y' : 'ies'} found in the current guide scan`
+      : 'No unscheduled upgrades found. Refresh Guide to run a new scan.';
+    list.innerHTML = rows.map(r => {
+      const start = new Date(r.start_ts * 1000).toLocaleString([], {weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      const airing = JSON.stringify({channel_id:r.channel_id,channel_name:r.channel_name,start_ts:r.start_ts,stop_ts:r.stop_ts}).replace(/"/g,'&quot;');
+      const title = JSON.stringify(r.title).replace(/"/g,'&quot;');
+      return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1e293b;">
+        <span style="flex:1;font-weight:600;">${esc(r.title)} <span style="color:#94a3b8;font-size:11px;font-weight:400;">Plex ${r.existing_height}p → ${r.incoming_height}p · ${esc(r.channel_name)} · ${start}</span></span>
+        ${r.scheduled ? '<span class="badge badge-record">Scheduled</span>' : `<button class="btn btn-primary btn-sm" onclick="recordAiring(${airing},${title});loadUpgradeOpportunities()">⏱ Record upgrade</button>`}
+      </div>`;
+    }).join('');
+  } catch(e) { setEl('upgrade-status', 'Could not load upgrades: '+e.message, 'err'); }
+}
 async function loadRecs() {
+  loadUpgradeOpportunities();
   document.getElementById('rec-status').textContent = 'Loading…';
   try {
     const d = await (await fetch('/epg-web/api/recommendations')).json();
