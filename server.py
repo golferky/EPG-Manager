@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260825a"
+VERSION = "v20260825b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2027,9 +2027,9 @@ def _auto_schedule_movie_upgrades():
     """Queue a few clearly higher-resolution clean-airing Plex replacements.
 
     This deliberately considers resolution only: source FPS is not a reliable
-    measure of a film's quality.  It scans the next day, schedules at most two
-    upgrades per refresh, and the recording agent keeps the Plex original until
-    a complete replacement has been byte-verified on the share.
+    measure of a film's quality.  It scans the next day; the recording agent
+    itself limits simultaneous recordings and keeps the Plex original until a
+    complete replacement has been byte-verified on the share.
     """
     try:
         from recording_agent import best_existing_copy, find_plex_candidates
@@ -2055,10 +2055,7 @@ def _auto_schedule_movie_upgrades():
             if (title_key in plex_movies and title_key not in candidates_by_title and
                     _is_commercial_free_channel(row['channel_name'])):
                 candidates_by_title[title_key] = row
-        scheduled = 0
         for title_key, candidate in candidates_by_title.items():
-            if scheduled >= 2:
-                break
             title = candidate['title']
             # Do not schedule a duplicate if this guide refresh is repeated.
             with _rec_lock:
@@ -2086,7 +2083,6 @@ def _auto_schedule_movie_upgrades():
             }):
                 queued = api_record().get_json()
             if queued.get('ok') and not queued.get('dup'):
-                scheduled += 1
                 print(f'[auto-upgrade] Scheduled {title}: {existing.get("height", 0)}p → {incoming.get("height", 0)}p')
         conn.close()
     except Exception as exc:
