@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826f"
+VERSION = "v20260826g"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2033,6 +2033,23 @@ def _recording_log_excerpt(path, max_chars=12000):
     except OSError:
         return ''
 
+@app.route('/epg-web/api/recording-health/raw-logs')
+def api_recording_health_raw_logs():
+    rec_dir = os.path.expanduser(load_config().get('rec_path', '~/Movies/Recordings'))
+    try:
+        files = []
+        for name in os.listdir(rec_dir):
+            if not name.endswith('.ffmpeg.log'):
+                continue
+            path = os.path.join(rec_dir, name)
+            stat = os.stat(path)
+            files.append({'name': name, 'size': stat.st_size,
+                          'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %I:%M %p')})
+        files.sort(key=lambda item: item['name'].lower())
+        return jsonify({'ok': True, 'files': files, 'total': sum(item['size'] for item in files)})
+    except OSError as exc:
+        return jsonify({'ok': False, 'error': f'Cannot read recording folder: {exc}'}), 500
+
 @app.route('/epg-web/api/recording-health/import-logs', methods=['POST'])
 def api_import_prior_recording_logs():
     """One-time migration of older raw FFmpeg logs into recording result_json."""
@@ -3943,6 +3960,7 @@ tr:hover td{background:#141414;}
   <div class="tab" onclick="switchTab('channels')">📡 Channels</div>
   <div class="tab" onclick="switchTab('247')">🔁 24/7</div>
   <div class="tab" onclick="switchTab('schedule')">📅 Schedule</div>
+  <div class="tab" onclick="switchTab('health')">🔎 Recording Health</div>
   <div class="tab" onclick="switchTab('conversions')">🔄 Conversions</div>
   <div class="tab" onclick="switchTab('storage')">💾 Storage</div>
 </nav>
@@ -4157,16 +4175,14 @@ tr:hover td{background:#141414;}
 <div id="pane-schedule" class="pane">
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
-      <h2 style="margin:0;">Recording Schedule</h2>
-      <label style="font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-scheduled" checked onchange="loadSchedule()"> Scheduled</label>
-      <label style="font-size:12px;color:#22c55e;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-completed" checked onchange="loadSchedule()"> Completed</label>
-      <label style="font-size:12px;color:#ef4444;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-failed" checked onchange="loadSchedule()"> Failed</label>
-      <label style="font-size:12px;color:#64748b;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-skipped" onchange="loadSchedule()"> Skipped</label>
-      <label style="font-size:12px;color:#64748b;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="sf-all-time" onchange="loadSchedule()"> All time</label>
+      <div>
+        <h2 style="margin:0;">Upcoming & Active Recordings</h2>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">Completed, failed, and skipped recordings are in Recording Health.</div>
+      </div>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadSchedule()">↻ Refresh</button>
     </div>
     <div id="sched-empty" class="empty" style="display:none;">
-      Schedule Empty<br><span style="font-size:12px;color:#333;margin-top:6px;display:block;">
+      Nothing waiting to record<br><span style="font-size:12px;color:#333;margin-top:6px;display:block;">
       Add programs from the Guide or Recommendations tab.</span>
     </div>
     <div style="overflow-x:auto;">
@@ -4176,17 +4192,32 @@ tr:hover td{background:#141414;}
       </table>
     </div>
   </div>
+</div>
+
+<!-- RECORDING HEALTH -->
+<div id="pane-health" class="pane">
   <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <div>
         <h2 style="margin:0;">🔎 Recording Health</h2>
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Clear results first; expand a row only when you want the technical FFmpeg details.</div>
       </div>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecordingHealth()">↻ Refresh</button>
+      <select id="health-filter" onchange="loadRecordingHealth()" style="margin-left:auto;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#cbd5e1;padding:5px 8px;font-size:12px;">
+        <option value="attention">Needs attention</option><option value="complete">Completed</option><option value="all">All results</option>
+      </select>
+      <button class="btn btn-ghost btn-sm" onclick="loadRecordingHealth()">↻ Refresh</button>
       <button class="btn btn-ghost btn-sm" onclick="importPriorRecordingLogs(this)">⇩ Import old FFmpeg logs</button>
     </div>
     <div id="recording-health-empty" style="display:none;color:#64748b;font-size:13px;">No completed recording reports yet. New recordings will appear here.</div>
     <div id="recording-health-list" style="max-height:460px;overflow-y:auto;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+      <div><h2 style="margin:0;">🧾 Raw FFmpeg Log Cleanup</h2><div style="font-size:12px;color:#64748b;margin-top:3px;">These are old raw logs still using space. Import archives matched logs into the database, then removes them.</div></div>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRawLogFiles()">↻ Refresh</button>
+    </div>
+    <div id="raw-log-empty" style="display:none;color:#64748b;font-size:13px;">No raw FFmpeg logs are waiting to be imported.</div>
+    <div id="raw-log-list" style="max-height:260px;overflow-y:auto;"></div>
   </div>
   <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
@@ -4383,7 +4414,7 @@ setInterval(loadStorageBar, 5 * 60 * 1000); // refresh every 5 min
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  const names = ['guide','recommendations','channels','247','schedule','conversions','storage'];
+  const names = ['guide','recommendations','channels','247','schedule','health','conversions','storage'];
   document.querySelectorAll('.tab').forEach((t,i) =>
     t.classList.toggle('active', names[i] === name));
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
@@ -4391,7 +4422,8 @@ function switchTab(name) {
   if (name === 'recommendations') loadRecs();
   if (name === 'channels') loadChannels();
   if (name === '247') load247();
-  if (name === 'schedule') { loadSchedule(); loadRecordingHealth(); loadSeriesRecordings(); loadRecFiles(); }
+  if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
+  if (name === 'health') { loadRecordingHealth(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
 }
@@ -5928,14 +5960,6 @@ async function addToSchedule(prog) {
   setGS(msg,'ok');
 }
 async function loadSchedule() {
-  const showScheduled = document.getElementById('sf-scheduled')?.checked ?? true;
-  const showCompleted = document.getElementById('sf-completed')?.checked ?? true;
-  const showFailed    = document.getElementById('sf-failed')?.checked ?? true;
-  const showSkipped   = document.getElementById('sf-skipped')?.checked ?? false;
-
-  const showAllTime = document.getElementById('sf-all-time')?.checked ?? false;
-  const cutoffMs   = showAllTime ? 0 : Date.now() - 30 * 24 * 60 * 60 * 1000;
-
   const [d, recD] = await Promise.all([
     (await fetch('/epg-web/api/schedule')).json(),
     (await fetch('/epg-web/api/record/status')).json(),
@@ -5950,21 +5974,10 @@ async function loadSchedule() {
     _id:        id,
   }));
   const memIds = new Set(memRecs.map(r => r._id));
-  // Filter DB rows: only hide old MISSED/STALE noise; always show completed, failed, and active
-  const dbRows = (d.schedule || []).filter(r => !r.rec_id || !memIds.has(r.rec_id)).filter(r => {
-    if (!cutoffMs) return true;
-    const s = (r.status||'').toLowerCase();
-    const alwaysShow = s === 'completed' || s === 'recorded' || s === 'complete' ||
-                       s === 'done' || s === 'done_ts' ||
-                       s === 'failed' || s === 'timeout' || s === 'error' ||
-                       ['queued','scheduled','agent_claimed','preflight','waiting',
-                        'recording','converting','awaiting_transfer','transferring',
-                        'copying'].includes(s);
-    if (alwaysShow) return true;
-    // Only apply 30-day cutoff to missed/stale/skipped/cancelled
-    const t = r.start_time ? new Date(r.start_time).getTime() : 0;
-    return !t || t >= cutoffMs;
-  });
+  const activeStates = ['scheduled','to_record','queued','agent_claimed','preflight','waiting',
+                        'recording','converting','awaiting_transfer','transferring','copying'];
+  const dbRows = (d.schedule || []).filter(r => !r.rec_id || !memIds.has(r.rec_id))
+    .filter(r => activeStates.includes((r.status || '').toLowerCase()));
   const all = [...memRecs, ...dbRows];
   const tbl   = document.getElementById('sched-table');
   const emp   = document.getElementById('sched-empty');
@@ -5981,17 +5994,7 @@ async function loadSchedule() {
   };
 
   const now = Date.now();
-  const sched = all.filter(r => {
-    const s = (r.status||'').toLowerCase();
-    const startMs = r.start_time ? new Date(r.start_time).getTime() : 0;
-    const isPast  = startMs > 0 && startMs < now;
-    if (['scheduled','to_record','queued','agent_claimed','preflight','waiting',
-         'recording','converting','awaiting_transfer','transferring','copying'].includes(s)) return showScheduled;
-    if (['completed','recorded','complete','done','done_ts'].includes(s)) return showCompleted;
-    if (s === 'failed'    || s === 'timeout' || s === 'error')     return showFailed;
-    if (s === 'skipped' || s === 'cancelled' || s.startsWith('skipped')) return showSkipped;
-    return true;  // unknown statuses always show
-  });
+  const sched = all.filter(r => activeStates.includes((r.status || '').toLowerCase()));
 
   if (!sched.length) { tbl.style.display='none'; emp.style.display='block'; return; }
   tbl.style.display='table'; emp.style.display='none';
@@ -6092,7 +6095,11 @@ async function loadRecordingHealth() {
   try {
     const d = await (await fetch('/epg-web/api/recording-health')).json();
     if (d.error) throw new Error(d.error);
-    const reports = d.reports || [];
+    const filter = document.getElementById('health-filter')?.value || 'attention';
+    const reports = (d.reports || []).filter(r => {
+      const complete = ['done', 'skipped_existing_better'].includes((r.status || '').toLowerCase());
+      return filter === 'all' || (filter === 'complete' ? complete : !complete);
+    });
     if (!reports.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
     list.innerHTML = reports.map(r => {
@@ -6133,11 +6140,29 @@ async function importPriorRecordingLogs(button) {
     if (!d.ok) throw new Error(d.error || 'Import failed');
     alert(`Imported ${d.imported} log${d.imported === 1 ? '' : 's'} into Recording Health and removed ${d.deleted} raw file${d.deleted === 1 ? '' : 's'}. ${d.skipped ? `${d.skipped} file${d.skipped === 1 ? '' : 's'} could not be matched and were kept.` : ''}`);
     await loadRecordingHealth();
+    await loadRawLogFiles();
   } catch (err) {
     alert(`Could not import old logs: ${err.message || err}`);
   } finally {
     button.disabled = false;
     button.textContent = original;
+  }
+}
+async function loadRawLogFiles() {
+  const list = document.getElementById('raw-log-list');
+  const empty = document.getElementById('raw-log-empty');
+  if (!list || !empty) return;
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;">Loading raw logs…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/raw-logs')).json();
+    if (!d.ok) throw new Error(d.error || 'Could not load logs');
+    if (!d.files.length) { list.innerHTML = ''; empty.style.display = ''; return; }
+    empty.style.display = 'none';
+    list.innerHTML = `<div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">${d.files.length} file${d.files.length === 1 ? '' : 's'} · ${fmtSize(d.total)}</div>` + d.files.map(f =>
+      `<div style="display:flex;gap:12px;padding:7px 0;border-bottom:1px solid #1e293b;font-size:12px;"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(f.name)}">${esc(f.name)}</span><span style="color:#94a3b8;white-space:nowrap;">${fmtSize(f.size)}</span><span style="color:#64748b;white-space:nowrap;">${esc(f.modified)}</span></div>`
+    ).join('');
+  } catch (err) {
+    list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load raw logs: ${esc(err.message || String(err))}</div>`;
   }
 }
 async function schedUpdate(i,s){await post('/epg-web/api/schedule',{action:'update',index:i,status:s});loadSchedule();}
