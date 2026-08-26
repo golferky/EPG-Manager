@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826i"
+VERSION = "v20260826j"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -149,6 +149,13 @@ def _is_premium_channel(name):
 def _is_commercial_free_channel(name):
     """Channels we can reliably treat as commercial-free for movie recording."""
     return _is_premium_channel(name)
+
+
+def _is_foreign_recording_feed(name):
+    """Exclude regional Spanish/Latino feeds from recording choices by default."""
+    return bool(re.search(
+        r'\b(?:latino|latina|latam|latin america|español|espanol|spanish)\b',
+        name or '', re.I))
 
 def get_db():
     cfg = load_config()
@@ -2194,6 +2201,7 @@ def _auto_schedule_movie_upgrades():
         for row in rows:
             title_key = _norm_plex_show(row['title'])
             if (title_key in plex_movies and _is_commercial_free_channel(row['channel_name'])
+                    and not _is_foreign_recording_feed(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
                     and not _recent_same_source_failure(row['title'], row['channel_id'])):
                 candidates_by_title.setdefault(title_key, []).append(row)
@@ -2994,7 +3002,7 @@ def api_airings():
                 'stop_ts':      eu.timestamp(),
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
-                'can_record':   not stream_error,
+                'can_record':   not stream_error and not _is_foreign_recording_feed(r['channel_name']),
                 'stream_quality': {
                     'width': stream_quality.get('width', 0),
                     'height': stream_quality.get('height', 0),
@@ -3218,7 +3226,8 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     # recording history marks it red/suspect.  A manual record remains allowed.
     reliability = _channel_recording_reliability()
     rows = [row for row in rows
-            if reliability.get(row['channel_id'], {}).get('level') != 'suspect'
+            if not _is_foreign_recording_feed(row['channel_name'])
+            and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
             and not _recent_same_source_failure(title, row['channel_id'])]
     ep_best = {}   # (sn, en) → row with best channel quality
     unknown_best = {}  # (channel, time) → unknown episode airing
