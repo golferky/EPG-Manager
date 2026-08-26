@@ -142,6 +142,9 @@ def _is_premium_channel(name):
         # Sky Cinema is a premium movie service too.  Treat it the same as
         # HBO/Showtime so its ad-free movie airings can be recorded/upgraded.
         'skycinema',
+        # PrimeStreams movie feeds that carry uninterrupted films, despite
+        # not being branded as a traditional US premium network.
+        'screenpix', 'hollywoodsuite',
     )
     return normalized.startswith(premium_prefixes)
 
