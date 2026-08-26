@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826d"
+VERSION = "v20260826e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -6048,21 +6048,28 @@ function healthVideo(probe) {
   if (probe.size) bits.push(healthSize(probe.size));
   return bits.join(' · ');
 }
-function recordingGrade(probe, scheduledSeconds, actualSeconds, inPlex) {
+function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex) {
   if (!inPlex) return null;
   const expected = Number(scheduledSeconds || 0);
   const actual = Number(actualSeconds || 0);
-  // Completion is non-negotiable: a beautiful but short recording is not a good copy.
-  if (expected && actual && actual / expected < 0.95) {
-    return {letter:'F', color:'#f87171', reason:'Incomplete recording'};
-  }
-  const height = Number((probe || {}).height || 0);
-  if (height >= 2160) return {letter:'A+', color:'#4ade80', reason:'Complete 4K capture'};
-  if (height >= 1080) return {letter:'A', color:'#4ade80', reason:'Complete 1080p capture'};
-  if (height >= 720)  return {letter:'B', color:'#fb923c', reason:'Complete 720p capture'};
-  if (height >= 540)  return {letter:'C', color:'#facc15', reason:'Complete standard-definition capture'};
-  if (height >= 1)    return {letter:'D', color:'#fb923c', reason:'Low-resolution capture'};
-  return {letter:'?', color:'#94a3b8', reason:'No video probe available'};
+  if (!probe || typeof probe !== 'object' || !Number(probe.height || 0)) return null;
+  // 40 completion + 35 picture + 15 bitrate + 5 motion + 5 audio = 100.
+  const completion = expected && actual ? Math.round(40 * Math.min(1, actual / expected)) : 40;
+  const height = Number(probe.height || 0);
+  const resolution = height >= 2160 ? 35 : height >= 1080 ? 30 : height >= 720 ? 23 : height >= 540 ? 15 : 8;
+  const bitrate = Number(probe.video_bitrate || probe.total_bitrate || 0);
+  const targetRate = height >= 2160 ? 16000000 : height >= 1080 ? 6000000 : height >= 720 ? 3000000 : 1500000;
+  const bitrateScore = bitrate ? Math.round(15 * Math.min(1, bitrate / targetRate)) : 0;
+  const fps = Number(probe.fps || 0);
+  const motion = fps >= 50 ? 5 : fps >= 24 ? 4 : fps > 0 ? 2 : 0;
+  const audio = Number(probe.audio_channels || 0) >= 6 ? 5 : Number(probe.audio_channels || 0) >= 2 ? 3 : 0;
+  // A short recording should never look excellent just because its stream was sharp.
+  const rawScore = completion + resolution + bitrateScore + motion + audio;
+  const incomplete = expected && actual && actual / expected < 0.95;
+  const score = Math.min(incomplete ? 59 : 100, rawScore);
+  const color = score >= 90 ? '#4ade80' : score >= 75 ? '#a3e635' : score >= 60 ? '#facc15' : '#fb923c';
+  const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
+  return {score, color, detail};
 }
 async function loadRecordingHealth() {
   const list = document.getElementById('recording-health-list');
@@ -6087,12 +6094,12 @@ async function loadRecordingHealth() {
       const video = healthVideo(recorded) || healthVideo(result.incoming);
       const technical = result.log_excerpt || '';
       const when = r.start_time || (r.start_ts ? new Date(Number(r.start_ts) * 1000).toLocaleString() : '');
-      const grade = recordingGrade(recorded, scheduled, actual, result.transferred_to_plex);
+      const score = recordingQualityScore(recorded, scheduled, actual, result.transferred_to_plex);
       return `<div style="padding:11px 2px;border-bottom:1px solid #222;">
         <div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;">
           <strong style="font-size:14px;">${esc(r.title || 'Untitled')}</strong>
           <span style="font-size:12px;color:${color};font-weight:700;">${esc(label)}</span>
-          ${grade ? `<span title="${esc(grade.reason)}" style="background:${grade.color};color:#101010;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:800;">GRADE ${grade.letter}</span><span style="font-size:11px;color:#94a3b8;">${esc(grade.reason)}</span>` : ''}
+          ${score ? `<span title="${esc(score.detail)}" style="background:${score.color};color:#101010;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:800;">QUALITY ${score.score}/100</span>` : ''}
           <span style="font-size:12px;color:#64748b;">${esc(r.channel || '')} ${when ? '· ' + esc(when) : ''}</span>
         </div>
         <div style="font-size:12px;color:#94a3b8;margin-top:5px;">${[timing, video, result.transferred_to_plex ? 'Moved to Plex' : ''].filter(Boolean).map(esc).join(' &nbsp;•&nbsp; ') || 'No media probe was available for this result.'}</div>
