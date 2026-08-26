@@ -5371,9 +5371,21 @@ async function openProg(p) {
       const unrecBtn = document.getElementById('pm-unrecorded-btn');
       const hasUnrecorded = window._allAirings.some(a => !recMap[a.channel_id+'|'+a.start_ts] && !a.on_now);
       unrecBtn.style.display = hasUnrecorded ? '' : 'none';
-      // Prefer the actual cached stream resolution, then frame rate and
-      // bitrate. A channel with repeated recording failures can never win
-      // the recommendation when a healthier alternative is available.
+      // “Best available” must mean a verified stream-quality improvement,
+      // never merely a channel-name/HD-label tie breaker.
+      const qualityLead = (a, b) => {
+        const aq = a.stream_quality || {}, bq = b.stream_quality || {};
+        const ap = Number(aq.width || 0) * Number(aq.height || 0);
+        const bp = Number(bq.width || 0) * Number(bq.height || 0);
+        if (!ap || !bp) return 0; // Unknown data: do not make a claim.
+        if (ap !== bp) return ap > bp ? 1 : -1;
+        const af = Number(aq.fps || 0), bf = Number(bq.fps || 0);
+        if (Math.abs(af - bf) >= 0.5) return af > bf ? 1 : -1;
+        const ab = Number(aq.bitrate || 0), bb = Number(bq.bitrate || 0);
+        if (ab && bb && Math.max(ab, bb) / Math.min(ab, bb) >= 1.15)
+          return ab > bb ? 1 : -1;
+        return 0;
+      };
       const scoreAiring = a => {
         const q = a.stream_quality || {};
         const pixels = Number(q.width || 0) * Number(q.height || 0);
@@ -5381,14 +5393,21 @@ async function openProg(p) {
         const bitrate = Number(q.bitrate || 0);
         const reliability = (a.reliability || {}).level || '';
         const reliabilityPenalty = reliability === 'suspect' ? -1000000000000 : reliability === 'warning' ? -100000000 : 0;
-        const namedHd = /\b(?:uhd|4k|hd)\b/i.test(a.channel_name || '') ? 100000 : 0;
-        return reliabilityPenalty + pixels * 1000 + fps * 100 + bitrate / 1000 + namedHd;
+        return reliabilityPenalty + pixels * 1000 + fps * 100 + bitrate / 1000;
       };
       const bestCandidates = window._allAirings.filter(a =>
         !a.on_now && !recMap[a.channel_id+'|'+a.start_ts]
       );
-      const bestAiring = (bestCandidates.length ? bestCandidates : window._allAirings)
-        .reduce((best, airing) => !best || scoreAiring(airing) > scoreAiring(best) ? airing : best, null);
+      const bestAiring = (() => {
+        const candidates = bestCandidates.length ? bestCandidates : window._allAirings;
+        if (candidates.length < 2) return null;
+        const winner = candidates.reduce((best, airing) =>
+          !best || scoreAiring(airing) > scoreAiring(best) ? airing : best, null);
+        // A winner must beat every other option by a real, cached stream
+        // difference. Equal quality (or missing metrics) means no star.
+        return candidates.every(a => a === winner || qualityLead(winner, a) > 0)
+          ? winner : null;
+      })();
       const bestAiringKey = bestAiring ? bestAiring.channel_id + '|' + bestAiring.start_ts : '';
       function renderAiringsList() {
         const list = window._showUnrecordedOnly
