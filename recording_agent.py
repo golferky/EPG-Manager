@@ -312,6 +312,41 @@ def run_process(api, job, status, cmd, cfg, log_path, file_path=''):
     return process.returncode
 
 
+def _log_excerpt(log_path, max_chars=12000):
+    """Return the useful tail of FFmpeg's log for the web health report."""
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_chars))
+            text = handle.read()
+        if size > max_chars:
+            text = '[Earlier FFmpeg output omitted]\n' + text
+        return text.strip()
+    except FileNotFoundError:
+        return ''
+    except OSError as exc:
+        return f'[Unable to read FFmpeg log: {exc}]'
+
+
+def archive_terminal_result(api, job, status, log_path, **fields):
+    """Store a readable log tail in guide.db, then remove the raw log safely."""
+    result = dict(fields.pop('result', {}) or {})
+    excerpt = _log_excerpt(log_path)
+    if excerpt:
+        result['log_excerpt'] = excerpt
+    response = api.heartbeat(job['id'], status, result=result, **fields)
+    # The heartbeat is the durable database write.  Only reclaim disk space
+    # after it succeeds; an offline server leaves the original log intact.
+    try:
+        Path(log_path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f'[cleanup] kept raw FFmpeg log {log_path}: {exc}', file=sys.stderr, flush=True)
+    return response
+
+
 def plex_mount_available(plex_root, marker=''):
     root = Path(plex_root)
     if not root.is_dir():
@@ -456,8 +491,9 @@ def process_job(api, job, cfg):
     if rc is None:
         return
     if rc != 0:
-        api.heartbeat(job['id'], 'failed', message='FFmpeg recording failed',
-                      file=str(ts_path), result=quality)
+        archive_terminal_result(api, job, 'failed', log_path,
+                                message='FFmpeg recording failed',
+                                file=str(ts_path), result=quality)
         return
 
     convert_cmd = [
@@ -467,15 +503,18 @@ def process_job(api, job, cfg):
     if rc is None:
         return
     if rc != 0:
-        api.heartbeat(job['id'], 'done_ts', message='Conversion failed; kept TS file',
-                      file=str(ts_path), quality_decision=decision, result=quality)
+        archive_terminal_result(api, job, 'done_ts', log_path,
+                                message='Conversion failed; kept TS file',
+                                file=str(ts_path), quality_decision=decision,
+                                result=quality)
         return
 
     transfer_deadline = time.time() + float(cfg['transfer_wait_timeout'])
     while not plex_mount_available(library_root, cfg.get('plex_mount_marker', '')):
         if time.time() >= transfer_deadline:
-            api.heartbeat(job['id'], 'failed', message='Timed out waiting for Plex mount',
-                          file=str(mp4_path), result=quality)
+            archive_terminal_result(api, job, 'failed', log_path,
+                                    message='Timed out waiting for Plex mount',
+                                    file=str(mp4_path), result=quality)
             return
         if not heartbeat_sleep(api, job, 'awaiting_transfer',
                                float(cfg['transfer_retry_seconds']), cfg,
@@ -499,8 +538,9 @@ def process_job(api, job, cfg):
         message = (f'Recording ended early: {actual_minutes:.0f} min captured '
                    f'of {expected_minutes:.0f} min scheduled')
         quality.update({'decision': 'incomplete recording', 'recorded': recorded_probe})
-        api.heartbeat(job['id'], 'failed', message=message, file=str(mp4_path),
-                      quality_decision='incomplete recording', result=quality)
+        archive_terminal_result(api, job, 'failed', log_path, message=message,
+                                file=str(mp4_path),
+                                quality_decision='incomplete recording', result=quality)
         print(f'[incomplete] {job["title"]}: {message}', flush=True)
         return
     final_incomplete_copy = bool(final_existing_probe and incomplete_for_scheduled_window(
@@ -529,8 +569,8 @@ def process_job(api, job, cfg):
             'recorded': recorded_probe,
         })
         if not should_transfer:
-            api.heartbeat(
-                job['id'], 'skipped_existing_better', file=str(mp4_path),
+            archive_terminal_result(
+                api, job, 'skipped_existing_better', log_path, file=str(mp4_path),
                 quality_decision=final_decision, result=quality,
             )
             print(f'[skip] {job["title"]}: {final_decision}', flush=True)
@@ -577,10 +617,12 @@ def process_job(api, job, cfg):
     # The Plex file was copied atomically and byte-verified above.  Keep local
     # recordings only when a recording/transfer failed; successful transfers
     # should not silently fill the Mac's recording disk.
-    api.heartbeat(job['id'], 'done', file=str(mp4_path), quality_decision=decision,
-                  result={**quality, 'plex_path': str(destination),
-                          'content_type': ('episode' if episode else
-                                           'episode_needs_metadata' if is_series else 'movie')})
+    archive_terminal_result(
+        api, job, 'done', log_path, file=str(mp4_path), quality_decision=decision,
+        result={**quality, 'plex_path': str(destination),
+                'content_type': ('episode' if episode else
+                                 'episode_needs_metadata' if is_series else 'movie')},
+    )
     try:
         mp4_path.unlink()
     except FileNotFoundError:

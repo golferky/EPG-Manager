@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826a"
+VERSION = "v20260826b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1992,6 +1992,35 @@ def api_get_schedule():
     merged = local + [r for r in legacy if r.get('title','') + str(r.get('start_ts','')) not in seen]
     json_sched = load_schedule()
     return jsonify({'schedule': merged, 'pending': json_sched})
+
+@app.route('/epg-web/api/recording-health')
+def api_recording_health():
+    """Recent completed/failed recording reports, including archived FFmpeg tails."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT rec_id, title, channel, start_time, start_ts,
+                                      stop_ts, status, failure_reason, quality_decision,
+                                      result_json, updated_at
+                               FROM recordings
+                               WHERE result_json IS NOT NULL AND result_json != ''
+                               ORDER BY start_ts DESC LIMIT 100''').fetchall()
+        conn.close()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'reports': []}), 500
+    reports = []
+    for row in rows:
+        record = dict(row)
+        try:
+            result = json.loads(record.pop('result_json') or '{}')
+        except (TypeError, ValueError):
+            result = {}
+        # Only return health fields; paths and any stream configuration stay local.
+        result['transferred_to_plex'] = bool(result.get('plex_path'))
+        for key in ('existing_path', 'plex_path'):
+            result.pop(key, None)
+        reports.append({**record, 'result': result})
+    return jsonify({'reports': reports})
 
 @app.route('/epg-web/api/schedule', methods=['POST'])
 def api_post_schedule():
@@ -4078,6 +4107,17 @@ tr:hover td{background:#141414;}
   </div>
   <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+      <div>
+        <h2 style="margin:0;">🔎 Recording Health</h2>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">Clear results first; expand a row only when you want the technical FFmpeg details.</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecordingHealth()">↻ Refresh</button>
+    </div>
+    <div id="recording-health-empty" style="display:none;color:#64748b;font-size:13px;">No completed recording reports yet. New recordings will appear here.</div>
+    <div id="recording-health-list" style="max-height:460px;overflow-y:auto;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <h2 style="margin:0;">🗑 Recordings Cleanup</h2>
       <span id="rec-files-total" style="font-size:12px;color:#64748b;"></span>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecFiles()">↻ Refresh</button>
@@ -4279,7 +4319,7 @@ function switchTab(name) {
   if (name === 'recommendations') loadRecs();
   if (name === 'channels') loadChannels();
   if (name === '247') load247();
-  if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); loadRecFiles(); }
+  if (name === 'schedule') { loadSchedule(); loadRecordingHealth(); loadSeriesRecordings(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
 }
@@ -5911,6 +5951,67 @@ async function loadSchedule() {
       </td>
     </tr>`;
   }).join('');
+}
+
+function healthSize(bytes) {
+  const n = Number(bytes || 0);
+  if (!n) return '';
+  const units = ['B','KB','MB','GB','TB'];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return `${(n / Math.pow(1024, i)).toFixed(i >= 3 ? 2 : 0)} ${units[i]}`;
+}
+function healthDuration(seconds) {
+  const n = Number(seconds || 0);
+  return n ? `${Math.round(n / 60)} min` : '';
+}
+function healthVideo(probe) {
+  if (!probe || typeof probe !== 'object') return '';
+  const height = Number(probe.height || 0);
+  const bits = [];
+  if (height) bits.push(`${height}p`);
+  if (probe.fps) bits.push(`${Number(probe.fps).toFixed(2).replace(/\.00$/, '')} fps`);
+  if (probe.video_codec) bits.push(String(probe.video_codec).toUpperCase());
+  if (probe.audio_codec) bits.push(String(probe.audio_codec).toUpperCase());
+  if (probe.audio_channels) bits.push(`${probe.audio_channels}ch`);
+  if (probe.size) bits.push(healthSize(probe.size));
+  return bits.join(' · ');
+}
+async function loadRecordingHealth() {
+  const list = document.getElementById('recording-health-list');
+  const empty = document.getElementById('recording-health-empty');
+  if (!list || !empty) return;
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;padding:6px 0;">Loading recording reports…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health')).json();
+    if (d.error) throw new Error(d.error);
+    const reports = d.reports || [];
+    if (!reports.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    list.innerHTML = reports.map(r => {
+      const result = r.result || {};
+      const recorded = result.recorded || {};
+      const scheduled = Math.max(0, Number(r.stop_ts || 0) - Number(r.start_ts || 0));
+      const actual = Number(recorded.duration || 0);
+      const isGood = ['done','skipped_existing_better'].includes((r.status || '').toLowerCase());
+      const color = isGood ? '#4ade80' : '#f87171';
+      const label = isGood ? 'Complete' : (r.failure_reason || r.quality_decision || String(r.status || 'Result').replace(/_/g, ' '));
+      const timing = actual ? `${healthDuration(actual)} captured${scheduled ? ` / ${healthDuration(scheduled)} scheduled` : ''}` : '';
+      const video = healthVideo(recorded) || healthVideo(result.incoming);
+      const technical = result.log_excerpt || '';
+      const when = r.start_time || (r.start_ts ? new Date(Number(r.start_ts) * 1000).toLocaleString() : '');
+      return `<div style="padding:11px 2px;border-bottom:1px solid #222;">
+        <div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;">
+          <strong style="font-size:14px;">${esc(r.title || 'Untitled')}</strong>
+          <span style="font-size:12px;color:${color};font-weight:700;">${esc(label)}</span>
+          <span style="font-size:12px;color:#64748b;">${esc(r.channel || '')} ${when ? '· ' + esc(when) : ''}</span>
+        </div>
+        <div style="font-size:12px;color:#94a3b8;margin-top:5px;">${[timing, video, result.transferred_to_plex ? 'Moved to Plex' : ''].filter(Boolean).map(esc).join(' &nbsp;•&nbsp; ') || 'No media probe was available for this result.'}</div>
+        ${technical ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#93c5fd;font-size:12px;">Show technical FFmpeg log</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;margin-top:7px;padding:9px;background:#111827;border:1px solid #263247;border-radius:5px;color:#cbd5e1;font-size:11px;line-height:1.35;">${esc(technical)}</pre></details>` : '<div style="font-size:11px;color:#475569;margin-top:6px;">Technical log was not saved for this older recording.</div>'}
+      </div>`;
+    }).join('');
+  } catch (err) {
+    list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load recording health: ${esc(err.message || String(err))}</div>`;
+  }
 }
 async function schedUpdate(i,s){await post('/epg-web/api/schedule',{action:'update',index:i,status:s});loadSchedule();}
 async function schedRemove(i){await post('/epg-web/api/schedule',{action:'remove',index:i});loadSchedule();}
