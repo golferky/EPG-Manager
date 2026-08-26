@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826b"
+VERSION = "v20260826c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2021,6 +2021,77 @@ def api_recording_health():
             result.pop(key, None)
         reports.append({**record, 'result': result})
     return jsonify({'reports': reports})
+
+def _recording_log_excerpt(path, max_chars=12000):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_chars))
+            text = handle.read()
+        return ('[Earlier FFmpeg output omitted]\n' if size > max_chars else '') + text.strip()
+    except OSError:
+        return ''
+
+@app.route('/epg-web/api/recording-health/import-logs', methods=['POST'])
+def api_import_prior_recording_logs():
+    """One-time migration of older raw FFmpeg logs into recording result_json."""
+    rec_dir = os.path.expanduser(load_config().get('rec_path', '~/Movies/Recordings'))
+    try:
+        entries = [name for name in os.listdir(rec_dir) if name.endswith('.ffmpeg.log')]
+    except OSError as exc:
+        return jsonify({'error': f'Cannot read recording folder: {exc}'}), 500
+    conn = sqlite3.connect(_guide_db_path(), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA busy_timeout=30000')
+    archived_paths, skipped = [], 0
+    try:
+        for name in entries:
+            match = re.match(r'^(.*)_(\d+)\.ffmpeg\.log$', name)
+            if not match:
+                skipped += 1
+                continue
+            title_part, stamp = match.groups()
+            rows = conn.execute(
+                'SELECT rec_id, title, result_json FROM recordings WHERE CAST(start_ts AS INTEGER)=?',
+                (int(stamp),),
+            ).fetchall()
+            normalized_file_title = re.sub(r'[^a-z0-9]', '', title_part.lower())
+            row = next((candidate for candidate in rows if re.sub(
+                r'[^a-z0-9]', '', str(candidate['title'] or '').lower()
+            ) == normalized_file_title), None)
+            if not row:
+                skipped += 1
+                continue
+            try:
+                result = json.loads(row['result_json'] or '{}')
+            except (TypeError, ValueError):
+                result = {}
+            excerpt = _recording_log_excerpt(os.path.join(rec_dir, name))
+            if not excerpt:
+                skipped += 1
+                continue
+            result['log_excerpt'] = excerpt
+            result['log_imported_at'] = datetime.now(timezone.utc).isoformat()
+            conn.execute('UPDATE recordings SET result_json=?, updated_at=? WHERE rec_id=?', (
+                json.dumps(result), datetime.now(timezone.utc).isoformat(), row['rec_id'],
+            ))
+            archived_paths.append(os.path.join(rec_dir, name))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    deleted = 0
+    for path in archived_paths:
+        try:
+            os.remove(path)
+            deleted += 1
+        except OSError:
+            pass
+    return jsonify({'ok': True, 'imported': len(archived_paths), 'deleted': deleted,
+                    'skipped': skipped})
 
 @app.route('/epg-web/api/schedule', methods=['POST'])
 def api_post_schedule():
@@ -4112,6 +4183,7 @@ tr:hover td{background:#141414;}
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Clear results first; expand a row only when you want the technical FFmpeg details.</div>
       </div>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecordingHealth()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" onclick="importPriorRecordingLogs(this)">⇩ Import old FFmpeg logs</button>
     </div>
     <div id="recording-health-empty" style="display:none;color:#64748b;font-size:13px;">No completed recording reports yet. New recordings will appear here.</div>
     <div id="recording-health-list" style="max-height:460px;overflow-y:auto;"></div>
@@ -6011,6 +6083,23 @@ async function loadRecordingHealth() {
     }).join('');
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load recording health: ${esc(err.message || String(err))}</div>`;
+  }
+}
+async function importPriorRecordingLogs(button) {
+  if (!confirm('Import the old raw FFmpeg logs into Recording Health? Successfully imported logs will then be removed from the recording drive.')) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Importing…';
+  try {
+    const d = await post('/epg-web/api/recording-health/import-logs', {});
+    if (!d.ok) throw new Error(d.error || 'Import failed');
+    alert(`Imported ${d.imported} log${d.imported === 1 ? '' : 's'} into Recording Health and removed ${d.deleted} raw file${d.deleted === 1 ? '' : 's'}. ${d.skipped ? `${d.skipped} file${d.skipped === 1 ? '' : 's'} could not be matched and were kept.` : ''}`);
+    await loadRecordingHealth();
+  } catch (err) {
+    alert(`Could not import old logs: ${err.message || err}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
   }
 }
 async function schedUpdate(i,s){await post('/epg-web/api/schedule',{action:'update',index:i,status:s});loadSchedule();}
