@@ -2854,6 +2854,23 @@ def api_prog_info():
             if results:
                 m = results[0]
                 poster = f"https://image.tmdb.org/t/p/w300{m['poster_path']}" if m.get('poster_path') else ''
+                media_kind = m.get('media_type') or ('tv' if content_type == 'series' else 'movie')
+                cast, director = [], ''
+                if m.get('id') and media_kind in ('movie', 'tv'):
+                    # Search results deliberately omit credits. Fetch the small
+                    # credits payload so fallback metadata is not poster/plot-only.
+                    credits_url = (f'https://api.themoviedb.org/3/{media_kind}/{m["id"]}/credits'
+                                   f'?api_key={tmdb_key}')
+                    with urlreq.urlopen(credits_url, timeout=5) as resp:
+                        credits = json.loads(resp.read())
+                    cast = [person.get('name', '') for person in credits.get('cast', [])[:4]
+                            if person.get('name')]
+                    if media_kind == 'movie':
+                        director = next((person.get('name', '') for person in credits.get('crew', [])
+                                         if person.get('job') == 'Director' and person.get('name')), '')
+                    else:
+                        director = next((person.get('name', '') for person in credits.get('crew', [])
+                                         if person.get('job') in ('Creator', 'Executive Producer') and person.get('name')), '')
                 return jsonify({
                     'source':      'tmdb',
                     'in_library':  in_library,
@@ -2862,8 +2879,8 @@ def api_prog_info():
                     'genre':       '',
                     'rated':       '',
                     'plot':        m.get('overview',''),
-                    'actors':      '',
-                    'director':    '',
+                    'actors':      ', '.join(cast),
+                    'director':    director,
                     'poster':      poster or local_poster,
                     'imdb_rating': str(round(m.get('vote_average',0),1)),
                     'imdb_votes':  '',
