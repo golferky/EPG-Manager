@@ -347,6 +347,18 @@ def archive_terminal_result(api, job, status, log_path, **fields):
     return response
 
 
+def discard_failed_media(*paths):
+    """Health/log data is durable; failed fragments need not consume disk space."""
+    for path in paths:
+        try:
+            Path(path).unlink()
+            print(f'[cleanup] removed failed recording fragment {path}', flush=True)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f'[cleanup] kept failed fragment {path}: {exc}', file=sys.stderr, flush=True)
+
+
 def plex_mount_available(plex_root, marker=''):
     root = Path(plex_root)
     if not root.is_dir():
@@ -494,6 +506,7 @@ def process_job(api, job, cfg):
         archive_terminal_result(api, job, 'failed', log_path,
                                 message='FFmpeg recording failed',
                                 file=str(ts_path), result=quality)
+        discard_failed_media(ts_path, mp4_path)
         return
 
     convert_cmd = [
@@ -507,6 +520,7 @@ def process_job(api, job, cfg):
                                 message='Conversion failed; kept TS file',
                                 file=str(ts_path), quality_decision=decision,
                                 result=quality)
+        discard_failed_media(ts_path, mp4_path)
         return
 
     transfer_deadline = time.time() + float(cfg['transfer_wait_timeout'])
@@ -515,6 +529,7 @@ def process_job(api, job, cfg):
             archive_terminal_result(api, job, 'failed', log_path,
                                     message='Timed out waiting for Plex mount',
                                     file=str(mp4_path), result=quality)
+            discard_failed_media(ts_path, mp4_path)
             return
         if not heartbeat_sleep(api, job, 'awaiting_transfer',
                                float(cfg['transfer_retry_seconds']), cfg,
@@ -541,6 +556,7 @@ def process_job(api, job, cfg):
         archive_terminal_result(api, job, 'failed', log_path, message=message,
                                 file=str(mp4_path),
                                 quality_decision='incomplete recording', result=quality)
+        discard_failed_media(ts_path, mp4_path)
         print(f'[incomplete] {job["title"]}: {message}', flush=True)
         return
     final_incomplete_copy = bool(final_existing_probe and incomplete_for_scheduled_window(
@@ -573,6 +589,7 @@ def process_job(api, job, cfg):
                 api, job, 'skipped_existing_better', log_path, file=str(mp4_path),
                 quality_decision=final_decision, result=quality,
             )
+            discard_failed_media(ts_path, mp4_path)
             print(f'[skip] {job["title"]}: {final_decision}', flush=True)
             return
         decision = final_decision

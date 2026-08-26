@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826g"
+VERSION = "v20260826h"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -760,6 +760,20 @@ def _channel_recording_reliability(days=30):
             level, label = 'reliable', 'Reliable'
         stats.update({'total': total, 'rate': rate, 'level': level, 'label': label})
     return outcomes
+
+def _recent_same_source_failure(title, channel_id, days=14):
+    """Avoid automatic retry loops for one title from one proven-bad source."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        row = conn.execute('''SELECT 1 FROM recordings
+                              WHERE lower(title)=lower(?) AND channel_id=?
+                                AND start_ts>=?
+                                AND status IN ('failed','error','done_ts')
+                              LIMIT 1''', (title, channel_id, time.time() - days * 86400)).fetchone()
+        conn.close()
+        return bool(row)
+    except Exception:
+        return False
 
 def _reconcile_stale_recordings():
     """Mark jobs that could not have survived a prior server stop."""
@@ -2175,10 +2189,13 @@ def _auto_schedule_movie_upgrades():
         rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc
             FROM guide WHERE prog_type='MV' AND start_utc>? AND start_utc<?
             ORDER BY start_utc''', (now_key, until_key)).fetchall()
+        reliability = _channel_recording_reliability()
         candidates_by_title = {}
         for row in rows:
             title_key = _norm_plex_show(row['title'])
-            if title_key in plex_movies and _is_commercial_free_channel(row['channel_name']):
+            if (title_key in plex_movies and _is_commercial_free_channel(row['channel_name'])
+                    and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
+                    and not _recent_same_source_failure(row['title'], row['channel_id'])):
                 candidates_by_title.setdefault(title_key, []).append(row)
         with _rec_lock:
             active_auto_upgrades = sum(
@@ -3188,6 +3205,12 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         if 'HD' in n:                return 2
         return 1
 
+    # Do not automatically queue repeated attempts from a channel whose real
+    # recording history marks it red/suspect.  A manual record remains allowed.
+    reliability = _channel_recording_reliability()
+    rows = [row for row in rows
+            if reliability.get(row['channel_id'], {}).get('level') != 'suspect'
+            and not _recent_same_source_failure(title, row['channel_id'])]
     ep_best = {}   # (sn, en) → row with best channel quality
     unknown_best = {}  # (channel, time) → unknown episode airing
     for r in rows:
