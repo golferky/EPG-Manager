@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826e"
+VERSION = "v20260826f"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -6048,7 +6048,19 @@ function healthVideo(probe) {
   if (probe.size) bits.push(healthSize(probe.size));
   return bits.join(' · ');
 }
-function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex) {
+function recordingLogPenalty(logText) {
+  const log = String(logText || '').toLowerCase();
+  if (!log) return {points:0, detail:''};
+  const severe = (log.match(/corrupt|invalid data|error while|decoding error|continuity check failed|packet corrupt|bad frame|dropped frame/g) || []).length;
+  const warnings = (log.match(/non-monotonous|timestamp discontinuity|past duration|invalid timestamp/g) || []).length;
+  const points = Math.min(35, severe * 3) + Math.min(10, warnings);
+  if (!points) return {points:0, detail:''};
+  const parts = [];
+  if (severe) parts.push(`${severe} stream error${severe === 1 ? '' : 's'}`);
+  if (warnings) parts.push(`${warnings} timestamp warning${warnings === 1 ? '' : 's'}`);
+  return {points, detail: `Log penalty −${points}: ${parts.join(', ')}`};
+}
+function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex, logText) {
   if (!inPlex) return null;
   const expected = Number(scheduledSeconds || 0);
   const actual = Number(actualSeconds || 0);
@@ -6064,11 +6076,12 @@ function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex) {
   const motion = fps >= 50 ? 5 : fps >= 24 ? 4 : fps > 0 ? 2 : 0;
   const audio = Number(probe.audio_channels || 0) >= 6 ? 5 : Number(probe.audio_channels || 0) >= 2 ? 3 : 0;
   // A short recording should never look excellent just because its stream was sharp.
-  const rawScore = completion + resolution + bitrateScore + motion + audio;
+  const logPenalty = recordingLogPenalty(logText);
+  const rawScore = completion + resolution + bitrateScore + motion + audio - logPenalty.points;
   const incomplete = expected && actual && actual / expected < 0.95;
-  const score = Math.min(incomplete ? 59 : 100, rawScore);
+  const score = Math.max(0, Math.min(incomplete ? 59 : 100, rawScore));
   const color = score >= 90 ? '#4ade80' : score >= 75 ? '#a3e635' : score >= 60 ? '#facc15' : '#fb923c';
-  const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
+  const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${logPenalty.detail ? ' · ' + logPenalty.detail : ''}${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
   return {score, color, detail};
 }
 async function loadRecordingHealth() {
@@ -6094,7 +6107,7 @@ async function loadRecordingHealth() {
       const video = healthVideo(recorded) || healthVideo(result.incoming);
       const technical = result.log_excerpt || '';
       const when = r.start_time || (r.start_ts ? new Date(Number(r.start_ts) * 1000).toLocaleString() : '');
-      const score = recordingQualityScore(recorded, scheduled, actual, result.transferred_to_plex);
+      const score = recordingQualityScore(recorded, scheduled, actual, result.transferred_to_plex, result.log_excerpt);
       return `<div style="padding:11px 2px;border-bottom:1px solid #222;">
         <div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;">
           <strong style="font-size:14px;">${esc(r.title || 'Untitled')}</strong>
