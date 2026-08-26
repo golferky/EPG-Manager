@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260825f"
+VERSION = "v20260826a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5651,10 +5651,14 @@ async function loadUpgradeOpportunities() {
       const title = JSON.stringify(r.title).replace(/"/g,'&quot;');
       return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1e293b;">
         <span style="flex:1;font-weight:600;">${esc(r.title)} <span style="color:#94a3b8;font-size:11px;font-weight:400;">Plex ${r.existing_height}p → ${r.incoming_height}p · ${esc(r.channel_name)} · ${start}</span></span>
-        ${r.scheduled ? '<span class="badge badge-record">Scheduled</span>' : `<button class="btn btn-primary btn-sm" onclick="recordAiring(${airing},${title});loadUpgradeOpportunities()">⏱ Record upgrade</button>`}
+        ${r.scheduled ? '<span class="badge badge-record">Scheduled</span>' : `<button class="btn btn-primary btn-sm" onclick="recordUpgradeOpportunity(this,${airing},${title})">⏱ Record upgrade</button>`}
       </div>`;
     }).join('');
   } catch(e) { setEl('upgrade-status', 'Could not load upgrades: '+e.message, 'err'); }
+}
+async function recordUpgradeOpportunity(button, airing, title) {
+  await recordAiring(airing, title, button);
+  await loadUpgradeOpportunities();
 }
 async function loadRecs() {
   loadUpgradeOpportunities();
