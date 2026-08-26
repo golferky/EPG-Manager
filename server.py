@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826h"
+VERSION = "v20260826i"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2974,6 +2974,7 @@ def api_airings():
         return jsonify({'airings': []})
 
     airings = []
+    reliability_by_channel = _channel_recording_reliability()
     for r in rows:
         try:
             su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -2985,6 +2986,7 @@ def api_airings():
             # catches SD numeric rows such as "MGM+ Hits HD" that map to a
             # PrimeStreams channel named simply "MGM+ HITS".
             _url, stream_error, stream_debug = _stream_url(r['channel_id'])
+            stream_quality = _saved_stream_quality(r['channel_id']) or {}
             airings.append({
                 'channel_id':   r['channel_id'],
                 'channel_name': r['channel_name'],
@@ -2993,6 +2995,13 @@ def api_airings():
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
                 'can_record':   not stream_error,
+                'stream_quality': {
+                    'width': stream_quality.get('width', 0),
+                    'height': stream_quality.get('height', 0),
+                    'fps': stream_quality.get('fps', 0),
+                    'bitrate': stream_quality.get('total_bitrate') or stream_quality.get('video_bitrate') or 0,
+                },
+                'reliability': reliability_by_channel.get(r['channel_id'], {}),
                 'commercial_free': _is_commercial_free_channel(r['channel_name']),
                 'stream_channel': stream_debug.get('matched_guide_channel') or '',
                 'on_now':       su.timestamp() <= now_ts < eu.timestamp(),
@@ -5353,6 +5362,25 @@ async function openProg(p) {
       const unrecBtn = document.getElementById('pm-unrecorded-btn');
       const hasUnrecorded = window._allAirings.some(a => !recMap[a.channel_id+'|'+a.start_ts] && !a.on_now);
       unrecBtn.style.display = hasUnrecorded ? '' : 'none';
+      // Prefer the actual cached stream resolution, then frame rate and
+      // bitrate. A channel with repeated recording failures can never win
+      // the recommendation when a healthier alternative is available.
+      const scoreAiring = a => {
+        const q = a.stream_quality || {};
+        const pixels = Number(q.width || 0) * Number(q.height || 0);
+        const fps = Number(q.fps || 0);
+        const bitrate = Number(q.bitrate || 0);
+        const reliability = (a.reliability || {}).level || '';
+        const reliabilityPenalty = reliability === 'suspect' ? -1000000000000 : reliability === 'warning' ? -100000000 : 0;
+        const namedHd = /\b(?:uhd|4k|hd)\b/i.test(a.channel_name || '') ? 100000 : 0;
+        return reliabilityPenalty + pixels * 1000 + fps * 100 + bitrate / 1000 + namedHd;
+      };
+      const bestCandidates = window._allAirings.filter(a =>
+        !a.on_now && !recMap[a.channel_id+'|'+a.start_ts]
+      );
+      const bestAiring = (bestCandidates.length ? bestCandidates : window._allAirings)
+        .reduce((best, airing) => !best || scoreAiring(airing) > scoreAiring(best) ? airing : best, null);
+      const bestAiringKey = bestAiring ? bestAiring.channel_id + '|' + bestAiring.start_ts : '';
       function renderAiringsList() {
         const list = window._showUnrecordedOnly
           ? window._allAirings.filter(a => !window._airingsRecMap[a.channel_id+'|'+a.start_ts] && !a.on_now)
@@ -5360,14 +5388,15 @@ async function openProg(p) {
         const renderRows = (items, unidentified=false) => items.map(a => {
           const key = a.channel_id + '|' + a.start_ts;
           const scheduled = window._airingsRecMap[key];
+          const best = key === bestAiringKey;
           const epInfo = (a.season_num != null ? `S${a.season_num}${a.episode_num != null ? 'E'+a.episode_num : ''}` : '') +
                          (a.episode_title ? (a.season_num != null ? ' · ' : '') + a.episode_title : '');
           const episodeKey = (a.season_num != null && a.episode_num != null)
             ? `${_normTitle(p.title).replace(/\s/g,'')}|${a.season_num}|${a.episode_num}` : '';
           const inPlex = !!episodeKey && _plexEpisodes.has(episodeKey);
-          return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;">
+          return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;${best ? 'background:#2b2208;border-left:3px solid #fbbf24;padding-left:7px;' : ''}">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-            <span style="color:#64748b;flex:1;">${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
+            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)
