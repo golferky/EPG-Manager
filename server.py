@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260827b"
+VERSION = "v20260827c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2148,6 +2148,108 @@ def api_trash_incomplete_plex_copy():
     except OSError as exc:
         return jsonify({'ok': False, 'error': f'Could not move file to Trash: {exc}'}), 500
     return jsonify({'ok': True, 'moved': copy['file_name']})
+
+
+def _best_incomplete_rerecord(title, expected_seconds):
+    """Choose one clean, reliable, recordable future airing for a retry."""
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    now = time.time()
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        # Do not stack retries for the same film. A user can cancel the queued
+        # retry first if they intentionally want a different airing.
+        queued = conn.execute('''SELECT title, channel, start_ts FROM recordings
+                                 WHERE lower(title)=lower(?) AND start_ts > ?
+                                   AND status IN ('queued','scheduled','agent_claimed','preflight',
+                                                  'waiting','recording','converting','awaiting_transfer','transferring')
+                                 ORDER BY start_ts LIMIT 1''', (title, now)).fetchone()
+        if queued:
+            conn.close()
+            return None, {'already_queued': dict(queued)}
+        rows = conn.execute('''SELECT channel_id, channel_name, start_utc, end_utc
+                               FROM guide
+                               WHERE lower(title)=lower(?) AND start_utc > ?
+                               ORDER BY start_utc LIMIT 250''',
+                            (title, datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S'))).fetchall()
+        conn.close()
+    except Exception as exc:
+        return None, {'error': str(exc)}
+
+    reliability = _channel_recording_reliability()
+    candidates = []
+    for row in rows:
+        try:
+            start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
+            stop = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
+        except (TypeError, ValueError):
+            continue
+        channel_id, channel = row['channel_id'], row['channel_name'] or row['channel_id']
+        if (stop - start) < expected_seconds * 0.90:
+            continue
+        if _is_foreign_recording_feed(channel) or not _is_commercial_free_channel(channel):
+            continue
+        _url, stream_error, stream_debug = _stream_url(channel_id)
+        if stream_error or _recent_same_source_failure(title, channel_id):
+            continue
+        quality = _saved_stream_quality(channel_id) or {}
+        rel = reliability.get(channel_id, {})
+        reliability_rank = {'reliable': 2, 'warning': 1, 'suspect': 0}.get(rel.get('level'), 1)
+        candidates.append({
+            'channel_id': channel_id, 'channel': channel, 'start_ts': start, 'stop_ts': stop,
+            'stream_id': str(stream_debug.get('stream_id') or ''),
+            'score': (int(quality.get('height') or 0), float(quality.get('fps') or 0),
+                      int(quality.get('total_bitrate') or quality.get('video_bitrate') or 0),
+                      reliability_rank, -start),
+        })
+    if not candidates:
+        return None, {'error': 'No clean, recordable future airing was found yet'}
+    return max(candidates, key=lambda item: item['score']), {}
+
+
+@app.route('/epg-web/api/recording-health/incomplete-plex/rerecord', methods=['POST'])
+def api_rerecord_incomplete_plex_copy():
+    """Queue the strongest safe retry for a currently incomplete Plex copy."""
+    rec_id = str((request.json or {}).get('rec_id') or '')
+    copy = next((item for item in _incomplete_plex_copy_reports()
+                 if str(item['rec_id']) == rec_id), None)
+    if not copy:
+        return jsonify({'ok': False,
+                        'error': 'That Plex copy is no longer flagged incomplete.'}), 409
+    candidate, detail = _best_incomplete_rerecord(copy['title'], copy['expected'])
+    if detail.get('already_queued'):
+        queued = detail['already_queued']
+        return jsonify({'ok': True, 'duplicate': True, 'channel': queued['channel'],
+                        'start_ts': queued['start_ts']})
+    if not candidate:
+        return jsonify({'ok': False, 'error': detail.get('error', 'No re-recording found')}), 404
+
+    retry_id = str(uuid.uuid4())[:8]
+    rec = {
+        'title': copy['title'], 'channel_id': candidate['channel_id'],
+        'channel': candidate['channel'], 'start_ts': candidate['start_ts'],
+        'stop_ts': candidate['stop_ts'], 'status': 'queued', 'progress': 0,
+        'log': [], 'pid': None, 'file': None, 'backend': _recording_backend(),
+        'stream_id': candidate['stream_id'], 'episode_title': '', 'season_num': None,
+        'episode_num': None, 'is_series': False, 'auto_upgrade': False,
+    }
+    if not _db_upsert_rec(retry_id, rec):
+        return jsonify({'ok': False, 'error': 'Could not save the re-recording'}), 500
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('UPDATE recordings SET quality_decision=? WHERE rec_id=?',
+                     ('re-recording incomplete Plex copy', retry_id))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+    with _rec_lock:
+        _recs[retry_id] = rec
+        _rec_cancel_events[retry_id] = threading.Event()
+    if rec['backend'] == 'local':
+        threading.Thread(target=_run_recording, args=(retry_id,), daemon=True).start()
+    return jsonify({'ok': True, 'id': retry_id, 'channel': candidate['channel'],
+                    'start_ts': candidate['start_ts']})
 
 def _recording_log_excerpt(path, max_chars=12000):
     try:
@@ -6369,6 +6471,7 @@ async function loadIncompletePlexCopies() {
           <div style="font-size:12px;color:#fbbf24;margin-top:5px;">${esc(detail)}${c.height ? ` · ${esc(c.height)}p` : ''}</div>
           <div style="font-size:11px;color:#64748b;margin-top:3px;">${esc(c.channel || '')} · ${esc(c.file_name || '')}</div>
         </div>
+        <button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;" onclick="scheduleIncompleteRerecord('${String(c.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Schedule best re-record</button>
         <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashIncompletePlexCopy('${String(c.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}')">🗑 Move to Trash</button>
       </div>`;
     }).join('');
@@ -6382,6 +6485,23 @@ async function trashIncompletePlexCopy(recId) {
   if (!d.ok) { alert(d.error || 'Could not move the Plex copy to Trash.'); return; }
   await loadIncompletePlexCopies();
   loadStorageBar();
+}
+async function scheduleIncompleteRerecord(recId, button) {
+  const original = button.textContent;
+  button.disabled = true; button.textContent = 'Finding re-record…';
+  try {
+    const d = await post('/epg-web/api/recording-health/incomplete-plex/rerecord', {rec_id: recId});
+    if (!d.ok) throw new Error(d.error || 'Could not schedule a re-recording.');
+    const when = d.start_ts ? new Date(Number(d.start_ts) * 1000).toLocaleString() : '';
+    alert(d.duplicate ? `A re-recording is already queued on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`
+                      : `Re-recording scheduled on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`);
+    await loadIncompletePlexCopies();
+    loadSchedule();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    button.disabled = false; button.textContent = original;
+  }
 }
 async function importPriorRecordingLogs(button) {
   if (!confirm('Import the old raw FFmpeg logs into Recording Health? Successfully imported logs will then be removed from the recording drive.')) return;
