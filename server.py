@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260827a"
+VERSION = "v20260827b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2045,6 +2045,109 @@ def api_recording_health():
             result.pop(key, None)
         reports.append({**record, 'result': result})
     return jsonify({'reports': reports})
+
+
+def _incomplete_plex_copy_reports():
+    """Find current Plex files that are materially shorter than their recording slot.
+
+    We deliberately probe the file that exists now rather than trusting a stale
+    historical result: a later re-record may have replaced the same Plex path.
+    """
+    cfg = load_config()
+    plex_root = os.path.realpath(cfg.get('plex_path', '/Volumes/Plex/Movies'))
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT rec_id, title, channel, start_ts, stop_ts, result_json
+                               FROM recordings
+                               WHERE result_json IS NOT NULL AND result_json != ''
+                               ORDER BY start_ts DESC LIMIT 150''').fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    # Keep the latest historical context for each actual Plex file.
+    candidates = {}
+    for row in rows:
+        try:
+            result = json.loads(row['result_json'] or '{}')
+        except (TypeError, ValueError):
+            continue
+        saved_path = result.get('plex_path')
+        expected = float(row['stop_ts'] or 0) - float(row['start_ts'] or 0)
+        if not saved_path or expected < 900:
+            continue
+        path = os.path.realpath(saved_path)
+        try:
+            is_plex_file = os.path.commonpath([plex_root, path]) == plex_root
+        except ValueError:
+            is_plex_file = False
+        if not is_plex_file or not os.path.isfile(path) or path in candidates:
+            continue
+        candidates[path] = {'rec_id': row['rec_id'], 'title': row['title'],
+                            'channel': row['channel'], 'expected': expected}
+
+    try:
+        from recording_agent import probe_media
+    except Exception:
+        return []
+    reports = []
+    for path, item in candidates.items():
+        try:
+            probe = probe_media(path, cfg.get('ffprobe', 'ffprobe'), timeout=20)
+            actual = float(probe.get('duration') or 0)
+        except Exception:
+            continue
+        # A five-percent allowance avoids flagging normal guide padding while
+        # still catching a clearly cut-off movie.
+        if actual and actual < item['expected'] * 0.95:
+            reports.append({**item, 'actual': actual, 'file_name': os.path.basename(path),
+                            'height': probe.get('height') or 0})
+    return reports
+
+
+@app.route('/epg-web/api/recording-health/incomplete-plex')
+def api_incomplete_plex_copies():
+    return jsonify({'copies': _incomplete_plex_copy_reports()})
+
+
+@app.route('/epg-web/api/recording-health/incomplete-plex/trash', methods=['POST'])
+def api_trash_incomplete_plex_copy():
+    """Move one currently verified incomplete Plex file to the user's Trash."""
+    rec_id = str((request.json or {}).get('rec_id') or '')
+    copy = next((item for item in _incomplete_plex_copy_reports()
+                 if str(item['rec_id']) == rec_id), None)
+    if not copy:
+        return jsonify({'ok': False,
+                        'error': 'That Plex copy is no longer flagged incomplete. Nothing was moved.'}), 409
+
+    cfg = load_config()
+    plex_root = os.path.realpath(cfg.get('plex_path', '/Volumes/Plex/Movies'))
+    # Resolve the selected record's stored path only after it has passed the
+    # current-duration check above; never accept a client-supplied path.
+    conn = sqlite3.connect(_guide_db_path(), timeout=30)
+    row = conn.execute('SELECT result_json FROM recordings WHERE rec_id=?', (rec_id,)).fetchone()
+    conn.close()
+    try:
+        path = os.path.realpath(json.loads((row or [''])[0] or '{}').get('plex_path', ''))
+        if os.path.commonpath([plex_root, path]) != plex_root or not os.path.isfile(path):
+            raise ValueError('Plex file is unavailable')
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return jsonify({'ok': False, 'error': f'Could not safely locate the Plex file: {exc}'}), 400
+
+    trash_dir = os.path.expanduser('~/.Trash')
+    os.makedirs(trash_dir, exist_ok=True)
+    stem, ext = os.path.splitext(os.path.basename(path))
+    destination = os.path.join(trash_dir, os.path.basename(path))
+    suffix = 2
+    while os.path.exists(destination):
+        destination = os.path.join(trash_dir, f'{stem} ({suffix}){ext}')
+        suffix += 1
+    try:
+        shutil.move(path, destination)
+    except OSError as exc:
+        return jsonify({'ok': False, 'error': f'Could not move file to Trash: {exc}'}), 500
+    return jsonify({'ok': True, 'moved': copy['file_name']})
 
 def _recording_log_excerpt(path, max_chars=12000):
     try:
@@ -4273,6 +4376,17 @@ tr:hover td{background:#141414;}
     <div id="recording-health-list" style="max-height:460px;overflow-y:auto;"></div>
   </div>
   <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div>
+        <h2 style="margin:0;">⚠ Incomplete Plex Copies</h2>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">Files that are still more than 5% shorter than the airing they were meant to capture.</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadIncompletePlexCopies()">↻ Refresh</button>
+    </div>
+    <div id="incomplete-plex-empty" style="display:none;color:#64748b;font-size:13px;">No incomplete Plex copies are currently flagged.</div>
+    <div id="incomplete-plex-list" style="max-height:260px;overflow-y:auto;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <div><h2 style="margin:0;">🧾 Raw FFmpeg Log Cleanup</h2><div style="font-size:12px;color:#64748b;margin-top:3px;">These are old raw logs still using space. Import archives matched logs into the database, then removes them.</div></div>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRawLogFiles()">↻ Refresh</button>
@@ -4484,7 +4598,7 @@ function switchTab(name) {
   if (name === 'channels') loadChannels();
   if (name === '247') load247();
   if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
-  if (name === 'health') { loadRecordingHealth(); loadRawLogFiles(); loadRecFiles(); }
+  if (name === 'health') { loadRecordingHealth(); loadIncompletePlexCopies(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
 }
@@ -6233,6 +6347,41 @@ async function loadRecordingHealth() {
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load recording health: ${esc(err.message || String(err))}</div>`;
   }
+}
+async function loadIncompletePlexCopies() {
+  const list = document.getElementById('incomplete-plex-list');
+  const empty = document.getElementById('incomplete-plex-empty');
+  if (!list || !empty) return;
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;padding:6px 0;">Checking current Plex files…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/incomplete-plex')).json();
+    const copies = d.copies || [];
+    if (!copies.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    list.innerHTML = copies.map(c => {
+      const actual = healthDuration(c.actual);
+      const expected = healthDuration(c.expected);
+      const detail = `${actual} captured / ${expected} expected`;
+      return `<div style="display:flex;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #222;flex-wrap:wrap;">
+        <div style="flex:1;min-width:230px;">
+          <strong style="font-size:14px;">${esc(c.title || 'Untitled')}</strong>
+          <span style="margin-left:7px;background:#7f1d1d;color:#fecaca;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:800;">INCOMPLETE</span>
+          <div style="font-size:12px;color:#fbbf24;margin-top:5px;">${esc(detail)}${c.height ? ` · ${esc(c.height)}p` : ''}</div>
+          <div style="font-size:11px;color:#64748b;margin-top:3px;">${esc(c.channel || '')} · ${esc(c.file_name || '')}</div>
+        </div>
+        <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashIncompletePlexCopy('${String(c.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}')">🗑 Move to Trash</button>
+      </div>`;
+    }).join('');
+  } catch (err) {
+    list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not check Plex copies: ${esc(err.message || String(err))}</div>`;
+  }
+}
+async function trashIncompletePlexCopy(recId) {
+  if (!confirm('Move this incomplete Plex copy to Trash? You can restore it from Trash if needed.')) return;
+  const d = await post('/epg-web/api/recording-health/incomplete-plex/trash', {rec_id: recId});
+  if (!d.ok) { alert(d.error || 'Could not move the Plex copy to Trash.'); return; }
+  await loadIncompletePlexCopies();
+  loadStorageBar();
 }
 async function importPriorRecordingLogs(button) {
   if (!confirm('Import the old raw FFmpeg logs into Recording Health? Successfully imported logs will then be removed from the recording drive.')) return;
