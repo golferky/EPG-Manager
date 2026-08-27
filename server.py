@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260826j"
+VERSION = "v20260827a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4848,7 +4848,11 @@ async function playPlex(title) {
 
 let _chIdFilter = '';
 async function fetchAndRenderGuide() {
+  // The NAS can reconnect after this page first loads.  Re-read the small
+  // movie-folder index on later guide refreshes so Plex badges recover without
+  // requiring a browser reload.
   if (!_plexTitlesReady && _plexTitlesPromise) await _plexTitlesPromise;
+  else await loadPlexTitles();
   if (_plexEpisodesPromise) await _plexEpisodesPromise;
   const params = new URLSearchParams();
   if (_guideWindowStart) params.set('start', _guideWindowStart);
