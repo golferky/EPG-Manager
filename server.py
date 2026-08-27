@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260827c"
+VERSION = "v20260827d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2147,7 +2147,19 @@ def api_trash_incomplete_plex_copy():
         shutil.move(path, destination)
     except OSError as exc:
         return jsonify({'ok': False, 'error': f'Could not move file to Trash: {exc}'}), 500
-    return jsonify({'ok': True, 'moved': copy['file_name']})
+    # Plex movies normally live in their own title folder. Clean up that folder
+    # only when it contains nothing at all after the selected file was moved.
+    # A folder containing artwork, subtitles, or another version is left alone.
+    folder_removed = False
+    parent = os.path.dirname(path)
+    if parent != plex_root:
+        try:
+            if not os.listdir(parent):
+                os.rmdir(parent)
+                folder_removed = True
+        except OSError:
+            pass
+    return jsonify({'ok': True, 'moved': copy['file_name'], 'folder_removed': folder_removed})
 
 
 def _best_incomplete_rerecord(title, expected_seconds):
