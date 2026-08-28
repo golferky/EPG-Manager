@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260828a"
+VERSION = "v20260828b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2189,6 +2189,10 @@ def _plex_transfer_debris():
                 debris.append({
                     'relative_path': os.path.relpath(path, root),
                     'file_name': name,
+                    # Legacy transfer names are the original movie title plus
+                    # the temporary extension.  Keep it so the UI can offer a
+                    # deliberate re-record before the leftover is discarded.
+                    'title': name[:-len('.part.mp4')],
                     'size': stat.st_size,
                     'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %I:%M %p'),
                 })
@@ -2248,6 +2252,49 @@ def api_trash_plex_transfer_debris():
             pass
     return jsonify({'ok': not errors, 'moved': moved, 'errors': errors,
                     'folder_removed': folder_removed})
+
+
+@app.route('/epg-web/api/recording-health/plex-transfer-debris/rerecord', methods=['POST'])
+def api_rerecord_plex_transfer_debris():
+    """Queue one safe retry for a legacy failed transfer, if it is still in guide."""
+    requested = str((request.json or {}).get('relative_path') or '')
+    debris = next((item for item in _plex_transfer_debris()
+                   if item['relative_path'] == requested), None)
+    if not debris:
+        return jsonify({'ok': False, 'error': 'That transfer leftover is no longer available.'}), 409
+    candidate, detail = _best_incomplete_rerecord(debris['title'], 0)
+    if detail.get('already_queued'):
+        queued = detail['already_queued']
+        return jsonify({'ok': True, 'duplicate': True, 'channel': queued['channel'],
+                        'start_ts': queued['start_ts']})
+    if not candidate:
+        return jsonify({'ok': False, 'error': detail.get('error', 'No re-recording found')}), 404
+
+    retry_id = str(uuid.uuid4())[:8]
+    rec = {
+        'title': debris['title'], 'channel_id': candidate['channel_id'],
+        'channel': candidate['channel'], 'start_ts': candidate['start_ts'],
+        'stop_ts': candidate['stop_ts'], 'status': 'queued', 'progress': 0,
+        'log': [], 'pid': None, 'file': None, 'backend': _recording_backend(),
+        'stream_id': candidate['stream_id'], 'episode_title': '', 'season_num': None,
+        'episode_num': None, 'is_series': False, 'auto_upgrade': False,
+    }
+    if not _db_upsert_rec(retry_id, rec):
+        return jsonify({'ok': False, 'error': 'Could not save the re-recording'}), 500
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('UPDATE recordings SET quality_decision=? WHERE rec_id=?',
+                     ('re-recording abandoned Plex transfer', retry_id))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+    with _rec_lock:
+        _recs[retry_id] = rec
+        _rec_cancel_events[retry_id] = threading.Event()
+    if rec['backend'] == 'local':
+        threading.Thread(target=_run_recording, args=(retry_id,), daemon=True).start()
+    return jsonify({'ok': True, 'id': retry_id, 'channel': candidate['channel'],
+                    'start_ts': candidate['start_ts']})
 
 
 def _best_incomplete_rerecord(title, expected_seconds):
@@ -4594,7 +4641,9 @@ tr:hover td{background:#141414;}
         <h2 style="margin:0;">🧹 Abandoned Plex Transfers</h2>
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Old `.part.mp4` files are failed transfer leftovers, not movies Plex can use.</div>
       </div>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadPlexTransferDebris()">↻ Refresh</button>
+      <label style="font-size:12px;color:#94a3b8;cursor:pointer;white-space:nowrap;"><input type="checkbox" id="plex-debris-select-all" onchange="toggleAllPlexDebris(this.checked)"> Select all</label>
+      <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashSelectedPlexTransferDebris()">🗑 Clean selected</button>
+      <button class="btn btn-ghost btn-sm" onclick="loadPlexTransferDebris()">↻ Refresh</button>
     </div>
     <div id="plex-debris-empty" style="display:none;color:#64748b;font-size:13px;">No abandoned Plex transfer files found.</div>
     <div id="plex-debris-list" style="max-height:260px;overflow-y:auto;"></div>
@@ -6625,16 +6674,41 @@ async function loadPlexTransferDebris() {
     if (!files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
     list.innerHTML = files.map(f => `<div style="display:flex;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #222;flex-wrap:wrap;">
+      <input class="plex-debris-choice" type="checkbox" data-path="${encodeURIComponent(f.relative_path || '')}" aria-label="Select ${esc(f.title || f.file_name || '')}">
       <div style="flex:1;min-width:230px;">
-        <strong style="font-size:13px;color:#fecaca;">${esc(f.file_name || '')}</strong>
+        <strong style="font-size:13px;color:#fecaca;">${esc(f.title || f.file_name || '')}</strong>
+        <span style="margin-left:6px;font-size:11px;color:#64748b;">abandoned transfer</span>
         <div style="font-size:12px;color:#94a3b8;margin-top:4px;">${esc(fmtSize(f.size))} · ${esc(f.modified || '')}</div>
         <div style="font-size:11px;color:#64748b;margin-top:3px;">${esc(f.relative_path || '')}</div>
       </div>
+      <button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;" onclick="schedulePlexTransferRerecord(this.dataset.path,this)" data-path="${encodeURIComponent(f.relative_path || '')}">↻ Re-record</button>
       <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashPlexTransferDebris(this.dataset.path,this)" data-path="${encodeURIComponent(f.relative_path || '')}">🗑 Clean up</button>
     </div>`).join('');
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not check transfer leftovers: ${esc(err.message || String(err))}</div>`;
   }
+}
+function toggleAllPlexDebris(checked) {
+  document.querySelectorAll('.plex-debris-choice').forEach(box => { box.checked = checked; });
+}
+async function trashSelectedPlexTransferDebris() {
+  const selected = [...document.querySelectorAll('.plex-debris-choice:checked')]
+    .map(box => decodeURIComponent(box.dataset.path || '')).filter(Boolean);
+  if (!selected.length) { alert('Select one or more abandoned transfers first.'); return; }
+  if (!confirm(`Move ${selected.length} abandoned transfer${selected.length === 1 ? '' : 's'} to Trash? Matching conversion logs will also be moved. This does not touch active recordings.`)) return;
+  const selectAll = document.getElementById('plex-debris-select-all');
+  if (selectAll) { selectAll.disabled = true; selectAll.checked = false; }
+  let moved = 0, failed = 0;
+  for (const relativePath of selected) {
+    try {
+      const d = await post('/epg-web/api/recording-health/plex-transfer-debris/trash', {relative_path: relativePath});
+      if (d.ok) moved++; else failed++;
+    } catch (_) { failed++; }
+  }
+  if (selectAll) selectAll.disabled = false;
+  await loadPlexTransferDebris();
+  loadStorageBar();
+  alert(`Moved ${moved} transfer${moved === 1 ? '' : 's'} to Trash.${failed ? ` ${failed} could not be moved and remain listed.` : ''}`);
 }
 async function trashPlexTransferDebris(encodedPath, button) {
   const relativePath = decodeURIComponent(encodedPath || '');
@@ -6646,6 +6720,24 @@ async function trashPlexTransferDebris(encodedPath, button) {
     if (!d.ok) throw new Error((d.errors || []).join('\\n') || d.error || 'Cleanup failed.');
     await loadPlexTransferDebris();
     loadStorageBar();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    button.disabled = false; button.textContent = original;
+  }
+}
+async function schedulePlexTransferRerecord(encodedPath, button) {
+  const relativePath = decodeURIComponent(encodedPath || '');
+  if (!relativePath) return;
+  const original = button.textContent;
+  button.disabled = true; button.textContent = 'Finding…';
+  try {
+    const d = await post('/epg-web/api/recording-health/plex-transfer-debris/rerecord', {relative_path: relativePath});
+    if (!d.ok) throw new Error(d.error || 'No re-recording found.');
+    const when = d.start_ts ? new Date(Number(d.start_ts) * 1000).toLocaleString() : '';
+    alert(d.duplicate ? `A re-recording is already queued on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`
+                      : `Re-recording scheduled on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`);
+    loadSchedule();
   } catch (err) {
     alert(err.message || String(err));
   } finally {
