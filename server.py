@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260827d"
+VERSION = "v20260828a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2160,6 +2160,94 @@ def api_trash_incomplete_plex_copy():
         except OSError:
             pass
     return jsonify({'ok': True, 'moved': copy['file_name'], 'folder_removed': folder_removed})
+
+
+def _plex_transfer_debris():
+    """Return abandoned legacy `.part.mp4` files in the Plex movie library.
+
+    The current transfer code uses a different temporary suffix and renames it
+    atomically.  These older `.part.mp4` files are failed-transfer leftovers,
+    not playable Plex movies.  We intentionally do not include current
+    `.partial` files, which could still be in an active transfer.
+    """
+    root = os.path.realpath(load_config().get('plex_path', '/Volumes/Plex/Movies'))
+    if not os.path.isdir(root):
+        return []
+    debris = []
+    try:
+        for directory, _dirs, names in os.walk(root):
+            for name in names:
+                if not name.lower().endswith('.part.mp4'):
+                    continue
+                path = os.path.realpath(os.path.join(directory, name))
+                try:
+                    if os.path.commonpath([root, path]) != root or not os.path.isfile(path):
+                        continue
+                    stat = os.stat(path)
+                except (OSError, ValueError):
+                    continue
+                debris.append({
+                    'relative_path': os.path.relpath(path, root),
+                    'file_name': name,
+                    'size': stat.st_size,
+                    'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %I:%M %p'),
+                })
+    except OSError:
+        pass
+    return sorted(debris, key=lambda item: item['modified'], reverse=True)
+
+
+@app.route('/epg-web/api/recording-health/plex-transfer-debris')
+def api_plex_transfer_debris():
+    return jsonify({'files': _plex_transfer_debris()})
+
+
+@app.route('/epg-web/api/recording-health/plex-transfer-debris/trash', methods=['POST'])
+def api_trash_plex_transfer_debris():
+    """Move one abandoned legacy partial file and its matching log to Trash."""
+    requested = str((request.json or {}).get('relative_path') or '')
+    root = os.path.realpath(load_config().get('plex_path', '/Volumes/Plex/Movies'))
+    path = os.path.realpath(os.path.join(root, requested))
+    try:
+        if (os.path.commonpath([root, path]) != root or not os.path.isfile(path)
+                or not path.lower().endswith('.part.mp4')):
+            raise ValueError('File is not a safe abandoned transfer item')
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+    parent = os.path.dirname(path)
+    base = os.path.basename(path)[:-len('.part.mp4')]
+    # Only take logs with the exact same title stem; unrelated logs remain.
+    related = [path]
+    for suffix in ('.convert.ffmpeg.log', '.ffmpeg.log'):
+        log = os.path.join(parent, base + suffix)
+        if os.path.isfile(log):
+            related.append(log)
+    trash_dir = os.path.expanduser('~/.Trash')
+    os.makedirs(trash_dir, exist_ok=True)
+    moved, errors = [], []
+    for source in related:
+        stem, ext = os.path.splitext(os.path.basename(source))
+        destination = os.path.join(trash_dir, os.path.basename(source))
+        suffix = 2
+        while os.path.exists(destination):
+            destination = os.path.join(trash_dir, f'{stem} ({suffix}){ext}')
+            suffix += 1
+        try:
+            shutil.move(source, destination)
+            moved.append(os.path.basename(source))
+        except OSError as exc:
+            errors.append(f'{os.path.basename(source)}: {exc}')
+    folder_removed = False
+    if moved:
+        try:
+            if not os.listdir(parent):
+                os.rmdir(parent)
+                folder_removed = True
+        except OSError:
+            pass
+    return jsonify({'ok': not errors, 'moved': moved, 'errors': errors,
+                    'folder_removed': folder_removed})
 
 
 def _best_incomplete_rerecord(title, expected_seconds):
@@ -4501,6 +4589,17 @@ tr:hover td{background:#141414;}
     <div id="incomplete-plex-list" style="max-height:260px;overflow-y:auto;"></div>
   </div>
   <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div>
+        <h2 style="margin:0;">🧹 Abandoned Plex Transfers</h2>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">Old `.part.mp4` files are failed transfer leftovers, not movies Plex can use.</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadPlexTransferDebris()">↻ Refresh</button>
+    </div>
+    <div id="plex-debris-empty" style="display:none;color:#64748b;font-size:13px;">No abandoned Plex transfer files found.</div>
+    <div id="plex-debris-list" style="max-height:260px;overflow-y:auto;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <div><h2 style="margin:0;">🧾 Raw FFmpeg Log Cleanup</h2><div style="font-size:12px;color:#64748b;margin-top:3px;">These are old raw logs still using space. Import archives matched logs into the database, then removes them.</div></div>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRawLogFiles()">↻ Refresh</button>
@@ -4712,7 +4811,7 @@ function switchTab(name) {
   if (name === 'channels') loadChannels();
   if (name === '247') load247();
   if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
-  if (name === 'health') { loadRecordingHealth(); loadIncompletePlexCopies(); loadRawLogFiles(); loadRecFiles(); }
+  if (name === 'health') { loadRecordingHealth(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
 }
@@ -6509,6 +6608,44 @@ async function scheduleIncompleteRerecord(recId, button) {
                       : `Re-recording scheduled on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`);
     await loadIncompletePlexCopies();
     loadSchedule();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    button.disabled = false; button.textContent = original;
+  }
+}
+async function loadPlexTransferDebris() {
+  const list = document.getElementById('plex-debris-list');
+  const empty = document.getElementById('plex-debris-empty');
+  if (!list || !empty) return;
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;padding:6px 0;">Checking Plex transfer leftovers…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/plex-transfer-debris')).json();
+    const files = d.files || [];
+    if (!files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    list.innerHTML = files.map(f => `<div style="display:flex;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #222;flex-wrap:wrap;">
+      <div style="flex:1;min-width:230px;">
+        <strong style="font-size:13px;color:#fecaca;">${esc(f.file_name || '')}</strong>
+        <div style="font-size:12px;color:#94a3b8;margin-top:4px;">${esc(fmtSize(f.size))} · ${esc(f.modified || '')}</div>
+        <div style="font-size:11px;color:#64748b;margin-top:3px;">${esc(f.relative_path || '')}</div>
+      </div>
+      <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashPlexTransferDebris(this.dataset.path,this)" data-path="${encodeURIComponent(f.relative_path || '')}">🗑 Clean up</button>
+    </div>`).join('');
+  } catch (err) {
+    list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not check transfer leftovers: ${esc(err.message || String(err))}</div>`;
+  }
+}
+async function trashPlexTransferDebris(encodedPath, button) {
+  const relativePath = decodeURIComponent(encodedPath || '');
+  if (!relativePath || !confirm('Move this abandoned transfer file and its matching conversion log to Trash?')) return;
+  const original = button.textContent;
+  button.disabled = true; button.textContent = 'Cleaning…';
+  try {
+    const d = await post('/epg-web/api/recording-health/plex-transfer-debris/trash', {relative_path: relativePath});
+    if (!d.ok) throw new Error((d.errors || []).join('\\n') || d.error || 'Cleanup failed.');
+    await loadPlexTransferDebris();
+    loadStorageBar();
   } catch (err) {
     alert(err.message || String(err));
   } finally {
