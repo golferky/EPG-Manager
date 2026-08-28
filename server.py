@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260828b"
+VERSION = "v20260828c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2198,6 +2198,27 @@ def _plex_transfer_debris():
                 })
     except OSError:
         pass
+    # Surface a queued retry directly beside its abandoned predecessor.  This
+    # prevents a second click from queuing the same movie again.
+    if debris:
+        try:
+            conn = sqlite3.connect(_guide_db_path(), timeout=30)
+            conn.row_factory = sqlite3.Row
+            active = conn.execute('''SELECT title, channel, start_ts FROM recordings
+                                     WHERE start_ts > ? AND status IN
+                                     ('queued','scheduled','agent_claimed','preflight','waiting','recording',
+                                      'converting','awaiting_transfer','transferring')''',
+                                  (time.time(),)).fetchall()
+            conn.close()
+            queued = {str(row['title']).strip().lower(): dict(row) for row in active}
+            for item in debris:
+                retry = queued.get(str(item['title']).strip().lower())
+                if retry:
+                    item['retry_queued'] = True
+                    item['retry_channel'] = retry.get('channel') or ''
+                    item['retry_start_ts'] = retry.get('start_ts')
+        except Exception:
+            pass
     return sorted(debris, key=lambda item: item['modified'], reverse=True)
 
 
@@ -6673,17 +6694,24 @@ async function loadPlexTransferDebris() {
     const files = d.files || [];
     if (!files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
-    list.innerHTML = files.map(f => `<div style="display:flex;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #222;flex-wrap:wrap;">
+    list.innerHTML = files.map(f => {
+      const retry = f.retry_queued ? `<div style="font-size:12px;color:#86efac;margin-top:5px;font-weight:700;">✓ Re-record queued${f.retry_start_ts ? ` · ${new Date(Number(f.retry_start_ts) * 1000).toLocaleString()}` : ''}${f.retry_channel ? ` · ${esc(f.retry_channel)}` : ''}</div>` : '';
+      const action = f.retry_queued
+        ? '<span style="font-size:12px;color:#86efac;white-space:nowrap;">Re-record queued</span>'
+        : `<button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;" onclick="schedulePlexTransferRerecord(this.dataset.path,this)" data-path="${encodeURIComponent(f.relative_path || '')}">↻ Re-record</button>`;
+      return `<div style="display:flex;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #222;flex-wrap:wrap;">
       <input class="plex-debris-choice" type="checkbox" data-path="${encodeURIComponent(f.relative_path || '')}" aria-label="Select ${esc(f.title || f.file_name || '')}">
       <div style="flex:1;min-width:230px;">
         <strong style="font-size:13px;color:#fecaca;">${esc(f.title || f.file_name || '')}</strong>
         <span style="margin-left:6px;font-size:11px;color:#64748b;">abandoned transfer</span>
         <div style="font-size:12px;color:#94a3b8;margin-top:4px;">${esc(fmtSize(f.size))} · ${esc(f.modified || '')}</div>
         <div style="font-size:11px;color:#64748b;margin-top:3px;">${esc(f.relative_path || '')}</div>
+        ${retry}
       </div>
-      <button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;" onclick="schedulePlexTransferRerecord(this.dataset.path,this)" data-path="${encodeURIComponent(f.relative_path || '')}">↻ Re-record</button>
+      ${action}
       <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashPlexTransferDebris(this.dataset.path,this)" data-path="${encodeURIComponent(f.relative_path || '')}">🗑 Clean up</button>
-    </div>`).join('');
+    </div>`;
+    }).join('');
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not check transfer leftovers: ${esc(err.message || String(err))}</div>`;
   }
@@ -6737,6 +6765,7 @@ async function schedulePlexTransferRerecord(encodedPath, button) {
     const when = d.start_ts ? new Date(Number(d.start_ts) * 1000).toLocaleString() : '';
     alert(d.duplicate ? `A re-recording is already queued on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`
                       : `Re-recording scheduled on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`);
+    await loadPlexTransferDebris();
     loadSchedule();
   } catch (err) {
     alert(err.message || String(err));
