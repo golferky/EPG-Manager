@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260828c"
+VERSION = "v20260828d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1316,6 +1316,8 @@ def api_load_guide():
         _schedule_active_series(db_path)
         threading.Thread(target=_auto_schedule_movie_upgrades,
                          name='epg-auto-upgrades', daemon=True).start()
+        threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
+                         name='epg-abandoned-transfer-retries', daemon=True).start()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows, 'loaded': _epg['loaded']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1336,6 +1338,8 @@ def api_refresh_downloaded_guide():
         _schedule_active_series(db_path)
         threading.Thread(target=_auto_schedule_movie_upgrades,
                          name='epg-auto-upgrades', daemon=True).start()
+        threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
+                         name='epg-abandoned-transfer-retries', daemon=True).start()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows,
                         'source': 'saved XML'})
     except Exception as exc:
@@ -1374,6 +1378,8 @@ def api_fetch_guide():
         # stays off the guide-fetch request and never delays the UI.
         threading.Thread(target=_auto_schedule_movie_upgrades,
                          name='epg-auto-upgrades', daemon=True).start()
+        threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
+                         name='epg-abandoned-transfer-retries', daemon=True).start()
         threading.Thread(target=_refresh_stream_quality_cache,
                          name='epg-stream-quality', daemon=True).start()
         print(f'[fetch-guide] Done: {count} programmes, {new_rows} new rows')
@@ -2231,6 +2237,7 @@ def api_plex_transfer_debris():
 def api_trash_plex_transfer_debris():
     """Move one abandoned legacy partial file and its matching log to Trash."""
     requested = str((request.json or {}).get('relative_path') or '')
+    permanent = bool((request.json or {}).get('permanent'))
     root = os.path.realpath(load_config().get('plex_path', '/Volumes/Plex/Movies'))
     path = os.path.realpath(os.path.join(root, requested))
     try:
@@ -2252,6 +2259,13 @@ def api_trash_plex_transfer_debris():
     os.makedirs(trash_dir, exist_ok=True)
     moved, errors = [], []
     for source in related:
+        if permanent:
+            try:
+                os.remove(source)
+                moved.append(os.path.basename(source))
+            except OSError as exc:
+                errors.append(f'{os.path.basename(source)}: {exc}')
+            continue
         stem, ext = os.path.splitext(os.path.basename(source))
         destination = os.path.join(trash_dir, os.path.basename(source))
         suffix = 2
@@ -2291,31 +2305,40 @@ def api_rerecord_plex_transfer_debris():
     if not candidate:
         return jsonify({'ok': False, 'error': detail.get('error', 'No re-recording found')}), 404
 
-    retry_id = str(uuid.uuid4())[:8]
-    rec = {
-        'title': debris['title'], 'channel_id': candidate['channel_id'],
-        'channel': candidate['channel'], 'start_ts': candidate['start_ts'],
-        'stop_ts': candidate['stop_ts'], 'status': 'queued', 'progress': 0,
-        'log': [], 'pid': None, 'file': None, 'backend': _recording_backend(),
-        'stream_id': candidate['stream_id'], 'episode_title': '', 'season_num': None,
-        'episode_num': None, 'is_series': False, 'auto_upgrade': False,
-    }
-    if not _db_upsert_rec(retry_id, rec):
+    rec = _queue_best_retry(debris['title'], candidate, 're-recording abandoned Plex transfer')
+    if not rec:
         return jsonify({'ok': False, 'error': 'Could not save the re-recording'}), 500
-    try:
-        conn = sqlite3.connect(_guide_db_path(), timeout=30)
-        conn.execute('UPDATE recordings SET quality_decision=? WHERE rec_id=?',
-                     ('re-recording abandoned Plex transfer', retry_id))
-        conn.commit(); conn.close()
-    except Exception:
-        pass
-    with _rec_lock:
-        _recs[retry_id] = rec
-        _rec_cancel_events[retry_id] = threading.Event()
-    if rec['backend'] == 'local':
-        threading.Thread(target=_run_recording, args=(retry_id,), daemon=True).start()
-    return jsonify({'ok': True, 'id': retry_id, 'channel': candidate['channel'],
-                    'start_ts': candidate['start_ts']})
+    return jsonify({'ok': True, 'channel': rec['channel'], 'start_ts': rec['start_ts']})
+
+
+@app.route('/epg-web/api/recording-health/plex-transfer-debris/rerecord-all', methods=['POST'])
+def api_rerecord_all_plex_transfer_debris():
+    """Archive every old partial, queue current matches, watch the rest."""
+    files = _plex_transfer_debris()
+    scheduled = watching = cleaned = failed = 0
+    for item in files:
+        candidate, detail = _best_incomplete_rerecord(item['title'], 0)
+        if candidate:
+            rec = _queue_best_retry(item['title'], candidate, 're-recording abandoned Plex transfer')
+            if rec:
+                scheduled += 1
+            else:
+                _watch_abandoned_transfer(item['title']); watching += 1
+        elif detail.get('already_queued'):
+            scheduled += 1
+        else:
+            _watch_abandoned_transfer(item['title']); watching += 1
+        # Reuse the same strict path validation and Trash behavior as one-file cleanup.
+        with app.test_request_context('/epg-web/api/recording-health/plex-transfer-debris/trash',
+                                      method='POST', json={'relative_path': item['relative_path'], 'permanent': True}):
+            response = api_trash_plex_transfer_debris()
+            payload = response[0].get_json() if isinstance(response, tuple) else response.get_json()
+            if payload.get('ok'):
+                cleaned += 1
+            else:
+                failed += 1
+    return jsonify({'ok': True, 'total': len(files), 'scheduled': scheduled,
+                    'watching': watching, 'cleaned': cleaned, 'failed': failed})
 
 
 def _best_incomplete_rerecord(title, expected_seconds):
@@ -2341,6 +2364,16 @@ def _best_incomplete_rerecord(title, expected_seconds):
                                WHERE lower(title)=lower(?) AND start_utc > ?
                                ORDER BY start_utc LIMIT 250''',
                             (title, datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S'))).fetchall()
+        # Old transfer folders sometimes omit the year found in the guide.
+        # Fall back to a narrow title-prefix search, then normalize before use.
+        if not rows:
+            base_title = re.sub(r'\s*\(\d{4}\)\s*$', '', str(title)).strip()
+            rough = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc
+                                    FROM guide WHERE lower(title) LIKE lower(?) AND start_utc > ?
+                                    ORDER BY start_utc LIMIT 500''',
+                                 (base_title + '%', datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S'))).fetchall()
+            wanted_key = _norm_plex_show(base_title)
+            rows = [row for row in rough if _norm_plex_show(row['title']) == wanted_key]
         conn.close()
     except Exception as exc:
         return None, {'error': str(exc)}
@@ -2374,6 +2407,64 @@ def _best_incomplete_rerecord(title, expected_seconds):
     if not candidates:
         return None, {'error': 'No clean, recordable future airing was found yet'}
     return max(candidates, key=lambda item: item['score']), {}
+
+
+def _queue_best_retry(title, candidate, decision):
+    """Persist a retry selected by `_best_incomplete_rerecord`."""
+    retry_id = str(uuid.uuid4())[:8]
+    rec = {
+        'title': title, 'channel_id': candidate['channel_id'],
+        'channel': candidate['channel'], 'start_ts': candidate['start_ts'],
+        'stop_ts': candidate['stop_ts'], 'status': 'queued', 'progress': 0,
+        'log': [], 'pid': None, 'file': None, 'backend': _recording_backend(),
+        'stream_id': candidate['stream_id'], 'episode_title': '', 'season_num': None,
+        'episode_num': None, 'is_series': False, 'auto_upgrade': False,
+    }
+    if not _db_upsert_rec(retry_id, rec):
+        return None
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('UPDATE recordings SET quality_decision=? WHERE rec_id=?', (decision, retry_id))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+    with _rec_lock:
+        _recs[retry_id] = rec
+        _rec_cancel_events[retry_id] = threading.Event()
+    if rec['backend'] == 'local':
+        threading.Thread(target=_run_recording, args=(retry_id,), daemon=True).start()
+    return rec
+
+
+def _watch_abandoned_transfer(title):
+    """Remember a failed transfer so a later guide refresh can retry it."""
+    clean = str(title or '').strip()
+    if not clean:
+        return
+    try:
+        db_run('''INSERT OR IGNORE INTO wanted_titles
+                  (title,normalized_title,year,type,source,status,notes,created_at,updated_at)
+                  VALUES (?,?,?,?,?,?,?,datetime("now"),datetime("now"))''',
+               (clean, _norm_plex_show(clean), '', 'movie', 'abandoned_transfer', 'wanted',
+                'Re-record after abandoned Plex transfer'))
+    except Exception as exc:
+        print(f'[abandoned-transfer] Could not add {clean!r} to Wanted: {exc}')
+
+
+def _auto_schedule_abandoned_transfer_wanted():
+    """On a guide refresh, retry a small number of watched failed transfers."""
+    try:
+        watched = db_rows("SELECT id,title FROM wanted_titles WHERE source='abandoned_transfer' AND status='wanted' LIMIT 2")
+        for item in watched:
+            candidate, detail = _best_incomplete_rerecord(item['title'], 0)
+            if not candidate or detail.get('already_queued'):
+                continue
+            rec = _queue_best_retry(item['title'], candidate, 're-recording abandoned Plex transfer')
+            if rec:
+                db_run("UPDATE wanted_titles SET status='scheduled',updated_at=datetime('now') WHERE id=?", (item['id'],))
+                print(f"[abandoned-transfer] Scheduled watched retry: {item['title']}")
+    except Exception as exc:
+        print(f'[abandoned-transfer] Watch scan error: {exc}')
 
 
 @app.route('/epg-web/api/recording-health/incomplete-plex/rerecord', methods=['POST'])
@@ -4663,6 +4754,7 @@ tr:hover td{background:#141414;}
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Old `.part.mp4` files are failed transfer leftovers, not movies Plex can use.</div>
       </div>
       <label style="font-size:12px;color:#94a3b8;cursor:pointer;white-space:nowrap;"><input type="checkbox" id="plex-debris-select-all" onchange="toggleAllPlexDebris(this.checked)"> Select all</label>
+      <button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;" onclick="rerecordAllPlexTransferDebris(this)">↻ Re-record all</button>
       <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashSelectedPlexTransferDebris()">🗑 Clean selected</button>
       <button class="btn btn-ghost btn-sm" onclick="loadPlexTransferDebris()">↻ Refresh</button>
     </div>
@@ -6718,6 +6810,22 @@ async function loadPlexTransferDebris() {
 }
 function toggleAllPlexDebris(checked) {
   document.querySelectorAll('.plex-debris-choice').forEach(box => { box.checked = checked; });
+}
+async function rerecordAllPlexTransferDebris(button) {
+  if (!confirm('For every abandoned transfer: queue the best clean future airing if one exists, otherwise add it to Wanted so future guide refreshes can schedule it. The old .part files and matching logs will then be permanently deleted to free Plex space. Continue?')) return;
+  const original = button.textContent;
+  button.disabled = true; button.textContent = 'Checking all…';
+  try {
+    const d = await post('/epg-web/api/recording-health/plex-transfer-debris/rerecord-all', {});
+    if (!d.ok) throw new Error(d.error || 'Could not process abandoned transfers.');
+    alert(`Processed ${d.total} abandoned transfer${d.total === 1 ? '' : 's'}: ${d.scheduled} queued or already queued, ${d.watching} added to Wanted for a future airing, ${d.cleaned} permanently deleted from Plex.${d.failed ? ` ${d.failed} were kept because cleanup failed.` : ''}`);
+    await loadPlexTransferDebris();
+    loadSchedule(); loadRecs(); loadStorageBar();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    button.disabled = false; button.textContent = original;
+  }
 }
 async function trashSelectedPlexTransferDebris() {
   const selected = [...document.querySelectorAll('.plex-debris-choice:checked')]
