@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829k"
+VERSION = "v20260829l"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3728,6 +3728,7 @@ def api_airings():
                 'stop_ts':      eu.timestamp(),
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
+                'can_play':     not stream_error and not _is_foreign_recording_feed(r['channel_name']),
                 'can_record':   not stream_error and not _is_foreign_recording_feed(r['channel_name']),
                 'stream_provider': str(stream_debug.get('provider') or ''),
                 'stream_quality': {
@@ -3771,8 +3772,12 @@ def api_airings():
         if current is None or score > current_score:
             deduped[key] = airing
     airings = sorted(deduped.values(), key=lambda item: item['start_ts'])
+    # Movies on commercial feeds are intentionally not offered for scheduled
+    # recording, but a currently live, usable stream must still be playable.
     if not is_series:
-        airings = [airing for airing in airings if airing['commercial_free']]
+        for airing in airings:
+            if not airing['commercial_free']:
+                airing['can_record'] = False
     return jsonify({
         'airings': airings, 'prog_type': prog_type, 'is_series': is_series,
         'commercial_free_only': not is_series,
@@ -6109,7 +6114,7 @@ async function openProg(p) {
       });
 
       // Find currently-airing primestreams show (for Play), then next future one (for Record)
-      const livePS   = ar.airings.find(a => a.can_record && a.on_now);
+      const livePS   = ar.airings.find(a => (a.can_play || a.can_record) && a.on_now);
       const futurePS = ar.airings.find(a => a.can_record && !a.on_now);
       const featPS   = livePS || futurePS;
       if (featPS) {
@@ -6148,7 +6153,7 @@ async function openProg(p) {
       // Full airings list
       // The modal is for recording, so omit guide-only channels with no
       // PrimeStreams stream instead of showing unusable rows.
-      window._allAirings = ar.airings.filter(a => a.can_record);
+      window._allAirings = ar.airings.filter(a => a.can_record || (a.can_play && a.on_now));
       document.getElementById('pm-airings-heading').textContent = '📡 Available Airings';
       window._airingsRecMap = recMap;
       window._showUnrecordedOnly = false;
