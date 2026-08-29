@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829e"
+VERSION = "v20260829f"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -37,7 +37,9 @@ def _bootstrap():
                 ('heartbeat_at', 'REAL'), ('updated_at', 'TEXT'),
                 ('quality_decision', 'TEXT'), ('result_json', 'TEXT'),
                 ('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'),
-                ('is_series', 'INTEGER DEFAULT 0'), ('auto_upgrade', 'INTEGER DEFAULT 0')]:
+                ('is_series', 'INTEGER DEFAULT 0'), ('auto_upgrade', 'INTEGER DEFAULT 0'),
+                ('stream_provider', "TEXT DEFAULT 'primestreams'"),
+                ('stream_extension', "TEXT DEFAULT 'ts'")]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -116,7 +118,11 @@ def save_watchlist(wl):
 
 def _channel_match_base(value):
     """Normalize provider/guide channel names, including known rebrands."""
-    base = re.sub(r'[^a-z0-9]', '', (value or '').lower())
+    # Xtream providers frequently prefix names as "US| HBO HD".  The region
+    # label is not part of the channel's identity and prevents a clean match
+    # against the existing Schedules Direct guide otherwise.
+    value = re.sub(r'^\s*(?:US|USA)\s*[|:/-]\s*', '', value or '', flags=re.I)
+    base = re.sub(r'[^a-z0-9]', '', value.lower())
     base = base.replace('paramountwithshowtime', 'showtime')
     if base.startswith('sho2'):
         base = 'showtime2' + base[4:]
@@ -279,6 +285,86 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         print(f'[ps_channel_ids] {e}')
         return set()
 
+def get_eaglecast_channel_ids(guide_db_path=None):
+    """Guide channel ids with a locally verified Eaglecast live-stream map."""
+    try:
+        conn = sqlite3.connect(guide_db_path or _guide_db_path())
+        rows = conn.execute(
+            "SELECT channel_id FROM provider_streams WHERE provider='eaglecast'"
+        ).fetchall()
+        conn.close()
+        return {row[0] for row in rows}
+    except Exception:
+        return set()
+
+def get_recordable_channel_ids(guide_db_path, movies_db_path):
+    """All guide channels that have either PrimeStreams or Eaglecast."""
+    return get_ps_channel_ids(guide_db_path, movies_db_path) | get_eaglecast_channel_ids(guide_db_path)
+
+def _eaglecast_stream_for_channel(channel_id):
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        row = conn.execute('''SELECT stream_id, provider_channel_name, stream_extension
+                              FROM provider_streams
+                              WHERE provider='eaglecast' AND channel_id=?''',
+                           (channel_id,)).fetchone()
+        conn.close()
+        return row
+    except Exception:
+        return None
+
+def _eaglecast_stream_url(stream_id, extension='ts'):
+    """Build an internal-only Eaglecast stream URL for probes/local playback."""
+    cfg = _load_eaglecast_test_config()
+    if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+        return None
+    from urllib.parse import quote
+    return (f"{cfg['server_url'].rstrip('/')}/live/{quote(str(cfg['username']), safe='')}"
+            f"/{quote(str(cfg['password']), safe='')}/{stream_id}.{str(extension or 'ts').lstrip('.')}")
+
+def _map_eaglecast_streams():
+    """Match US Eaglecast channels to existing guide rows, never import its guide."""
+    cfg = _load_eaglecast_test_config()
+    if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+        raise ValueError('Save and test Eaglecast on the private setup page first.')
+    streams = _eaglecast_live_streams(cfg)
+    # Only US-labeled live channels are eligible.  This keeps foreign feeds out
+    # of the guide's recording choices as requested.
+    us_streams = [item for item in streams if re.match(r'^\s*(?:US|USA)\s*[|:/-]',
+                                                        str(item.get('name') or ''), re.I)]
+    by_base = {}
+    for item in us_streams:
+        name = str(item.get('name') or '').strip()
+        stream_id = str(item.get('stream_id') or '').strip()
+        if not name or not stream_id:
+            continue
+        by_base.setdefault(_channel_match_base(name), []).append(item)
+    conn = sqlite3.connect(_guide_db_path(), timeout=30)
+    guide_rows = conn.execute('SELECT channel_id, channel_name FROM guide_channels').fetchall()
+    if not guide_rows:
+        guide_rows = conn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
+    matched = []
+    for channel_id, guide_name in guide_rows:
+        candidates = by_base.get(_channel_match_base(guide_name), [])
+        if not candidates:
+            continue
+        wants_hd = bool(re.search(r'\b(?:UHD|HD)\b', guide_name or '', re.I))
+        candidate = max(candidates, key=lambda item: (
+            int(bool(re.search(r'\b(?:UHD|HD)\b', str(item.get('name') or ''), re.I)) == wants_hd),
+            int('EAST' not in str(item.get('name') or '').upper()),
+        ))
+        matched.append((
+            'eaglecast', channel_id, guide_name or '', str(candidate.get('name') or ''),
+            str(candidate.get('stream_id')), str(candidate.get('container_extension') or 'ts').lstrip('.'),
+            time.time(),
+        ))
+    conn.execute("DELETE FROM provider_streams WHERE provider='eaglecast'")
+    conn.executemany('''INSERT INTO provider_streams
+        (provider,channel_id,guide_channel_name,provider_channel_name,stream_id,stream_extension,mapped_at)
+        VALUES (?,?,?,?,?,?,?)''', matched)
+    conn.commit(); conn.close()
+    return {'live_channels': len(us_streams), 'matched_channels': len(matched)}
+
 def ensure_guide_db(db_path):
     """Create guide.db with schema if it doesn't exist."""
     conn = sqlite3.connect(db_path)
@@ -328,6 +414,21 @@ def ensure_guide_db(db_path):
             stream_id TEXT NOT NULL,
             provider_name TEXT,
             discovered_at REAL NOT NULL
+        )
+    ''')
+    # A second provider map is intentionally separate from PrimeStreams'
+    # Movies.db.  It is populated only from the private Eaglecast setup page;
+    # the normal guide remains the sole schedule source.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS provider_streams (
+            provider TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            guide_channel_name TEXT,
+            provider_channel_name TEXT,
+            stream_id TEXT NOT NULL,
+            stream_extension TEXT DEFAULT 'ts',
+            mapped_at REAL NOT NULL,
+            PRIMARY KEY(provider, channel_id)
         )
     ''')
     conn.execute('''
@@ -655,6 +756,8 @@ def _init_recordings_table():
             ('episode_num', 'INTEGER'),
             ('is_series', 'INTEGER DEFAULT 0'),
             ('auto_upgrade', 'INTEGER DEFAULT 0'),
+            ('stream_provider', "TEXT DEFAULT 'primestreams'"),
+            ('stream_extension', "TEXT DEFAULT 'ts'"),
         ]
         for column, typedef in migrations:
             try:
@@ -675,8 +778,8 @@ def _db_upsert_rec(rec_id, rec):
         conn.execute('''INSERT INTO recordings
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
              status, failure_reason, file, created_at, backend, stream_id, updated_at,
-             episode_title, season_num, episode_num, is_series, auto_upgrade)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             episode_title, season_num, episode_num, is_series, auto_upgrade, stream_provider, stream_extension)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
@@ -688,7 +791,9 @@ def _db_upsert_rec(rec_id, rec):
               season_num=excluded.season_num,
               episode_num=excluded.episode_num,
               is_series=excluded.is_series,
-              auto_upgrade=excluded.auto_upgrade
+              auto_upgrade=excluded.auto_upgrade,
+              stream_provider=excluded.stream_provider,
+              stream_extension=excluded.stream_extension
         ''', (
             rec_id,
             rec.get('title',''),
@@ -709,6 +814,8 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('episode_num'),
             1 if rec.get('is_series') else 0,
             1 if rec.get('auto_upgrade') else 0,
+            rec.get('stream_provider', 'primestreams'),
+            rec.get('stream_extension', 'ts'),
         ))
         conn.commit()
         conn.close()
@@ -844,6 +951,8 @@ def _load_pending_recs():
                 'file':       r['file'] or None,
                 'backend':    'local',
                 'stream_id':  r['stream_id'] or '',
+                'stream_provider': r['stream_provider'] or 'primestreams',
+                'stream_extension': r['stream_extension'] or 'ts',
                 'episode_title': r['episode_title'] or '',
                 'season_num': r['season_num'], 'episode_num': r['episode_num'],
                 'is_series': bool(r['is_series']),
@@ -864,6 +973,8 @@ def _load_pending_recs():
                     'progress': 0, 'log': [], 'pid': None,
                     'file': r['file'] or None, 'backend': 'agent',
                     'stream_id': r['stream_id'] or '',
+                    'stream_provider': r['stream_provider'] or 'primestreams',
+                    'stream_extension': r['stream_extension'] or 'ts',
                     'episode_title': r['episode_title'] or '',
                     'season_num': r['season_num'], 'episode_num': r['episode_num'],
                     'is_series': bool(r['is_series']),
@@ -874,12 +985,22 @@ def _load_pending_recs():
     except Exception as e:
         print(f'[recdb] load error: {e}')
 
-def _stream_url(channel_id):
+def _stream_url(channel_id, preferred_provider=None):
     """Look up stream_id from Movies.db and build the stream URL.
     Returns (url, error, debug_info) where debug_info is a dict."""
     import re as _re2
     cfg  = load_config()
-    debug = {'channel_id': channel_id, 'matched_guide_channel': None, 'stream_id': None, 'method': None}
+    debug = {'channel_id': channel_id, 'matched_guide_channel': None, 'stream_id': None,
+             'method': None, 'provider': None, 'stream_extension': 'ts'}
+    if preferred_provider == 'eaglecast':
+        eaglecast = _eaglecast_stream_for_channel(channel_id)
+        if eaglecast:
+            sid, mapped_name, extension = eaglecast
+            debug.update({'method': 'Eaglecast map', 'matched_guide_channel': mapped_name or channel_id,
+                          'stream_id': str(sid), 'provider': 'eaglecast',
+                          'stream_extension': str(extension or 'ts')})
+            url = _eaglecast_stream_url(sid, extension)
+            return url, None if url else 'Eaglecast settings are incomplete', debug
     # A provider-discovered mapping is tied to this exact XMLTV channel ID and
     # avoids relying on the older NAS-side channel table.
     try:
@@ -893,7 +1014,7 @@ def _stream_url(channel_id):
             sid, mapped_name = discovered
             debug.update({'method': 'provider discovery',
                           'matched_guide_channel': mapped_name or channel_id,
-                          'stream_id': str(sid)})
+                          'stream_id': str(sid), 'provider': 'primestreams'})
             url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
             return url, None, debug
     except Exception as ex:
@@ -944,9 +1065,18 @@ def _stream_url(channel_id):
         except Exception as ex:
             debug['fuzzy_error'] = str(ex)
     if not rows:
+        eaglecast = _eaglecast_stream_for_channel(channel_id)
+        if eaglecast:
+            sid, mapped_name, extension = eaglecast
+            debug.update({'method': 'Eaglecast fallback', 'matched_guide_channel': mapped_name or channel_id,
+                          'stream_id': str(sid), 'provider': 'eaglecast',
+                          'stream_extension': str(extension or 'ts')})
+            url = _eaglecast_stream_url(sid, extension)
+            return url, None if url else 'Eaglecast settings are incomplete', debug
         return None, 'No stream_id found for channel', debug
     sid = rows[0]['stream_id']
     debug['stream_id'] = sid
+    debug['provider'] = 'primestreams'
     url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
     return url, None, debug
 
@@ -1070,7 +1200,7 @@ def _run_recording(rec_id):
         _db_update_rec_status(rec_id, 'skipped_too_short', 'Stop time already passed')
         return
 
-    url, err, _dbg = _stream_url(ch_id)
+    url, err, _dbg = _stream_url(ch_id, rec.get('stream_provider'))
     if err:
         with _rec_lock:
             _recs[rec_id].update({'status': 'error', 'log': [err]})
@@ -1448,7 +1578,7 @@ def api_guide():
     movie_favorites = set()
     if fav_only or movie_only or ps_only:
         if ps_only and not fav_only and not movie_only:
-            allowed_ch_ids = get_ps_channel_ids(guide_db_path, movies_db_path)
+            allowed_ch_ids = get_recordable_channel_ids(guide_db_path, movies_db_path)
         else:
             # Get the display names of favorite/movie channels from guide.db
             # by looking up what name each Movies.db guide_channel appears as
@@ -1580,7 +1710,7 @@ def api_guide():
     page_chs  = ordered_channels[ch_offset:ch_offset + ch_cap]
     # Mark channels that can be recorded, without exposing their stream URLs.
     try:
-        source_recordable = get_ps_channel_ids(guide_db_path, movies_db_path)
+        source_recordable = get_recordable_channel_ids(guide_db_path, movies_db_path)
         recordable_ids = {id_to_canonical.get(channel_id, channel_id)
                           for channel_id in source_recordable}
         quality_by_id = {}
@@ -1635,7 +1765,7 @@ def api_search():
         conn.row_factory = sqlite3.Row
 
         # Get channel_ids that have a PrimeStreams stream (uses name-based fallback matching)
-        playable_ids = get_ps_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
+        playable_ids = get_recordable_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
 
         # Channel name matches (only channels with current/future programming AND a playable stream)
         ch_rows = conn.execute('''
@@ -2418,6 +2548,8 @@ def _best_incomplete_rerecord(title, expected_seconds):
         candidates.append({
             'channel_id': channel_id, 'channel': channel, 'start_ts': start, 'stop_ts': stop,
             'stream_id': str(stream_debug.get('stream_id') or ''),
+            'stream_provider': str(stream_debug.get('provider') or 'primestreams'),
+            'stream_extension': str(stream_debug.get('stream_extension') or 'ts'),
             'score': (int(quality.get('height') or 0), float(quality.get('fps') or 0),
                       int(quality.get('total_bitrate') or quality.get('video_bitrate') or 0),
                       reliability_rank, -start),
@@ -2436,6 +2568,8 @@ def _queue_best_retry(title, candidate, decision):
         'stop_ts': candidate['stop_ts'], 'status': 'queued', 'progress': 0,
         'log': [], 'pid': None, 'file': None, 'backend': _recording_backend(),
         'stream_id': candidate['stream_id'], 'episode_title': '', 'season_num': None,
+        'stream_provider': candidate.get('stream_provider', 'primestreams'),
+        'stream_extension': candidate.get('stream_extension', 'ts'),
         'episode_num': None, 'is_series': False, 'auto_upgrade': False,
     }
     if not _db_upsert_rec(retry_id, rec):
@@ -3694,7 +3828,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     now_str   = now_utc.strftime('%Y%m%d%H%M%S')
     clean     = _re3.match(r'^(.+?)\s*\(\d{4}\)\s*$', title)
     clean_title = clean.group(1).strip() if clean else title
-    recordable = get_ps_channel_ids(guide_db_path, movies_db_path)
+    recordable = get_recordable_channel_ids(guide_db_path, movies_db_path)
     scheduled = 0
     try:
         conn = sqlite3.connect(guide_db_path)
@@ -3810,6 +3944,8 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 'start_ts': su.timestamp(), 'stop_ts': eu.timestamp(),
                 'status': 'queued', 'progress': 0, 'log': [], 'pid': None, 'file': None,
                 'backend': backend, 'stream_id': str(stream_debug.get('stream_id') or ''),
+                'stream_provider': str(stream_debug.get('provider') or 'primestreams'),
+                'stream_extension': str(stream_debug.get('stream_extension') or 'ts'),
                 'episode_title': r.get('episode_title') or '',
                 'season_num': r.get('season_num'),
                 'episode_num': r.get('episode_num'),
@@ -3864,7 +4000,7 @@ def api_series_list():
         result = []
         for s in series:
             # Count upcoming primestreams airings
-            recordable = get_ps_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
+            recordable = get_recordable_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
             cnt = 0
             if recordable:
                 cnt = conn.execute(
@@ -3953,29 +4089,20 @@ def api_record():
     guide_db    = cfg2.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
     movies_db   = cfg2.get('db_path', '/Volumes/EPG/Movies.db')
 
-    # Check whether the requested channel has a PrimeStreams stream
-    has_stream = False
-    try:
-        mconn = sqlite3.connect(movies_db)
-        row = mconn.execute(
-            'SELECT stream_id FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
-            (channel_id,)
-        ).fetchone()
-        has_stream = bool(row)
-        mconn.close()
-    except Exception:
-        pass
+    # The requested guide channel may be supplied by either provider.
+    _requested_url, requested_error, _requested_debug = _stream_url(channel_id)
+    has_stream = not requested_error
 
-    # If no stream on requested channel, find the nearest upcoming PS airing of same title
+    # If no stream on this guide row, find the nearest upcoming airing supplied
+    # by either provider.  The guide itself stays unchanged.
     if not has_stream:
         ps_channel_id = None
         ps_channel_name = None
         ps_start_ts = None
         ps_stop_ts = None
         try:
-            # Get all PS-streamable channel IDs
-            ps_ids = get_ps_channel_ids(guide_db, movies_db)
-            if ps_ids:
+            recordable_ids = get_recordable_channel_ids(guide_db, movies_db)
+            if recordable_ids:
                 now_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
                 gconn = sqlite3.connect(guide_db)
                 gconn.row_factory = sqlite3.Row
@@ -3983,8 +4110,8 @@ def api_record():
                     '''SELECT channel_id, channel_name, start_utc, end_utc FROM guide
                        WHERE lower(title)=lower(?) AND start_utc > ?
                        AND channel_id IN ({})
-                       ORDER BY start_utc LIMIT 1'''.format(','.join('?'*len(ps_ids))),
-                    [title, now_str] + list(ps_ids)
+                       ORDER BY start_utc LIMIT 1'''.format(','.join('?'*len(recordable_ids))),
+                    [title, now_str] + list(recordable_ids)
                 ).fetchone()
                 gconn.close()
                 if airing:
@@ -3995,16 +4122,16 @@ def api_record():
                     ps_start_ts     = su.timestamp()
                     ps_stop_ts      = eu.timestamp()
         except Exception as e:
-            print(f'[record] PS fallback error: {e}')
+            print(f'[record] provider fallback error: {e}')
 
         if ps_channel_id:
             channel_id   = ps_channel_id
             channel_name = ps_channel_name
             start_ts     = ps_start_ts
             stop_ts      = ps_stop_ts
-            print(f'[record] Remapped "{title}" → PS channel {channel_id} at {start_ts}')
+            print(f'[record] Remapped "{title}" → available channel {channel_id} at {start_ts}')
         else:
-            return jsonify({'ok': False, 'error': f'"{title}" is not airing on any PrimeStreams channel soon'}), 200
+            return jsonify({'ok': False, 'error': f'"{title}" is not airing on any mapped provider channel soon'}), 200
     else:
         # Channel has a stream — just look up its name
         channel_name = channel_id
@@ -4038,6 +4165,8 @@ def api_record():
         'file':       None,
         'backend':    _recording_backend(),
         'stream_id':  '',
+        'stream_provider': 'primestreams',
+        'stream_extension': 'ts',
         'episode_title': episode_title,
         'season_num': season_num,
         'episode_num': episode_num,
@@ -4048,6 +4177,8 @@ def api_record():
     if stream_error:
         return jsonify({'ok': False, 'error': stream_error}), 400
     rec['stream_id'] = str(stream_debug.get('stream_id') or '')
+    rec['stream_provider'] = str(stream_debug.get('provider') or 'primestreams')
+    rec['stream_extension'] = str(stream_debug.get('stream_extension') or 'ts')
     if not _db_upsert_rec(rec_id, rec):
         return jsonify({'ok': False, 'error': 'Could not save recording to guide database'}), 500
     with _rec_lock:
@@ -4164,6 +4295,8 @@ def _agent_job_dict(row):
     return {
         'id': row['rec_id'], 'title': row['title'], 'channel': row['channel'],
         'channel_id': row['channel_id'], 'stream_id': row['stream_id'] or '',
+        'stream_provider': row['stream_provider'] or 'primestreams',
+        'stream_extension': row['stream_extension'] or 'ts',
         'start_ts': row['start_ts'], 'stop_ts': row['stop_ts'],
         'status': row['status'], 'agent_id': row['agent_id'],
         'lease_until': row['lease_until'],
@@ -4239,6 +4372,8 @@ def api_agent_claim():
         rec = _recs.setdefault(row['rec_id'], {})
         rec.update({'title': row['title'], 'channel': row['channel'],
                     'channel_id': row['channel_id'], 'stream_id': row['stream_id'] or '',
+                    'stream_provider': row['stream_provider'] or 'primestreams',
+                    'stream_extension': row['stream_extension'] or 'ts',
                     'start_ts': row['start_ts'], 'stop_ts': row['stop_ts'],
                     'status': 'agent_claimed', 'backend': 'agent', 'pid': None,
                     'file': row['file'] or None, 'progress': 0, 'log': [],
@@ -7199,6 +7334,16 @@ def eaglecast_test_channels():
     except Exception as exc:
         return jsonify({'ok': False, 'error': f'Could not load channels: {exc}'}), 502
 
+@app.route('/eaglecast-test/api/integrate', methods=['POST'])
+def eaglecast_test_integrate():
+    if not _eaglecast_local_request():
+        return jsonify({'ok': False, 'error': 'This private setup page is local-only.'}), 403
+    try:
+        result = _map_eaglecast_streams()
+        return jsonify({'ok': True, **result})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Could not map Eaglecast to the guide: {exc}'}), 502
+
 @app.route('/eaglecast-test/api/recording/status')
 def eaglecast_test_recording_status():
     if not _eaglecast_local_request():
@@ -7264,15 +7409,17 @@ body{margin:0;background:#090d16;color:#dbe5f5;font:16px -apple-system,BlinkMacS
 <label>Password</label><input id="pass" type="password" autocomplete="new-password" placeholder="Xtream password">
 <button id="save" onclick="save()">Save private settings</button><button class="secondary" id="test" onclick="test()">Test connection</button><div id="result" class="result hint">Enter the three Xtream fields, save them, then test the connection.</div></div>
 <div class="card"><h2>2. Channel check</h2><p>After a successful connection test, confirm Eaglecast actually returns a live-channel list.</p><button class="secondary" id="channels" onclick="channels()">Load channel sample</button><div id="channelResult" class="result hint">No channel test yet.</div><ul id="list"></ul></div>
-<div class="card"><h2>3. One-minute recording test</h2><p>This captures exactly one minute on the Mac, to <b>Movies/Recordings/Eaglecast Test</b>. It does not enter Plex, the guide, or your normal recording schedule.</p><p class="warning">Your Eaglecast plan has one connection. Do not watch Eaglecast while this test is running.</p><label>Channel to test</label><input id="recordChannel" placeholder="Copy a channel name from the sample, e.g. US| COZI"><button id="record" onclick="recordTest()">Record one-minute test</button><div id="recordResult" class="result hint">No recording test yet.</div></div>
+<div class="card"><h2>3. Add Eaglecast to EPG Manager</h2><p>Matches <b>US</b> Eaglecast live channels to your existing guide. It does not download or show Eaglecast’s guide. PrimeStreams stays preferred whenever it already has the channel; Eaglecast fills in channels PrimeStreams does not have.</p><button class="secondary" id="integrate" onclick="integrate()">Map Eaglecast channels to my guide</button><div id="integrateResult" class="result hint">Not added to the main guide yet.</div></div>
+<div class="card"><h2>4. One-minute recording test</h2><p>This captures exactly one minute on the Mac, to <b>Movies/Recordings/Eaglecast Test</b>. It does not enter Plex, the guide, or your normal recording schedule.</p><p class="warning">Your Eaglecast plan has one connection. Do not watch Eaglecast while this test is running.</p><label>Channel to test</label><input id="recordChannel" placeholder="Copy a channel name from the sample, e.g. US| COZI"><button id="record" onclick="recordTest()">Record one-minute test</button><div id="recordResult" class="result hint">No recording test yet.</div></div>
 </main><script>
-const result=document.getElementById('result'), channelResult=document.getElementById('channelResult'), recordResult=document.getElementById('recordResult');
+const result=document.getElementById('result'), channelResult=document.getElementById('channelResult'), integrateResult=document.getElementById('integrateResult'), recordResult=document.getElementById('recordResult');
 function show(el,msg,ok){el.textContent=msg;el.className='result '+(ok?'ok':'bad')}
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});return r.json()}
 async function setup(){const d=await api('/eaglecast-test/api/config');if(!d.ok){show(result,d.error,false);return}document.getElementById('url').value=d.server_url||'';if(d.configured)show(result,'Private Eaglecast settings are saved. Re-enter username and password only if you need to change them.',true)}
 async function save(){const b=document.getElementById('save');b.disabled=true;try{const d=await api('/eaglecast-test/api/config',{server_url:url.value.trim(),username:user.value.trim(),password:pass.value});if(!d.ok)throw Error(d.error);pass.value='';show(result,'Saved locally on this Mac. Now click Test connection.',true)}catch(e){show(result,e.message,false)}finally{b.disabled=false}}
 async function test(){const b=document.getElementById('test');b.disabled=true;show(result,'Connecting…',true);try{const d=await api('/eaglecast-test/api/test',{});if(!d.ok)throw Error(d.error);show(result,`Connected: ${d.status}\nActive connections: ${d.active_connections}\nPlan maximum: ${d.max_connections}\nExpiry reported: ${d.expires_at||'not reported'}`,true)}catch(e){show(result,e.message,false)}finally{b.disabled=false}}
 async function channels(){const b=document.getElementById('channels');b.disabled=true;try{const d=await api('/eaglecast-test/api/channels',{});if(!d.ok)throw Error(d.error);show(channelResult,`${d.total} live channels returned. First 100 shown below.`,true);list.innerHTML=d.sample.map(n=>`<li>${String(n).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</li>`).join('')}catch(e){show(channelResult,e.message,false)}finally{b.disabled=false}}
+async function integrate(){const b=document.getElementById('integrate');b.disabled=true;show(integrateResult,'Matching Eaglecast to your existing guide…',true);try{const d=await api('/eaglecast-test/api/integrate',{});if(!d.ok)throw Error(d.error);show(integrateResult,`Added ${d.matched_channels} mapped guide channels from ${d.live_channels} US Eaglecast live channels. Reload the normal EPG Manager page to use them.`,true)}catch(e){show(integrateResult,e.message,false)}finally{b.disabled=false}}
 let recordTimer=null;
 async function recordingStatus(){try{const d=await api('/eaglecast-test/api/recording/status');if(!d.ok)throw Error(d.error);const active=['starting','recording'].includes(d.status);show(recordResult,`${d.status==='idle'?'No recording test yet.':d.message}${d.channel?`\nChannel: ${d.channel}`:''}${d.file?`\nFile: ${d.file}`:''}`,d.status!=='failed');document.getElementById('record').disabled=active;if(active&&!recordTimer)recordTimer=setInterval(recordingStatus,1500);if(!active&&recordTimer){clearInterval(recordTimer);recordTimer=null}}catch(e){show(recordResult,e.message,false)}}
 async function recordTest(){const channel=document.getElementById('recordChannel').value.trim();if(!channel){show(recordResult,'Copy a channel name from the sample first.',false);return}const b=document.getElementById('record');b.disabled=true;show(recordResult,'Starting…',true);try{const d=await api('/eaglecast-test/api/recording/start',{channel_name:channel});if(!d.ok)throw Error(d.error);show(recordResult,d.message+'\nChannel: '+d.channel,true);recordTimer=setInterval(recordingStatus,1500)}catch(e){show(recordResult,e.message,false);b.disabled=false}}

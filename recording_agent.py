@@ -270,7 +270,21 @@ def best_existing_copy(paths, ffprobe):
     ))
 
 
-def stream_url(cfg, stream_id):
+def stream_url(cfg, stream_id, provider='primestreams', extension='ts'):
+    """Resolve credentials locally for the source selected by the EPG server."""
+    if provider == 'eaglecast':
+        path = os.path.expanduser(cfg.get(
+            'eaglecast_config_path', '~/epg/eaglecast_test_config.json'
+        ))
+        try:
+            with open(path, encoding='utf-8') as handle:
+                eaglecast = json.load(handle)
+            base = str(eaglecast['server_url']).rstrip('/')
+            username = urllib.parse.quote(str(eaglecast['username']), safe='')
+            password = urllib.parse.quote(str(eaglecast['password']), safe='')
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f'Eaglecast settings are unavailable on this Mac: {exc}') from exc
+        return f"{base}/live/{username}/{password}/{stream_id}.{str(extension or 'ts').lstrip('.')}"
     base = cfg['epg_url'].rstrip('/')
     return f"{base}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{stream_id}.ts"
 
@@ -448,7 +462,8 @@ def process_job(api, job, cfg):
     ts_path = local_dir / f'{title_slug}_{int(job["start_ts"])}.ts'
     mp4_path = ts_path.with_suffix('.mp4')
     log_path = local_dir / f'{title_slug}_{int(job["start_ts"])}.ffmpeg.log'
-    url = stream_url(cfg, job['stream_id'])
+    url = stream_url(cfg, job['stream_id'], job.get('stream_provider', 'primestreams'),
+                     job.get('stream_extension', 'ts'))
     episode = episode_metadata(job)
     is_series = bool(job.get('is_series'))
     library_root = cfg['plex_tv_path'] if (episode or is_series) else cfg['plex_path']
