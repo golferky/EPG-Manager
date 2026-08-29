@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829a"
+VERSION = "v20260829b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2035,9 +2035,15 @@ def api_recording_health():
                                FROM recordings
                                WHERE result_json IS NOT NULL AND result_json != ''
                                ORDER BY start_ts DESC LIMIT 100''').fetchall()
+        active_rows = conn.execute('''SELECT title, channel, start_ts FROM recordings
+                                      WHERE start_ts > ? AND status IN
+                                      ('queued','scheduled','agent_claimed','preflight','waiting','recording',
+                                       'converting','awaiting_transfer','transferring')''',
+                                   (time.time(),)).fetchall()
         conn.close()
     except Exception as exc:
         return jsonify({'error': str(exc), 'reports': []}), 500
+    queued_retries = {str(row['title']).strip().lower(): dict(row) for row in active_rows}
     reports = []
     for row in rows:
         record = dict(row)
@@ -2049,7 +2055,8 @@ def api_recording_health():
         result['transferred_to_plex'] = bool(result.get('plex_path'))
         for key in ('existing_path', 'plex_path'):
             result.pop(key, None)
-        reports.append({**record, 'result': result})
+        retry = queued_retries.get(str(record.get('title') or '').strip().lower())
+        reports.append({**record, 'result': result, 'retry': retry})
     return jsonify({'reports': reports})
 
 
@@ -6729,6 +6736,7 @@ async function loadRecordingHealth() {
     empty.style.display = 'none';
     list.innerHTML = reports.map(r => {
       const result = r.result || {};
+      const retry = r.retry || null;
       const recorded = result.recorded || {};
       const scheduled = Math.max(0, Number(r.stop_ts || 0) - Number(r.start_ts || 0));
       const actual = Number(recorded.duration || 0);
@@ -6749,7 +6757,10 @@ async function loadRecordingHealth() {
           <span style="font-size:12px;color:#64748b;">${esc(r.channel || '')} ${when ? '· ' + esc(when) : ''}</span>
         </div>
         <div style="font-size:12px;color:#94a3b8;margin-top:5px;">${[timing, video, result.transferred_to_plex ? 'Moved to Plex' : ''].filter(Boolean).map(esc).join(' &nbsp;•&nbsp; ') || 'No media probe was available for this result.'}</div>
-        ${!isGood && !isActive ? `<button class="btn btn-sm" style="margin-top:8px;background:#1d4ed8;color:#dbeafe;" onclick="rerecordFromHealth('${String(r.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Find re-record</button>` : ''}
+        ${!isGood && !isActive ? (retry
+          ? `<div style="margin-top:8px;display:inline-block;background:#14532d;color:#bbf7d0;border:1px solid #166534;border-radius:5px;padding:5px 8px;font-size:12px;font-weight:700;">✓ Will re-record${retry.start_ts ? ` · ${new Date(Number(retry.start_ts) * 1000).toLocaleString()}` : ''}${retry.channel ? ` · ${esc(retry.channel)}` : ''}</div>`
+          : `<button class="btn btn-sm" style="margin-top:8px;background:#1d4ed8;color:#dbeafe;" onclick="rerecordFromHealth('${String(r.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Find re-record</button>`)
+          : ''}
         ${technical ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#93c5fd;font-size:12px;">Show technical FFmpeg log</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;margin-top:7px;padding:9px;background:#111827;border:1px solid #263247;border-radius:5px;color:#cbd5e1;font-size:11px;line-height:1.35;">${esc(technical)}</pre></details>` : '<div style="font-size:11px;color:#475569;margin-top:6px;">Technical log was not saved for this older recording.</div>'}
       </div>`;
     }).join('');
@@ -6763,13 +6774,6 @@ async function rerecordFromHealth(recId, button) {
   try {
     const d = await post('/epg-web/api/recording-health/rerecord', {rec_id: recId});
     if (!d.ok) throw new Error(d.error || 'Could not find a re-recording.');
-    if (d.watched) {
-      alert('No clean future airing is available yet. This title is now in Wanted and will be checked after each guide refresh.');
-    } else {
-      const when = d.start_ts ? new Date(Number(d.start_ts) * 1000).toLocaleString() : '';
-      alert(d.duplicate ? `A re-recording is already queued${when ? ` for ${when}` : ''}.`
-                        : `Re-recording scheduled on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`);
-    }
     await loadRecordingHealth(); loadSchedule(); loadRecs();
   } catch (err) {
     alert(err.message || String(err));
