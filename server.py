@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829d"
+VERSION = "v20260829e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -7054,6 +7054,9 @@ function setEl(id,msg,cls){const e=document.getElementById(id);e.textContent=msg
 # primary guide, channel mapping, or recording agent until its provider has
 # been tested and intentionally integrated.
 EAGLECAST_TEST_CONFIG = os.path.join(BASE_DIR, 'eaglecast_test_config.json')
+EAGLECAST_TEST_DIR = os.path.expanduser('~/Movies/Recordings/Eaglecast Test')
+_eaglecast_recording_lock = threading.Lock()
+_eaglecast_recording = {'status': 'idle', 'pid': None, 'channel': '', 'file': '', 'message': ''}
 
 def _eaglecast_local_request():
     """Keep Xtream credentials off the public DuckDNS endpoint."""
@@ -7083,6 +7086,51 @@ def _save_eaglecast_test_config(data):
     with open(tmp_path, 'w') as handle:
         json.dump(data, handle, indent=2)
     os.replace(tmp_path, EAGLECAST_TEST_CONFIG)
+
+def _eaglecast_live_streams(cfg):
+    """Return the provider's live stream metadata without exposing credentials."""
+    from urllib import request as urlreq
+    from urllib.parse import urlencode
+    query = urlencode({'username': cfg['username'], 'password': cfg['password'],
+                       'action': 'get_live_streams'})
+    req = urlreq.Request(f"{cfg['server_url']}/player_api.php?{query}",
+                         headers={'User-Agent': 'EPG-Manager Eaglecast Test'})
+    with urlreq.urlopen(req, timeout=30) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+    return payload if isinstance(payload, list) else []
+
+def _eaglecast_public_recording_status():
+    with _eaglecast_recording_lock:
+        data = dict(_eaglecast_recording)
+    data.pop('pid', None)
+    return data
+
+def _run_eaglecast_recording_test(channel, stream_url, output_file):
+    """A deliberately short, standalone capture.  It never goes to Plex."""
+    try:
+        cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+               '-i', stream_url, '-t', '60', '-c', 'copy', output_file]
+        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, text=True)
+        with _eaglecast_recording_lock:
+            _eaglecast_recording.update({'status': 'recording', 'pid': process.pid,
+                                         'channel': channel, 'file': output_file,
+                                         'message': 'Recording one minute…'})
+        stderr = process.communicate()[1] or ''
+        if process.returncode:
+            message = (stderr.strip().splitlines()[-1] if stderr.strip()
+                       else f'FFmpeg stopped with code {process.returncode}.')
+            status = 'failed'
+        elif not os.path.exists(output_file) or os.path.getsize(output_file) < 1024 * 1024:
+            status, message = 'failed', 'The test finished but produced an unexpectedly small file.'
+        else:
+            status, message = 'passed', 'One-minute recording completed. It is in the Eaglecast Test folder, not Plex.'
+        with _eaglecast_recording_lock:
+            _eaglecast_recording.update({'status': status, 'pid': None, 'message': message})
+    except Exception as exc:
+        with _eaglecast_recording_lock:
+            _eaglecast_recording.update({'status': 'failed', 'pid': None,
+                                         'message': f'Recording test failed: {exc}'})
 
 @app.route('/eaglecast-test')
 def eaglecast_test_page():
@@ -7144,18 +7192,66 @@ def eaglecast_test_channels():
     cfg = _load_eaglecast_test_config()
     if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
         return jsonify({'ok': False, 'error': 'Save the provider settings first.'}), 400
-    from urllib import request as urlreq
-    from urllib.parse import urlencode
     try:
-        query = urlencode({'username': cfg['username'], 'password': cfg['password'], 'action': 'get_live_streams'})
-        req = urlreq.Request(f"{cfg['server_url']}/player_api.php?{query}",
-                             headers={'User-Agent': 'EPG-Manager Eaglecast Test'})
-        with urlreq.urlopen(req, timeout=30) as response:
-            streams = json.loads(response.read().decode('utf-8'))
+        streams = _eaglecast_live_streams(cfg)
         names = [str(item.get('name') or '').strip() for item in streams if item.get('name')]
         return jsonify({'ok': True, 'total': len(names), 'sample': names[:100]})
     except Exception as exc:
         return jsonify({'ok': False, 'error': f'Could not load channels: {exc}'}), 502
+
+@app.route('/eaglecast-test/api/recording/status')
+def eaglecast_test_recording_status():
+    if not _eaglecast_local_request():
+        return jsonify({'ok': False, 'error': 'This private setup page is local-only.'}), 403
+    return jsonify({'ok': True, **_eaglecast_public_recording_status()})
+
+@app.route('/eaglecast-test/api/recording/start', methods=['POST'])
+def eaglecast_test_recording_start():
+    """Start a one-minute capture in a quarantine folder, never Plex."""
+    if not _eaglecast_local_request():
+        return jsonify({'ok': False, 'error': 'This private setup page is local-only.'}), 403
+    cfg = _load_eaglecast_test_config()
+    if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+        return jsonify({'ok': False, 'error': 'Save the provider settings first.'}), 400
+    requested_name = str((request.json or {}).get('channel_name') or '').strip()
+    if not requested_name or len(requested_name) > 160:
+        return jsonify({'ok': False, 'error': 'Enter a channel name from the sample above.'}), 400
+    with _eaglecast_recording_lock:
+        if _eaglecast_recording['status'] in ('starting', 'recording'):
+            return jsonify({'ok': False, 'error': 'An Eaglecast test recording is already running.'}), 409
+        _eaglecast_recording.update({'status': 'starting', 'pid': None, 'channel': '',
+                                     'file': '', 'message': 'Finding the requested channel…'})
+    try:
+        streams = _eaglecast_live_streams(cfg)
+        normalized = requested_name.casefold()
+        match = next((item for item in streams
+                      if str(item.get('name') or '').strip().casefold() == normalized), None)
+        if not match:
+            match = next((item for item in streams
+                          if normalized in str(item.get('name') or '').strip().casefold()), None)
+        stream_id = str((match or {}).get('stream_id') or '').strip()
+        if not stream_id:
+            with _eaglecast_recording_lock:
+                _eaglecast_recording.update({'status': 'idle', 'message': ''})
+            return jsonify({'ok': False, 'error': 'No matching live channel was found. Copy a name exactly from the sample.'}), 404
+        channel_name = str(match.get('name') or requested_name).strip()
+        extension = str(match.get('container_extension') or 'ts').strip().lstrip('.')
+        from urllib.parse import quote
+        stream_url = (f"{cfg['server_url']}/live/{quote(str(cfg['username']), safe='')}"
+                      f"/{quote(str(cfg['password']), safe='')}/{stream_id}.{extension}")
+        os.makedirs(EAGLECAST_TEST_DIR, exist_ok=True)
+        filename = f"{_safe_filename(channel_name)}_{int(time.time())}_eaglecast-test.ts"
+        output_file = os.path.join(EAGLECAST_TEST_DIR, filename)
+        thread = threading.Thread(target=_run_eaglecast_recording_test,
+                                  args=(channel_name, stream_url, output_file), daemon=True)
+        thread.start()
+        return jsonify({'ok': True, 'channel': channel_name,
+                        'message': 'Starting a one-minute test recording. Do not watch Eaglecast during this test; your plan allows one stream.'})
+    except Exception as exc:
+        with _eaglecast_recording_lock:
+            _eaglecast_recording.update({'status': 'failed', 'pid': None,
+                                         'message': f'Could not start test: {exc}'})
+        return jsonify({'ok': False, 'error': f'Could not start recording test: {exc}'}), 502
 
 EAGLECAST_TEST_HTML = r'''<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -7168,15 +7264,18 @@ body{margin:0;background:#090d16;color:#dbe5f5;font:16px -apple-system,BlinkMacS
 <label>Password</label><input id="pass" type="password" autocomplete="new-password" placeholder="Xtream password">
 <button id="save" onclick="save()">Save private settings</button><button class="secondary" id="test" onclick="test()">Test connection</button><div id="result" class="result hint">Enter the three Xtream fields, save them, then test the connection.</div></div>
 <div class="card"><h2>2. Channel check</h2><p>After a successful connection test, confirm Eaglecast actually returns a live-channel list.</p><button class="secondary" id="channels" onclick="channels()">Load channel sample</button><div id="channelResult" class="result hint">No channel test yet.</div><ul id="list"></ul></div>
-<div class="card"><h2>3. Recording test — next step</h2><p>Once connection and channels pass, we will add a one-program recording test that uses the existing Mac recording agent. PrimeStreams remains untouched until that test is proven reliable.</p></div>
+<div class="card"><h2>3. One-minute recording test</h2><p>This captures exactly one minute on the Mac, to <b>Movies/Recordings/Eaglecast Test</b>. It does not enter Plex, the guide, or your normal recording schedule.</p><p class="warning">Your Eaglecast plan has one connection. Do not watch Eaglecast while this test is running.</p><label>Channel to test</label><input id="recordChannel" placeholder="Copy a channel name from the sample, e.g. US| COZI"><button id="record" onclick="recordTest()">Record one-minute test</button><div id="recordResult" class="result hint">No recording test yet.</div></div>
 </main><script>
-const result=document.getElementById('result'), channelResult=document.getElementById('channelResult');
+const result=document.getElementById('result'), channelResult=document.getElementById('channelResult'), recordResult=document.getElementById('recordResult');
 function show(el,msg,ok){el.textContent=msg;el.className='result '+(ok?'ok':'bad')}
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});return r.json()}
 async function setup(){const d=await api('/eaglecast-test/api/config');if(!d.ok){show(result,d.error,false);return}document.getElementById('url').value=d.server_url||'';if(d.configured)show(result,'Private Eaglecast settings are saved. Re-enter username and password only if you need to change them.',true)}
 async function save(){const b=document.getElementById('save');b.disabled=true;try{const d=await api('/eaglecast-test/api/config',{server_url:url.value.trim(),username:user.value.trim(),password:pass.value});if(!d.ok)throw Error(d.error);pass.value='';show(result,'Saved locally on this Mac. Now click Test connection.',true)}catch(e){show(result,e.message,false)}finally{b.disabled=false}}
 async function test(){const b=document.getElementById('test');b.disabled=true;show(result,'Connecting…',true);try{const d=await api('/eaglecast-test/api/test',{});if(!d.ok)throw Error(d.error);show(result,`Connected: ${d.status}\nActive connections: ${d.active_connections}\nPlan maximum: ${d.max_connections}\nExpiry reported: ${d.expires_at||'not reported'}`,true)}catch(e){show(result,e.message,false)}finally{b.disabled=false}}
 async function channels(){const b=document.getElementById('channels');b.disabled=true;try{const d=await api('/eaglecast-test/api/channels',{});if(!d.ok)throw Error(d.error);show(channelResult,`${d.total} live channels returned. First 100 shown below.`,true);list.innerHTML=d.sample.map(n=>`<li>${String(n).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</li>`).join('')}catch(e){show(channelResult,e.message,false)}finally{b.disabled=false}}
+let recordTimer=null;
+async function recordingStatus(){try{const d=await api('/eaglecast-test/api/recording/status');if(!d.ok)throw Error(d.error);const active=['starting','recording'].includes(d.status);show(recordResult,`${d.status==='idle'?'No recording test yet.':d.message}${d.channel?`\nChannel: ${d.channel}`:''}${d.file?`\nFile: ${d.file}`:''}`,d.status!=='failed');document.getElementById('record').disabled=active;if(active&&!recordTimer)recordTimer=setInterval(recordingStatus,1500);if(!active&&recordTimer){clearInterval(recordTimer);recordTimer=null}}catch(e){show(recordResult,e.message,false)}}
+async function recordTest(){const channel=document.getElementById('recordChannel').value.trim();if(!channel){show(recordResult,'Copy a channel name from the sample first.',false);return}const b=document.getElementById('record');b.disabled=true;show(recordResult,'Starting…',true);try{const d=await api('/eaglecast-test/api/recording/start',{channel_name:channel});if(!d.ok)throw Error(d.error);show(recordResult,d.message+'\nChannel: '+d.channel,true);recordTimer=setInterval(recordingStatus,1500)}catch(e){show(recordResult,e.message,false);b.disabled=false}}
 setup();</script></body></html>'''
 
 # ── Startup auto-load ────────────────────────────────────────────────────────
