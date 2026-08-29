@@ -992,7 +992,9 @@ def _stream_url(channel_id, preferred_provider=None):
     cfg  = load_config()
     debug = {'channel_id': channel_id, 'matched_guide_channel': None, 'stream_id': None,
              'method': None, 'provider': None, 'stream_extension': 'ts'}
-    if preferred_provider == 'eaglecast':
+    # Eaglecast is the preferred source once it has been explicitly mapped by
+    # the owner.  PrimeStreams remains the automatic fallback.
+    if preferred_provider in (None, 'eaglecast'):
         eaglecast = _eaglecast_stream_for_channel(channel_id)
         if eaglecast:
             sid, mapped_name, extension = eaglecast
@@ -1713,6 +1715,8 @@ def api_guide():
         source_recordable = get_recordable_channel_ids(guide_db_path, movies_db_path)
         recordable_ids = {id_to_canonical.get(channel_id, channel_id)
                           for channel_id in source_recordable}
+        eaglecast_ids = {id_to_canonical.get(channel_id, channel_id)
+                         for channel_id in get_eaglecast_channel_ids(guide_db_path)}
         quality_by_id = {}
         try:
             qconn = sqlite3.connect(guide_db_path)
@@ -1726,6 +1730,8 @@ def api_guide():
             pass
         for prog in progs_in_window:
             prog['can_record'] = prog['channel_id'] in recordable_ids
+            prog['stream_provider'] = ('eaglecast' if prog['channel_id'] in eaglecast_ids
+                                       else 'primestreams') if prog['can_record'] else ''
             if prog['can_record'] and prog['channel_id'] in quality_by_id:
                 prog['stream_quality'] = quality_by_id[prog['channel_id']]
     except Exception:
@@ -3671,6 +3677,7 @@ def api_airings():
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
                 'can_record':   not stream_error and not _is_foreign_recording_feed(r['channel_name']),
+                'stream_provider': str(stream_debug.get('provider') or ''),
                 'stream_quality': {
                     'width': stream_quality.get('width', 0),
                     'height': stream_quality.get('height', 0),
@@ -4536,6 +4543,7 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .prog-block.cat-movie  .cat-badge{background:#b45309;color:#fef3c7;}
 .prog-block.cat-series {background:#0f1e2e;border-left-color:#38bdf8;}
 .prog-block.cat-series .cat-badge{background:#0369a1;color:#e0f2fe;}
+.source-eagle{font-size:12px;line-height:1;margin:0 3px 0 2px;flex:none;}
 .plex-play-btn{font-size:9px;color:#a78bfa;background:#2d1f5e;border:1px solid #7c3aed;border-radius:3px;padding:0 4px;margin-right:3px;flex-shrink:0;cursor:pointer;line-height:14px;}
 .plex-play-btn:hover{background:#7c3aed;color:#fff;}
 .rec-dot{font-size:9px;color:#ef4444;margin-right:3px;flex-shrink:0;animation:pulse-rec 1s infinite;}
@@ -5658,6 +5666,8 @@ function renderGuide() {
                     : isSeries ? {cls:'cat-series', badge:'TV', title:'Series'}
                     : _catInfo(p.category || '');
       const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
+      const sourceBadge = p.stream_provider === 'eaglecast'
+        ? '<span class="source-eagle" title="Eaglecast is the selected recording source">🦅</span>' : '';
       const sq = p.stream_quality || null;
       const qualityClass = !sq || !sq.height ? ''
         : sq.height >= 2160 ? 'q-4k'
@@ -5679,7 +5689,7 @@ function renderGuide() {
         onmouseenter="showTip(event,${pd.replace(/"/g,'&quot;')})"
         onmouseleave="hideTip()"
         onclick="openProg(${pd.replace(/"/g,'&quot;')})">
-        <div class="prog-row-top">${badges}${catBadge}<span class="prog-title">${esc(p.title)}</span>${recInfo.autoUpgrade ? '<span class="upgrade-suggest" title="Automatic higher-resolution Plex replacement">↑ UPGRADE</span>' : ''}${streamMeta}</div>
+        <div class="prog-row-top">${badges}${catBadge}${sourceBadge}<span class="prog-title">${esc(p.title)}</span>${recInfo.autoUpgrade ? '<span class="upgrade-suggest" title="Automatic higher-resolution Plex replacement">↑ UPGRADE</span>' : ''}${streamMeta}</div>
         ${epLine ? `<span class="prog-ep">${esc(epLine)}</span>` : ''}
       </div>`;
     }
@@ -6122,7 +6132,7 @@ async function openProg(p) {
           const inPlex = !!episodeKey && _plexEpisodes.has(episodeKey);
           return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;${best ? 'background:#2b2208;border-left:3px solid #fbbf24;padding-left:7px;' : ''}">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
+            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span title="Eaglecast recording source">🦅</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)
