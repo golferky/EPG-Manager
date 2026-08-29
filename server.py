@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829h"
+VERSION = "v20260829i"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4794,9 +4794,9 @@ tr:hover td{background:#141414;}
         <span style="font-size:10px;font-weight:700;color:#60a5fa;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">📡 RECORDING STREAM</span>
         <span id="pm-stream-info" style="font-size:12px;color:#93c5fd;font-family:monospace;"></span>
       </div>
-      <!-- Next primestreams airing (featured) -->
+      <!-- Next usable provider airing (featured) -->
       <div id="pm-next-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;background:#0f1923;">
-        <div style="font-size:11px;font-weight:600;color:#3b82f6;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">📡 Next on PrimeStreams</div>
+        <div id="pm-next-heading" style="font-size:11px;font-weight:600;color:#3b82f6;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">📡 Next Available Stream</div>
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
           <div id="pm-next-info" style="flex:1;font-size:13px;color:#e2e8f0;"></div>
           <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
@@ -4806,7 +4806,7 @@ tr:hover td{background:#141414;}
       <!-- All future airings -->
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
-          <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📡 PrimeStreams Airings</span>
+          <span id="pm-airings-heading" style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📡 Available Airings</span>
           <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Identified Episodes</button>
           <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unscheduled Only</button>
         </div>
@@ -6059,6 +6059,8 @@ async function openProg(p) {
           ? `ON NOW  ·  ${featPS.channel_name}  (until ${featPS.stop_fmt})`
           : `${featPS.start_fmt} – ${featPS.stop_fmt}  ·  ${featPS.channel_name}`;
         document.getElementById('pm-next-info').textContent = label;
+        document.getElementById('pm-next-heading').textContent = featPS.stream_provider === 'eaglecast'
+          ? '🦅 Next on Eaglecast' : '📡 Next on PrimeStreams';
 
         // Play button: only when currently airing; reflect current playing state
         const pBtn = document.getElementById('pm-play-btn');
@@ -6086,6 +6088,7 @@ async function openProg(p) {
       // The modal is for recording, so omit guide-only channels with no
       // PrimeStreams stream instead of showing unusable rows.
       window._allAirings = ar.airings.filter(a => a.can_record);
+      document.getElementById('pm-airings-heading').textContent = '📡 Available Airings';
       window._airingsRecMap = recMap;
       window._showUnrecordedOnly = false;
       const unrecBtn = document.getElementById('pm-unrecorded-btn');
