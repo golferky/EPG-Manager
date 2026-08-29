@@ -1714,12 +1714,14 @@ def api_guide():
     total_ch  = len(ordered_channels)
     page_chs  = ordered_channels[ch_offset:ch_offset + ch_cap]
     # Mark channels that can be recorded, without exposing their stream URLs.
+    eaglecast_display_ids = set()
     try:
         source_recordable = get_recordable_channel_ids(guide_db_path, movies_db_path)
         recordable_ids = {id_to_canonical.get(channel_id, channel_id)
                           for channel_id in source_recordable}
         eaglecast_ids = {id_to_canonical.get(channel_id, channel_id)
                          for channel_id in get_eaglecast_channel_ids(guide_db_path)}
+        eaglecast_display_ids = set(eaglecast_ids)
         quality_by_id = {}
         try:
             qconn = sqlite3.connect(guide_db_path)
@@ -1750,6 +1752,7 @@ def api_guide():
         'channels':     page_chs,
         'total_channels': total_ch,
         'ch_offset':    ch_offset,
+        'eaglecast_channel_ids': sorted(eaglecast_display_ids),
         'programmes':   progs_in_window,
     })
 
@@ -5602,6 +5605,9 @@ function renderGuide() {
 
   // Channels already filtered server-side
   const channels = d.channels;
+  // The server supplies a separate source list as well as a per-program field.
+  // Using the list makes the Eagle marker robust across duplicate XMLTV rows.
+  const eaglecastChannels = new Set(d.eaglecast_channel_ids || []);
 
   // Build time header
   let timeHTML = `<div class="time-header"><div class="ch-name-hdr"></div>`;
@@ -5671,7 +5677,7 @@ function renderGuide() {
                     : isSeries ? {cls:'cat-series', badge:'TV', title:'Series'}
                     : _catInfo(p.category || '');
       const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
-      const sourceBadge = p.stream_provider === 'eaglecast'
+      const sourceBadge = (p.stream_provider === 'eaglecast' || eaglecastChannels.has(p.channel_id))
         ? '<span class="source-eagle" title="Eaglecast is the selected recording source">🦅</span>' : '';
       const sq = p.stream_quality || null;
       const qualityClass = !sq || !sq.height ? ''
