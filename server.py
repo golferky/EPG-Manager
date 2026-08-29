@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829b"
+VERSION = "v20260829c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1224,17 +1224,28 @@ def api_disk():
             usage = shutil.disk_usage(p)
             df = subprocess.run(['df', p], capture_output=True, text=True)
             lines = df.stdout.strip().splitlines()
-            mount = lines[-1].split()[-1] if len(lines) >= 2 else p
+            fields = lines[-1].split() if len(lines) >= 2 else []
+            mount = fields[-1] if fields else p
             if mount in seen:
                 for r in results:
                     if r.get('mount') == mount:
                         r['label'] += f' / {label}'
                 continue
             seen.add(mount)
-            pct = round(usage.used / usage.total * 100, 1) if usage.total else 0
+            # macOS `statvfs` / shutil.disk_usage can return contradictory
+            # quota values for SMB shares (for example more free space than
+            # the reported volume size).  `df -k` is the server's own
+            # capacity report, so prefer it whenever its normal columns exist.
+            if len(fields) >= 5 and all(part.isdigit() for part in fields[1:4]):
+                total = int(fields[1]) * 1024
+                used = int(fields[2]) * 1024
+                free = int(fields[3]) * 1024
+            else:
+                total, used, free = usage.total, usage.used, usage.free
+            pct = round(used / total * 100, 1) if total else 0
             results.append({
                 'label': label, 'mount': mount,
-                'total': usage.total, 'used': usage.used, 'free': usage.free,
+                'total': total, 'used': used, 'free': free,
                 'pct': pct,
             })
         except Exception as e:
