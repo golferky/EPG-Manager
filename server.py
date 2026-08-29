@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260828d"
+VERSION = "v20260829a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2436,7 +2436,7 @@ def _queue_best_retry(title, candidate, decision):
     return rec
 
 
-def _watch_abandoned_transfer(title):
+def _watch_abandoned_transfer(title, source='abandoned_transfer'):
     """Remember a failed transfer so a later guide refresh can retry it."""
     clean = str(title or '').strip()
     if not clean:
@@ -2445,7 +2445,7 @@ def _watch_abandoned_transfer(title):
         db_run('''INSERT OR IGNORE INTO wanted_titles
                   (title,normalized_title,year,type,source,status,notes,created_at,updated_at)
                   VALUES (?,?,?,?,?,?,?,datetime("now"),datetime("now"))''',
-               (clean, _norm_plex_show(clean), '', 'movie', 'abandoned_transfer', 'wanted',
+               (clean, _norm_plex_show(clean), '', 'movie', source, 'wanted',
                 'Re-record after abandoned Plex transfer'))
     except Exception as exc:
         print(f'[abandoned-transfer] Could not add {clean!r} to Wanted: {exc}')
@@ -2454,7 +2454,7 @@ def _watch_abandoned_transfer(title):
 def _auto_schedule_abandoned_transfer_wanted():
     """On a guide refresh, retry a small number of watched failed transfers."""
     try:
-        watched = db_rows("SELECT id,title FROM wanted_titles WHERE source='abandoned_transfer' AND status='wanted' LIMIT 2")
+        watched = db_rows("SELECT id,title FROM wanted_titles WHERE source IN ('abandoned_transfer','recording_health') AND status='wanted' LIMIT 2")
         for item in watched:
             candidate, detail = _best_incomplete_rerecord(item['title'], 0)
             if not candidate or detail.get('already_queued'):
@@ -2509,6 +2509,38 @@ def api_rerecord_incomplete_plex_copy():
         threading.Thread(target=_run_recording, args=(retry_id,), daemon=True).start()
     return jsonify({'ok': True, 'id': retry_id, 'channel': candidate['channel'],
                     'start_ts': candidate['start_ts']})
+
+
+@app.route('/epg-web/api/recording-health/rerecord', methods=['POST'])
+def api_rerecord_from_health():
+    """Retry a failed/short recording even when it never reached Plex."""
+    rec_id = str((request.json or {}).get('rec_id') or '')
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('''SELECT rec_id,title,start_ts,stop_ts,status FROM recordings
+                              WHERE rec_id=?''', (rec_id,)).fetchone()
+        conn.close()
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+    if not row:
+        return jsonify({'ok': False, 'error': 'That recording report no longer exists.'}), 404
+    if str(row['status'] or '').lower() in ('recording','converting','awaiting_transfer','transferring'):
+        return jsonify({'ok': False, 'error': 'That recording is still active.'}), 409
+    expected = max(0, float(row['stop_ts'] or 0) - float(row['start_ts'] or 0))
+    candidate, detail = _best_incomplete_rerecord(row['title'], expected)
+    if detail.get('already_queued'):
+        queued = detail['already_queued']
+        return jsonify({'ok': True, 'duplicate': True, 'channel': queued['channel'],
+                        'start_ts': queued['start_ts']})
+    if not candidate:
+        _watch_abandoned_transfer(row['title'], source='recording_health')
+        return jsonify({'ok': True, 'watched': True,
+                        'message': 'No clean future airing yet; added to Wanted.'})
+    rec = _queue_best_retry(row['title'], candidate, 're-recording failed capture')
+    if not rec:
+        return jsonify({'ok': False, 'error': 'Could not save the re-recording'}), 500
+    return jsonify({'ok': True, 'channel': rec['channel'], 'start_ts': rec['start_ts']})
 
 def _recording_log_excerpt(path, max_chars=12000):
     try:
@@ -6701,6 +6733,7 @@ async function loadRecordingHealth() {
       const scheduled = Math.max(0, Number(r.stop_ts || 0) - Number(r.start_ts || 0));
       const actual = Number(recorded.duration || 0);
       const isGood = ['done','skipped_existing_better'].includes((r.status || '').toLowerCase());
+      const isActive = ['recording','converting','awaiting_transfer','transferring'].includes((r.status || '').toLowerCase());
       const color = isGood ? '#4ade80' : '#f87171';
       const label = isGood ? 'Complete' : (r.failure_reason || r.quality_decision || String(r.status || 'Result').replace(/_/g, ' '));
       const timing = actual ? `${healthDuration(actual)} captured${scheduled ? ` / ${healthDuration(scheduled)} scheduled` : ''}` : '';
@@ -6716,11 +6749,32 @@ async function loadRecordingHealth() {
           <span style="font-size:12px;color:#64748b;">${esc(r.channel || '')} ${when ? '· ' + esc(when) : ''}</span>
         </div>
         <div style="font-size:12px;color:#94a3b8;margin-top:5px;">${[timing, video, result.transferred_to_plex ? 'Moved to Plex' : ''].filter(Boolean).map(esc).join(' &nbsp;•&nbsp; ') || 'No media probe was available for this result.'}</div>
+        ${!isGood && !isActive ? `<button class="btn btn-sm" style="margin-top:8px;background:#1d4ed8;color:#dbeafe;" onclick="rerecordFromHealth('${String(r.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Find re-record</button>` : ''}
         ${technical ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#93c5fd;font-size:12px;">Show technical FFmpeg log</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;margin-top:7px;padding:9px;background:#111827;border:1px solid #263247;border-radius:5px;color:#cbd5e1;font-size:11px;line-height:1.35;">${esc(technical)}</pre></details>` : '<div style="font-size:11px;color:#475569;margin-top:6px;">Technical log was not saved for this older recording.</div>'}
       </div>`;
     }).join('');
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load recording health: ${esc(err.message || String(err))}</div>`;
+  }
+}
+async function rerecordFromHealth(recId, button) {
+  const original = button.textContent;
+  button.disabled = true; button.textContent = 'Finding…';
+  try {
+    const d = await post('/epg-web/api/recording-health/rerecord', {rec_id: recId});
+    if (!d.ok) throw new Error(d.error || 'Could not find a re-recording.');
+    if (d.watched) {
+      alert('No clean future airing is available yet. This title is now in Wanted and will be checked after each guide refresh.');
+    } else {
+      const when = d.start_ts ? new Date(Number(d.start_ts) * 1000).toLocaleString() : '';
+      alert(d.duplicate ? `A re-recording is already queued${when ? ` for ${when}` : ''}.`
+                        : `Re-recording scheduled on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`);
+    }
+    await loadRecordingHealth(); loadSchedule(); loadRecs();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    button.disabled = false; button.textContent = original;
   }
 }
 async function loadIncompletePlexCopies() {
