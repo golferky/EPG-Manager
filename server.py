@@ -7049,6 +7049,136 @@ function setEl(id,msg,cls){const e=document.getElementById(id);e.textContent=msg
 </body>
 </html>"""
 
+# ── Isolated Eaglecast / Xtream test page ────────────────────────────────────
+# This deliberately has its own config file and routes.  It does not feed the
+# primary guide, channel mapping, or recording agent until its provider has
+# been tested and intentionally integrated.
+EAGLECAST_TEST_CONFIG = os.path.join(BASE_DIR, 'eaglecast_test_config.json')
+
+def _eaglecast_local_request():
+    """Keep Xtream credentials off the public DuckDNS endpoint."""
+    host = (request.host or '').split(':', 1)[0].lower()
+    return request.remote_addr in ('127.0.0.1', '::1') and host in ('localhost', '127.0.0.1', '::1')
+
+def _load_eaglecast_test_config():
+    try:
+        with open(EAGLECAST_TEST_CONFIG) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _eaglecast_test_public_config():
+    cfg = _load_eaglecast_test_config()
+    return {
+        'server_url': cfg.get('server_url', ''),
+        'username_set': bool(cfg.get('username')),
+        'password_set': bool(cfg.get('password')),
+        'configured': bool(cfg.get('server_url') and cfg.get('username') and cfg.get('password')),
+    }
+
+def _save_eaglecast_test_config(data):
+    os.makedirs(BASE_DIR, exist_ok=True)
+    tmp_path = EAGLECAST_TEST_CONFIG + '.tmp'
+    with open(tmp_path, 'w') as handle:
+        json.dump(data, handle, indent=2)
+    os.replace(tmp_path, EAGLECAST_TEST_CONFIG)
+
+@app.route('/eaglecast-test')
+def eaglecast_test_page():
+    if not _eaglecast_local_request():
+        return ('This private setup page is available only on the Mac at '
+                'http://localhost:5001/eaglecast-test.', 403)
+    return EAGLECAST_TEST_HTML
+
+@app.route('/eaglecast-test/api/config', methods=['GET', 'POST'])
+def eaglecast_test_config():
+    if not _eaglecast_local_request():
+        return jsonify({'ok': False, 'error': 'This private setup page is local-only.'}), 403
+    if request.method == 'GET':
+        return jsonify({'ok': True, **_eaglecast_test_public_config()})
+    data = request.json or {}
+    server_url = str(data.get('server_url') or '').strip().rstrip('/')
+    username = str(data.get('username') or '').strip()
+    password = str(data.get('password') or '')
+    parsed = __import__('urllib.parse', fromlist=['urlparse']).urlparse(server_url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.username or parsed.password:
+        return jsonify({'ok': False, 'error': 'Enter a normal server URL such as https://provider.example:8443 — no username or password in the URL.'}), 400
+    if not username or not password:
+        return jsonify({'ok': False, 'error': 'Username and password are required.'}), 400
+    _save_eaglecast_test_config({'server_url': server_url, 'username': username, 'password': password})
+    return jsonify({'ok': True, **_eaglecast_test_public_config()})
+
+@app.route('/eaglecast-test/api/test', methods=['POST'])
+def eaglecast_test_connection():
+    if not _eaglecast_local_request():
+        return jsonify({'ok': False, 'error': 'This private setup page is local-only.'}), 403
+    cfg = _load_eaglecast_test_config()
+    if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+        return jsonify({'ok': False, 'error': 'Save the server URL, username, and password first.'}), 400
+    from urllib import request as urlreq
+    from urllib.parse import urlencode
+    try:
+        query = urlencode({'username': cfg['username'], 'password': cfg['password']})
+        url = f"{cfg['server_url']}/player_api.php?{query}"
+        req = urlreq.Request(url, headers={'User-Agent': 'EPG-Manager Eaglecast Test'})
+        with urlreq.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        user = payload.get('user_info') or {}
+        if str(user.get('auth', '0')) != '1':
+            return jsonify({'ok': False, 'error': 'The server responded, but rejected the Xtream login.'}), 401
+        return jsonify({
+            'ok': True,
+            'status': user.get('status') or 'Active',
+            'max_connections': user.get('max_connections') or 'not reported',
+            'active_connections': user.get('active_cons') or 0,
+            'expires_at': user.get('exp_date') or '',
+        })
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Could not connect: {exc}'}), 502
+
+@app.route('/eaglecast-test/api/channels', methods=['POST'])
+def eaglecast_test_channels():
+    if not _eaglecast_local_request():
+        return jsonify({'ok': False, 'error': 'This private setup page is local-only.'}), 403
+    cfg = _load_eaglecast_test_config()
+    if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+        return jsonify({'ok': False, 'error': 'Save the provider settings first.'}), 400
+    from urllib import request as urlreq
+    from urllib.parse import urlencode
+    try:
+        query = urlencode({'username': cfg['username'], 'password': cfg['password'], 'action': 'get_live_streams'})
+        req = urlreq.Request(f"{cfg['server_url']}/player_api.php?{query}",
+                             headers={'User-Agent': 'EPG-Manager Eaglecast Test'})
+        with urlreq.urlopen(req, timeout=30) as response:
+            streams = json.loads(response.read().decode('utf-8'))
+        names = [str(item.get('name') or '').strip() for item in streams if item.get('name')]
+        return jsonify({'ok': True, 'total': len(names), 'sample': names[:100]})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Could not load channels: {exc}'}), 502
+
+EAGLECAST_TEST_HTML = r'''<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Eaglecast Test</title><style>
+body{margin:0;background:#090d16;color:#dbe5f5;font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:760px;margin:42px auto;padding:0 22px}.card{background:#101827;border:1px solid #263247;border-radius:12px;padding:22px;margin:16px 0}h1{margin:0 0 8px;color:#60a5fa}h2{font-size:16px;margin:0 0 14px;color:#cbd5e1}p,.hint{color:#94a3b8;line-height:1.45}.warning{color:#fbbf24}label{display:block;margin:13px 0 5px;color:#cbd5e1;font-size:13px}input{box-sizing:border-box;width:100%;padding:10px;border:1px solid #334155;border-radius:6px;background:#0b1220;color:#e2e8f0}button{margin:12px 8px 0 0;padding:9px 12px;border:0;border-radius:6px;background:#2563eb;color:white;font-weight:650;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.secondary{background:#334155}.result{margin-top:14px;padding:12px;border-radius:6px;background:#0b1220;white-space:pre-wrap}.ok{color:#86efac}.bad{color:#fca5a5}ul{max-height:260px;overflow:auto;padding-left:22px;color:#cbd5e1}</style></head>
+<body><main><h1>🧪 Eaglecast Test</h1><p>Private setup sandbox. It is separate from PrimeStreams and cannot change your guide or recordings.</p>
+<div class="card"><h2>1. Xtream connection</h2><p class="warning">Open this page only on the Mac: <b>http://localhost:5001/eaglecast-test</b>. Your password stays in a separate local Mac configuration file and is never displayed here.</p>
+<label>Server URL</label><input id="url" placeholder="https://provider.example:8443">
+<label>Username</label><input id="user" autocomplete="off" placeholder="Xtream username">
+<label>Password</label><input id="pass" type="password" autocomplete="new-password" placeholder="Xtream password">
+<button id="save" onclick="save()">Save private settings</button><button class="secondary" id="test" onclick="test()">Test connection</button><div id="result" class="result hint">Enter the three Xtream fields, save them, then test the connection.</div></div>
+<div class="card"><h2>2. Channel check</h2><p>After a successful connection test, confirm Eaglecast actually returns a live-channel list.</p><button class="secondary" id="channels" onclick="channels()">Load channel sample</button><div id="channelResult" class="result hint">No channel test yet.</div><ul id="list"></ul></div>
+<div class="card"><h2>3. Recording test — next step</h2><p>Once connection and channels pass, we will add a one-program recording test that uses the existing Mac recording agent. PrimeStreams remains untouched until that test is proven reliable.</p></div>
+</main><script>
+const result=document.getElementById('result'), channelResult=document.getElementById('channelResult');
+function show(el,msg,ok){el.textContent=msg;el.className='result '+(ok?'ok':'bad')}
+async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});return r.json()}
+async function setup(){const d=await api('/eaglecast-test/api/config');if(!d.ok){show(result,d.error,false);return}document.getElementById('url').value=d.server_url||'';if(d.configured)show(result,'Private Eaglecast settings are saved. Re-enter username and password only if you need to change them.',true)}
+async function save(){const b=document.getElementById('save');b.disabled=true;try{const d=await api('/eaglecast-test/api/config',{server_url:url.value.trim(),username:user.value.trim(),password:pass.value});if(!d.ok)throw Error(d.error);pass.value='';show(result,'Saved locally on this Mac. Now click Test connection.',true)}catch(e){show(result,e.message,false)}finally{b.disabled=false}}
+async function test(){const b=document.getElementById('test');b.disabled=true;show(result,'Connecting…',true);try{const d=await api('/eaglecast-test/api/test',{});if(!d.ok)throw Error(d.error);show(result,`Connected: ${d.status}\nActive connections: ${d.active_connections}\nPlan maximum: ${d.max_connections}\nExpiry reported: ${d.expires_at||'not reported'}`,true)}catch(e){show(result,e.message,false)}finally{b.disabled=false}}
+async function channels(){const b=document.getElementById('channels');b.disabled=true;try{const d=await api('/eaglecast-test/api/channels',{});if(!d.ok)throw Error(d.error);show(channelResult,`${d.total} live channels returned. First 100 shown below.`,true);list.innerHTML=d.sample.map(n=>`<li>${String(n).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</li>`).join('')}catch(e){show(channelResult,e.message,false)}finally{b.disabled=false}}
+setup();</script></body></html>'''
+
 # ── Startup auto-load ────────────────────────────────────────────────────────
 
 def _startup_load():
