@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829l"
+VERSION = "v20260829m"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3432,6 +3432,14 @@ def api_prog_info():
     content_type = request.args.get('content_type', '').strip().lower()
     if content_type not in ('movie', 'series'):
         content_type = ''
+    # The guide normally labels films as "Movie", even when the browser did
+    # not send an explicit type.  Preserve that useful hint so a short title
+    # such as "Gravity" is not looked up as a TV series with a longer name.
+    if not content_type:
+        if 'movie' in category or 'film' in category:
+            content_type = 'movie'
+        elif 'series' in category or 'tv' in category:
+            content_type = 'series'
     if not title:
         return jsonify({'error': 'No title'}), 400
 
@@ -3465,11 +3473,10 @@ def api_prog_info():
         'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated FROM master_titles WHERE lower(title)=lower(?) LIMIT 1',
         (title,)
     )
-    if not rows:
-        rows = db_rows(
-            'SELECT title, poster_url, actors, plot, imdb_rating, genre, year, director, rated FROM master_titles WHERE lower(title) LIKE lower(?) LIMIT 1',
-            (f'%{title}%',)
-        )
+    # Do not use a substring fallback here.  It turns a guide entry named
+    # "Gravity" into "Gravity Falls" (or other longer, unrelated titles).
+    # External providers below can still supply metadata when there is no
+    # exact local-library title.
     if rows:
         lib_row = rows[0]
 
@@ -3554,12 +3561,25 @@ def api_prog_info():
         try:
             q   = quote(title)
             yr_param = f'&year={year}' if year else ''
-            url = f'https://api.themoviedb.org/3/search/multi?api_key={tmdb_key}&query={q}{yr_param}'
+            search_kind = ('movie' if content_type == 'movie' else
+                           'tv' if content_type == 'series' else 'multi')
+            url = f'https://api.themoviedb.org/3/search/{search_kind}?api_key={tmdb_key}&query={q}{yr_param}'
             with urlreq.urlopen(url, timeout=5) as resp:
                 td = json.loads(resp.read())
             results = td.get('results', [])
             if results:
-                m = results[0]
+                # A provider search can rank a longer title above the exact
+                # one.  Only use a normalized exact title match; showing no
+                # metadata is much better than confidently showing the wrong
+                # show, actors, poster, and Plex badge.
+                wanted_title = _re.sub(r'[^a-z0-9]', '', title.lower())
+                m = next((item for item in results
+                          if _re.sub(r'[^a-z0-9]', '',
+                                     (item.get('title') or item.get('name') or '').lower()) == wanted_title),
+                         None)
+                if not m:
+                    results = []
+            if results:
                 poster = f"https://image.tmdb.org/t/p/w300{m['poster_path']}" if m.get('poster_path') else ''
                 media_kind = m.get('media_type') or ('tv' if content_type == 'series' else 'movie')
                 cast, director = [], ''

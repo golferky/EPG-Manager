@@ -249,7 +249,9 @@ class RecordingTests(unittest.TestCase):
 
     def test_airings_ui_lists_playable_rows_and_uses_series_flag(self):
         self.assertIn("const isSeries = !!ar.is_series;", server.HTML)
-        self.assertIn("window._allAirings = ar.airings.filter(a => a.can_record);", server.HTML)
+        # A live usable stream remains playable even when it is not eligible
+        # for scheduled recording (for example, a commercial-supported feed).
+        self.assertIn("window._allAirings = ar.airings.filter(a => a.can_record || (a.can_play && a.on_now));", server.HTML)
 
     def test_active_in_memory_recording_is_not_marked_stale(self):
         self.assertIn(
