@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829f"
+VERSION = "v20260829g"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1561,6 +1561,7 @@ def api_guide():
     fav_only   = request.args.get('fav', '0') == '1'
     movie_only = request.args.get('movie', '0') == '1'
     ps_only    = request.args.get('ps',  '0') == '1'
+    eagle_only = request.args.get('eagle', '0') == '1'
     ps_episode_only = request.args.get('ps_episode', '0') == '1'
     sd_only    = request.args.get('sd',  '0') == '1'
     ps_only = ps_only or ps_episode_only
@@ -1578,10 +1579,12 @@ def api_guide():
     except Exception:
         guide_favorites = set()
     movie_favorites = set()
-    if fav_only or movie_only or ps_only:
+    if fav_only or movie_only or ps_only or eagle_only:
+        if eagle_only and not fav_only and not movie_only:
+            allowed_ch_ids = get_eaglecast_channel_ids(guide_db_path)
         if ps_only and not fav_only and not movie_only:
             allowed_ch_ids = get_recordable_channel_ids(guide_db_path, movies_db_path)
-        else:
+        elif not eagle_only:
             # Get the display names of favorite/movie channels from guide.db
             # by looking up what name each Movies.db guide_channel appears as
             where_parts = []
@@ -4695,6 +4698,7 @@ tr:hover td{background:#141414;}
       <option value="fav">★ Favorites</option>
       <option value="movie">🎬 Movie Channels</option>
       <option value="ps">📡 PrimeStreams Only</option>
+      <option value="eagle">🦅 Eaglecast Only</option>
       <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
     </select>
@@ -5546,6 +5550,7 @@ async function fetchAndRenderGuide() {
   if (mode === 'fav')   params.set('fav',   '1');
   if (mode === 'movie') params.set('movie', '1');
   if (mode === 'ps')    params.set('ps',    '1');
+  if (mode === 'eagle') params.set('eagle', '1');
   if (mode === 'ps_episode') params.set('ps_episode', '1');
   if (mode === 'sd')    params.set('sd',    '1');
   params.set('ch_offset', _chOffset);
