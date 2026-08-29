@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829g"
+VERSION = "v20260829h"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4549,7 +4549,8 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .prog-block.cat-movie  .cat-badge{background:#b45309;color:#fef3c7;}
 .prog-block.cat-series {background:#0f1e2e;border-left-color:#38bdf8;}
 .prog-block.cat-series .cat-badge{background:#0369a1;color:#e0f2fe;}
-.source-eagle{font-size:12px;line-height:1;margin:0 3px 0 2px;flex:none;}
+.source-eagle{font-size:8px;font-weight:800;letter-spacing:.04em;line-height:1.25;padding:2px 4px;border-radius:3px;
+  margin:0 4px 0 2px;flex:none;background:#6b4b08;color:#fde68a;border:1px solid #d97706;}
 .plex-play-btn{font-size:9px;color:#a78bfa;background:#2d1f5e;border:1px solid #7c3aed;border-radius:3px;padding:0 4px;margin-right:3px;flex-shrink:0;cursor:pointer;line-height:14px;}
 .plex-play-btn:hover{background:#7c3aed;color:#fff;}
 .rec-dot{font-size:9px;color:#ef4444;margin-right:3px;flex-shrink:0;animation:pulse-rec 1s infinite;}
@@ -5678,7 +5679,7 @@ function renderGuide() {
                     : _catInfo(p.category || '');
       const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
       const sourceBadge = (p.stream_provider === 'eaglecast' || eaglecastChannels.has(p.channel_id))
-        ? '<span class="source-eagle" title="Eaglecast is the selected recording source">🦅</span>' : '';
+        ? '<span class="source-eagle" title="Eaglecast is the selected recording source">🦅 EC</span>' : '';
       const sq = p.stream_quality || null;
       const qualityClass = !sq || !sq.height ? ''
         : sq.height >= 2160 ? 'q-4k'
@@ -6143,7 +6144,7 @@ async function openProg(p) {
           const inPlex = !!episodeKey && _plexEpisodes.has(episodeKey);
           return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;${best ? 'background:#2b2208;border-left:3px solid #fbbf24;padding-left:7px;' : ''}">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span title="Eaglecast recording source">🦅</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
+            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span style="color:#fde68a;background:#6b4b08;border:1px solid #d97706;border-radius:3px;padding:1px 3px;font-weight:700;" title="Eaglecast recording source">🦅 EC</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)
