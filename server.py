@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829j"
+VERSION = "v20260829k"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1599,6 +1599,8 @@ def api_guide():
     movie_only = request.args.get('movie', '0') == '1'
     ps_only    = request.args.get('ps',  '0') == '1'
     eagle_only = request.args.get('eagle', '0') == '1'
+    eagle_movie_only = request.args.get('eagle_movie', '0') == '1'
+    eagle_only = eagle_only or eagle_movie_only
     ps_episode_only = request.args.get('ps_episode', '0') == '1'
     sd_only    = request.args.get('sd',  '0') == '1'
     ps_only = ps_only or ps_episode_only
@@ -1617,11 +1619,14 @@ def api_guide():
         guide_favorites = set()
     movie_favorites = set()
     if fav_only or movie_only or ps_only or eagle_only:
-        if eagle_only and not fav_only and not movie_only:
+        if eagle_only:
             allowed_ch_ids = get_eaglecast_channel_ids(guide_db_path)
-        if ps_only and not fav_only and not movie_only:
+            if eagle_movie_only:
+                rows = db_rows('SELECT guide_channel FROM channels WHERE is_movie_channel=1 AND guide_channel IS NOT NULL AND guide_channel != ""')
+                allowed_ch_ids &= {r['guide_channel'] for r in rows}
+        elif ps_only and not fav_only and not movie_only:
             allowed_ch_ids = get_recordable_channel_ids(guide_db_path, movies_db_path)
-        elif not eagle_only:
+        else:
             # Get the display names of favorite/movie channels from guide.db
             # by looking up what name each Movies.db guide_channel appears as
             where_parts = []
@@ -4757,6 +4762,7 @@ tr:hover td{background:#141414;}
       <option value="movie">🎬 Movie Channels</option>
       <option value="ps">📡 PrimeStreams Only</option>
       <option value="eagle">🦅 Eaglecast Only</option>
+      <option value="eagle_movie">🦅 Eaglecast Premium Movies</option>
       <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
     </select>
@@ -5609,6 +5615,7 @@ async function fetchAndRenderGuide() {
   if (mode === 'movie') params.set('movie', '1');
   if (mode === 'ps')    params.set('ps',    '1');
   if (mode === 'eagle') params.set('eagle', '1');
+  if (mode === 'eagle_movie') params.set('eagle_movie', '1');
   if (mode === 'ps_episode') params.set('ps_episode', '1');
   if (mode === 'sd')    params.set('sd',    '1');
   params.set('ch_offset', _chOffset);
