@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829i"
+VERSION = "v20260829j"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1067,7 +1067,7 @@ def _stream_url(channel_id, preferred_provider=None):
         except Exception as ex:
             debug['fuzzy_error'] = str(ex)
     if not rows:
-        eaglecast = _eaglecast_stream_for_channel(channel_id)
+        eaglecast = _eaglecast_stream_for_channel(channel_id) if preferred_provider != 'primestreams' else None
         if eaglecast:
             sid, mapped_name, extension = eaglecast
             debug.update({'method': 'Eaglecast fallback', 'matched_guide_channel': mapped_name or channel_id,
@@ -1081,6 +1081,43 @@ def _stream_url(channel_id, preferred_provider=None):
     debug['provider'] = 'primestreams'
     url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
     return url, None, debug
+
+def _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id=''):
+    """Return one active/queued Eaglecast booking that overlaps this window."""
+    active = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting',
+              'recording', 'converting', 'awaiting_transfer', 'transferring')
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        row = conn.execute('''SELECT title, channel, start_ts, stop_ts FROM recordings
+                              WHERE COALESCE(stream_provider,'primestreams')='eaglecast'
+                                AND status IN ({}) AND start_ts < ? AND stop_ts > ?
+                                AND rec_id != ? ORDER BY start_ts LIMIT 1'''.format(
+                                    ','.join('?' * len(active))),
+                           list(active) + [stop_ts, start_ts, exclude_rec_id]).fetchone()
+        conn.close()
+        return row
+    except Exception:
+        return None
+
+def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id=''):
+    """Prefer Eaglecast, but never knowingly schedule two overlapping EC streams."""
+    eaglecast_exists = bool(_eaglecast_stream_for_channel(channel_id))
+    if eaglecast_exists:
+        conflict = _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id)
+        if not conflict:
+            url, error, debug = _stream_url(channel_id, 'eaglecast')
+            if not error:
+                return url, None, debug
+        # The single Eaglecast connection is occupied.  PrimeStreams becomes
+        # the safe fallback for this one recording window.
+        url, error, debug = _stream_url(channel_id, 'primestreams')
+        if not error:
+            debug['fallback_reason'] = 'Eaglecast already scheduled for an overlapping recording'
+            return url, None, debug
+        title = conflict[0] if conflict else 'another recording'
+        return None, (f'Eaglecast is already scheduled for overlapping "{title}", '
+                      'and PrimeStreams has no usable stream for this channel.'), {}
+    return _stream_url(channel_id, 'primestreams')
 
 def _saved_stream_quality(channel_id):
     """Read a safe cached channel-quality record from guide.db."""
@@ -2551,7 +2588,7 @@ def _best_incomplete_rerecord(title, expected_seconds):
             continue
         if _is_foreign_recording_feed(channel) or not _is_commercial_free_channel(channel):
             continue
-        _url, stream_error, stream_debug = _stream_url(channel_id)
+        _url, stream_error, stream_debug = _resolve_recording_source(channel_id, start, stop)
         if stream_error or _recent_same_source_failure(title, channel_id):
             continue
         quality = _saved_stream_quality(channel_id) or {}
@@ -3045,13 +3082,15 @@ def api_recommendation_movie_upgrade():
             row['channel_name'])), None)
         if not candidate:
             return jsonify({'better': False, 'decision': 'No future commercial-free airing found'})
-        url, stream_error, _debug = _stream_url(candidate['channel_id'])
+        start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        url, stream_error, _debug = _resolve_recording_source(
+            candidate['channel_id'], start.timestamp(), stop.timestamp()
+        )
         if stream_error:
             return jsonify({'better': False, 'decision': 'The next clean airing is not recordable'})
         incoming = probe_media(url, ffprobe=cfg.get('ffprobe', 'ffprobe'), timeout=45)
         better, decision = quality_decision(existing, incoming)
-        start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
-        stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
         return jsonify({
             'better': better, 'decision': decision,
             'airing': {
@@ -3673,7 +3712,9 @@ def api_airings():
             # Resolve each listing with the same lookup used when recording. This
             # catches SD numeric rows such as "MGM+ Hits HD" that map to a
             # PrimeStreams channel named simply "MGM+ HITS".
-            _url, stream_error, stream_debug = _stream_url(r['channel_id'])
+            _url, stream_error, stream_debug = _resolve_recording_source(
+                r['channel_id'], su.timestamp(), eu.timestamp()
+            )
             stream_quality = _saved_stream_quality(r['channel_id']) or {}
             airings.append({
                 'channel_id':   r['channel_id'],
@@ -3946,7 +3987,9 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             if key in existing_keys:
                 continue
             rec_id = f"rec_{int(time.time()*1000)}_{r['channel_id'][:8]}"
-            _url, stream_error, stream_debug = _stream_url(r['channel_id'])
+            _url, stream_error, stream_debug = _resolve_recording_source(
+                r['channel_id'], su.timestamp(), eu.timestamp()
+            )
             if stream_error:
                 print(f'[series] stream lookup failed for {r["channel_id"]}: {stream_error}')
                 continue
@@ -4186,7 +4229,7 @@ def api_record():
         'is_series': bool(data.get('is_series', False)),
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
     }
-    _url, stream_error, stream_debug = _stream_url(channel_id)
+    _url, stream_error, stream_debug = _resolve_recording_source(channel_id, start_ts, stop_ts)
     if stream_error:
         return jsonify({'ok': False, 'error': stream_error}), 400
     rec['stream_id'] = str(stream_debug.get('stream_id') or '')
@@ -4200,7 +4243,9 @@ def api_record():
     if rec['backend'] == 'local':
         t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
         t.start()
-    return jsonify({'ok': True, 'id': rec_id, 'channel': channel_name, 'start_ts': start_ts})
+    return jsonify({'ok': True, 'id': rec_id, 'channel': channel_name, 'start_ts': start_ts,
+                    'source': rec['stream_provider'],
+                    'fallback_reason': stream_debug.get('fallback_reason', '')})
 
 @app.route('/epg-web/api/record/status')
 def api_rec_status():
@@ -4354,11 +4399,20 @@ def api_agent_claim():
                         WHERE COALESCE(backend,'local')='agent'
                         AND status IN ('recording','converting','awaiting_transfer','transferring')
                         AND lease_until IS NOT NULL AND lease_until < ?''', (now,))
-        row = conn.execute('''SELECT * FROM recordings
-                              WHERE COALESCE(backend,'local')='agent'
-                              AND status IN ('queued','scheduled')
-                              AND stop_ts > ? AND start_ts <= ?
-                              ORDER BY start_ts LIMIT 1''',
+        row = conn.execute('''SELECT * FROM recordings AS candidate
+                              WHERE COALESCE(candidate.backend,'local')='agent'
+                              AND candidate.status IN ('queued','scheduled')
+                              AND candidate.stop_ts > ? AND candidate.start_ts <= ?
+                              AND (COALESCE(candidate.stream_provider,'primestreams') != 'eaglecast'
+                                   OR NOT EXISTS (
+                                      SELECT 1 FROM recordings AS other
+                                      WHERE other.rec_id != candidate.rec_id
+                                        AND COALESCE(other.stream_provider,'primestreams')='eaglecast'
+                                        AND other.status IN ('queued','scheduled','agent_claimed','preflight','waiting','recording','converting','awaiting_transfer','transferring')
+                                        AND other.start_ts < candidate.stop_ts
+                                        AND other.stop_ts > candidate.start_ts
+                                   ))
+                              ORDER BY candidate.start_ts LIMIT 1''',
                            (now + 30, now + claim_ahead)).fetchone()
         if row:
             lease_until = now + lease_seconds
@@ -6519,7 +6573,10 @@ async function recordAiring(airing, title, button) {
   if (r.ok) {
     btn.textContent = '✅ Scheduled';
     btn.style.background = '#166534';
-    document.getElementById('pm-status').textContent = `✅ "${title}" queued`;
+    const sourceText = r.source === 'eaglecast' ? 'on Eaglecast'
+      : r.fallback_reason ? 'on PrimeStreams (Eaglecast is busy)'
+      : 'on PrimeStreams';
+    document.getElementById('pm-status').textContent = `✅ "${title}" queued ${sourceText}`;
     document.getElementById('pm-status').className = 'status-msg ok';
     startRecPoll();
     refreshGuideRecMap().then(() => renderGuide());
