@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260829m"
+VERSION = "v20260830a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -158,6 +158,26 @@ def _is_premium_channel(name):
 def _is_commercial_free_channel(name):
     """Channels we can reliably treat as commercial-free for movie recording."""
     return _is_premium_channel(name)
+
+
+def _is_premium_movie_channel(name):
+    """True for the curated movie-network list used by the Eaglecast movie view.
+
+    Movies.db's ``is_movie_channel`` is useful for broad discovery, but it is
+    provider-supplied and can occasionally label a sports feed as a movie
+    channel.  This filter is intentionally conservative and name-based.
+    """
+    normalized = _channel_match_base(name)
+    movie_prefixes = (
+        # Traditional premium and commercial-free movie services.
+        'hbo', 'showtime', 'starz', 'encore', 'cinemax', 'mgm', 'epix',
+        'skycinema', 'screenpix', 'hollywoodsuite',
+        # Dedicated movie networks that are useful to browse even though some
+        # may carry commercials.
+        'movieplex', 'indieplex', 'retroplex', 'fxm', 'pixl', 'sony',
+        'tcm', 'turnerclassicmovies', 'lifetimemovie', 'hallmarkmovies',
+    )
+    return normalized.startswith(movie_prefixes)
 
 
 def _is_foreign_recording_feed(name):
@@ -1622,8 +1642,15 @@ def api_guide():
         if eagle_only:
             allowed_ch_ids = get_eaglecast_channel_ids(guide_db_path)
             if eagle_movie_only:
-                rows = db_rows('SELECT guide_channel FROM channels WHERE is_movie_channel=1 AND guide_channel IS NOT NULL AND guide_channel != ""')
-                allowed_ch_ids &= {r['guide_channel'] for r in rows}
+                # Do not rely on the broad provider category here: it has
+                # incorrectly classified channels such as FOX Soccer Plus as
+                # movie channels.  Use the deliberately curated network list.
+                guide_names = {str(c.get('id') or ''): str(c.get('name') or '')
+                               for c in _epg.get('channels', [])}
+                allowed_ch_ids = {
+                    channel_id for channel_id in allowed_ch_ids
+                    if _is_premium_movie_channel(guide_names.get(str(channel_id), ''))
+                }
         elif ps_only and not fav_only and not movie_only:
             allowed_ch_ids = get_recordable_channel_ids(guide_db_path, movies_db_path)
         else:
