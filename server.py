@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260830b"
+VERSION = "v20260830c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5691,6 +5691,10 @@ function renderGuide() {
   if (!_guideData) return;
   _progMap = {};
   const d = _guideData;
+  const guideMode = document.getElementById('guide-ch-mode').value;
+  // In either Eaglecast-only view the source is already obvious from the
+  // filter, so repeating an EC badge on every programme only adds clutter.
+  const showEagleBadges = guideMode !== 'eagle' && guideMode !== 'eagle_movie';
   const wsTs = d.window_start_ts;
   const weTs = d.window_end_ts;
   const totalMins = (weTs - wsTs) / 60;
@@ -5778,7 +5782,7 @@ function renderGuide() {
                     : isSeries ? {cls:'cat-series', badge:'TV', title:'Series'}
                     : _catInfo(p.category || '');
       const catBadge = catI.badge ? `<span class="cat-badge" title="${catI.title || catI.badge}">${catI.badge}</span>` : '';
-      const sourceBadge = (p.stream_provider === 'eaglecast' || eaglecastChannels.has(p.channel_id))
+      const sourceBadge = showEagleBadges && (p.stream_provider === 'eaglecast' || eaglecastChannels.has(p.channel_id))
         ? '<span class="source-eagle" title="Eaglecast is the selected recording source">🦅 EC</span>' : '';
       const sq = p.stream_quality || null;
       const qualityClass = !sq || !sq.height ? ''
