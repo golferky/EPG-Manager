@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260830a"
+VERSION = "v20260830b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -161,23 +161,8 @@ def _is_commercial_free_channel(name):
 
 
 def _is_premium_movie_channel(name):
-    """True for the curated movie-network list used by the Eaglecast movie view.
-
-    Movies.db's ``is_movie_channel`` is useful for broad discovery, but it is
-    provider-supplied and can occasionally label a sports feed as a movie
-    channel.  This filter is intentionally conservative and name-based.
-    """
-    normalized = _channel_match_base(name)
-    movie_prefixes = (
-        # Traditional premium and commercial-free movie services.
-        'hbo', 'showtime', 'starz', 'encore', 'cinemax', 'mgm', 'epix',
-        'skycinema', 'screenpix', 'hollywoodsuite',
-        # Dedicated movie networks that are useful to browse even though some
-        # may carry commercials.
-        'movieplex', 'indieplex', 'retroplex', 'fxm', 'pixl', 'sony',
-        'tcm', 'turnerclassicmovies', 'lifetimemovie', 'hallmarkmovies',
-    )
-    return normalized.startswith(movie_prefixes)
+    """Premium, commercial-free movie networks for the Eaglecast premium view."""
+    return _is_premium_channel(name)
 
 
 def _is_foreign_recording_feed(name):
@@ -1644,7 +1629,9 @@ def api_guide():
             if eagle_movie_only:
                 # Do not rely on the broad provider category here: it has
                 # incorrectly classified channels such as FOX Soccer Plus as
-                # movie channels.  Use the deliberately curated network list.
+                # movie channels.  This is deliberately the clean premium
+                # group only — commercial movie networks such as FXM belong
+                # in Eaglecast All, not Eaglecast Premium Movies.
                 guide_names = {str(c.get('id') or ''): str(c.get('name') or '')
                                for c in _epg.get('channels', [])}
                 allowed_ch_ids = {
@@ -4813,7 +4800,7 @@ tr:hover td{background:#141414;}
       <option value="fav">★ Favorites</option>
       <option value="movie">🎬 Movie Channels</option>
       <option value="ps">📡 PrimeStreams Only</option>
-      <option value="eagle">🦅 Eaglecast Only</option>
+      <option value="eagle">🦅 Eaglecast All (mapped)</option>
       <option value="eagle_movie">🦅 Eaglecast Premium Movies</option>
       <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
