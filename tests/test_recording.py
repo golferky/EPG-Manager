@@ -37,6 +37,15 @@ class RecordingTests(unittest.TestCase):
         self.assertTrue(server._is_premium_channel("Sky Cinema Greats"))
         self.assertFalse(server._is_premium_channel("ANTENNA TV"))
 
+    def test_commercial_report_parser_reads_frame_ranges(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = os.path.join(temp, "review.txt")
+            with open(report, "w") as handle:
+                handle.write("FILE PROCESSING COMPLETE  1000 FRAMES AT  2997\n---\n2997\t5994\n")
+            self.assertEqual(server._commercial_breaks_from_report(report, 29.97), [
+                {'start': 100.0, 'end': 200.0, 'duration': 100.0},
+            ])
+
     def test_agent_transfer_status_is_active(self):
         self.assertTrue(server._rec_is_active({"status": "awaiting_transfer"}))
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260830c"
+VERSION = "v20260901a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -205,6 +205,8 @@ _epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'loaded': None}
 _ps_channel_cache = {'paths': (), 'loaded_at': 0, 'ids': set()}
 _stream_quality_scan = {'running': False, 'completed': 0, 'total': 0}
 _stream_quality_scan_lock = threading.Lock()
+_commercial_review_lock = threading.Lock()
+_commercial_review_running = set()
 
 def _parse_dt(s):
     s = s.strip()
@@ -2267,6 +2269,166 @@ def api_recording_health():
         retry = queued_retries.get(str(record.get('title') or '').strip().lower())
         reports.append({**record, 'result': result, 'retry': retry})
     return jsonify({'reports': reports})
+
+
+def _commercial_review_roots(cfg):
+    """The only media locations the commercial reviewer may ever read."""
+    roots = [cfg.get('plex_path', '/Volumes/Plex/Movies'), _plex_tv_path(cfg)]
+    return [os.path.realpath(root) for root in roots if root and os.path.isdir(root)]
+
+
+def _commercial_review_path_is_safe(path, cfg):
+    """Keep analysis restricted to an existing file inside a Plex library."""
+    if not path or not os.path.isfile(path):
+        return False
+    real_path = os.path.realpath(path)
+    try:
+        return any(os.path.commonpath([root, real_path]) == root
+                   for root in _commercial_review_roots(cfg))
+    except ValueError:
+        return False
+
+
+def _commercial_review_candidates():
+    """Finished Plex recordings that can be analyzed without accepting a path from the browser."""
+    cfg = load_config()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT rec_id, title, channel, start_ts, result_json
+                               FROM recordings
+                               WHERE result_json IS NOT NULL AND result_json != ''
+                               ORDER BY start_ts DESC LIMIT 300''').fetchall()
+        conn.close()
+    except Exception:
+        return []
+    candidates, seen_paths = [], set()
+    for row in rows:
+        try:
+            result = json.loads(row['result_json'] or '{}')
+        except (TypeError, ValueError):
+            continue
+        media_path = result.get('plex_path')
+        if (not _commercial_review_path_is_safe(media_path, cfg)
+                or media_path in seen_paths):
+            continue
+        seen_paths.add(media_path)
+        try:
+            stat = os.stat(media_path)
+        except OSError:
+            continue
+        candidates.append({
+            'rec_id': str(row['rec_id']), 'title': row['title'] or 'Untitled',
+            'channel': row['channel'] or '', 'file_name': os.path.basename(media_path),
+            'size': stat.st_size, 'start_ts': row['start_ts'] or 0,
+        })
+        if len(candidates) >= 80:
+            break
+    return candidates
+
+
+def _find_commercial_review_candidate(rec_id):
+    return next((item for item in _commercial_review_candidates()
+                 if item['rec_id'] == str(rec_id)), None)
+
+
+def _commercial_reviewer_binary(cfg):
+    """Find an explicitly configured Comskip binary without downloading anything."""
+    configured = str(cfg.get('comskip_path') or os.environ.get('COMSKIP_PATH') or '').strip()
+    candidates = [configured] if configured else []
+    candidates.extend([shutil.which('comskip') or '',
+                       os.path.join(BASE_DIR, 'tools', 'comskip'),
+                       '/opt/homebrew/bin/comskip', '/usr/local/bin/comskip'])
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ''
+
+
+def _commercial_breaks_from_report(report_path, fps):
+    """Read Comskip's frame ranges; no media is changed by this parser."""
+    breaks = []
+    try:
+        with open(report_path, encoding='utf-8', errors='replace') as report:
+            for line in report:
+                match = re.match(r'^\s*(\d+)\s+(\d+)\s*$', line)
+                if not match:
+                    continue
+                start_frame, end_frame = int(match.group(1)), int(match.group(2))
+                if end_frame <= start_frame:
+                    continue
+                start, end = start_frame / fps, end_frame / fps
+                breaks.append({'start': round(start, 1), 'end': round(end, 1),
+                               'duration': round(end - start, 1)})
+    except OSError:
+        pass
+    return breaks
+
+
+def _commercial_time(seconds):
+    seconds = max(0, int(round(seconds)))
+    return f'{seconds // 60}:{seconds % 60:02d}'
+
+
+@app.route('/epg-web/api/recording-health/commercial-review')
+def api_commercial_review_candidates():
+    return jsonify({'candidates': _commercial_review_candidates(),
+                    'analyzer_ready': bool(_commercial_reviewer_binary(load_config()))})
+
+
+@app.route('/epg-web/api/recording-health/commercial-review/analyze', methods=['POST'])
+def api_analyze_commercials():
+    """Create a non-destructive commercial-break report for one known Plex recording."""
+    rec_id = str((request.json or {}).get('rec_id') or '')
+    candidate = _find_commercial_review_candidate(rec_id)
+    if not candidate:
+        return jsonify({'ok': False, 'error': 'That completed Plex recording is no longer available.'}), 404
+    cfg = load_config()
+    binary = _commercial_reviewer_binary(cfg)
+    if not binary:
+        return jsonify({'ok': False,
+                        'error': 'Commercial analysis is not installed on this Mac yet.'}), 503
+    with _commercial_review_lock:
+        if rec_id in _commercial_review_running:
+            return jsonify({'ok': False, 'error': 'That recording is already being analyzed.'}), 409
+        _commercial_review_running.add(rec_id)
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        row = conn.execute('SELECT result_json FROM recordings WHERE rec_id=?', (rec_id,)).fetchone()
+        conn.close()
+        result = json.loads((row or [''])[0] or '{}')
+        media_path = result.get('plex_path')
+        if not _commercial_review_path_is_safe(media_path, cfg):
+            return jsonify({'ok': False, 'error': 'The Plex file is unavailable or outside its library.'}), 409
+        review_id = uuid.uuid4().hex[:12]
+        output_dir = os.path.join(BASE_DIR, 'commercial_reviews', review_id)
+        os.makedirs(output_dir, exist_ok=False)
+        base_name = 'commercial-review'
+        try:
+            completed = subprocess.run(
+                [binary, f'--output={output_dir}', f'--output-filename={base_name}', media_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return jsonify({'ok': False, 'error': 'Analysis timed out after 10 minutes. The recording was not changed.'}), 504
+        if completed.returncode:
+            detail = (completed.stderr or '').strip().splitlines()[-1:] or ['unknown analyzer error']
+            return jsonify({'ok': False, 'error': f'Analysis could not finish: {detail[0]}'}), 500
+        try:
+            from recording_agent import probe_media
+            probe = probe_media(media_path, cfg.get('ffprobe', 'ffprobe'), timeout=30)
+            fps = float(probe.get('fps') or 0) or 29.97
+        except Exception:
+            fps = 29.97
+        breaks = _commercial_breaks_from_report(os.path.join(output_dir, f'{base_name}.txt'), fps)
+        total = round(sum(item['duration'] for item in breaks), 1)
+        return jsonify({'ok': True, 'review_id': review_id, 'title': candidate['title'],
+                        'breaks': breaks, 'total_seconds': total,
+                        'message': 'Report only — the Plex recording was not edited.'})
+    finally:
+        with _commercial_review_lock:
+            _commercial_review_running.discard(rec_id)
 
 
 def _incomplete_plex_copy_reports():
@@ -5039,6 +5201,18 @@ tr:hover td{background:#141414;}
   <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
       <div>
+        <h2 style="margin:0;">✂️ Commercial Review</h2>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">Analyze a completed Plex recording and inspect possible breaks first. This does not edit or replace the Plex file.</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadCommercialReview()">↻ Refresh</button>
+    </div>
+    <div id="commercial-review-note" style="font-size:12px;color:#94a3b8;margin-bottom:8px;"></div>
+    <div id="commercial-review-empty" style="display:none;color:#64748b;font-size:13px;">No completed Plex recordings are available to review yet.</div>
+    <div id="commercial-review-list" style="max-height:320px;overflow-y:auto;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div>
         <h2 style="margin:0;">⚠ Incomplete Plex Copies</h2>
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Files that are still more than 5% shorter than the airing they were meant to capture.</div>
       </div>
@@ -5273,7 +5447,7 @@ function switchTab(name) {
   if (name === 'channels') loadChannels();
   if (name === '247') load247();
   if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
-  if (name === 'health') { loadRecordingHealth(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
+  if (name === 'health') { loadRecordingHealth(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
 }
@@ -7044,6 +7218,55 @@ async function loadRecordingHealth() {
     }).join('');
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load recording health: ${esc(err.message || String(err))}</div>`;
+  }
+}
+function commercialClock(seconds) {
+  const n = Math.max(0, Math.round(Number(seconds || 0)));
+  return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}`;
+}
+async function loadCommercialReview() {
+  const list = document.getElementById('commercial-review-list');
+  const empty = document.getElementById('commercial-review-empty');
+  const note = document.getElementById('commercial-review-note');
+  if (!list || !empty || !note) return;
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;padding:6px 0;">Finding completed Plex recordings…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/commercial-review')).json();
+    note.textContent = d.analyzer_ready
+      ? 'Review mode is on. Results are suggestions only; no video will be edited.'
+      : 'The review screen is ready, but the commercial analyzer still needs to be installed on this Mac.';
+    note.style.color = d.analyzer_ready ? '#86efac' : '#fbbf24';
+    const files = d.candidates || [];
+    if (!files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    list.innerHTML = files.map(f => `<div id="commercial-review-${esc(String(f.rec_id || ''))}" style="display:flex;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #222;flex-wrap:wrap;">
+      <div style="flex:1;min-width:230px;">
+        <strong style="font-size:14px;">${esc(f.title || 'Untitled')}</strong>
+        <div style="font-size:12px;color:#94a3b8;margin-top:4px;">${esc(f.channel || '')}${f.file_name ? ` · ${esc(f.file_name)}` : ''}${f.size ? ` · ${esc(healthSize(f.size))}` : ''}</div>
+      </div>
+      <button class="btn btn-sm" ${d.analyzer_ready ? '' : 'disabled'} style="background:#1d4ed8;color:#dbeafe;" onclick="analyzeCommercials('${String(f.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">✂ Analyze breaks</button>
+    </div>`).join('');
+  } catch (err) {
+    list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load commercial review: ${esc(err.message || String(err))}</div>`;
+  }
+}
+async function analyzeCommercials(recId, button) {
+  if (!confirm('Analyze this recording for possible commercial breaks? This creates a report only. Plex and the video file will not be changed.')) return;
+  const original = button.textContent;
+  button.disabled = true; button.textContent = 'Analyzing…';
+  try {
+    const d = await post('/epg-web/api/recording-health/commercial-review/analyze', {rec_id: recId});
+    if (!d.ok) throw new Error(d.error || 'Could not analyze this recording.');
+    const target = document.getElementById(`commercial-review-${recId}`);
+    const breaks = d.breaks || [];
+    const detail = breaks.length
+      ? breaks.map(b => `${commercialClock(b.start)}–${commercialClock(b.end)} (${Math.round(b.duration)} sec)`).join(' · ')
+      : 'No likely commercial blocks found.';
+    if (target) target.insertAdjacentHTML('beforeend', `<div style="width:100%;padding:8px 10px;background:#111827;border:1px solid #334155;border-radius:5px;font-size:12px;color:#cbd5e1;">${esc(detail)}${breaks.length ? `<div style="margin-top:4px;color:#fbbf24;font-weight:700;">${Math.round(d.total_seconds || 0)} sec proposed for review — nothing was removed.</div>` : ''}</div>`);
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    button.disabled = false; button.textContent = original;
   }
 }
 async function rerecordFromHealth(recId, button) {
