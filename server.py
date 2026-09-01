@@ -2303,8 +2303,9 @@ def _commercial_review_path_is_safe(path, cfg):
 
 
 def _commercial_review_candidates():
-    """Finished Plex recordings that can be analyzed without accepting a path from the browser."""
+    """Finished Plex TV recordings that can be analyzed without a browser path."""
     cfg = load_config()
+    tv_root = os.path.realpath(_plex_tv_path(cfg))
     try:
         conn = sqlite3.connect(_guide_db_path(), timeout=30)
         conn.row_factory = sqlite3.Row
@@ -2322,7 +2323,11 @@ def _commercial_review_candidates():
         except (TypeError, ValueError):
             continue
         media_path = result.get('plex_path')
-        if (not _commercial_review_path_is_safe(media_path, cfg)
+        try:
+            is_tv_episode = os.path.commonpath([tv_root, os.path.realpath(media_path or '')]) == tv_root
+        except ValueError:
+            is_tv_episode = False
+        if (not is_tv_episode or not _commercial_review_path_is_safe(media_path, cfg)
                 or media_path in seen_paths):
             continue
         seen_paths.add(media_path)
@@ -5221,12 +5226,12 @@ tr:hover td{background:#141414;}
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
       <div>
         <h2 style="margin:0;">✂️ Commercial Review</h2>
-        <div style="font-size:12px;color:#64748b;margin-top:3px;">Analyze a completed Plex recording and inspect possible breaks first. This does not edit or replace the Plex file.</div>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">TV episodes only: analyze a completed Plex episode and inspect possible breaks first. This does not edit or replace the Plex file.</div>
       </div>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadCommercialReview()">↻ Refresh</button>
     </div>
     <div id="commercial-review-note" style="font-size:12px;color:#94a3b8;margin-bottom:8px;"></div>
-    <div id="commercial-review-empty" style="display:none;color:#64748b;font-size:13px;">No completed Plex recordings are available to review yet.</div>
+    <div id="commercial-review-empty" style="display:none;color:#64748b;font-size:13px;">No completed Plex TV episodes are available to review yet.</div>
     <div id="commercial-review-list" style="max-height:320px;overflow-y:auto;"></div>
   </div>
   <div class="card" style="margin-top:12px;">
@@ -7248,7 +7253,7 @@ async function loadCommercialReview() {
   const empty = document.getElementById('commercial-review-empty');
   const note = document.getElementById('commercial-review-note');
   if (!list || !empty || !note) return;
-  list.innerHTML = '<div style="color:#64748b;font-size:13px;padding:6px 0;">Finding completed Plex recordings…</div>';
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;padding:6px 0;">Finding completed Plex TV episodes…</div>';
   try {
     const d = await (await fetch('/epg-web/api/recording-health/commercial-review')).json();
     note.textContent = d.analyzer_ready
