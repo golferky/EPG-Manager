@@ -166,9 +166,18 @@ def _is_premium_movie_channel(name):
 
 
 def _is_foreign_recording_feed(name):
-    """Exclude regional Spanish/Latino feeds from recording choices by default."""
+    """Exclude clearly non-English feeds from every new recording choice.
+
+    This intentionally keys off explicit language/region labels in a channel
+    name.  It does not guess from a show's title, and does not reject ordinary
+    English-language Canadian or US regional feeds.
+    """
     return bool(re.search(
-        r'\b(?:latino|latina|latam|latin america|español|espanol|spanish)\b',
+        r'\b(?:latino|latina|latam|latin america|español|espanol|spanish|'
+        r'french|français|francais|german|deutsch|italian|italiano|'
+        r'portuguese|português|portugues|brazilian|arabic|hindi|punjabi|'
+        r'urdu|chinese|mandarin|cantonese|korean|japanese|vietnamese|'
+        r'tagalog|filipino|russian|polish|greek|turkish)\b',
         name or '', re.I))
 
 def get_db():
@@ -1792,7 +1801,11 @@ def api_guide():
         except Exception:
             pass
         for prog in progs_in_window:
-            prog['can_record'] = prog['channel_id'] in recordable_ids
+            # Never offer a record action on an explicitly non-English feed.
+            # The server below enforces the same rule so a stale browser cannot
+            # bypass it.
+            prog['can_record'] = (prog['channel_id'] in recordable_ids
+                                  and not _is_foreign_recording_feed(prog.get('channel_name', '')))
             prog['stream_provider'] = ('eaglecast' if prog['channel_id'] in eaglecast_ids
                                        else 'primestreams') if prog['can_record'] else ''
             if prog['can_record'] and prog['channel_id'] in quality_by_id:
@@ -4405,6 +4418,12 @@ def api_record():
             gconn.close()
         except Exception:
             pass
+
+    # Enforce the same language rule used by the guide, detail modal, retries,
+    # and series scheduling.  The browser never gets to override it.
+    if _is_foreign_recording_feed(channel_name):
+        return jsonify({'ok': False,
+                        'error': f'{channel_name} is excluded because it is a non-English feed.'}), 400
 
     # Dedup: reject if same channel+start_ts already queued/scheduled/recording
     with _rec_lock:

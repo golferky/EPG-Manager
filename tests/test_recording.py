@@ -37,6 +37,14 @@ class RecordingTests(unittest.TestCase):
         self.assertTrue(server._is_premium_channel("Sky Cinema Greats"))
         self.assertFalse(server._is_premium_channel("ANTENNA TV"))
 
+    def test_non_english_channel_classifier(self):
+        self.assertTrue(server._is_foreign_recording_feed("HBO Latino HD"))
+        self.assertTrue(server._is_foreign_recording_feed("CINE ESPAÑOL"))
+        self.assertTrue(server._is_foreign_recording_feed("TV5 French"))
+        self.assertTrue(server._is_foreign_recording_feed("Arabic Movies"))
+        self.assertFalse(server._is_foreign_recording_feed("A&E Canada HD"))
+        self.assertFalse(server._is_foreign_recording_feed("HBO Drama"))
+
     def test_commercial_report_parser_reads_frame_ranges(self):
         with tempfile.TemporaryDirectory() as temp:
             report = os.path.join(temp, "review.txt")
