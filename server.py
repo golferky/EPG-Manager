@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260901c"
+VERSION = "v20260901d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2445,14 +2445,17 @@ def api_analyze_commercials():
         # Persist the exact source fingerprint and proposed ranges.  The copy
         # endpoint accepts only this server-created report, never a browser
         # path or browser-supplied cut list.
-        with open(os.path.join(output_dir, 'report.json'), 'w', encoding='utf-8') as report:
-            json.dump({
+        manifest = {
                 'rec_id': rec_id, 'title': candidate['title'], 'source_path': media_path,
                 'source_size': os.path.getsize(media_path),
                 'source_mtime': os.path.getmtime(media_path), 'breaks': breaks,
-            }, report)
+        }
+        with open(os.path.join(output_dir, 'report.json'), 'w', encoding='utf-8') as report:
+            json.dump(manifest, report)
+        copy_job_id, copy_error = _queue_commercial_review_copy(manifest, cfg)
         return jsonify({'ok': True, 'review_id': review_id, 'title': candidate['title'],
-                        'breaks': breaks, 'total_seconds': total,
+                        'breaks': breaks, 'total_seconds': total, 'copy_job_id': copy_job_id,
+                        'copy_error': copy_error,
                         'message': 'Report only — the Plex recording was not edited.'})
     finally:
         with _commercial_review_lock:
@@ -2496,6 +2499,26 @@ def _unique_review_copy_path(output_dir, source_path):
         destination = os.path.join(output_dir, f'{stem} ({suffix}){ext}')
         suffix += 1
     return destination
+
+
+def _queue_commercial_review_copy(manifest, cfg):
+    """Queue one safe comparison copy and return its in-memory progress ID."""
+    output_dir = _commercial_review_output_dir(cfg)
+    if not _commercial_review_output_is_safe(output_dir, cfg):
+        return '', 'Commercial Review cannot write inside a Plex library.'
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as exc:
+        return '', f'Could not create the Commercial Review folder: {exc}'
+    job_id = uuid.uuid4().hex[:12]
+    destination = _unique_review_copy_path(output_dir, manifest['source_path'])
+    _commercial_copy_jobs[job_id] = {'status': 'queued', 'progress': 0,
+                                     'message': 'Preparing comparison copy…',
+                                     'title': manifest.get('title', 'Untitled'),
+                                     'destination': destination}
+    threading.Thread(target=_start_commercial_review_copy,
+                     args=(job_id, manifest, cfg), daemon=True).start()
+    return job_id, ''
 
 
 def _commercial_keep_segments(duration, breaks):
@@ -2577,21 +2600,9 @@ def api_create_commercial_review_copy():
     if not unchanged:
         return jsonify({'ok': False,
                         'error': 'The Plex source changed after analysis. Analyze it again first.'}), 409
-    output_dir = _commercial_review_output_dir(cfg)
-    if not _commercial_review_output_is_safe(output_dir, cfg):
-        return jsonify({'ok': False, 'error': 'Commercial Review cannot write inside a Plex library.'}), 400
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-    except OSError as exc:
-        return jsonify({'ok': False, 'error': f'Could not create the Commercial Review folder: {exc}'}), 500
-    job_id = uuid.uuid4().hex[:12]
-    destination = _unique_review_copy_path(output_dir, source)
-    _commercial_copy_jobs[job_id] = {'status': 'queued', 'progress': 0,
-                                     'message': 'Preparing comparison copy…',
-                                     'title': manifest.get('title', 'Untitled'),
-                                     'destination': destination}
-    threading.Thread(target=_start_commercial_review_copy,
-                     args=(job_id, manifest, cfg), daemon=True).start()
+    job_id, error = _queue_commercial_review_copy(manifest, cfg)
+    if error:
+        return jsonify({'ok': False, 'error': error}), 400
     return jsonify({'ok': True, 'job_id': job_id})
 
 
@@ -7459,8 +7470,9 @@ async function loadCommercialReview() {
   }
 }
 async function analyzeCommercials(recId, button) {
-  if (!confirm('Analyze this recording for possible commercial breaks? This creates a report only. Plex and the video file will not be changed.')) return;
+  if (!confirm('Analyze this episode and automatically create a separate commercial-cut comparison copy outside Plex? The Plex original will not be changed.')) return;
   const original = button.textContent;
+  let copyStarted = false;
   button.disabled = true; button.textContent = 'Analyzing…';
   try {
     const d = await post('/epg-web/api/recording-health/commercial-review/analyze', {rec_id: recId});
@@ -7470,37 +7482,32 @@ async function analyzeCommercials(recId, button) {
     const detail = breaks.length
       ? breaks.map(b => `${commercialClock(b.start)}–${commercialClock(b.end)} (${Math.round(b.duration)} sec)`).join(' · ')
       : 'No likely commercial blocks found.';
-    if (target) target.insertAdjacentHTML('beforeend', `<div style="width:100%;padding:8px 10px;background:#111827;border:1px solid #334155;border-radius:5px;font-size:12px;color:#cbd5e1;">${esc(detail)}${breaks.length ? `<div style="margin-top:4px;color:#fbbf24;font-weight:700;">${Math.round(d.total_seconds || 0)} sec proposed for review — nothing was removed.</div><button class="btn btn-sm" style="margin-top:8px;background:#166534;color:#dcfce7;" onclick="createCommercialReviewCopy('${esc(d.review_id || '')}',this)">Create review copy</button><div class="commercial-copy-status" style="margin-top:6px;color:#94a3b8;"></div>` : ''}</div>`);
+    if (target) target.insertAdjacentHTML('beforeend', `<div style="width:100%;padding:8px 10px;background:#111827;border:1px solid #334155;border-radius:5px;font-size:12px;color:#cbd5e1;">${esc(detail)}${breaks.length ? `<div style="margin-top:4px;color:#fbbf24;font-weight:700;">${Math.round(d.total_seconds || 0)} sec proposed for review — creating comparison copy.</div><div class="commercial-copy-status" style="margin-top:6px;color:#94a3b8;"></div>` : ''}</div>`);
+    const status = target?.querySelector('.commercial-copy-status');
+    if (breaks.length && d.copy_job_id) {
+      copyStarted = true; button.textContent = 'Creating copy…';
+      trackCommercialReviewCopy(d.copy_job_id, status, button);
+    }
+    if (breaks.length && d.copy_error && status) status.textContent = `Could not start comparison copy: ${d.copy_error}`;
   } catch (err) {
     alert(err.message || String(err));
   } finally {
-    button.disabled = false; button.textContent = original;
+    if (!copyStarted) { button.disabled = false; button.textContent = original; }
   }
 }
-async function createCommercialReviewCopy(reviewId, button) {
-  if (!reviewId || !confirm('Create a separate commercial-cut copy outside Plex for comparison? The Plex original will not change.')) return;
-  const status = button.parentElement?.querySelector('.commercial-copy-status');
-  button.disabled = true; button.textContent = 'Preparing…';
+async function trackCommercialReviewCopy(jobId, status, button) {
   try {
-    const d = await post('/epg-web/api/recording-health/commercial-review/copy', {review_id: reviewId});
-    if (!d.ok) throw new Error(d.error || 'Could not start the comparison copy.');
-    const poll = async () => {
-      const progress = await (await fetch(`/epg-web/api/recording-health/commercial-review/copy/${encodeURIComponent(d.job_id)}`)).json();
-      if (!progress.ok) throw new Error(progress.error || 'Could not check copy progress.');
-      if (status) status.textContent = progress.status === 'done'
-        ? `✓ ${progress.message} ${progress.file_name || ''}`
-        : `${progress.message} ${progress.progress ? `(${progress.progress}%)` : ''}`;
-      if (progress.status === 'done') { button.textContent = '✓ Copy ready'; return; }
-      if (progress.status === 'failed') throw new Error(progress.message || 'Copy failed.');
-      setTimeout(() => poll().catch(err => {
-        if (status) status.textContent = `Could not create copy: ${err.message || err}`;
-        button.disabled = false; button.textContent = 'Create review copy';
-      }), 1000);
-    };
-    await poll();
+    const progress = await (await fetch(`/epg-web/api/recording-health/commercial-review/copy/${encodeURIComponent(jobId)}`)).json();
+    if (!progress.ok) throw new Error(progress.error || 'Could not check copy progress.');
+    if (status) status.textContent = progress.status === 'done'
+      ? `✓ ${progress.message} ${progress.file_name || ''}`
+      : `${progress.message} ${progress.progress ? `(${progress.progress}%)` : ''}`;
+    if (progress.status === 'done') { button.textContent = '✓ Copy ready'; return; }
+    if (progress.status === 'failed') throw new Error(progress.message || 'Copy failed.');
+    setTimeout(() => trackCommercialReviewCopy(jobId, status, button), 1000);
   } catch (err) {
     if (status) status.textContent = `Could not create copy: ${err.message || err}`;
-    button.disabled = false; button.textContent = 'Create review copy';
+    button.disabled = false; button.textContent = '✂ Analyze breaks';
   }
 }
 async function rerecordFromHealth(recId, button) {
