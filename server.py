@@ -7244,7 +7244,7 @@ async function loadCommercialReview() {
         <strong style="font-size:14px;">${esc(f.title || 'Untitled')}</strong>
         <div style="font-size:12px;color:#94a3b8;margin-top:4px;">${esc(f.channel || '')}${f.file_name ? ` · ${esc(f.file_name)}` : ''}${f.size ? ` · ${esc(healthSize(f.size))}` : ''}</div>
       </div>
-      <button class="btn btn-sm" ${d.analyzer_ready ? '' : 'disabled'} style="background:#1d4ed8;color:#dbeafe;" onclick="analyzeCommercials('${String(f.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">✂ Analyze breaks</button>
+      <button class="btn btn-sm" ${d.analyzer_ready ? '' : 'disabled'} style="background:#1d4ed8;color:#dbeafe;" onclick="analyzeCommercials('${String(f.rec_id || '').replace(/[^a-zA-Z0-9_-]/g,'')}',this)">✂ Analyze breaks</button>
     </div>`).join('');
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load commercial review: ${esc(err.message || String(err))}</div>`;
