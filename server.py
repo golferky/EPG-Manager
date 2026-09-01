@@ -4430,6 +4430,35 @@ def api_record():
         return jsonify({'ok': False,
                         'error': f'{channel_name} is excluded because it is a non-English feed.'}), 400
 
+    # Movies are recorded only from commercial-free channels.  Do this on the
+    # server as well as in the airing picker: a guide refresh or an old open
+    # browser tab must not be able to queue a TNT/FXM-style movie by mistake.
+    is_series_request = bool(data.get('is_series', False) or season_num is not None
+                             or episode_num is not None)
+    if not is_series_request:
+        try:
+            start_utc = datetime.fromtimestamp(start_ts, timezone.utc)
+            lower = (start_utc - timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+            upper = (start_utc + timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+            gconn = sqlite3.connect(guide_db)
+            guide_row = gconn.execute('''SELECT prog_type, season_num, episode_num
+                                         FROM guide
+                                         WHERE channel_id=? AND lower(title)=lower(?)
+                                           AND start_utc BETWEEN ? AND ?
+                                         ORDER BY start_utc LIMIT 1''',
+                                      (channel_id, title, lower, upper)).fetchone()
+            gconn.close()
+            is_series_request = bool(guide_row and (
+                guide_row[0] in ('EP', 'SH') or guide_row[1] is not None or guide_row[2] is not None
+            ))
+        except Exception:
+            # If the guide is temporarily unavailable, retain the conservative
+            # movie rule rather than recording a commercial-supported feed.
+            is_series_request = False
+    if not is_series_request and not _is_commercial_free_channel(channel_name):
+        return jsonify({'ok': False,
+                        'error': f'{channel_name} carries commercials, so movies are not recorded there.'}), 400
+
     # Dedup: reject if same channel+start_ts already queued/scheduled/recording
     with _rec_lock:
         for existing in _recs.values():
@@ -4456,7 +4485,7 @@ def api_record():
         'episode_title': episode_title,
         'season_num': season_num,
         'episode_num': episode_num,
-        'is_series': bool(data.get('is_series', False)),
+        'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
     }
     _url, stream_error, stream_debug = _resolve_recording_source(channel_id, start_ts, stop_ts)
