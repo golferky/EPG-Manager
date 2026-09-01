@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260901d"
+VERSION = "v20260901e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2465,7 +2465,7 @@ def api_analyze_commercials():
 def _commercial_review_output_dir(cfg):
     """A comparison-only folder outside Plex, so scans can never import it."""
     return os.path.realpath(os.path.expanduser(
-        cfg.get('commercial_review_path', '~/Movies/Commercial Review')
+        cfg.get('commercial_review_path', '~/Commercial Review')
     ))
 
 
