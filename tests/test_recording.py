@@ -54,6 +54,11 @@ class RecordingTests(unittest.TestCase):
                 {'start': 100.0, 'end': 200.0, 'duration': 100.0},
             ])
 
+    def test_commercial_copy_keeps_parts_outside_proposed_breaks(self):
+        self.assertEqual(server._commercial_keep_segments(100, [
+            {'start': 10, 'end': 20}, {'start': 60, 'end': 70},
+        ]), [(0.0, 10.0), (20.0, 60.0), (70.0, 100)])
+
     def test_agent_transfer_status_is_active(self):
         self.assertTrue(server._rec_is_active({"status": "awaiting_transfer"}))
 

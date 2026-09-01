@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260901b"
+VERSION = "v20260901c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -216,6 +216,7 @@ _stream_quality_scan = {'running': False, 'completed': 0, 'total': 0}
 _stream_quality_scan_lock = threading.Lock()
 _commercial_review_lock = threading.Lock()
 _commercial_review_running = set()
+_commercial_copy_jobs = {}
 
 def _parse_dt(s):
     s = s.strip()
@@ -2441,12 +2442,166 @@ def api_analyze_commercials():
             fps = 29.97
         breaks = _commercial_breaks_from_report(os.path.join(output_dir, f'{base_name}.txt'), fps)
         total = round(sum(item['duration'] for item in breaks), 1)
+        # Persist the exact source fingerprint and proposed ranges.  The copy
+        # endpoint accepts only this server-created report, never a browser
+        # path or browser-supplied cut list.
+        with open(os.path.join(output_dir, 'report.json'), 'w', encoding='utf-8') as report:
+            json.dump({
+                'rec_id': rec_id, 'title': candidate['title'], 'source_path': media_path,
+                'source_size': os.path.getsize(media_path),
+                'source_mtime': os.path.getmtime(media_path), 'breaks': breaks,
+            }, report)
         return jsonify({'ok': True, 'review_id': review_id, 'title': candidate['title'],
                         'breaks': breaks, 'total_seconds': total,
                         'message': 'Report only — the Plex recording was not edited.'})
     finally:
         with _commercial_review_lock:
             _commercial_review_running.discard(rec_id)
+
+
+def _commercial_review_output_dir(cfg):
+    """A comparison-only folder outside Plex, so scans can never import it."""
+    return os.path.realpath(os.path.expanduser(
+        cfg.get('commercial_review_path', '~/Movies/Commercial Review')
+    ))
+
+
+def _commercial_review_output_is_safe(output_dir, cfg):
+    """Refuse an output folder inside either Plex library."""
+    try:
+        return not any(os.path.commonpath([root, output_dir]) == root
+                       for root in _commercial_review_roots(cfg))
+    except ValueError:
+        return False
+
+
+def _commercial_review_manifest(review_id):
+    if not re.fullmatch(r'[a-f0-9]{12}', str(review_id or '')):
+        return None, ''
+    report_path = os.path.join(BASE_DIR, 'commercial_reviews', review_id, 'report.json')
+    try:
+        with open(report_path, encoding='utf-8') as report:
+            return json.load(report), report_path
+    except (OSError, ValueError):
+        return None, report_path
+
+
+def _unique_review_copy_path(output_dir, source_path):
+    """Keep the source name; the parent folder already identifies it as review media."""
+    source_name = os.path.basename(source_path)
+    stem, ext = os.path.splitext(source_name)
+    destination = os.path.join(output_dir, source_name)
+    suffix = 2
+    while os.path.exists(destination):
+        destination = os.path.join(output_dir, f'{stem} ({suffix}){ext}')
+        suffix += 1
+    return destination
+
+
+def _commercial_keep_segments(duration, breaks):
+    """Return the wanted parts of a recording after proposed breaks are removed."""
+    cursor, segments = 0.0, []
+    for item in sorted(breaks, key=lambda entry: float(entry.get('start', 0))):
+        start = min(duration, max(cursor, float(item.get('start', 0))))
+        end = min(duration, max(start, float(item.get('end', 0))))
+        if start - cursor >= 0.25:
+            segments.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor >= 0.25:
+        segments.append((cursor, duration))
+    return segments
+
+
+def _start_commercial_review_copy(job_id, manifest, cfg):
+    """Build a separate re-encoded comparison copy; never writes beside Plex media."""
+    job = _commercial_copy_jobs[job_id]
+    source = manifest['source_path']
+    destination = job['destination']
+    partial = destination + '.partial.mp4'
+    try:
+        from recording_agent import probe_media
+        probe = probe_media(source, cfg.get('ffprobe', 'ffprobe'), timeout=30)
+        duration = float(probe.get('duration') or 0)
+        segments = _commercial_keep_segments(duration, manifest.get('breaks') or [])
+        if duration <= 0 or not segments:
+            raise RuntimeError('No playable video remains after the proposed break ranges.')
+        filters, concat_inputs = [], []
+        for index, (start, end) in enumerate(segments):
+            filters.extend([
+                f'[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{index}]',
+                f'[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{index}]',
+            ])
+            concat_inputs.append(f'[v{index}][a{index}]')
+        filters.append(f'{"".join(concat_inputs)}concat=n={len(segments)}:v=1:a=1[outv][outa]')
+        ffmpeg = cfg.get('ffmpeg') or shutil.which('ffmpeg') or '/opt/homebrew/bin/ffmpeg'
+        command = [ffmpeg, '-hide_banner', '-y', '-i', source, '-filter_complex', ';'.join(filters),
+                   '-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+                   '-c:a', 'aac', '-b:a', '192k', '-progress', 'pipe:1', '-nostats', partial]
+        job.update({'status': 'creating', 'message': 'Creating comparison copy…', 'progress': 0})
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, bufsize=1)
+        expected = sum(end - start for start, end in segments)
+        for line in process.stdout or []:
+            match = re.match(r'out_time_ms=(\d+)', line.strip())
+            if match and expected:
+                # FFmpeg reports microseconds despite the historic field name.
+                job['progress'] = min(99, round(int(match.group(1)) / 1000000 / expected * 100))
+        if process.wait() != 0:
+            raise RuntimeError('FFmpeg could not create the comparison copy.')
+        os.replace(partial, destination)
+        job.update({'status': 'done', 'progress': 100, 'message': 'Comparison copy is ready.',
+                    'file_name': os.path.basename(destination)})
+    except Exception as exc:
+        try:
+            if os.path.isfile(partial):
+                os.unlink(partial)
+        except OSError:
+            pass
+        job.update({'status': 'failed', 'message': str(exc), 'progress': 0})
+
+
+@app.route('/epg-web/api/recording-health/commercial-review/copy', methods=['POST'])
+def api_create_commercial_review_copy():
+    """Start a separate comparison copy from one completed server-side review."""
+    review_id = str((request.json or {}).get('review_id') or '')
+    manifest, _report_path = _commercial_review_manifest(review_id)
+    cfg = load_config()
+    source = (manifest or {}).get('source_path', '')
+    if not manifest or not _commercial_review_path_is_safe(source, cfg):
+        return jsonify({'ok': False, 'error': 'That commercial review is no longer available.'}), 404
+    try:
+        unchanged = (os.path.getsize(source) == int(manifest.get('source_size', -1))
+                     and os.path.getmtime(source) == float(manifest.get('source_mtime', -2)))
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        return jsonify({'ok': False,
+                        'error': 'The Plex source changed after analysis. Analyze it again first.'}), 409
+    output_dir = _commercial_review_output_dir(cfg)
+    if not _commercial_review_output_is_safe(output_dir, cfg):
+        return jsonify({'ok': False, 'error': 'Commercial Review cannot write inside a Plex library.'}), 400
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as exc:
+        return jsonify({'ok': False, 'error': f'Could not create the Commercial Review folder: {exc}'}), 500
+    job_id = uuid.uuid4().hex[:12]
+    destination = _unique_review_copy_path(output_dir, source)
+    _commercial_copy_jobs[job_id] = {'status': 'queued', 'progress': 0,
+                                     'message': 'Preparing comparison copy…',
+                                     'title': manifest.get('title', 'Untitled'),
+                                     'destination': destination}
+    threading.Thread(target=_start_commercial_review_copy,
+                     args=(job_id, manifest, cfg), daemon=True).start()
+    return jsonify({'ok': True, 'job_id': job_id})
+
+
+@app.route('/epg-web/api/recording-health/commercial-review/copy/<job_id>')
+def api_commercial_review_copy_status(job_id):
+    job = _commercial_copy_jobs.get(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'That comparison-copy job is no longer available.'}), 404
+    return jsonify({'ok': True, 'status': job.get('status'), 'progress': job.get('progress', 0),
+                    'message': job.get('message', ''), 'file_name': job.get('file_name', '')})
 
 
 def _incomplete_plex_copy_reports():
@@ -7315,11 +7470,37 @@ async function analyzeCommercials(recId, button) {
     const detail = breaks.length
       ? breaks.map(b => `${commercialClock(b.start)}–${commercialClock(b.end)} (${Math.round(b.duration)} sec)`).join(' · ')
       : 'No likely commercial blocks found.';
-    if (target) target.insertAdjacentHTML('beforeend', `<div style="width:100%;padding:8px 10px;background:#111827;border:1px solid #334155;border-radius:5px;font-size:12px;color:#cbd5e1;">${esc(detail)}${breaks.length ? `<div style="margin-top:4px;color:#fbbf24;font-weight:700;">${Math.round(d.total_seconds || 0)} sec proposed for review — nothing was removed.</div>` : ''}</div>`);
+    if (target) target.insertAdjacentHTML('beforeend', `<div style="width:100%;padding:8px 10px;background:#111827;border:1px solid #334155;border-radius:5px;font-size:12px;color:#cbd5e1;">${esc(detail)}${breaks.length ? `<div style="margin-top:4px;color:#fbbf24;font-weight:700;">${Math.round(d.total_seconds || 0)} sec proposed for review — nothing was removed.</div><button class="btn btn-sm" style="margin-top:8px;background:#166534;color:#dcfce7;" onclick="createCommercialReviewCopy('${esc(d.review_id || '')}',this)">Create review copy</button><div class="commercial-copy-status" style="margin-top:6px;color:#94a3b8;"></div>` : ''}</div>`);
   } catch (err) {
     alert(err.message || String(err));
   } finally {
     button.disabled = false; button.textContent = original;
+  }
+}
+async function createCommercialReviewCopy(reviewId, button) {
+  if (!reviewId || !confirm('Create a separate commercial-cut copy outside Plex for comparison? The Plex original will not change.')) return;
+  const status = button.parentElement?.querySelector('.commercial-copy-status');
+  button.disabled = true; button.textContent = 'Preparing…';
+  try {
+    const d = await post('/epg-web/api/recording-health/commercial-review/copy', {review_id: reviewId});
+    if (!d.ok) throw new Error(d.error || 'Could not start the comparison copy.');
+    const poll = async () => {
+      const progress = await (await fetch(`/epg-web/api/recording-health/commercial-review/copy/${encodeURIComponent(d.job_id)}`)).json();
+      if (!progress.ok) throw new Error(progress.error || 'Could not check copy progress.');
+      if (status) status.textContent = progress.status === 'done'
+        ? `✓ ${progress.message} ${progress.file_name || ''}`
+        : `${progress.message} ${progress.progress ? `(${progress.progress}%)` : ''}`;
+      if (progress.status === 'done') { button.textContent = '✓ Copy ready'; return; }
+      if (progress.status === 'failed') throw new Error(progress.message || 'Copy failed.');
+      setTimeout(() => poll().catch(err => {
+        if (status) status.textContent = `Could not create copy: ${err.message || err}`;
+        button.disabled = false; button.textContent = 'Create review copy';
+      }), 1000);
+    };
+    await poll();
+  } catch (err) {
+    if (status) status.textContent = `Could not create copy: ${err.message || err}`;
+    button.disabled = false; button.textContent = 'Create review copy';
   }
 }
 async function rerecordFromHealth(recId, button) {
