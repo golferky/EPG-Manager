@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260902e"
+VERSION = "v20260902f"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3031,9 +3031,13 @@ def _best_incomplete_rerecord(title, expected_seconds):
             'stream_id': str(stream_debug.get('stream_id') or ''),
             'stream_provider': str(stream_debug.get('provider') or 'primestreams'),
             'stream_extension': str(stream_debug.get('stream_extension') or 'ts'),
-            'score': (int(quality.get('height') or 0), float(quality.get('fps') or 0),
+            # A clean channel is more valuable than a marginal resolution or
+            # bitrate gain.  A warning/suspect feed remains a last resort when
+            # it is the only future airing, but never beats a reliable option.
+            'score': (reliability_rank, int(quality.get('height') or 0),
+                      float(quality.get('fps') or 0),
                       int(quality.get('total_bitrate') or quality.get('video_bitrate') or 0),
-                      reliability_rank, -start),
+                      -start),
         })
     if not candidates:
         return None, {'error': 'No clean, recordable future airing was found yet'}
