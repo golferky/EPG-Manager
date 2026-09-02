@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260902a"
+VERSION = "v20260902b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -181,14 +181,20 @@ def _is_foreign_recording_feed(name):
         name or '', re.I))
 
 
-def _is_sd_channel_name(name):
-    return bool(re.search(r'\bSD\b', name or '', re.I))
+def _is_quality_variant_channel_name(name):
+    """Whether a label differs only by an SD/HD quality suffix."""
+    return bool(re.search(r'\b(?:SD|HD)\b', name or '', re.I))
 
 
-def _sd_duplicate_channel_key(name):
-    """Normalize a channel label after removing its SD-only qualifier."""
-    without_sd = re.sub(r'\bSD\b', '', name or '', flags=re.I)
-    return re.sub(r'[^a-z0-9]', '', without_sd.lower())
+def _quality_duplicate_channel_key(name):
+    """Normalize a channel label after removing SD/HD quality qualifiers.
+
+    This deliberately leaves geographic variants such as East, West, and
+    Pacific intact: those can carry different programming and must remain
+    independently recordable.
+    """
+    without_quality = re.sub(r'\b(?:SD|HD)\b', '', name or '', flags=re.I)
+    return re.sub(r'[^a-z0-9]', '', without_quality.lower())
 
 def get_db():
     cfg = load_config()
@@ -1738,18 +1744,21 @@ def api_guide():
     elif ch_filter:
         ordered_channels_raw = [c for c in ordered_channels_raw if ch_filter in c['name'].lower()]
 
-    # Keep an SD channel when it is the only available version.  When the same
-    # channel also appears without an SD tag, hide just that redundant SD row
-    # unless the user turns the checkbox off.
+    # Keep just one quality-labelled duplicate (plain/HD/SD) while preserving
+    # distinct geographic variants such as East, West, and Pacific.
     if hide_sd_duplicates and not sd_only:
-        non_sd_bases = {_sd_duplicate_channel_key(c['name']) for c in ordered_channels_raw
-                        if not _is_sd_channel_name(c['name'])}
-        hidden_sd_ids = {c['id'] for c in ordered_channels_raw
-                         if _is_sd_channel_name(c['name'])
-                         and _sd_duplicate_channel_key(c['name']) in non_sd_bases}
-        if hidden_sd_ids:
-            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in hidden_sd_ids]
-            progs_in_window = [p for p in progs_in_window if p['channel_id'] not in hidden_sd_ids]
+        quality_by_base = {}
+        hidden_quality_ids = set()
+        for channel in ordered_channels_raw:
+            base = _quality_duplicate_channel_key(channel['name'])
+            is_quality_variant = _is_quality_variant_channel_name(channel['name'])
+            if base in quality_by_base and (is_quality_variant or quality_by_base[base]):
+                hidden_quality_ids.add(channel['id'])
+            else:
+                quality_by_base[base] = is_quality_variant
+        if hidden_quality_ids:
+            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in hidden_quality_ids]
+            progs_in_window = [p for p in progs_in_window if p['channel_id'] not in hidden_quality_ids]
 
     # When a filter is active (fav/movie/ps), also include matching channels that
     # have NO current programming — they show as empty rows (guide data expired)
@@ -1761,14 +1770,18 @@ def api_guide():
                     ordered_channels_raw.append(dict(c, no_data=True))
 
     if hide_sd_duplicates and not sd_only:
-        non_sd_bases = {_sd_duplicate_channel_key(c['name']) for c in ordered_channels_raw
-                        if not _is_sd_channel_name(c['name'])}
-        hidden_sd_ids = {c['id'] for c in ordered_channels_raw
-                         if _is_sd_channel_name(c['name'])
-                         and _sd_duplicate_channel_key(c['name']) in non_sd_bases}
-        if hidden_sd_ids:
-            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in hidden_sd_ids]
-            progs_in_window = [p for p in progs_in_window if p['channel_id'] not in hidden_sd_ids]
+        quality_by_base = {}
+        hidden_quality_ids = set()
+        for channel in ordered_channels_raw:
+            base = _quality_duplicate_channel_key(channel['name'])
+            is_quality_variant = _is_quality_variant_channel_name(channel['name'])
+            if base in quality_by_base and (is_quality_variant or quality_by_base[base]):
+                hidden_quality_ids.add(channel['id'])
+            else:
+                quality_by_base[base] = is_quality_variant
+        if hidden_quality_ids:
+            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in hidden_quality_ids]
+            progs_in_window = [p for p in progs_in_window if p['channel_id'] not in hidden_quality_ids]
 
     for c in ordered_channels_raw:
         norm = _re5.sub(r'[^a-z0-9]', '', c['name'].lower())
@@ -5221,8 +5234,8 @@ tr:hover td{background:#141414;}
       <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
     </select>
-    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide an SD channel only when the same channel also has a non-SD version">
-      <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide SD duplicates
+    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide redundant SD/HD channel-name duplicates; East, West, and Pacific stay visible">
+      <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide quality duplicates
     </label>
     <div style="position:relative;display:inline-block;">
       <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value);updateSearchClear()" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;padding-right:30px;">

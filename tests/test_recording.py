@@ -45,11 +45,14 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(server._is_foreign_recording_feed("A&E Canada HD"))
         self.assertFalse(server._is_foreign_recording_feed("HBO Drama"))
 
-    def test_sd_duplicate_channel_helpers(self):
-        self.assertTrue(server._is_sd_channel_name("A&E (SD)"))
-        self.assertFalse(server._is_sd_channel_name("A&E HD"))
-        self.assertEqual(server._sd_duplicate_channel_key("A&E (SD)"),
-                         server._sd_duplicate_channel_key("A&E"))
+    def test_quality_duplicate_channel_helpers(self):
+        self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
+        self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))
+        self.assertFalse(server._is_quality_variant_channel_name("A&E West"))
+        self.assertEqual(server._quality_duplicate_channel_key("HBO Comedy HD"),
+                         server._quality_duplicate_channel_key("HBO Comedy"))
+        self.assertNotEqual(server._quality_duplicate_channel_key("HBO West"),
+                            server._quality_duplicate_channel_key("HBO"))
 
     def test_commercial_report_parser_reads_frame_ranges(self):
         with tempfile.TemporaryDirectory() as temp:
