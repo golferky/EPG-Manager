@@ -45,6 +45,12 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(server._is_foreign_recording_feed("A&E Canada HD"))
         self.assertFalse(server._is_foreign_recording_feed("HBO Drama"))
 
+    def test_sd_duplicate_channel_helpers(self):
+        self.assertTrue(server._is_sd_channel_name("A&E (SD)"))
+        self.assertFalse(server._is_sd_channel_name("A&E HD"))
+        self.assertEqual(server._sd_duplicate_channel_key("A&E (SD)"),
+                         server._sd_duplicate_channel_key("A&E"))
+
     def test_commercial_report_parser_reads_frame_ranges(self):
         with tempfile.TemporaryDirectory() as temp:
             report = os.path.join(temp, "review.txt")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260901e"
+VERSION = "v20260902a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -179,6 +179,16 @@ def _is_foreign_recording_feed(name):
         r'urdu|chinese|mandarin|cantonese|korean|japanese|vietnamese|'
         r'tagalog|filipino|russian|polish|greek|turkish)\b',
         name or '', re.I))
+
+
+def _is_sd_channel_name(name):
+    return bool(re.search(r'\bSD\b', name or '', re.I))
+
+
+def _sd_duplicate_channel_key(name):
+    """Normalize a channel label after removing its SD-only qualifier."""
+    without_sd = re.sub(r'\bSD\b', '', name or '', flags=re.I)
+    return re.sub(r'[^a-z0-9]', '', without_sd.lower())
 
 def get_db():
     cfg = load_config()
@@ -1620,6 +1630,7 @@ def api_guide():
     eagle_only = eagle_only or eagle_movie_only
     ps_episode_only = request.args.get('ps_episode', '0') == '1'
     sd_only    = request.args.get('sd',  '0') == '1'
+    hide_sd_duplicates = request.args.get('hide_sd', '1') != '0'
     ps_only = ps_only or ps_episode_only
 
     # Build allowed channel set from Movies.db if filtering
@@ -1727,6 +1738,19 @@ def api_guide():
     elif ch_filter:
         ordered_channels_raw = [c for c in ordered_channels_raw if ch_filter in c['name'].lower()]
 
+    # Keep an SD channel when it is the only available version.  When the same
+    # channel also appears without an SD tag, hide just that redundant SD row
+    # unless the user turns the checkbox off.
+    if hide_sd_duplicates and not sd_only:
+        non_sd_bases = {_sd_duplicate_channel_key(c['name']) for c in ordered_channels_raw
+                        if not _is_sd_channel_name(c['name'])}
+        hidden_sd_ids = {c['id'] for c in ordered_channels_raw
+                         if _is_sd_channel_name(c['name'])
+                         and _sd_duplicate_channel_key(c['name']) in non_sd_bases}
+        if hidden_sd_ids:
+            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in hidden_sd_ids]
+            progs_in_window = [p for p in progs_in_window if p['channel_id'] not in hidden_sd_ids]
+
     # When a filter is active (fav/movie/ps), also include matching channels that
     # have NO current programming — they show as empty rows (guide data expired)
     if allowed_ch_ids is not None:
@@ -1735,6 +1759,16 @@ def api_guide():
             if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
                 if not ch_filter or ch_filter in c['name'].lower():
                     ordered_channels_raw.append(dict(c, no_data=True))
+
+    if hide_sd_duplicates and not sd_only:
+        non_sd_bases = {_sd_duplicate_channel_key(c['name']) for c in ordered_channels_raw
+                        if not _is_sd_channel_name(c['name'])}
+        hidden_sd_ids = {c['id'] for c in ordered_channels_raw
+                         if _is_sd_channel_name(c['name'])
+                         and _sd_duplicate_channel_key(c['name']) in non_sd_bases}
+        if hidden_sd_ids:
+            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in hidden_sd_ids]
+            progs_in_window = [p for p in progs_in_window if p['channel_id'] not in hidden_sd_ids]
 
     for c in ordered_channels_raw:
         norm = _re5.sub(r'[^a-z0-9]', '', c['name'].lower())
@@ -1755,8 +1789,9 @@ def api_guide():
     ordered_channels = []
     for c in ordered_channels_raw:
         canon = id_to_canonical.get(c['id'], c['id'])
-        if canon not in seen_ids:
-            seen_ids.add(canon)
+        if canon in seen_ids:
+            continue
+        seen_ids.add(canon)
         reliability = (reliability_by_id.get(canon)
                        or reliability_by_id.get(c['id'])
                        or {})
@@ -5186,8 +5221,12 @@ tr:hover td{background:#141414;}
       <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
     </select>
+    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide an SD channel only when the same channel also has a non-SD version">
+      <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide SD duplicates
+    </label>
     <div style="position:relative;display:inline-block;">
-      <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value)" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;">
+      <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value);updateSearchClear()" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;padding-right:30px;">
+      <button id="ch-filter-clear" type="button" onclick="clearSearch()" aria-label="Clear search" title="Clear search" style="display:none;position:absolute;right:5px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:#94a3b8;font-size:19px;line-height:1;cursor:pointer;padding:1px 4px;">×</button>
       <div id="search-dropdown" style="display:none;position:absolute;top:100%;left:0;width:320px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;z-index:500;max-height:320px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);margin-top:4px;"></div>
     </div>
     <button id="ch-page-prev" class="btn btn-ghost btn-sm" onclick="chPagePrev()" style="display:none;">◀ Prev 200</button>
@@ -5650,6 +5689,8 @@ async function autoLoad() {
 (function() {
   const saved = localStorage.getItem('epg_guide_mode');
   if (saved) { const el = document.getElementById('guide-ch-mode'); if (el) el.value = saved; }
+  const hideSd = document.getElementById('hide-sd-duplicates');
+  if (hideSd) hideSd.checked = localStorage.getItem('epg_hide_sd_duplicates') !== '0';
 })();
 autoLoad();
 loadStorageBar();
@@ -5837,13 +5878,20 @@ function onSearchInput(val) {
 }
 function clearSearch() {
   document.getElementById('ch-filter').value = '';
+  updateSearchClear();
   document.getElementById('search-dropdown').style.display = 'none';
   _chIdFilter = '';
   _chOffset = 0; fetchAndRenderGuide();
 }
+function updateSearchClear() {
+  const input = document.getElementById('ch-filter');
+  const button = document.getElementById('ch-filter-clear');
+  if (input && button) button.style.display = input.value ? '' : 'none';
+}
 function jumpToChannel(id, name) {
   document.getElementById('search-dropdown').style.display = 'none';
   document.getElementById('ch-filter').value = name;
+  updateSearchClear();
   _chIdFilter = id;
   _chOffset = 0; fetchAndRenderGuide();
 }
@@ -6050,6 +6098,7 @@ async function fetchAndRenderGuide() {
   if (mode === 'eagle_movie') params.set('eagle_movie', '1');
   if (mode === 'ps_episode') params.set('ps_episode', '1');
   if (mode === 'sd')    params.set('sd',    '1');
+  if (!document.getElementById('hide-sd-duplicates').checked) params.set('hide_sd', '0');
   params.set('ch_offset', _chOffset);
   try {
     const [r] = await Promise.all([
