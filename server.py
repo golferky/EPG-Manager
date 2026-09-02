@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260902c"
+VERSION = "v20260902d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -195,6 +195,17 @@ def _quality_duplicate_channel_key(name):
     """
     without_quality = re.sub(r'\b(?:SD|HD)\b', '', name or '', flags=re.I)
     return re.sub(r'[^a-z0-9]', '', without_quality.lower())
+
+
+def _metadata_title_matches(requested_title, returned_title):
+    """Require an exact normalized provider title before using its metadata.
+
+    OMDb's ``t=`` endpoint may return a longer partial match (for example,
+    asking for *Wolves* can return *Dances with Wolves*).  A missing poster is
+    safer than attaching the wrong poster, cast, plot, or Plex folder name.
+    """
+    normalize = lambda value: re.sub(r'[^a-z0-9]', '', str(value or '').lower())
+    return bool(normalize(requested_title)) and normalize(requested_title) == normalize(returned_title)
 
 def get_db():
     cfg = load_config()
@@ -1345,7 +1356,8 @@ def _run_recording(rec_id):
                     q = _up.quote(title)
                     r = _ur.urlopen(f'http://www.omdbapi.com/?apikey={omdb_key}&t={q}&type=movie', timeout=8)
                     od = json.loads(r.read())
-                    if od.get('Response') == 'True':
+                    if (od.get('Response') == 'True' and
+                            _metadata_title_matches(title, od.get('Title'))):
                         plex_title = od.get('Title', title)
                         year = od.get('Year', '')[:4]
             except Exception:
@@ -3923,14 +3935,14 @@ def api_prog_info():
                 url = f'http://www.omdbapi.com/?t={q}&type=series&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     od = json.loads(resp.read())
-                if od.get('Response') == 'True':
+                if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
                     return jsonify(_omdb_result(od))
             elif year:
                 # Year known — direct lookup is reliable
                 url = f'http://www.omdbapi.com/?t={q}&y={year}&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     od = json.loads(resp.read())
-                if od.get('Response') == 'True':
+                if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
                     return jsonify(_omdb_result(od))
             else:
                 # No year — search for all versions, then pick best by description match
@@ -3944,23 +3956,23 @@ def api_prog_info():
                     url = f'http://www.omdbapi.com/?t={q}&apikey={omdb_key}'
                     with urlreq.urlopen(url, timeout=5) as resp:
                         od = json.loads(resp.read())
-                    if od.get('Response') == 'True':
+                    if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
                         return jsonify(_omdb_result(od))
                 else:
                     # Score each candidate: fetch full details for top 4, pick best actor match
                     desc_words = set(_re.findall(r'[A-Z][a-z]+', desc)) if desc else set()
-                    title_norm = title.lower().strip()
                     best_od, best_score = None, -1
                     for hit in hits[:4]:
                         iid = hit.get('imdbID','')
                         if not iid: continue
                         with urlreq.urlopen(f'http://www.omdbapi.com/?i={iid}&apikey={omdb_key}', timeout=5) as r2:
                             od2 = json.loads(r2.read())
-                        if od2.get('Response') != 'True': continue
+                        if (od2.get('Response') != 'True' or
+                                not _metadata_title_matches(title, od2.get('Title'))):
+                            continue
                         # Score: exact title match wins, then actor name words from desc
                         actor_words = set(_re.findall(r'[A-Z][a-z]+', od2.get('Actors','')))
-                        exact_bonus = 20 if od2.get('Title','').lower().strip() == title_norm else 0
-                        score = exact_bonus + len(desc_words & actor_words)
+                        score = len(desc_words & actor_words)
                         if score > best_score:
                             best_score, best_od = score, od2
                     if best_od:

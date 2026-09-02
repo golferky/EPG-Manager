@@ -54,6 +54,13 @@ class RecordingTests(unittest.TestCase):
         self.assertNotEqual(server._quality_duplicate_channel_key("HBO West"),
                             server._quality_duplicate_channel_key("HBO"))
 
+    def test_metadata_requires_exact_title(self):
+        self.assertTrue(server._metadata_title_matches("Wolves", "Wolves"))
+        self.assertTrue(server._metadata_title_matches("Spider-Man: Homecoming",
+                                                        "Spider Man Homecoming"))
+        self.assertFalse(server._metadata_title_matches("Wolves", "Dances with Wolves"))
+        self.assertFalse(server._metadata_title_matches("Gravity", "Gravity Falls"))
+
     def test_commercial_report_parser_reads_frame_ranges(self):
         with tempfile.TemporaryDirectory() as temp:
             report = os.path.join(temp, "review.txt")
