@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260902b"
+VERSION = "v20260902c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1145,7 +1145,11 @@ def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id=''):
         # the safe fallback for this one recording window.
         url, error, debug = _stream_url(channel_id, 'primestreams')
         if not error:
-            debug['fallback_reason'] = 'Eaglecast already scheduled for an overlapping recording'
+            conflict_title = conflict[0] if conflict else 'another recording'
+            debug['fallback_reason'] = (
+                f'Eaglecast is already reserved for overlapping "{conflict_title}". '
+                'Using PrimeStreams instead; quality may be lower.'
+            )
             return url, None, debug
         title = conflict[0] if conflict else 'another recording'
         return None, (f'Eaglecast is already scheduled for overlapping "{title}", '
@@ -7079,7 +7083,7 @@ async function recordAiring(airing, title, button) {
     btn.textContent = '✅ Scheduled';
     btn.style.background = '#166534';
     const sourceText = r.source === 'eaglecast' ? 'on Eaglecast'
-      : r.fallback_reason ? 'on PrimeStreams (Eaglecast is busy)'
+      : r.fallback_reason ? `on PrimeStreams — ${r.fallback_reason}`
       : 'on PrimeStreams';
     document.getElementById('pm-status').textContent = `✅ "${title}" queued ${sourceText}`;
     document.getElementById('pm-status').className = 'status-msg ok';
