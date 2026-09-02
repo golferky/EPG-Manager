@@ -34,6 +34,8 @@ class RecordingTests(unittest.TestCase):
         self.assertTrue(server._is_premium_channel("HBO Movies"))
         self.assertTrue(server._is_premium_channel("MGM+ Hits HD"))
         self.assertTrue(server._is_premium_channel("Showtime Extreme"))
+        self.assertTrue(server._is_commercial_free_channel("Paramount+ with Showtime HD"))
+        self.assertFalse(server._is_commercial_free_channel("Paramount Network HD"))
         self.assertTrue(server._is_premium_channel("Sky Cinema Greats"))
         self.assertFalse(server._is_premium_channel("ANTENNA TV"))
 

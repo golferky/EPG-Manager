@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260902d"
+VERSION = "v20260902e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -145,6 +145,9 @@ def _is_premium_channel(name):
     normalized = _channel_match_base(name)
     premium_prefixes = (
         'hbo', 'showtime', 'starz', 'encore', 'cinemax', 'mgm', 'epix',
+        # This is the premium Paramount+ with Showtime linear feed.  Do not
+        # use a broad "paramount" prefix: Paramount Network is ad-supported.
+        'paramountwithshowtime',
         # Sky Cinema is a premium movie service too.  Treat it the same as
         # HBO/Showtime so its ad-free movie airings can be recorded/upgraded.
         'skycinema',
@@ -3390,6 +3393,7 @@ def _auto_schedule_movie_upgrades():
             # deduplication, and the recording backend all behave identically.
             with app.test_request_context('/epg-web/api/record', method='POST', json={
                 'title': option['title'], 'channel_id': option['candidate']['channel_id'],
+                'channel_name': option['candidate']['channel_name'],
                 'start_ts': option['start'].timestamp(), 'stop_ts': option['stop'].timestamp(),
                 'auto_upgrade': True,
             }):
@@ -4643,11 +4647,21 @@ def api_record():
         else:
             return jsonify({'ok': False, 'error': f'"{title}" is not airing on any mapped provider channel soon'}), 200
     else:
-        # Channel has a stream — just look up its name
-        channel_name = channel_id
+        # Resolve the label for this exact airing.  A bare ``LIMIT 1`` by
+        # channel id can pick a stale/unrelated guide row (for example,
+        # PARSHOH instead of Paramount+ with Showtime) when providers reuse
+        # an id across guide imports.
+        channel_name = str(data.get('channel_name', '') or channel_id)
         try:
+            start_utc = datetime.fromtimestamp(start_ts, timezone.utc)
+            lower = (start_utc - timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+            upper = (start_utc + timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
             gconn = sqlite3.connect(guide_db)
-            row = gconn.execute('SELECT channel_name FROM guide WHERE channel_id=? LIMIT 1', (channel_id,)).fetchone()
+            row = gconn.execute('''SELECT channel_name FROM guide
+                                   WHERE channel_id=? AND lower(title)=lower(?)
+                                     AND start_utc BETWEEN ? AND ?
+                                   ORDER BY start_utc LIMIT 1''',
+                                (channel_id, title, lower, upper)).fetchone()
             if row:
                 channel_name = row[0]
             gconn.close()
@@ -6074,7 +6088,7 @@ async function quickRecord(key, btnEl) {
   try {
     const r = await fetch('/epg-web/api/record', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({title: p.title, channel_id: p.channel_id,
+      body: JSON.stringify({title: p.title, channel_id: p.channel_id, channel_name: p.channel,
                             start_ts: p.start_ts, stop_ts: p.stop_ts,
                             episode_title: p.episode_title || '',
                             season_num: p.season_num, episode_num: p.episode_num})
@@ -7085,6 +7099,7 @@ async function recordAiring(airing, title, button) {
   const r = await post('/epg-web/api/record', {
     title:      title,
     channel_id: airing.channel_id,
+    channel_name: airing.channel_name || airing.channel || airing.channel_id,
     start_ts:   airing.start_ts,
     stop_ts:    airing.stop_ts,
     episode_title: airing.episode_title || '',
