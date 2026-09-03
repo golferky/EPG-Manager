@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260903a"
+VERSION = "v20260903b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -215,6 +215,14 @@ def _metadata_runtime_minutes(value):
     """Parse an OMDb-style runtime (for example ``127 min``) safely."""
     match = re.search(r'\d+', str(value or ''))
     return int(match.group()) if match else 0
+
+
+def _metadata_runtime_is_plausible(expected_minutes, returned_runtime):
+    """Reject a clearly different-length same-title result when duration is known."""
+    runtime = _metadata_runtime_minutes(returned_runtime)
+    if not expected_minutes or not runtime:
+        return True
+    return abs(runtime - float(expected_minutes)) <= max(25, float(expected_minutes) * 0.35)
 
 def get_db():
     cfg = load_config()
@@ -3953,14 +3961,16 @@ def api_prog_info():
                 url = f'http://www.omdbapi.com/?t={q}&type=series&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     od = json.loads(resp.read())
-                if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
+                if (od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title'))
+                        and _metadata_runtime_is_plausible(expected_minutes, od.get('Runtime'))):
                     return jsonify(_omdb_result(od))
             elif year:
                 # Year known — direct lookup is reliable
                 url = f'http://www.omdbapi.com/?t={q}&y={year}&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     od = json.loads(resp.read())
-                if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
+                if (od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title'))
+                        and _metadata_runtime_is_plausible(expected_minutes, od.get('Runtime'))):
                     return jsonify(_omdb_result(od))
             else:
                 # No year — search all exact-title versions.  When titles are
@@ -3976,12 +3986,12 @@ def api_prog_info():
                     url = f'http://www.omdbapi.com/?t={q}&apikey={omdb_key}'
                     with urlreq.urlopen(url, timeout=5) as resp:
                         od = json.loads(resp.read())
-                    if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
+                    if (od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title'))
+                            and _metadata_runtime_is_plausible(expected_minutes, od.get('Runtime'))):
                         return jsonify(_omdb_result(od))
                 else:
                     # Fetch only exact-title candidates.  Runtime comes first
                     # when the guide supplied a duration; descriptions break
-                    # ties between different releases of the same length.
                     desc_words = set(_re.findall(r'[A-Z][a-z]+', desc)) if desc else set()
                     best_od, best_score = None, (-float('inf'), -1)
                     exact_hits = [hit for hit in hits
@@ -4030,10 +4040,28 @@ def api_prog_info():
                 # metadata is much better than confidently showing the wrong
                 # show, actors, poster, and Plex badge.
                 wanted_title = _re.sub(r'[^a-z0-9]', '', title.lower())
-                m = next((item for item in results
-                          if _re.sub(r'[^a-z0-9]', '',
-                                     (item.get('title') or item.get('name') or '').lower()) == wanted_title),
-                         None)
+                exact_results = [item for item in results
+                                 if _re.sub(r'[^a-z0-9]', '',
+                                            (item.get('title') or item.get('name') or '').lower()) == wanted_title]
+                m = exact_results[0] if exact_results else None
+                # Same-title films need the same duration check as OMDb.  TMDb
+                # search results omit runtime, so fetch only the few exact
+                # candidates before deciding.
+                if expected_minutes and search_kind == 'movie' and exact_results:
+                    scored = []
+                    for candidate in exact_results[:5]:
+                        try:
+                            details_url = (f'https://api.themoviedb.org/3/movie/{candidate["id"]}'
+                                           f'?api_key={tmdb_key}')
+                            with urlreq.urlopen(details_url, timeout=5) as resp:
+                                details = json.loads(resp.read())
+                            runtime = _metadata_runtime_minutes(details.get('runtime'))
+                            score = -abs(runtime - expected_minutes) if runtime else -10000
+                            scored.append((score, {**candidate, **details}))
+                        except Exception:
+                            continue
+                    if scored:
+                        m = max(scored, key=lambda item: item[0])[1]
                 if not m:
                     results = []
             if results:
