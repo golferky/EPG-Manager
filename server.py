@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260903b"
+VERSION = "v20260903c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3880,6 +3880,11 @@ def api_prog_info():
         expected_minutes = max(0, float(request.args.get('duration', 0) or 0) / 60)
     except (TypeError, ValueError):
         expected_minutes = 0
+    try:
+        guide_start_ts = float(request.args.get('start_ts', 0) or 0)
+    except (TypeError, ValueError):
+        guide_start_ts = 0
+    guide_channel_id = request.args.get('channel_id', '').strip()
     if content_type not in ('movie', 'series'):
         content_type = ''
     # The guide normally labels films as "Movie", even when the browser did
@@ -3916,6 +3921,29 @@ def api_prog_info():
     cfg = load_config()
     omdb_key = cfg.get('omdb_key', '')
     tmdb_key = cfg.get('tmdb_key', '')
+
+    # Do not rely solely on a browser-provided duration.  The guide row is the
+    # authoritative duration for an open programme and makes same-title
+    # matching safe even if an older browser has incomplete programme data.
+    if guide_start_ts and guide_channel_id:
+        try:
+            guide_db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+            start = datetime.fromtimestamp(guide_start_ts, timezone.utc)
+            lower = (start - timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+            upper = (start + timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+            gconn = sqlite3.connect(guide_db_path)
+            row = gconn.execute('''SELECT start_utc,end_utc FROM guide
+                                   WHERE channel_id=? AND lower(title)=lower(?)
+                                     AND start_utc BETWEEN ? AND ?
+                                   ORDER BY start_utc LIMIT 1''',
+                                (guide_channel_id, title, lower, upper)).fetchone()
+            gconn.close()
+            if row:
+                actual_start = datetime.strptime(row[0], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                actual_end = datetime.strptime(row[1], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                expected_minutes = max(0, (actual_end - actual_start).total_seconds() / 60)
+        except Exception:
+            pass
 
     # 1. Check master_titles — for in_library flag + local poster fallback
     lib_row = None
@@ -6482,7 +6510,7 @@ function showTip(e, p) {
     if (_imdbCache[key]) { ttImdb.textContent = _imdbCache[key]; ttImdb.style.display = 'block'; }
   } else {
     _imdbCache[key] = '';
-    fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}&desc=${encodeURIComponent(p.desc||'')}&duration=${encodeURIComponent(Math.max(0, (p.stop_ts||0) - (p.start_ts||0)))}`)
+    fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}&desc=${encodeURIComponent(p.desc||'')}&duration=${encodeURIComponent(Math.max(0, (p.stop_ts||0) - (p.start_ts||0)))}&start_ts=${encodeURIComponent(p.start_ts||'')}&channel_id=${encodeURIComponent(p.channel_id||'')}`)
       .then(r => r.json()).then(info => {
         const parts = [];
         if (info.imdb_rating) parts.push(`★ ${info.imdb_rating}`);
@@ -6560,6 +6588,8 @@ async function openProg(p) {
     if (p.year)     params.set('year', p.year);
     if (p.category) params.set('category', p.category);
     if (p.stop_ts && p.start_ts) params.set('duration', Math.max(0, p.stop_ts - p.start_ts));
+    if (p.start_ts) params.set('start_ts', p.start_ts);
+    if (p.channel_id) params.set('channel_id', p.channel_id);
     info = await fetchJsonWithin(`/epg-web/api/prog-info?${params}`) || {};
   } catch(e) {}
 
