@@ -62,6 +62,8 @@ class RecordingTests(unittest.TestCase):
                                                         "Spider Man Homecoming"))
         self.assertFalse(server._metadata_title_matches("Wolves", "Dances with Wolves"))
         self.assertFalse(server._metadata_title_matches("Gravity", "Gravity Falls"))
+        self.assertEqual(server._metadata_runtime_minutes("127 min"), 127)
+        self.assertEqual(server._metadata_runtime_minutes("N/A"), 0)
 
     def test_commercial_report_parser_reads_frame_ranges(self):
         with tempfile.TemporaryDirectory() as temp:

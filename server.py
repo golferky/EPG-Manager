@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260902f"
+VERSION = "v20260903a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -209,6 +209,12 @@ def _metadata_title_matches(requested_title, returned_title):
     """
     normalize = lambda value: re.sub(r'[^a-z0-9]', '', str(value or '').lower())
     return bool(normalize(requested_title)) and normalize(requested_title) == normalize(returned_title)
+
+
+def _metadata_runtime_minutes(value):
+    """Parse an OMDb-style runtime (for example ``127 min``) safely."""
+    match = re.search(r'\d+', str(value or ''))
+    return int(match.group()) if match else 0
 
 def get_db():
     cfg = load_config()
@@ -3862,6 +3868,10 @@ def api_prog_info():
     desc     = request.args.get('desc', '').strip()
     category = request.args.get('category', '').strip().lower()
     content_type = request.args.get('content_type', '').strip().lower()
+    try:
+        expected_minutes = max(0, float(request.args.get('duration', 0) or 0) / 60)
+    except (TypeError, ValueError):
+        expected_minutes = 0
     if content_type not in ('movie', 'series'):
         content_type = ''
     # The guide normally labels films as "Movie", even when the browser did
@@ -3953,7 +3963,9 @@ def api_prog_info():
                 if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
                     return jsonify(_omdb_result(od))
             else:
-                # No year — search for all versions, then pick best by description match
+                # No year — search all exact-title versions.  When titles are
+                # identical (Se7en is both a feature film and a short), the
+                # guide's airing length is the strongest safe discriminator.
                 kind = content_type or 'movie'
                 url = f'http://www.omdbapi.com/?s={q}&type={kind}&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
@@ -3967,10 +3979,14 @@ def api_prog_info():
                     if od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title')):
                         return jsonify(_omdb_result(od))
                 else:
-                    # Score each candidate: fetch full details for top 4, pick best actor match
+                    # Fetch only exact-title candidates.  Runtime comes first
+                    # when the guide supplied a duration; descriptions break
+                    # ties between different releases of the same length.
                     desc_words = set(_re.findall(r'[A-Z][a-z]+', desc)) if desc else set()
-                    best_od, best_score = None, -1
-                    for hit in hits[:4]:
+                    best_od, best_score = None, (-float('inf'), -1)
+                    exact_hits = [hit for hit in hits
+                                  if _metadata_title_matches(title, hit.get('Title'))][:5]
+                    for hit in exact_hits:
                         iid = hit.get('imdbID','')
                         if not iid: continue
                         with urlreq.urlopen(f'http://www.omdbapi.com/?i={iid}&apikey={omdb_key}', timeout=5) as r2:
@@ -3980,7 +3996,16 @@ def api_prog_info():
                             continue
                         # Score: exact title match wins, then actor name words from desc
                         actor_words = set(_re.findall(r'[A-Z][a-z]+', od2.get('Actors','')))
-                        score = len(desc_words & actor_words)
+                        actor_score = len(desc_words & actor_words)
+                        runtime = _metadata_runtime_minutes(od2.get('Runtime'))
+                        if expected_minutes:
+                            # Prefer the closest plausible running time.  A
+                            # missing runtime stays eligible but never wins
+                            # over a known close match.
+                            runtime_score = -abs(runtime - expected_minutes) if runtime else -10000
+                            score = (runtime_score, actor_score)
+                        else:
+                            score = (0, actor_score)
                         if score > best_score:
                             best_score, best_od = score, od2
                     if best_od:
@@ -6429,7 +6454,7 @@ function showTip(e, p) {
     if (_imdbCache[key]) { ttImdb.textContent = _imdbCache[key]; ttImdb.style.display = 'block'; }
   } else {
     _imdbCache[key] = '';
-    fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}&desc=${encodeURIComponent(p.desc||'')}`)
+    fetch(`/epg-web/api/prog-info?title=${encodeURIComponent(p.title)}&desc=${encodeURIComponent(p.desc||'')}&duration=${encodeURIComponent(Math.max(0, (p.stop_ts||0) - (p.start_ts||0)))}`)
       .then(r => r.json()).then(info => {
         const parts = [];
         if (info.imdb_rating) parts.push(`★ ${info.imdb_rating}`);
@@ -6506,6 +6531,7 @@ async function openProg(p) {
     if (p.desc)     params.set('desc', p.desc);
     if (p.year)     params.set('year', p.year);
     if (p.category) params.set('category', p.category);
+    if (p.stop_ts && p.start_ts) params.set('duration', Math.max(0, p.stop_ts - p.start_ts));
     info = await fetchJsonWithin(`/epg-web/api/prog-info?${params}`) || {};
   } catch(e) {}
 
