@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260903c"
+VERSION = "v20260904a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4046,7 +4046,8 @@ def api_prog_info():
                             score = (0, actor_score)
                         if score > best_score:
                             best_score, best_od = score, od2
-                    if best_od:
+                    if (best_od and _metadata_runtime_is_plausible(
+                            expected_minutes, best_od.get('Runtime'))):
                         return jsonify(_omdb_result(best_od))
         except Exception as e:
             print(f'[OMDB] {e}')
@@ -4090,6 +4091,8 @@ def api_prog_info():
                             continue
                     if scored:
                         m = max(scored, key=lambda item: item[0])[1]
+                        if not _metadata_runtime_is_plausible(expected_minutes, m.get('runtime')):
+                            m = None
                 if not m:
                     results = []
             if results:
