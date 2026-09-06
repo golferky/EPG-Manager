@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260906a"
+VERSION = "v20260906b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
+
+RECORDING_TAIL_SECONDS = 45
 
 BASE_DIR = os.path.abspath(
     os.environ.get('EPG_BASE_DIR', os.path.expanduser('~/epg'))
@@ -1311,7 +1313,9 @@ def _run_recording(rec_id):
         _db_update_rec_status(rec_id, 'error', err)
         return
 
-    duration = int(stop_ts - time.time()) + 30  # always relative to now, not scheduled start
+    # End 45 seconds after the scheduled guide stop.  This protects a slightly
+    # late ending while keeping the amount of the following program minimal.
+    duration = int(stop_ts - time.time()) + RECORDING_TAIL_SECONDS
     ts_file  = os.path.join(rec_dir, f'{_safe_filename(title)}_{int(start_ts)}.ts')
     mp4_file = ts_file.replace('.ts', '.mp4')
 

@@ -22,6 +22,7 @@ from pathlib import Path
 
 
 MEDIA_EXTENSIONS = {'.mp4', '.mkv', '.m4v', '.ts'}
+DEFAULT_RECORDING_TAIL_SECONDS = 45
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -48,12 +49,19 @@ def load_config(path):
     cfg.setdefault('ffprobe', 'ffprobe')
     cfg.setdefault('transfer_retry_seconds', 30)
     cfg.setdefault('transfer_wait_timeout', 86400)
+    # A small cushion keeps a provider's slightly-late final scene/credits from
+    # being cut off, without routinely capturing much of the following program.
+    cfg.setdefault('recording_tail_seconds', DEFAULT_RECORDING_TAIL_SECONDS)
     try:
         cfg['max_concurrent_recordings'] = max(
             1, min(int(cfg['max_concurrent_recordings']), 16)
         )
     except (TypeError, ValueError):
         cfg['max_concurrent_recordings'] = 6
+    try:
+        cfg['recording_tail_seconds'] = max(0, min(int(cfg['recording_tail_seconds']), 120))
+    except (TypeError, ValueError):
+        cfg['recording_tail_seconds'] = DEFAULT_RECORDING_TAIL_SECONDS
     return cfg
 
 
@@ -505,7 +513,7 @@ def process_job(api, job, cfg):
     if wait > 0 and not heartbeat_sleep(
             api, job, 'waiting', wait, cfg, quality_decision=decision):
         return
-    remaining = int(job['stop_ts'] - time.time()) + 30
+    remaining = int(job['stop_ts'] - time.time()) + cfg['recording_tail_seconds']
     if remaining < 60:
         api.heartbeat(job['id'], 'skipped_too_short',
                       message='Recording window has already passed', result=quality)

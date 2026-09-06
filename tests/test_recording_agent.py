@@ -7,6 +7,14 @@ import recording_agent
 
 
 class QualityDecisionTests(unittest.TestCase):
+    def test_recording_tail_defaults_to_45_seconds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "agent.json"
+            config.write_text('{"server_url":"http://example.test","agent_token":"x",'
+                              '"epg_url":"http://example.test","epg_user":"u",'
+                              '"epg_pass":"p"}', encoding="utf-8")
+            self.assertEqual(recording_agent.load_config(config)["recording_tail_seconds"], 45)
+
     def test_higher_resolution_records(self):
         record, reason = recording_agent.quality_decision(
             {"width": 1280, "height": 720, "fps": 60, "total_bitrate": 6_000_000},

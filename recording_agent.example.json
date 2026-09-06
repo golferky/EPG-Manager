@@ -17,5 +17,6 @@
   "claim_ahead_seconds": 300,
   "max_concurrent_recordings": 6,
   "transfer_retry_seconds": 30,
-  "transfer_wait_timeout": 86400
+  "transfer_wait_timeout": 86400,
+  "recording_tail_seconds": 45
 }
