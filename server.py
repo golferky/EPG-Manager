@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260904a"
+VERSION = "v20260906a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5988,9 +5988,12 @@ function onSearchInput(val) {
       ).join('');
     }
     if (d.programs && d.programs.length) {
+      // Keep the exact search rows: a title may air simultaneously on several
+      // channels, and clicking one must not reopen the first same-title row.
+      window._searchProgramRows = d.programs;
       html += '<div style="padding:6px 12px;font-size:11px;color:#f59e0b;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;">🎬 On Now / Upcoming</div>';
-      html += d.programs.map(p =>
-        `<div class="sr" onclick="searchOpenProg(${JSON.stringify(p.title).replace(/"/g,'&quot;')})" style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:10px;">
+      html += d.programs.map((p, index) =>
+        `<div class="sr" onclick="openProg(window._searchProgramRows[${index}])" style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:10px;">
           <span style="font-size:12px;min-width:70px;color:${p.on_now?'#22c55e':'#94a3b8'};font-weight:${p.on_now?'600':'400'};">${esc(p.start_fmt)}</span>
           <span style="flex:1;font-size:13px;color:#e2e8f0;">${esc(p.title)}</span>
           <span style="font-size:11px;color:#64748b;text-align:right;">${p.has_stream ? '📡 ' : ''}${esc(p.channel_name)}</span>
@@ -6727,10 +6730,17 @@ async function openProg(p) {
           recMap[r.channel_id + '|' + r.start_ts] = true;
       });
 
-      // Find currently-airing primestreams show (for Play), then next future one (for Record)
+      // Keep the exact row the user clicked when it is present.  A title can
+      // air on Sundance and Sky Cinema at the same time; the click must not
+      // silently switch the modal to the first other channel returned.
+      const selectedAiring = ar.airings.find(a =>
+        a.channel_id === p.channel_id && Math.abs((a.start_ts || 0) - (p.start_ts || 0)) < 60
+      );
+      // Otherwise find currently-airing primestreams show (for Play), then
+      // the next future one (for Record).
       const livePS   = ar.airings.find(a => (a.can_play || a.can_record) && a.on_now);
       const futurePS = ar.airings.find(a => a.can_record && !a.on_now);
-      const featPS   = livePS || futurePS;
+      const featPS   = selectedAiring || livePS || futurePS;
       if (featPS) {
         _nextAiring = featPS;
         _nextAiring._title = p.title;
