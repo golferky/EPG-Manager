@@ -268,6 +268,11 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("addWanted('movie')", server.HTML)
         self.assertIn("addWanted('series')", server.HTML)
 
+    def test_wanted_movie_requires_imdb_choice_before_save(self):
+        self.assertIn('/epg-web/api/wanted/movie-matches', server.HTML)
+        self.assertIn('showWantedMoviePicker', server.HTML)
+        self.assertIn('imdb_id:movie.imdb_id', server.HTML)
+
     def test_wanted_ui_separates_movies_and_series(self):
         self.assertIn("['MOVIES', recs.filter", server.HTML)
         self.assertIn("['MOVIES — IN PLEX', recs.filter", server.HTML)

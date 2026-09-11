@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260906b"
+VERSION = "v20260911a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3605,10 +3605,16 @@ def api_wanted():
     action = data.get('action')
     if action == 'add':
         title = data.get('title','').strip()
-        year  = data.get('year','')
+        year  = str(data.get('year','')).strip()
+        imdb_id = str(data.get('imdb_id','')).strip()
+        item_type = data.get('type','movie')
+        if not title:
+            return jsonify({'error': 'Choose a title first.'}), 400
         norm  = title.lower().replace("'",'').replace('-',' ')
-        db_run('INSERT OR IGNORE INTO wanted_titles (title,normalized_title,year,type,source,status,created_at,updated_at) VALUES (?,?,?,?,?,?,datetime("now"),datetime("now"))',
-               (title, norm, year, data.get('type','movie'), 'manual', 'wanted'))
+        db_run('''INSERT OR IGNORE INTO wanted_titles
+                  (title,normalized_title,year,imdb_id,type,source,status,created_at,updated_at)
+                  VALUES (?,?,?,?,?,?,?,datetime("now"),datetime("now"))''',
+               (title, norm, year, imdb_id, item_type, 'manual', 'wanted'))
         return jsonify({'ok': True})
     if action == 'remove':
         db_run('DELETE FROM wanted_titles WHERE id=?', (data.get('id'),))
@@ -3618,6 +3624,72 @@ def api_wanted():
                (data.get('status'), data.get('notes',''), data.get('id')))
         return jsonify({'ok': True})
     return jsonify({'error': 'Unknown action'}), 400
+
+
+@app.route('/epg-web/api/wanted/movie-matches')
+def api_wanted_movie_matches():
+    """Return IMDb/OMDb candidates for a manual Wanted movie choice.
+
+    A title alone is not enough for movies such as *Crash* or *The Thing*.
+    Deliberately present the candidates before adding anything to Wanted, so a
+    later guide match is tied to the title/year the user actually selected.
+    """
+    from urllib import request as urlreq
+    from urllib.parse import quote
+
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({'error': 'Enter a movie title.'}), 400
+    omdb_key = load_config().get('omdb_key', '')
+    if not omdb_key:
+        return jsonify({'error': 'IMDb lookup is not configured on this server.'}), 503
+    try:
+        with urlreq.urlopen(
+            f'http://www.omdbapi.com/?s={quote(query)}&type=movie&apikey={omdb_key}',
+            timeout=8,
+        ) as response:
+            search = json.loads(response.read())
+        if search.get('Response') != 'True':
+            return jsonify({'matches': [], 'message': search.get('Error', 'No movie matches found.')})
+
+        # OMDb search cards have only a title/year/poster.  Fetch the selected
+        # set's details so the chooser has enough context to make a safe pick.
+        matches = []
+        for hit in search.get('Search', [])[:8]:
+            imdb_id = hit.get('imdbID', '')
+            if not imdb_id:
+                continue
+            try:
+                with urlreq.urlopen(
+                    f'http://www.omdbapi.com/?i={quote(imdb_id)}&apikey={omdb_key}',
+                    timeout=6,
+                ) as response:
+                    detail = json.loads(response.read())
+            except Exception:
+                detail = hit
+            if detail.get('Response') == 'False':
+                detail = hit
+            poster = detail.get('Poster', '')
+            matches.append({
+                'title': detail.get('Title') or hit.get('Title', ''),
+                'year': detail.get('Year') or hit.get('Year', ''),
+                'imdb_id': detail.get('imdbID') or imdb_id,
+                'poster': '' if poster == 'N/A' else poster,
+                'runtime': detail.get('Runtime', ''),
+                'rated': detail.get('Rated', ''),
+                'genre': detail.get('Genre', ''),
+                'director': detail.get('Director', ''),
+                'actors': detail.get('Actors', ''),
+                'plot': detail.get('Plot', ''),
+                'imdb_rating': detail.get('imdbRating', ''),
+            })
+        # Exact title results first, while retaining alternate spellings and
+        # similarly named films for a conscious user choice.
+        matches.sort(key=lambda row: not _metadata_title_matches(query, row['title']))
+        return jsonify({'matches': matches})
+    except Exception as exc:
+        print(f'[wanted IMDb] {exc}')
+        return jsonify({'error': 'Could not reach IMDb details right now.'}), 502
 
 @app.route('/epg-web/api/library')
 def api_library():
@@ -7374,7 +7446,74 @@ async function removeWanted(id) {
 async function addWanted(type) {
   const title = prompt(type === 'series' ? 'Series title:' : 'Movie title:');
   if (!title) return;
-  await post('/epg-web/api/wanted', {action:'add', title, type});
+  if (type === 'movie') return findWantedMovie(title.trim());
+  await post('/epg-web/api/wanted', {action:'add', title: title.trim(), type});
+  loadRecs();
+}
+
+async function findWantedMovie(query) {
+  setEl('rec-status', 'Looking up IMDb movie choices…', '');
+  try {
+    const d = await (await fetch(`/epg-web/api/wanted/movie-matches?q=${encodeURIComponent(query)}`)).json();
+    if (d.error) { setEl('rec-status', d.error, 'err'); return; }
+    if (!d.matches || !d.matches.length) {
+      setEl('rec-status', d.message || `No IMDb movie choices found for “${query}”. Nothing was added.`, 'err');
+      return;
+    }
+    showWantedMoviePicker(query, d.matches);
+  } catch (e) {
+    setEl('rec-status', 'Could not look up movie choices: ' + e.message, 'err');
+  }
+}
+
+function showWantedMoviePicker(query, matches) {
+  const old = document.getElementById('wanted-movie-picker');
+  if (old) old.remove();
+  window._wantedMovieMatches = matches;
+  const cards = matches.map((m, index) => {
+    const poster = m.poster
+      ? `<img src="${esc(m.poster)}" alt="" style="width:72px;height:108px;object-fit:cover;background:#0d1117;border-radius:5px;">`
+      : `<div style="width:72px;height:108px;background:#0d1117;border-radius:5px;display:flex;align-items:center;justify-content:center;color:#475569;font-size:10px;">No poster</div>`;
+    const rating = m.imdb_rating && m.imdb_rating !== 'N/A' ? `★ ${esc(m.imdb_rating)} · ` : '';
+    const facts = [m.runtime, m.rated, m.genre].filter(v => v && v !== 'N/A').map(esc).join(' · ');
+    const people = [m.director && m.director !== 'N/A' ? `🎬 ${m.director}` : '', m.actors && m.actors !== 'N/A' ? `🎭 ${m.actors}` : ''].filter(Boolean).map(esc).join('<br>');
+    return `<button onclick="chooseWantedMovie(${index})" style="width:100%;display:flex;gap:13px;text-align:left;padding:12px;border:1px solid #263449;border-radius:9px;background:#101827;color:#e5e7eb;cursor:pointer;margin-bottom:9px;">
+      ${poster}
+      <span style="min-width:0;flex:1;">
+        <span style="display:block;font-size:16px;font-weight:700;margin-bottom:4px;">${esc(m.title)} <span style="color:#94a3b8;font-weight:500;">(${esc(m.year)})</span></span>
+        <span style="display:block;color:#fbbf24;font-size:12px;margin-bottom:4px;">${rating}IMDb</span>
+        <span style="display:block;color:#a5b4c7;font-size:12px;margin-bottom:5px;">${facts}</span>
+        <span style="display:block;color:#a5b4c7;font-size:12px;line-height:1.45;margin-bottom:5px;">${people}</span>
+        <span style="display:block;color:#94a3b8;font-size:12px;line-height:1.45;">${esc(m.plot && m.plot !== 'N/A' ? m.plot : '')}</span>
+      </span>
+    </button>`;
+  }).join('');
+  const overlay = document.createElement('div');
+  overlay.id = 'wanted-movie-picker';
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:1500;background:rgba(0,0,0,.78);display:flex;align-items:center;justify-content:center;padding:20px;';
+  overlay.onclick = event => { if (event.target === overlay) overlay.remove(); };
+  overlay.innerHTML = `<div style="width:min(760px,100%);max-height:88vh;overflow:auto;background:#111827;border:1px solid #334155;border-radius:14px;padding:20px;box-shadow:0 25px 80px #000;">
+    <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:8px;">
+      <div><h2 style="margin:0 0 5px;font-size:20px;">Choose the right movie</h2><div style="color:#94a3b8;font-size:13px;">IMDb results for “${esc(query)}” — select one to add it to Wanted.</div></div>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('wanted-movie-picker').remove()">Close</button>
+    </div>
+    <div style="color:#64748b;font-size:12px;margin:12px 0;">The year and IMDb identity you choose will be saved with the wanted title.</div>
+    ${cards}
+  </div>`;
+  document.body.appendChild(overlay);
+  setEl('rec-status', 'Choose the correct movie from IMDb.', '');
+}
+
+async function chooseWantedMovie(index) {
+  const movie = (window._wantedMovieMatches || [])[index];
+  if (!movie) return;
+  const picker = document.getElementById('wanted-movie-picker');
+  if (picker) picker.remove();
+  const response = await post('/epg-web/api/wanted', {
+    action:'add', title:movie.title, year:movie.year, imdb_id:movie.imdb_id, type:'movie'
+  });
+  if (response && response.error) { setEl('rec-status', response.error, 'err'); return; }
+  setEl('rec-status', `Added “${movie.title}” (${movie.year}) to Wanted.`, 'ok');
   loadRecs();
 }
 
