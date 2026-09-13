@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260913b"
+VERSION = "v20260913c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5647,6 +5647,7 @@ tr:hover td{background:#141414;}
         <h2 style="margin:0;">Upcoming & Active Recordings</h2>
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Completed, failed, and skipped recordings are in Recording Health.</div>
       </div>
+      <input id="sched-search" type="search" placeholder="Search scheduled recordings…" oninput="filterSchedule()" style="width:230px;max-width:100%;background:#111827;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:7px 10px;font-size:12px;" aria-label="Search scheduled recordings">
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadSchedule()">↻ Refresh</button>
     </div>
     <div id="sched-empty" class="empty" style="display:none;">
@@ -7656,9 +7657,20 @@ async function loadSchedule() {
   };
 
   const now = Date.now();
-  const sched = all.filter(r => activeStates.includes((r.status || '').toLowerCase()));
+  const allScheduled = all.filter(r => activeStates.includes((r.status || '').toLowerCase()));
+  const query = (document.getElementById('sched-search')?.value || '').trim().toLowerCase();
+  const sched = query ? allScheduled.filter(r =>
+    [r.title, r.channel, r.episode_title, r.season_number, r.episode_number]
+      .some(value => String(value || '').toLowerCase().includes(query))
+  ) : allScheduled;
 
-  if (!sched.length) { tbl.style.display='none'; emp.style.display='block'; return; }
+  if (!sched.length) {
+    tbl.style.display='none'; emp.style.display='block';
+    emp.innerHTML = query
+      ? `No scheduled recordings match “${esc(query)}”.`
+      : `Nothing waiting to record<br><span style="font-size:12px;color:#333;margin-top:6px;display:block;">Add programs from the Guide or Recommendations tab.</span>`;
+    return;
+  }
   tbl.style.display='table'; emp.style.display='none';
 
   document.getElementById('sched-body').innerHTML = sched.map((r,i) => {
@@ -7688,6 +7700,11 @@ async function loadSchedule() {
       </td>
     </tr>`;
   }).join('');
+}
+
+function filterSchedule() {
+  // Refresh the current queued/active snapshot and apply the text filter.
+  loadSchedule();
 }
 
 function healthSize(bytes) {

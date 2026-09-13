@@ -281,6 +281,10 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("r.get('channel_id') is not None", source)
         self.assertIn("r.get('start_ts') is not None", source)
 
+    def test_schedule_has_text_filter(self):
+        self.assertIn('id="sched-search"', server.HTML)
+        self.assertIn('function filterSchedule()', server.HTML)
+
     def test_wanted_ui_separates_movies_and_series(self):
         self.assertIn("['MOVIES', recs.filter", server.HTML)
         self.assertIn("['MOVIES — IN PLEX', recs.filter", server.HTML)
