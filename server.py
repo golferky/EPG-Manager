@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260913a"
+VERSION = "v20260913b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4597,8 +4597,15 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     best_rows = list(ep_best.values()) + list(unknown_best.values())
 
     with _rec_lock:
-        existing_keys = {(r['channel_id'], r['start_ts']) for r in _recs.values()
-                         if _rec_is_active(r)}
+        # _recs also contains a few transient UI/playback entries.  They are
+        # active but are not recordings and have no guide channel or start
+        # time.  Ignore them here rather than letting one abort a series run
+        # after some episodes have already been queued.
+        existing_keys = {
+            (r['channel_id'], r['start_ts']) for r in _recs.values()
+            if (_rec_is_active(r) and r.get('channel_id') is not None
+                and r.get('start_ts') is not None)
+        }
     # The in-memory list is empty during early startup, so also consult the
     # durable queue before adding work from an active series rule.
     try:
@@ -7040,15 +7047,21 @@ async function recordSeries() {
   if (!title) return;
   const btn = document.getElementById('pm-series-btn');
   btn.disabled = true; btn.textContent = '⏳ Scheduling…';
-  const r = await post('/epg-web/api/record/series', {title});
-  if (r.ok) {
-    btn.textContent = `✅ Episodes (${r.scheduled})`;
-    document.getElementById('pm-status').textContent = `📺 Recurring recording set for "${title}" — ${r.scheduled} identified episodes queued`;
-    document.getElementById('pm-status').className = 'status-msg ok';
-    loadSeriesRecordings();
-  } else {
+  try {
+    const r = await post('/epg-web/api/record/series', {title});
+    if (r.ok) {
+      btn.textContent = `✅ Episodes (${r.scheduled})`;
+      document.getElementById('pm-status').textContent = `📺 Recurring recording set for "${title}" — ${r.scheduled} identified episodes queued`;
+      document.getElementById('pm-status').className = 'status-msg ok';
+      loadSeriesRecordings();
+    } else {
+      btn.disabled = false; btn.textContent = '📺 Record Identified Episodes';
+      document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
+      document.getElementById('pm-status').className = 'status-msg err';
+    }
+  } catch (e) {
     btn.disabled = false; btn.textContent = '📺 Record Identified Episodes';
-    document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
+    document.getElementById('pm-status').textContent = '❌ Scheduling failed: ' + e.message;
     document.getElementById('pm-status').className = 'status-msg err';
   }
 }

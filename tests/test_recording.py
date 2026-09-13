@@ -273,6 +273,14 @@ class RecordingTests(unittest.TestCase):
         self.assertIn('showWantedMoviePicker', server.HTML)
         self.assertIn('imdb_id:movie.imdb_id', server.HTML)
 
+    def test_series_scheduler_ignores_non_recording_runtime_entries(self):
+        # Playback/UI state can share the in-memory registry but does not have
+        # the channel/start pair used for recording deduplication.
+        with open(server.__file__) as handle:
+            source = handle.read()
+        self.assertIn("r.get('channel_id') is not None", source)
+        self.assertIn("r.get('start_ts') is not None", source)
+
     def test_wanted_ui_separates_movies_and_series(self):
         self.assertIn("['MOVIES', recs.filter", server.HTML)
         self.assertIn("['MOVIES — IN PLEX', recs.filter", server.HTML)
