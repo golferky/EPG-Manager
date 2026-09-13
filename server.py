@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260913c"
+VERSION = "v20260913d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -7781,7 +7781,7 @@ async function loadRecordingHealth() {
     });
     if (!reports.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
-    list.innerHTML = reports.map(r => {
+    const rows = reports.map(r => {
       const result = r.result || {};
       const retry = r.retry || null;
       const recorded = result.recorded || {};
@@ -7796,21 +7796,19 @@ async function loadRecordingHealth() {
       const technical = result.log_excerpt || '';
       const when = r.start_time || (r.start_ts ? new Date(Number(r.start_ts) * 1000).toLocaleString() : '');
       const score = recordingQualityScore(recorded, scheduled, actual, result.transferred_to_plex, result.log_excerpt);
-      return `<div style="padding:11px 2px;border-bottom:1px solid #222;">
-        <div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;">
-          <strong style="font-size:14px;">${esc(r.title || 'Untitled')}</strong>
-          <span style="font-size:12px;color:${color};font-weight:700;">${esc(label)}</span>
-          ${score ? `<span title="${esc(score.detail)}" style="background:${score.color};color:#101010;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:800;">QUALITY ${score.score}/100</span>` : ''}
-          <span style="font-size:12px;color:#64748b;">${esc(r.channel || '')} ${when ? '· ' + esc(when) : ''}</span>
-        </div>
-        <div style="font-size:12px;color:#94a3b8;margin-top:5px;">${[timing, video, result.transferred_to_plex ? 'Moved to Plex' : ''].filter(Boolean).map(esc).join(' &nbsp;•&nbsp; ') || 'No media probe was available for this result.'}</div>
-        ${!isGood && !isActive ? (retry
-          ? `<div style="margin-top:8px;display:inline-block;background:#14532d;color:#bbf7d0;border:1px solid #166534;border-radius:5px;padding:5px 8px;font-size:12px;font-weight:700;">✓ Will re-record${retry.start_ts ? ` · ${new Date(Number(retry.start_ts) * 1000).toLocaleString()}` : ''}${retry.channel ? ` · ${esc(retry.channel)}` : ''}</div>`
-          : `<button class="btn btn-sm" style="margin-top:8px;background:#1d4ed8;color:#dbeafe;" onclick="rerecordFromHealth('${String(r.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Find re-record</button>`)
-          : ''}
-        ${technical ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#93c5fd;font-size:12px;">Show technical FFmpeg log</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;margin-top:7px;padding:9px;background:#111827;border:1px solid #263247;border-radius:5px;color:#cbd5e1;font-size:11px;line-height:1.35;">${esc(technical)}</pre></details>` : '<div style="font-size:11px;color:#475569;margin-top:6px;">Technical log was not saved for this older recording.</div>'}
-      </div>`;
+      const compactResult = isGood ? 'Complete' : (timing || esc(label));
+      const action = !isGood && !isActive ? (retry
+        ? `<span style="color:#86efac;font-size:11px;font-weight:700;white-space:nowrap;">✓ Re-record queued</span>`
+        : `<button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;white-space:nowrap;" onclick="rerecordFromHealth('${String(r.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Find re-record</button>`) : '';
+      return `<tr>
+        <td class="title-cell">${esc(r.title || 'Untitled')}${r.episode_title ? `<br><span style="font-size:11px;color:#64748b;font-weight:400;">S${esc(r.season_num || '?')}E${esc(r.episode_num || '?')} · ${esc(r.episode_title)}</span>` : ''}</td>
+        <td class="ch-cell">${esc(r.channel || '')}</td>
+        <td class="time-cell">${esc(when)}</td>
+        <td style="font-size:12px;color:${color};font-weight:700;white-space:nowrap;">${esc(compactResult)}${score ? `<span title="${esc(score.detail)}" style="display:inline-block;background:${score.color};color:#101010;border-radius:4px;padding:2px 5px;margin-left:5px;font-size:10px;">${score.score}</span>` : ''}</td>
+        <td class="act-cell">${action}${technical ? `<details><summary style="cursor:pointer;color:#93c5fd;font-size:11px;white-space:nowrap;">Log</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;margin-top:7px;padding:9px;background:#111827;border:1px solid #263247;border-radius:5px;color:#cbd5e1;font-size:11px;line-height:1.35;min-width:360px;">${esc(technical)}</pre></details>` : ''}</td>
+      </tr>`;
     }).join('');
+    list.innerHTML = `<div style="overflow-x:auto;"><table><thead><tr><th>Recording</th><th>Channel</th><th>When</th><th>Result</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   } catch (err) {
     list.innerHTML = `<div style="color:#f87171;font-size:13px;">Could not load recording health: ${esc(err.message || String(err))}</div>`;
   }

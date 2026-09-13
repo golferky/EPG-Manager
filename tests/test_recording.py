@@ -285,6 +285,10 @@ class RecordingTests(unittest.TestCase):
         self.assertIn('id="sched-search"', server.HTML)
         self.assertIn('function filterSchedule()', server.HTML)
 
+    def test_recording_health_uses_compact_rows_with_rerecord_action(self):
+        self.assertIn('<th>Recording</th><th>Channel</th><th>When</th><th>Result</th><th>Actions</th>', server.HTML)
+        self.assertIn('↻ Find re-record', server.HTML)
+
     def test_wanted_ui_separates_movies_and_series(self):
         self.assertIn("['MOVIES', recs.filter", server.HTML)
         self.assertIn("['MOVIES — IN PLEX', recs.filter", server.HTML)
