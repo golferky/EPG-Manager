@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260911a"
+VERSION = "v20260913a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -294,8 +294,17 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         ps_guide_channels = {r[0] for r in mrows}
 
         gconn = sqlite3.connect(guide_db_path)
-        # All distinct channel_id/channel_name pairs in guide.db
-        grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
+        # guide has millions of programme rows.  Reading DISTINCT channel pairs
+        # from it made the first series-record click appear frozen for minutes.
+        # guide_channels is the compact canonical channel list maintained on
+        # every guide import; retain the old query only for an older database
+        # that has not populated it yet.
+        grows = gconn.execute(
+            'SELECT channel_id, channel_name FROM guide_channels '
+            'WHERE channel_id IS NOT NULL AND channel_name IS NOT NULL'
+        ).fetchall()
+        if not grows:
+            grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
         try:
             discovered_ids = {r[0] for r in gconn.execute(
                 'SELECT channel_id FROM discovered_streams'
