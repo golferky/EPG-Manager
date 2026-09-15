@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260913d"
+VERSION = "v20260915a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -184,6 +184,18 @@ def _is_foreign_recording_feed(name):
         r'urdu|chinese|mandarin|cantonese|korean|japanese|vietnamese|'
         r'tagalog|filipino|russian|polish|greek|turkish)\b',
         name or '', re.I))
+
+
+def _is_automatic_recording_quarantined_channel(name):
+    """Keep verified guide/stream mismatches out of unattended recordings.
+
+    Tastemade's September 2026 guide listings were verified against recordings
+    from both available providers and did not match the aired programming.
+    This is deliberately limited to automatic work (series, retry, upgrade),
+    so an explicitly requested one-off recording can still be made.
+    """
+    normalized = re.sub(r'[^a-z0-9]+', '', (name or '').lower())
+    return normalized.startswith('tastemade')
 
 
 def _is_quality_variant_channel_name(name):
@@ -3045,7 +3057,9 @@ def _best_incomplete_rerecord(title, expected_seconds):
         channel_id, channel = row['channel_id'], row['channel_name'] or row['channel_id']
         if (stop - start) < expected_seconds * 0.90:
             continue
-        if _is_foreign_recording_feed(channel) or not _is_commercial_free_channel(channel):
+        if (_is_foreign_recording_feed(channel)
+                or _is_automatic_recording_quarantined_channel(channel)
+                or not _is_commercial_free_channel(channel)):
             continue
         _url, stream_error, stream_debug = _resolve_recording_source(channel_id, start, stop)
         if stream_error or _recent_same_source_failure(title, channel_id):
@@ -3365,6 +3379,7 @@ def _auto_schedule_movie_upgrades():
             title_key = _norm_plex_show(row['title'])
             if (title_key in plex_movies and _is_commercial_free_channel(row['channel_name'])
                     and not _is_foreign_recording_feed(row['channel_name'])
+                    and not _is_automatic_recording_quarantined_channel(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
                     and not _recent_same_source_failure(row['title'], row['channel_id'])):
                 candidates_by_title.setdefault(title_key, []).append(row)
@@ -4580,6 +4595,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     reliability = _channel_recording_reliability()
     rows = [row for row in rows
             if not _is_foreign_recording_feed(row['channel_name'])
+            and not _is_automatic_recording_quarantined_channel(row['channel_name'])
             and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
             and not _recent_same_source_failure(title, row['channel_id'])]
     ep_best = {}   # (sn, en) → row with best channel quality
@@ -7890,6 +7906,13 @@ async function rerecordFromHealth(recId, button) {
   try {
     const d = await post('/epg-web/api/recording-health/rerecord', {rec_id: recId});
     if (!d.ok) throw new Error(d.error || 'Could not find a re-recording.');
+    if (d.message) alert(d.message);
+    else {
+      const when = d.start_ts ? new Date(Number(d.start_ts) * 1000).toLocaleString() : '';
+      alert(d.duplicate
+        ? `A re-recording is already queued on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`
+        : `Re-recording scheduled on ${d.channel || 'a channel'}${when ? ` for ${when}` : ''}.`);
+    }
     await loadRecordingHealth(); loadSchedule(); loadRecs();
   } catch (err) {
     alert(err.message || String(err));
