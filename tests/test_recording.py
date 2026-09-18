@@ -268,10 +268,12 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("addWanted('movie')", server.HTML)
         self.assertIn("addWanted('series')", server.HTML)
 
-    def test_wanted_movie_requires_imdb_choice_before_save(self):
+    def test_wanted_titles_require_imdb_choice_before_save(self):
         self.assertIn('/epg-web/api/wanted/movie-matches', server.HTML)
-        self.assertIn('showWantedMoviePicker', server.HTML)
+        self.assertIn('showWantedTitlePicker', server.HTML)
+        self.assertIn("type=${kind}", server.HTML)
         self.assertIn('imdb_id:movie.imdb_id', server.HTML)
+        self.assertIn("type = window._wantedTitleType === 'series' ? 'series' : 'movie'", server.HTML)
 
     def test_series_scheduler_ignores_non_recording_runtime_entries(self):
         # Playback/UI state can share the in-memory registry but does not have
