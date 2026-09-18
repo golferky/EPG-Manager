@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260915a"
+VERSION = "v20260918a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5590,11 +5590,14 @@ tr:hover td{background:#141414;}
     <div id="upgrade-list" style="font-size:13px;"></div>
   </div>
   <div class="card">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
-      <h2 style="margin:0;">Wanted Titles</h2>
-      <div style="display:flex;gap:8px;">
-        <button class="btn btn-primary btn-sm" onclick="addWanted('movie')">+ Movie</button>
-        <button class="btn btn-primary btn-sm" onclick="addWanted('series')">+ Series</button>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:10px;flex-wrap:wrap;">
+      <div>
+        <h2 style="margin:0 0 4px;">Wanted Titles</h2>
+        <div style="font-size:13px;color:#94a3b8;">Add something you want; EPG Manager will watch the guide for it.</div>
+      </div>
+      <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap;">
+        <button class="btn btn-primary" onclick="addWanted('movie')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Movie</button>
+        <button class="btn btn-primary" onclick="addWanted('series')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Series</button>
         <button class="btn btn-ghost btn-sm" onclick="loadRecs()">↻ Refresh</button>
       </div>
     </div>
