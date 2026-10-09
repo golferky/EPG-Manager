@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261009d"
+VERSION = "v20261009e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -754,6 +754,7 @@ _conv_lock = threading.Lock()
 _plex_info_cache = {}  # norm_title -> ffprobe result dict
 _stream_info_cache = {}  # channel_id -> (timestamp, safe ffprobe result)
 _plex_episode_cache = {'root': '', 'loaded_at': 0, 'episodes': set()}
+_tmdb_series_catalog_cache = {}
 _plex_title_cache = {
     'roots': (), 'loaded_at': 0, 'movies': set(), 'movie_versions': set(),
     'unyearred_movies': set(), 'shows': set(),
@@ -3815,7 +3816,43 @@ def _plex_episode_keys(tv_root):
     return episodes
 
 
-def _plex_series_inventory(tv_root):
+def _tmdb_series_catalog(title, tmdb_key):
+    """Return TMDb's season/episode totals for an exact series-title match."""
+    clean_title, _year = _plex_title_and_year(title)
+    cache_key = _norm_plex_show(clean_title)
+    cached = _tmdb_series_catalog_cache.get(cache_key)
+    if cached and time.time() - cached['checked_at'] < 86400:
+        return cached['catalog']
+    if not tmdb_key or not clean_title:
+        return None
+    try:
+        from urllib import request as urlreq
+        from urllib.parse import quote
+        search_url = (f'https://api.themoviedb.org/3/search/tv?api_key={tmdb_key}'
+                      f'&query={quote(clean_title)}')
+        with urlreq.urlopen(search_url, timeout=6) as response:
+            results = json.loads(response.read()).get('results', [])
+        exact = next((item for item in results
+                      if _norm_plex_show(item.get('name', '')) == cache_key), None)
+        if not exact or not exact.get('id'):
+            return None
+        detail_url = f'https://api.themoviedb.org/3/tv/{exact["id"]}?api_key={tmdb_key}'
+        with urlreq.urlopen(detail_url, timeout=6) as response:
+            details = json.loads(response.read())
+        catalog = {
+            int(season.get('season_number')): int(season.get('episode_count') or 0)
+            for season in details.get('seasons', [])
+            if int(season.get('season_number', 0)) > 0 and int(season.get('episode_count') or 0) > 0
+        }
+        if catalog:
+            _tmdb_series_catalog_cache[cache_key] = {'checked_at': time.time(), 'catalog': catalog}
+        return catalog or None
+    except Exception as exc:
+        print(f'[Plex series] TMDb catalog lookup failed for {title}: {exc}')
+        return None
+
+
+def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key=''):
     """Read the Plex TV layout and report only objectively detectable gaps.
 
     A filename scan can safely say that S02E03 is missing when S02E02 and
@@ -3864,7 +3901,55 @@ def _plex_series_inventory(tv_root):
             'seasons': season_rows,
             'episode_count': sum(len(values) for values in seasons.values()),
             'missing_count': missing_total,
+            'tracked': False,
+            'catalog_found': False,
         })
+
+    # A recurring series may have no folder yet. Include it so the user can
+    # see that every catalogued episode is still missing rather than silently
+    # hiding the title until the first recording arrives.
+    by_key = {_norm_plex_show(show['title']): show for show in shows}
+    for title in tracked_titles:
+        clean_title, _year = _plex_title_and_year(title)
+        key = _norm_plex_show(clean_title)
+        if not key:
+            continue
+        show = by_key.get(key)
+        if not show:
+            show = {
+                'title': clean_title,
+                'seasons': [],
+                'episode_count': 0,
+                'missing_count': 0,
+                'tracked': True,
+                'catalog_found': False,
+            }
+            shows.append(show)
+            by_key[key] = show
+        else:
+            show['tracked'] = True
+
+    # Full missing lists are meaningful only for series the user explicitly
+    # tracks. For those few titles, use an exact TMDb match as the catalogue.
+    for show in shows:
+        if not show.get('tracked'):
+            continue
+        catalog = _tmdb_series_catalog(show['title'], tmdb_key)
+        if not catalog:
+            continue
+        local = {row['season']: set(row['episodes']) for row in show['seasons']}
+        show['seasons'] = [
+            {
+                'season': season,
+                'episodes': sorted(local.get(season, set())),
+                'missing': [episode for episode in range(1, total + 1)
+                            if episode not in local.get(season, set())],
+            }
+            for season, total in sorted(catalog.items())
+        ]
+        show['missing_count'] = sum(len(row['missing']) for row in show['seasons'])
+        show['catalog_found'] = True
+    shows.sort(key=lambda show: show['title'].lower())
     return shows
 
 @app.route('/epg-web/api/plex/episodes')
@@ -3876,7 +3961,18 @@ def api_plex_episodes():
 @app.route('/epg-web/api/plex/series-inventory')
 def api_plex_series_inventory():
     cfg = load_config()
-    shows = _plex_series_inventory(_plex_tv_path(cfg))
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    try:
+        conn = sqlite3.connect(db_path)
+        tracked_titles = [row[0] for row in conn.execute(
+            'SELECT title FROM series_recordings WHERE active=1'
+        ).fetchall()]
+        conn.close()
+    except Exception:
+        tracked_titles = []
+    shows = _plex_series_inventory(
+        _plex_tv_path(cfg), tracked_titles, cfg.get('tmdb_key', '')
+    )
     return jsonify({
         'series': shows,
         'series_count': len(shows),
@@ -5731,7 +5827,7 @@ tr:hover td{background:#141414;}
     <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:6px;">
       <div>
         <h2 style="margin:0 0 4px;">Plex Series</h2>
-        <div style="font-size:13px;color:#94a3b8;">See what is in Plex and find gaps between episodes you already have.</div>
+        <div style="font-size:13px;color:#94a3b8;">See what is in Plex and what is missing from series you are tracking.</div>
       </div>
       <button class="btn btn-ghost btn-sm" onclick="loadPlexSeries()">↻ Scan Plex TV</button>
     </div>
@@ -5740,7 +5836,7 @@ tr:hover td{background:#141414;}
     </div>
     <div id="plex-series-status" class="status-msg"></div>
     <div id="plex-series-list" style="font-size:13px;"></div>
-    <div style="font-size:11px;color:#64748b;margin-top:12px;">“Missing” means a gap between episode numbers present in Plex (for example, E1 and E3 but not E2). It does not guess whether an episode after your newest one has aired.</div>
+    <div style="font-size:11px;color:#64748b;margin-top:12px;">For a tracked series, missing episodes come from its episode catalog. Other Plex-only series show detected number gaps only (for example, E1 and E3 but not E2).</div>
   </div>
 </div>
 
@@ -7606,7 +7702,7 @@ function renderPlexSeries() {
   }
   list.innerHTML = shows.map(show => {
     const seasons = show.seasons.map(season => {
-      const have = season.episodes.map(number => 'E' + number).join(', ');
+      const have = season.episodes.length ? season.episodes.map(number => 'E' + number).join(', ') : 'No episodes in Plex';
       const missing = season.missing.length
         ? `<span style="color:#fca5a5;font-weight:600;">Missing: ${season.missing.map(number => 'E' + number).join(', ')}</span>`
         : '<span style="color:#86efac;">No gaps detected</span>';
@@ -7616,9 +7712,9 @@ function renderPlexSeries() {
     }).join('');
     return `<details style="border-bottom:1px solid #1e293b;padding:10px 0;" ${show.missing_count ? 'open' : ''}>
       <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;">
-        <span style="font-weight:650;color:#e2e8f0;flex:1;">${esc(show.title)}</span>
+        <span style="font-weight:650;color:#e2e8f0;flex:1;">${esc(show.title)}${show.tracked ? ' <span style="font-size:10px;color:#60a5fa;border:1px solid #2563eb;border-radius:3px;padding:1px 4px;">TRACKING</span>' : ''}</span>
         <span style="color:#94a3b8;font-size:12px;">${show.episode_count} episode${show.episode_count === 1 ? '' : 's'}</span>
-        <span style="font-size:12px;color:${show.missing_count ? '#fca5a5' : '#86efac'};">${show.missing_count ? show.missing_count + ' gap' + (show.missing_count === 1 ? '' : 's') : 'No gaps'}</span>
+        <span style="font-size:12px;color:${show.missing_count ? '#fca5a5' : '#86efac'};">${show.missing_count ? show.missing_count + ' missing' : (show.catalog_found ? 'Complete' : 'No gaps')}</span>
       </summary>
       <div style="padding-top:7px;">${seasons}</div>
     </details>`;
