@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261009a"
+VERSION = "v20261009b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1567,7 +1567,9 @@ def api_fetch_sd():
     sd_pass = cfg.get('sd_pass','')
     db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
     tz_str  = cfg.get('timezone','America/New_York')
-    days    = int(request.json.get('days', 14) if request.json else 14)
+    # SD retains roughly three weeks of listings.  Keep that full useful
+    # window so recurring rules can see more than the short provider feed.
+    days    = int(request.json.get('days', 21) if request.json else 21)
     if not sd_user or not sd_pass:
         return jsonify({'error': 'SD credentials not configured'}), 400
     _sd_status['running'] = True
@@ -4644,6 +4646,16 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             unknown_best[(r['channel_id'], r['start_utc'])] = r
     best_rows = list(ep_best.values()) + list(unknown_best.values())
 
+    # A recurring rule means “get what is missing,” not “make another copy of
+    # every episode Plex already owns.”  Episodes without S/E data remain
+    # eligible because they cannot be matched safely to a Plex filename.
+    plex_episode_keys = _plex_episode_keys(_plex_tv_path(load_config()))
+    show_key = _norm_plex_show(clean_title)
+    best_rows = [r for r in best_rows if (
+        r['season_num'] is None or r['episode_num'] is None or
+        f"{show_key}|{int(r['season_num'])}|{int(r['episode_num'])}" not in plex_episode_keys
+    )]
+
     with _rec_lock:
         # _recs also contains a few transient UI/playback entries.  They are
         # active but are not recordings and have no guide channel or start
@@ -5503,7 +5515,7 @@ tr:hover td{background:#141414;}
     <button id="ch-page-prev" class="btn btn-ghost btn-sm" onclick="chPagePrev()" style="display:none;">◀ Prev 200</button>
     <span id="ch-page-info" style="font-size:12px;color:#64748b;"></span>
     <button id="ch-page-next" class="btn btn-ghost btn-sm" onclick="chPageNext()" style="display:none;">Next 200 ▶</button>
-    <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 14 days from Schedules Direct">📡 Fetch SD</button>
+    <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 21 days from Schedules Direct">📡 Fetch SD</button>
   </div>
   <div class="guide-legend-bar" title="Program colors come from the guide's content classification">
     <span class="guide-legend-title">Guide colors</span>
@@ -5526,6 +5538,10 @@ tr:hover td{background:#141414;}
     <div id="guide-progress-text" style="font-size:11px;color:#94a3b8;margin-top:4px;"></div>
   </div>
   <div id="sd-status" class="status-msg" style="display:none;"></div>
+  <div id="sd-progress" style="display:none;max-width:430px;margin:0 0 8px;">
+    <div style="height:7px;background:#1e293b;border-radius:99px;overflow:hidden;"><div id="sd-progress-bar" style="height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#38bdf8,#60a5fa);transition:width .4s ease;"></div></div>
+    <div id="sd-progress-text" style="font-size:11px;color:#94a3b8;margin-top:5px;"></div>
+  </div>
   <div class="guide-wrap" id="guide-wrap" style="display:none;">
     <div id="guide-inner"></div>
   </div>
@@ -5941,23 +5957,8 @@ async function autoLoad() {
     const sdEl = document.getElementById('sd-status');
     sdEl.style.display = '';
     sdEl.textContent = '📡 Fetching from Schedules Direct…';
-    if (_sdPoll) clearInterval(_sdPoll);
-    _sdPoll = setInterval(async () => {
-      const s2 = await (await fetch('/epg-web/api/fetch-sd/status')).json();
-      const last = s2.log.length ? s2.log[s2.log.length-1] : '…';
-      if (s2.running) {
-        sdEl.textContent = '📡 ' + last;
-      } else if (s2.error) {
-        sdEl.textContent = '❌ ' + s2.error;
-        sdEl.className = 'status-msg err';
-        clearInterval(_sdPoll);
-      } else if (s2.result) {
-        const r = s2.result;
-        sdEl.innerHTML = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total &nbsp;<button class="btn btn-ghost btn-sm" onclick="fetchAndRenderGuide()">↻ Reload Guide</button>`;
-        sdEl.className = 'status-msg ok';
-        clearInterval(_sdPoll);
-      }
-    }, 2000);
+    setSDProgress(6, 'Checking the 21-day guide refresh…');
+    pollSD();
   }
 }
 // Restore saved guide mode before first render
@@ -6059,31 +6060,78 @@ function setGS(msg,cls='') {
 }
 
 let _sdPoll = null;
+function setSDProgress(pct, text, show=true) {
+  const wrap = document.getElementById('sd-progress');
+  wrap.style.display = show ? '' : 'none';
+  document.getElementById('sd-progress-bar').style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  document.getElementById('sd-progress-text').textContent = text || '';
+}
+function sdProgressFromLog(log) {
+  const text = log || 'Preparing the Schedule Direct fetch…';
+  const lower = text.toLowerCase();
+  if (lower.includes('auth')) return 12;
+  if (lower.includes('station') || lower.includes('lineup')) return 28;
+  if (lower.includes('download')) return 48;
+  if (lower.includes('import') || lower.includes('insert')) return 72;
+  if (lower.includes('load') || lower.includes('programme')) return 86;
+  if (lower.includes('series') || lower.includes('schedul')) return 94;
+  return 18;
+}
+function showSDResult(s, btn) {
+  const sdEl = document.getElementById('sd-status');
+  if (s.running) {
+    const last = s.log.length ? s.log[s.log.length - 1] : 'Preparing the Schedule Direct fetch…';
+    sdEl.textContent = '📡 ' + last;
+    setSDProgress(sdProgressFromLog(last), last);
+    return true;
+  }
+  if (s.error) {
+    sdEl.textContent = '❌ ' + s.error;
+    sdEl.className = 'status-msg err';
+    setSDProgress(0, 'Schedule Direct fetch did not finish.', false);
+  } else if (s.result) {
+    const r = s.result;
+    sdEl.innerHTML = `✅ SD ready — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total`;
+    sdEl.className = 'status-msg ok';
+    setSDProgress(100, 'Guide and recurring recordings are up to date.');
+    fetchAndRenderGuide();
+  }
+  if (btn) { btn.disabled = false; btn.textContent = '📡 Fetch SD'; }
+  return false;
+}
+function pollSD(btn=null) {
+  if (_sdPoll) clearInterval(_sdPoll);
+  _sdPoll = setInterval(async () => {
+    try {
+      const s = await (await fetch('/epg-web/api/fetch-sd/status')).json();
+      if (!showSDResult(s, btn)) { clearInterval(_sdPoll); _sdPoll = null; }
+    } catch (e) {
+      const sdEl = document.getElementById('sd-status');
+      sdEl.textContent = '❌ Could not check Schedule Direct progress: ' + e.message;
+      sdEl.className = 'status-msg err';
+      if (btn) { btn.disabled = false; btn.textContent = '📡 Fetch SD'; }
+      clearInterval(_sdPoll); _sdPoll = null;
+    }
+  }, 1200);
+}
 async function fetchSD() {
   const btn = document.getElementById('btn-sd');
   const sdEl = document.getElementById('sd-status');
   btn.disabled = true;
   sdEl.style.display = '';
   sdEl.className = 'status-msg';
-  sdEl.textContent = 'Starting Schedules Direct fetch…';
-  await post('/epg-web/api/fetch-sd', {days: 14});
-  if (_sdPoll) clearInterval(_sdPoll);
-  _sdPoll = setInterval(async () => {
-    const s = await (await fetch('/epg-web/api/fetch-sd/status')).json();
-    const last = s.log.length ? s.log[s.log.length - 1] : '…';
-    if (s.running) {
-      sdEl.textContent = '📡 ' + last;
-    } else if (s.error) {
-      sdEl.textContent = '❌ ' + s.error;
-      sdEl.className = 'status-msg err';
-      clearInterval(_sdPoll); btn.disabled = false;
-    } else if (s.result) {
-      const r = s.result;
-      sdEl.innerHTML = `✅ SD done — ${r.inserted} new, ${r.total_loaded.toLocaleString()} total &nbsp;<button class="btn btn-ghost btn-sm" onclick="fetchAndRenderGuide()">↻ Reload Guide</button>`;
-      sdEl.className = 'status-msg ok';
-      clearInterval(_sdPoll); btn.disabled = false;
-    }
-  }, 2000);
+  sdEl.textContent = '📡 Starting 21-day Schedule Direct fetch…';
+  setSDProgress(6, 'Contacting Schedules Direct…');
+  try {
+    const r = await post('/epg-web/api/fetch-sd', {days: 21});
+    if (!r.ok) throw new Error(r.error || 'Could not start Schedule Direct fetch');
+    pollSD(btn);
+  } catch (e) {
+    sdEl.textContent = '❌ ' + e.message;
+    sdEl.className = 'status-msg err';
+    setSDProgress(0, '', false);
+    btn.disabled = false; btn.textContent = '📡 Fetch SD';
+  }
 }
 function guideNav(hours) {
   if (!_guideWindowStart) return;
@@ -6117,9 +6165,17 @@ function onSearchInput(val) {
   const dd = document.getElementById('search-dropdown');
   if (val.length < 2) { dd.style.display = 'none'; fetchAndRenderGuide(); return; }
   const seq = ++_searchSeq;
+  dd.innerHTML = '<div style="padding:12px 14px;color:#94a3b8;font-size:13px;display:flex;align-items:center;gap:8px;"><span class="spin"></span> Searching the guide…</div>';
+  dd.style.display = 'block';
   _searchTimer = setTimeout(async () => {
-    const r = await fetch('/epg-web/api/search?q=' + encodeURIComponent(val));
-    const d = await r.json();
+    let d;
+    try {
+      const r = await fetch('/epg-web/api/search?q=' + encodeURIComponent(val));
+      d = await r.json();
+    } catch (e) {
+      if (seq === _searchSeq) dd.innerHTML = '<div style="padding:12px 14px;color:#f87171;font-size:13px;">Search could not finish. Please try again.</div>';
+      return;
+    }
     if (seq !== _searchSeq) return; // stale response — a newer search is in flight
     let html = '';
     if (d.channels && d.channels.length) {
@@ -7103,7 +7159,9 @@ async function recordSeries() {
     const r = await post('/epg-web/api/record/series', {title});
     if (r.ok) {
       btn.textContent = `✅ Episodes (${r.scheduled})`;
-      document.getElementById('pm-status').textContent = `📺 Recurring recording set for "${title}" — ${r.scheduled} identified episodes queued`;
+      document.getElementById('pm-status').textContent = r.scheduled
+        ? `📺 Recurring recording set for "${title}" — ${r.scheduled} missing episode${r.scheduled === 1 ? '' : 's'} queued`
+        : `📺 Recurring recording set for "${title}" — no new missing episodes are in the guide yet; future ones will be added automatically`;
       document.getElementById('pm-status').className = 'status-msg ok';
       loadSeriesRecordings();
     } else {
