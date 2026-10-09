@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261009c"
+VERSION = "v20261009d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -269,6 +269,7 @@ def db_run(sql, params=()):
 # ── EPG Parsing ───────────────────────────────────────────────────────────────
 
 _epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'loaded': None}
+_startup_status = {'loading': False}
 _ps_channel_cache = {'paths': (), 'loaded_at': 0, 'ids': set()}
 _stream_quality_scan = {'running': False, 'completed': 0, 'total': 0}
 _stream_quality_scan_lock = threading.Lock()
@@ -1473,7 +1474,8 @@ def api_status():
         last  = datetime.fromtimestamp(progs[-1]['start_ts'], tz=ltz).strftime('%Y-%m-%d %H:%M')
         extra = {'range_first': first, 'range_last': last}
     return jsonify({'ok': True, 'time': datetime.now().strftime('%I:%M:%S %p'),
-                    'loaded': _epg['loaded'], 'programmes': len(progs), **extra})
+                    'loaded': _epg['loaded'], 'programmes': len(progs),
+                    'starting': _startup_status['loading'], **extra})
 
 @app.route('/epg-web/api/disk')
 def api_disk():
@@ -6016,6 +6018,10 @@ tickClock();
 async function refreshStatus() {
   try {
     const d = await (await fetch('/epg-web/api/status')).json();
+    if (d.starting) {
+      document.getElementById('live-badge').textContent = '● Server live · preparing guide…';
+      return;
+    }
     if (d.programmes) {
       document.getElementById('live-badge').textContent =
         `● Server live · ${d.programmes.toLocaleString()} prog`;
@@ -6031,6 +6037,10 @@ async function autoLoad() {
     const s = await (await fetch('/epg-web/api/status')).json();
     if (s.programmes > 0) {
       await fetchAndRenderGuide();
+    } else if (s.starting) {
+      setGS('Preparing the guide after restart…', '');
+      setTimeout(autoLoad, 1200);
+      return;
     }
   } catch(e) { console.warn('[autoLoad] status fetch failed:', e.message); return; }
   let sd;
@@ -8648,51 +8658,59 @@ setup();</script></body></html>'''
 # ── Startup auto-load ────────────────────────────────────────────────────────
 
 def _startup_load():
-    cfg     = load_config()
-    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
-    tz_str  = cfg.get('timezone', 'America/New_York')
-    sd_user = cfg.get('sd_user', '')
-    sd_pass = cfg.get('sd_pass', '')
+    try:
+        cfg     = load_config()
+        db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+        tz_str  = cfg.get('timezone', 'America/New_York')
+        sd_user = cfg.get('sd_user', '')
+        sd_pass = cfg.get('sd_pass', '')
 
-    # Load whatever's already in guide.db
-    if os.path.exists(db_path):
-        try:
-            count = load_epg_from_db(db_path, tz_str)
-            _schedule_active_series(db_path)
-            print(f'[startup] Loaded {count} programmes from guide.db')
-        except Exception as e:
-            print(f'[startup] guide.db load failed: {e}')
+        # Load whatever's already in guide.db after Flask begins listening.
+        # A large accumulated guide can take minutes to prepare; it must not
+        # make the whole website look offline after a normal restart.
+        if os.path.exists(db_path):
+            try:
+                count = load_epg_from_db(db_path, tz_str)
+                _schedule_active_series(db_path)
+                print(f'[startup] Loaded {count} programmes from guide.db')
+            except Exception as e:
+                print(f'[startup] guide.db load failed: {e}')
 
-    # If SD credentials exist and guide is empty or stale (last entry < 24h from now), auto-fetch
-    if sd_user and sd_pass:
-        stale = True
-        if _epg['programmes']:
-            last_ts = _epg['programmes'][-1]['stop_ts']
-            stale = last_ts < (time.time() + 86400)  # less than 1 day of future data
-        if stale:
-            print('[startup] Guide stale — auto-fetching from Schedules Direct…')
-            _sd_status['running'] = True
-            _sd_status['log']     = []
-            _sd_status['result']  = None
-            _sd_status['error']   = None
-            def _run():
-                try:
-                    from sd_guide import fetch_sd_guide
-                    def log(msg):
-                        print(f'[SD] {msg}')
-                        _sd_status['log'].append(msg)
-                    result = fetch_sd_guide(sd_user, sd_pass, db_path, days=14, log=log)
-                    count  = load_epg_from_db(db_path, tz_str)
-                    _sd_status['result'] = {**result, 'total_loaded': count}
-                    print(f'[startup] SD fetch complete — {count} programmes loaded')
-                except Exception as e:
-                    _sd_status['error'] = str(e)
-                    print(f'[startup] SD fetch error: {e}')
-                finally:
-                    _sd_status['running'] = False
-            threading.Thread(target=_run, daemon=True).start()
+        # If SD credentials exist and guide is empty or stale (last entry < 24h from now), auto-fetch
+        if sd_user and sd_pass:
+            stale = True
+            if _epg['programmes']:
+                last_ts = _epg['programmes'][-1]['stop_ts']
+                stale = last_ts < (time.time() + 86400)  # less than 1 day of future data
+            if stale:
+                print('[startup] Guide stale — auto-fetching from Schedules Direct…')
+                _sd_status['running'] = True
+                _sd_status['log']     = []
+                _sd_status['result']  = None
+                _sd_status['error']   = None
+                def _run():
+                    try:
+                        from sd_guide import fetch_sd_guide
+                        def log(msg):
+                            print(f'[SD] {msg}')
+                            _sd_status['log'].append(msg)
+                        result = fetch_sd_guide(sd_user, sd_pass, db_path, days=21, log=log)
+                        count  = load_epg_from_db(db_path, tz_str)
+                        _sd_status['result'] = {**result, 'total_loaded': count}
+                        print(f'[startup] SD fetch complete — {count} programmes loaded')
+                    except Exception as e:
+                        _sd_status['error'] = str(e)
+                        print(f'[startup] SD fetch error: {e}')
+                    finally:
+                        _sd_status['running'] = False
+                threading.Thread(target=_run, daemon=True).start()
+    finally:
+        _startup_status['loading'] = False
 
-_startup_load()
+# Bind the web server immediately, then prepare the large guide in the
+# background.  The browser displays a clear preparation message meanwhile.
+_startup_status['loading'] = True
+threading.Thread(target=_startup_load, daemon=True).start()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
