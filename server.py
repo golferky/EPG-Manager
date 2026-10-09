@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261009b"
+VERSION = "v20261009c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -3812,10 +3812,74 @@ def _plex_episode_keys(tv_root):
     _plex_episode_cache.update({'root': tv_root, 'loaded_at': now, 'episodes': episodes})
     return episodes
 
+
+def _plex_series_inventory(tv_root):
+    """Read the Plex TV layout and report only objectively detectable gaps.
+
+    A filename scan can safely say that S02E03 is missing when S02E02 and
+    S02E04 exist.  It intentionally does not guess at episodes before the
+    first or after the last local episode: that needs a trusted show catalog.
+    """
+    shows = []
+    episode_re = re.compile(r'\bS(\d{1,2})E(\d{1,3})\b', re.I)
+    if not os.path.isdir(tv_root):
+        return shows
+    try:
+        folders = sorted(
+            (entry for entry in os.scandir(tv_root)
+             if entry.is_dir() and not entry.name.startswith('.')),
+            key=lambda entry: entry.name.lower(),
+        )
+    except OSError:
+        return shows
+    for show in folders:
+        seasons = {}
+        try:
+            for root, _dirs, files in os.walk(show.path):
+                for filename in files:
+                    if os.path.splitext(filename)[1].lower() not in {'.mp4', '.mkv', '.m4v'}:
+                        continue
+                    for match in episode_re.finditer(filename):
+                        season, episode = int(match.group(1)), int(match.group(2))
+                        seasons.setdefault(season, set()).add(episode)
+        except OSError:
+            continue
+        if not seasons:
+            continue
+        season_rows, missing_total = [], 0
+        for season, episodes in sorted(seasons.items()):
+            ordered = sorted(episodes)
+            missing = [number for number in range(ordered[0], ordered[-1] + 1)
+                       if number not in episodes]
+            missing_total += len(missing)
+            season_rows.append({
+                'season': season,
+                'episodes': ordered,
+                'missing': missing,
+            })
+        shows.append({
+            'title': show.name,
+            'seasons': season_rows,
+            'episode_count': sum(len(values) for values in seasons.values()),
+            'missing_count': missing_total,
+        })
+    return shows
+
 @app.route('/epg-web/api/plex/episodes')
 def api_plex_episodes():
     cfg = load_config()
     return jsonify({'episodes': sorted(_plex_episode_keys(_plex_tv_path(cfg)))})
+
+
+@app.route('/epg-web/api/plex/series-inventory')
+def api_plex_series_inventory():
+    cfg = load_config()
+    shows = _plex_series_inventory(_plex_tv_path(cfg))
+    return jsonify({
+        'series': shows,
+        'series_count': len(shows),
+        'missing_count': sum(show['missing_count'] for show in shows),
+    })
 
 @app.route('/epg-web/api/plex/info')
 def api_plex_info():
@@ -5482,6 +5546,7 @@ tr:hover td{background:#141414;}
   <div class="tab" onclick="switchTab('channels')">📡 Channels</div>
   <div class="tab" onclick="switchTab('247')">🔁 24/7</div>
   <div class="tab" onclick="switchTab('schedule')">📅 Schedule</div>
+  <div class="tab" onclick="switchTab('plex-series')">📚 Plex Series</div>
   <div class="tab" onclick="switchTab('health')">🔎 Recording Health</div>
   <div class="tab" onclick="switchTab('conversions')">🔄 Conversions</div>
   <div class="tab" onclick="switchTab('storage')">💾 Storage</div>
@@ -5655,6 +5720,25 @@ tr:hover td{background:#141414;}
         <th>Title</th><th>Next Airing on Guide</th><th>Status</th><th>Actions</th>
       </tr></thead><tbody id="rec-body"></tbody></table>
     </div>
+  </div>
+</div>
+
+<!-- PLEX SERIES -->
+<div id="pane-plex-series" class="pane">
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:6px;">
+      <div>
+        <h2 style="margin:0 0 4px;">Plex Series</h2>
+        <div style="font-size:13px;color:#94a3b8;">See what is in Plex and find gaps between episodes you already have.</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="loadPlexSeries()">↻ Scan Plex TV</button>
+    </div>
+    <div class="search-row" style="max-width:440px;margin-top:14px;">
+      <input id="plex-series-search" placeholder="Search your Plex series…" oninput="renderPlexSeries()">
+    </div>
+    <div id="plex-series-status" class="status-msg"></div>
+    <div id="plex-series-list" style="font-size:13px;"></div>
+    <div style="font-size:11px;color:#64748b;margin-top:12px;">“Missing” means a gap between episode numbers present in Plex (for example, E1 and E3 but not E2). It does not guess whether an episode after your newest one has aired.</div>
   </div>
 </div>
 
@@ -5974,7 +6058,7 @@ setInterval(loadStorageBar, 5 * 60 * 1000); // refresh every 5 min
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  const names = ['guide','recommendations','channels','247','schedule','health','conversions','storage'];
+  const names = ['guide','recommendations','channels','247','schedule','plex-series','health','conversions','storage'];
   document.querySelectorAll('.tab').forEach((t,i) =>
     t.classList.toggle('active', names[i] === name));
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
@@ -5983,6 +6067,7 @@ function switchTab(name) {
   if (name === 'channels') loadChannels();
   if (name === '247') load247();
   if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
+  if (name === 'plex-series') loadPlexSeries();
   if (name === 'health') { loadRecordingHealth(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
@@ -7480,6 +7565,54 @@ async function cancelRec(id, refreshSchedule=false) {
   if (refreshSchedule) await loadSchedule();
   if (!result.ok && result.error) setGS(result.error, 'err');
   return result;
+}
+
+// ── Plex Series ──────────────────────────────────────────────────────────────
+let _plexSeries = [];
+async function loadPlexSeries() {
+  const status = document.getElementById('plex-series-status');
+  const list = document.getElementById('plex-series-list');
+  status.textContent = 'Scanning your Plex TV folders…';
+  list.innerHTML = '';
+  try {
+    const d = await (await fetch('/epg-web/api/plex/series-inventory')).json();
+    if (d.error) { setEl('plex-series-status', d.error, 'err'); return; }
+    _plexSeries = d.series || [];
+    setEl('plex-series-status', `${d.series_count || 0} series · ${d.missing_count || 0} episode gap${d.missing_count === 1 ? '' : 's'} detected`, d.missing_count ? 'err' : 'ok');
+    renderPlexSeries();
+  } catch (e) {
+    setEl('plex-series-status', 'Could not scan Plex TV: ' + e.message, 'err');
+  }
+}
+function renderPlexSeries() {
+  const list = document.getElementById('plex-series-list');
+  const query = (document.getElementById('plex-series-search').value || '').trim().toLowerCase();
+  const shows = _plexSeries.filter(show => !query || show.title.toLowerCase().includes(query));
+  if (!shows.length) {
+    list.innerHTML = _plexSeries.length
+      ? '<div style="color:#64748b;padding:8px 0;">No series match that search.</div>'
+      : '<div style="color:#64748b;padding:8px 0;">No Plex series were found yet.</div>';
+    return;
+  }
+  list.innerHTML = shows.map(show => {
+    const seasons = show.seasons.map(season => {
+      const have = season.episodes.map(number => 'E' + number).join(', ');
+      const missing = season.missing.length
+        ? `<span style="color:#fca5a5;font-weight:600;">Missing: ${season.missing.map(number => 'E' + number).join(', ')}</span>`
+        : '<span style="color:#86efac;">No gaps detected</span>';
+      return `<div style="padding:5px 0 5px 14px;color:#94a3b8;line-height:1.45;">
+        <span style="color:#e2e8f0;font-weight:600;">Season ${season.season}</span> · ${have}<br>${missing}
+      </div>`;
+    }).join('');
+    return `<details style="border-bottom:1px solid #1e293b;padding:10px 0;" ${show.missing_count ? 'open' : ''}>
+      <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;">
+        <span style="font-weight:650;color:#e2e8f0;flex:1;">${esc(show.title)}</span>
+        <span style="color:#94a3b8;font-size:12px;">${show.episode_count} episode${show.episode_count === 1 ? '' : 's'}</span>
+        <span style="font-size:12px;color:${show.missing_count ? '#fca5a5' : '#86efac'};">${show.missing_count ? show.missing_count + ' gap' + (show.missing_count === 1 ? '' : 's') : 'No gaps'}</span>
+      </summary>
+      <div style="padding-top:7px;">${seasons}</div>
+    </details>`;
+  }).join('');
 }
 
 // ── Recommendations ───────────────────────────────────────────────────────────
