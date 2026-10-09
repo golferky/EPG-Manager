@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20260918b"
+VERSION = "v20261009a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -396,6 +396,19 @@ def _eaglecast_stream_for_channel(channel_id):
         return row
     except Exception:
         return None
+
+
+def _is_quarantined_eaglecast_stream(stream):
+    """Return whether an Eaglecast mapping is unsafe for unattended capture.
+
+    Stream 45503 was labelled ``US|SHOWTIME HD`` but delivered *V for
+    Vendetta* for the Oct. 5, 2026 *MobLand* airing.  Do not trust it for a
+    scheduled recording until the provider corrects the mapping.  The rule is
+    tied to the stream ID rather than a broad Showtime label so other valid
+    Eaglecast Showtime feeds remain usable.
+    """
+    return bool(stream and str(stream[0] if not isinstance(stream, dict)
+                               else stream.get('stream_id', '')) == '45503')
 
 def _eaglecast_stream_url(stream_id, extension='ts'):
     """Build an internal-only Eaglecast stream URL for probes/local playback."""
@@ -1185,23 +1198,35 @@ def _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id=''):
 
 def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id=''):
     """Prefer Eaglecast, but never knowingly schedule two overlapping EC streams."""
-    eaglecast_exists = bool(_eaglecast_stream_for_channel(channel_id))
+    eaglecast_stream = _eaglecast_stream_for_channel(channel_id)
+    eaglecast_exists = bool(eaglecast_stream)
     if eaglecast_exists:
+        quarantined = _is_quarantined_eaglecast_stream(eaglecast_stream)
         conflict = _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id)
-        if not conflict:
+        if not quarantined and not conflict:
             url, error, debug = _stream_url(channel_id, 'eaglecast')
             if not error:
                 return url, None, debug
-        # The single Eaglecast connection is occupied.  PrimeStreams becomes
-        # the safe fallback for this one recording window.
+        # The single Eaglecast connection is occupied—or its provider mapping
+        # has been quarantined after a verified wrong-program capture.
+        # PrimeStreams becomes the safe fallback for this recording window.
         url, error, debug = _stream_url(channel_id, 'primestreams')
         if not error:
-            conflict_title = conflict[0] if conflict else 'another recording'
-            debug['fallback_reason'] = (
-                f'Eaglecast is already reserved for overlapping "{conflict_title}". '
-                'Using PrimeStreams instead; quality may be lower.'
-            )
+            if quarantined:
+                debug['fallback_reason'] = (
+                    'Eaglecast stream mapping was quarantined after a verified '
+                    'wrong-program capture. Using PrimeStreams instead; quality may be lower.'
+                )
+            else:
+                conflict_title = conflict[0] if conflict else 'another recording'
+                debug['fallback_reason'] = (
+                    f'Eaglecast is already reserved for overlapping "{conflict_title}". '
+                    'Using PrimeStreams instead; quality may be lower.'
+                )
             return url, None, debug
+        if quarantined:
+            return None, ('Eaglecast mapping is quarantined after a verified wrong-program '
+                          'capture, and PrimeStreams has no usable stream for this channel.'), {}
         title = conflict[0] if conflict else 'another recording'
         return None, (f'Eaglecast is already scheduled for overlapping "{title}", '
                       'and PrimeStreams has no usable stream for this channel.'), {}

@@ -47,6 +47,12 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(server._is_foreign_recording_feed("A&E Canada HD"))
         self.assertFalse(server._is_foreign_recording_feed("HBO Drama"))
 
+    def test_quarantined_eaglecast_stream_classifier(self):
+        self.assertTrue(server._is_quarantined_eaglecast_stream(
+            ("45503", "US| SHOWTIME HD", "ts")))
+        self.assertFalse(server._is_quarantined_eaglecast_stream(
+            ("92020", "US| SHOWTIME WEST HD", "ts")))
+
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
         self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))
