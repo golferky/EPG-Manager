@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261010c"
+VERSION = "v20261010d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -271,6 +271,7 @@ def db_run(sql, params=()):
 _epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'loaded': None}
 _startup_status = {'loading': False}
 _ps_channel_cache = {'paths': (), 'loaded_at': 0, 'ids': set()}
+_provider_live_epg_lock = threading.Lock()
 _stream_quality_scan = {'running': False, 'completed': 0, 'total': 0}
 _stream_quality_scan_lock = threading.Lock()
 _commercial_review_lock = threading.Lock()
@@ -686,6 +687,144 @@ def load_epg_from_db(db_path, tz_str='America/New_York'):
     _epg['programmes']  = programmes
     _epg['loaded']      = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     return len(programmes)
+
+def _decode_provider_epg_text(value):
+    """Xtream's short-EPG API base64-encodes programme text."""
+    if not value:
+        return ''
+    try:
+        import base64
+        return base64.b64decode(str(value)).decode('utf-8', 'replace').strip()
+    except Exception:
+        return str(value).strip()
+
+def refresh_provider_live_epg(guide_db_path=None, *, limit=24):
+    """Overlay current listings from the provider's live per-channel EPG.
+
+    The bulk XMLTV file can lag even while the provider's streams and its
+    player API are current.  Refresh the user's favourites from the same live
+    API used by player apps, and only replace the time ranges returned there.
+    """
+    from urllib import parse as urlparse, request as urlreq
+
+    cfg = load_config()
+    base = str(cfg.get('epg_url') or '').rstrip('/')
+    user = str(cfg.get('epg_user') or '')
+    password = str(cfg.get('epg_pass') or '')
+    movies_db = cfg.get('db_path', '/Volumes/EPG/Movies.db')
+    guide_db_path = guide_db_path or cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    if not base or not user or not password:
+        return {'updated': 0, 'channels': 0, 'skipped': 0, 'error': 'Provider credentials are not configured'}
+
+    with _provider_live_epg_lock:
+        try:
+            api_base = base + '/player_api.php'
+            auth = {'username': user, 'password': password}
+            live_query = urlparse.urlencode({**auth, 'action': 'get_live_streams'})
+            req = urlreq.Request(api_base + '?' + live_query, headers={'User-Agent': 'TiViMate/4.7.0'})
+            with urlreq.urlopen(req, timeout=25) as resp:
+                live_streams = json.loads(resp.read())
+        except Exception as exc:
+            return {'updated': 0, 'channels': 0, 'skipped': 0,
+                    'error': f'Provider live-channel lookup failed: {exc}'}
+
+        # The provider's own epg_channel_id is the authoritative mapping.  It
+        # corrects legacy stream IDs (including channels whose names are too
+        # similar for name matching) before the short EPG is requested.
+        by_epg_id = {str(s.get('epg_channel_id') or '').strip(): s
+                     for s in live_streams if str(s.get('epg_channel_id') or '').strip()}
+        try:
+            mconn = sqlite3.connect(movies_db)
+            mconn.row_factory = sqlite3.Row
+            favorites = mconn.execute('''SELECT channel_id, nickname, guide_channel, stream_id
+                                         FROM channels
+                                         WHERE favorite=1 AND stream_id IS NOT NULL
+                                           AND guide_channel IS NOT NULL AND guide_channel != ''
+                                           AND (is_bad=0 OR is_bad IS NULL)''').fetchall()
+        except Exception as exc:
+            return {'updated': 0, 'channels': 0, 'skipped': 0,
+                    'error': f'Could not read favourite channels: {exc}'}
+
+        targets = []
+        for row in favorites:
+            channel_id = str(row['guide_channel'])
+            stream = by_epg_id.get(channel_id)
+            stream_id = str((stream or {}).get('stream_id') or row['stream_id'] or '').strip()
+            if not stream_id:
+                continue
+            if stream and str(row['stream_id'] or '') != stream_id:
+                mconn.execute('UPDATE channels SET stream_id=? WHERE channel_id=?',
+                              (stream_id, row['channel_id']))
+            targets.append((channel_id, str(row['nickname'] or channel_id), stream_id))
+        mconn.commit()
+        mconn.close()
+
+        # Fetch each favourite's currently active/upcoming listing.  This is a
+        # small bounded set (not the whole provider catalogue) and avoids the
+        # known-stale bulk XMLTV file.
+        listings_by_channel = {}
+        skipped = 0
+        for channel_id, channel_name, stream_id in targets:
+            try:
+                query = urlparse.urlencode({**auth, 'action': 'get_short_epg',
+                                            'stream_id': stream_id, 'limit': str(limit)})
+                req = urlreq.Request(api_base + '?' + query, headers={'User-Agent': 'TiViMate/4.7.0'})
+                with urlreq.urlopen(req, timeout=15) as resp:
+                    payload = json.loads(resp.read())
+                rows = payload.get('epg_listings') if isinstance(payload, dict) else []
+                parsed = []
+                for item in rows or []:
+                    try:
+                        start = datetime.fromtimestamp(float(item['start_timestamp']), timezone.utc)
+                        end = datetime.fromtimestamp(float(item['stop_timestamp']), timezone.utc)
+                    except (KeyError, TypeError, ValueError, OSError):
+                        continue
+                    title = _decode_provider_epg_text(item.get('title'))
+                    if title and end > start:
+                        parsed.append((title, start.strftime('%Y%m%d%H%M%S'),
+                                       end.strftime('%Y%m%d%H%M%S'),
+                                       _decode_provider_epg_text(item.get('description'))[:300]))
+                if parsed:
+                    listings_by_channel[channel_id] = (channel_name, parsed)
+                else:
+                    skipped += 1
+            except Exception as exc:
+                print(f'[provider-live-epg] {channel_name}: {exc}')
+                skipped += 1
+
+        if not listings_by_channel:
+            return {'updated': 0, 'channels': 0, 'skipped': skipped,
+                    'error': 'Provider returned no current EPG listings for favourite channels'}
+
+        conn = sqlite3.connect(guide_db_path, timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
+        inserted = 0
+        try:
+            for channel_id, (channel_name, rows) in listings_by_channel.items():
+                first_start = min(row[1] for row in rows)
+                last_end = max(row[2] for row in rows)
+                # Replace only the live API's window.  Longer Schedule Direct
+                # data outside this period remains available in the guide.
+                conn.execute('''DELETE FROM guide WHERE channel_id=?
+                                AND start_utc >= ? AND start_utc < ?''',
+                             (channel_id, first_start, last_end))
+                old_channel = conn.execute('SELECT icon FROM guide_channels WHERE channel_id=?',
+                                           (channel_id,)).fetchone()
+                conn.execute('''INSERT OR REPLACE INTO guide_channels(channel_id, channel_name, icon)
+                                VALUES (?,?,?)''',
+                             (channel_id, channel_name, old_channel[0] if old_channel else ''))
+                for title, start_utc, end_utc, desc in rows:
+                    cur = conn.execute('''INSERT OR IGNORE INTO guide
+                                        (title, channel_id, channel_name, start_utc, end_utc, desc, category)
+                                        VALUES (?,?,?,?,?,?,?)''',
+                                       (title, channel_id, channel_name, start_utc, end_utc, desc, ''))
+                    inserted += cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+
+        _ps_channel_cache['loaded_at'] = 0
+        return {'updated': inserted, 'channels': len(listings_by_channel), 'skipped': skipped}
 
 def load_epg(path, tz_str='America/New_York'):
     """Legacy XML-only load (kept for fallback). Prefers guide.db path."""
@@ -1668,9 +1807,8 @@ def api_fetch_guide():
         with urlreq.urlopen(req, timeout=60) as resp:
             data = resp.read()
         # A provider can return a syntactically valid XML file that is already
-        # a day old.  Importing it appears successful but leaves channels with
-        # no current programme.  Reject it before replacing the last usable
-        # local copy or touching the guide database.
+        # a day old.  Do not replace the last usable local copy with it; use
+        # the provider's live per-channel EPG below instead.
         starts = re.findall(br'<programme\\b[^>]*\\bstart="(\\d{14})', data)
         if not starts:
             raise RuntimeError('Provider guide contains no programme listings')
@@ -1679,17 +1817,17 @@ def api_fetch_guide():
         newest_local = datetime.strptime(newest_stamp, '%Y%m%d%H%M%S').replace(
             tzinfo=ZoneInfo(tz_str))
         guide_age = datetime.now(ZoneInfo(tz_str)) - newest_local
-        if guide_age > timedelta(hours=6):
-            raise RuntimeError(
-                'Provider guide is stale: its newest listing is '
-                f'{newest_local.strftime("%b %-d, %-I:%M %p")}. '
-                'It was not imported.'
-            )
-        print(f'[fetch-guide] Got {len(data):,} bytes, saving to {local_xml}')
-        with open(local_xml, 'wb') as f:
-            f.write(data)
-        xml_path = local_xml  # import from local copy
-        new_rows = import_xml_to_guide_db(xml_path, db_path)
+        xml_stale = guide_age > timedelta(hours=6)
+        new_rows = 0
+        if xml_stale:
+            print('[fetch-guide] Bulk XML is stale; using live per-channel EPG for favourites')
+        else:
+            print(f'[fetch-guide] Got {len(data):,} bytes, saving to {local_xml}')
+            with open(local_xml, 'wb') as f:
+                f.write(data)
+            xml_path = local_xml  # import from local copy
+            new_rows = import_xml_to_guide_db(xml_path, db_path)
+        live_epg = refresh_provider_live_epg(db_path)
         count    = load_epg_from_db(db_path, tz_str)
         _ps_channel_cache['loaded_at'] = 0
         _schedule_active_series(db_path)
@@ -1701,8 +1839,12 @@ def api_fetch_guide():
                          name='epg-abandoned-transfer-retries', daemon=True).start()
         threading.Thread(target=_refresh_stream_quality_cache,
                          name='epg-stream-quality', daemon=True).start()
-        print(f'[fetch-guide] Done: {count} programmes, {new_rows} new rows')
-        return jsonify({'ok': True, 'bytes': len(data), 'count': count, 'new_rows': new_rows})
+        print(f'[fetch-guide] Done: {count} programmes, {new_rows} XML rows, '
+              f"{live_epg.get('updated', 0)} live rows")
+        return jsonify({'ok': True, 'bytes': len(data), 'count': count, 'new_rows': new_rows,
+                        'provider_xml_stale': xml_stale,
+                        'provider_xml_newest': newest_local.isoformat(),
+                        'live_epg': live_epg})
     except Exception as e:
         print(f'[fetch-guide] Error: {e}')
         return jsonify({'error': str(e)}), 500
@@ -6272,8 +6414,13 @@ async function fetchGuide() {
     const d = await r.json();
     if (d.error) { setGS('Fetch error: '+d.error, 'err'); return; }
     const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new rows)';
-    setGS(`Refreshed ${d.count.toLocaleString()} provider programmes${newInfo}`, 'ok');
-    setGuideProgress(100, 'Fresh provider guide downloaded and imported.');
+    const live = d.live_epg || {};
+    const liveInfo = live.channels ? ` · ${live.channels} favourite channels refreshed live` : '';
+    const source = d.provider_xml_stale ? 'Live provider listings refreshed' : 'Fresh provider guide downloaded and imported';
+    setGS(`${source}: ${d.count.toLocaleString()} programmes${newInfo}${liveInfo}`, 'ok');
+    setGuideProgress(100, d.provider_xml_stale
+      ? 'Bulk guide was stale; current favourite-channel listings came from the live provider API.'
+      : 'Fresh provider guide downloaded and imported.');
     await fetchAndRenderGuide();
   } catch(e) { setGS('Fetch failed: '+e.message,'err'); setGuideProgress(0, '', false); }
   finally { btn.disabled=false; btn.textContent='↻ Refresh Guide'; }
@@ -8802,6 +8949,23 @@ def _startup_load():
                 count = load_epg_from_db(db_path, tz_str)
                 _schedule_active_series(db_path)
                 print(f'[startup] Loaded {count} programmes from guide.db')
+                # The provider's bulk XML can lag while the live player API is
+                # current.  Refresh favourite-channel windows in the
+                # background so a normal restart repairs those gaps without
+                # delaying the web server becoming available.
+                def _refresh_live_favourites():
+                    try:
+                        result = refresh_provider_live_epg(db_path)
+                        if result.get('updated'):
+                            total = load_epg_from_db(db_path, tz_str)
+                            _schedule_active_series(db_path)
+                            print(f'[startup] Refreshed {result["channels"]} live provider channels; {total} programmes loaded')
+                        elif result.get('error'):
+                            print(f'[startup] live provider EPG: {result["error"]}')
+                    except Exception as exc:
+                        print(f'[startup] live provider EPG refresh failed: {exc}')
+                threading.Thread(target=_refresh_live_favourites,
+                                 name='epg-live-provider-favourites', daemon=True).start()
             except Exception as e:
                 print(f'[startup] guide.db load failed: {e}')
 
