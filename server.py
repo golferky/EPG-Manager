@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261010a"
+VERSION = "v20261010b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -6247,15 +6247,15 @@ async function fetchGuide() {
   const btn = document.getElementById('btn-fetch-guide');
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Refreshing…';
   if (_qualityPoll) { clearTimeout(_qualityPoll); _qualityPoll = null; }
-  setGuideProgress(35, 'Importing saved XML into the guide database…');
-  setGS('Refreshing from the XML downloaded by the 3:00 AM job…');
+  setGuideProgress(12, 'Downloading a fresh provider guide…');
+  setGS('Downloading and importing the current provider guide…');
   try {
-    const r = await fetch('/epg-web/api/refresh-guide', {method:'POST'});
+    const r = await fetch('/epg-web/api/fetch-guide', {method:'POST'});
     const d = await r.json();
     if (d.error) { setGS('Fetch error: '+d.error, 'err'); return; }
     const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new rows)';
-    setGS(`Refreshed ${d.count.toLocaleString()} programmes from saved XML${newInfo}`, 'ok');
-    setGuideProgress(100, 'Guide database refreshed from saved XML.');
+    setGS(`Refreshed ${d.count.toLocaleString()} provider programmes${newInfo}`, 'ok');
+    setGuideProgress(100, 'Fresh provider guide downloaded and imported.');
     await fetchAndRenderGuide();
   } catch(e) { setGS('Fetch failed: '+e.message,'err'); setGuideProgress(0, '', false); }
   finally { btn.disabled=false; btn.textContent='↻ Refresh Guide'; }
