@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261010b"
+VERSION = "v20261010c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1667,6 +1667,24 @@ def api_fetch_guide():
         req = urlreq.Request(xmltv_url, headers={'User-Agent': 'TiViMate/4.7.0 (Amazon AFTS; Android 9)'})
         with urlreq.urlopen(req, timeout=60) as resp:
             data = resp.read()
+        # A provider can return a syntactically valid XML file that is already
+        # a day old.  Importing it appears successful but leaves channels with
+        # no current programme.  Reject it before replacing the last usable
+        # local copy or touching the guide database.
+        starts = re.findall(br'<programme\\b[^>]*\\bstart="(\\d{14})', data)
+        if not starts:
+            raise RuntimeError('Provider guide contains no programme listings')
+        newest_stamp = max(starts).decode('ascii')
+        from zoneinfo import ZoneInfo
+        newest_local = datetime.strptime(newest_stamp, '%Y%m%d%H%M%S').replace(
+            tzinfo=ZoneInfo(tz_str))
+        guide_age = datetime.now(ZoneInfo(tz_str)) - newest_local
+        if guide_age > timedelta(hours=6):
+            raise RuntimeError(
+                'Provider guide is stale: its newest listing is '
+                f'{newest_local.strftime("%b %-d, %-I:%M %p")}. '
+                'It was not imported.'
+            )
         print(f'[fetch-guide] Got {len(data):,} bytes, saving to {local_xml}')
         with open(local_xml, 'wb') as f:
             f.write(data)
