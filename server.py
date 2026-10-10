@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261009e"
+VERSION = "v20261010a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1765,11 +1765,26 @@ def api_guide():
             if movie_only: where_parts.append('is_movie_channel = 1')
             where = (' AND '.join(where_parts) + ' AND ' if where_parts else '') + \
                     'guide_channel IS NOT NULL AND guide_channel != ""'
-            rows = db_rows(f'SELECT guide_channel FROM channels WHERE {where}')
+            rows = db_rows(f'SELECT guide_channel, nickname FROM channels WHERE {where}')
             direct_ids = {r['guide_channel'] for r in rows}
             if fav_only:
-                movie_favorites = set(direct_ids)
-                allowed_ch_ids = set(direct_ids) | guide_favorites
+                # Schedule Direct uses numeric station IDs while the older
+                # PrimeStreams guide used domain-style IDs (for example
+                # ``cinemax.us``).  Prefer the current numeric SD IDs for a
+                # favorite whenever the channel name matches; otherwise the
+                # guide would show the retired ID as an empty "No guide data"
+                # row even though Cinemax/HBO data is present right beside it.
+                ids_by_name = {}
+                for channel in _epg.get('channels', []):
+                    ids_by_name.setdefault(_channel_match_base(channel.get('name', '')), []).append(channel['id'])
+                resolved_favorites = set()
+                for row in rows:
+                    key = _channel_match_base(row.get('nickname') or row['guide_channel'])
+                    candidates = ids_by_name.get(key, [])
+                    numeric = [channel_id for channel_id in candidates if str(channel_id).isdigit()]
+                    resolved_favorites.update(numeric or candidates or [row['guide_channel']])
+                movie_favorites = set(resolved_favorites)
+                allowed_ch_ids = set(resolved_favorites) | guide_favorites
             else:
                 allowed_ch_ids = set(direct_ids)
     elif guide_favorites:
