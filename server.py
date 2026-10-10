@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261010d"
+VERSION = "v20261010e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4028,11 +4028,10 @@ def _tmdb_series_catalog(title, tmdb_key):
 
 
 def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key=''):
-    """Read the Plex TV layout and report only objectively detectable gaps.
+    """Read the Plex TV layout and compare it to exact TMDb show catalogues.
 
-    A filename scan can safely say that S02E03 is missing when S02E02 and
-    S02E04 exist.  It intentionally does not guess at episodes before the
-    first or after the last local episode: that needs a trusted show catalog.
+    The filename scan still supplies an internal-gap fallback, but an exact
+    catalogue match also finds missing episodes after the last local file.
     """
     shows = []
     episode_re = re.compile(r'\bS(\d{1,2})E(\d{1,3})\b', re.I)
@@ -4104,11 +4103,10 @@ def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key=''):
         else:
             show['tracked'] = True
 
-    # Full missing lists are meaningful only for series the user explicitly
-    # tracks. For those few titles, use an exact TMDb match as the catalogue.
+    # Use an exact TMDb match for every Plex show.  This identifies episodes
+    # after the last local file (for example, having S01E01-E02 of a nine
+    # episode season), which an internal filename-only gap scan cannot see.
     for show in shows:
-        if not show.get('tracked'):
-            continue
         catalog = _tmdb_series_catalog(show['title'], tmdb_key)
         if not catalog:
             continue
