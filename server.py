@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261010e"
+VERSION = "v20261012a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -119,13 +119,18 @@ def save_watchlist(wl):
 # ── Movies.db ────────────────────────────────────────────────────────────────
 
 def _channel_match_base(value):
-    """Normalize provider/guide channel names, including known rebrands."""
+    """Normalize a channel name without treating distinct feeds as aliases.
+
+    In particular, Paramount+ with Showtime is not interchangeable with a
+    provider's generic Showtime feed.  Collapsing those names caused guide
+    airings to be captured from the wrong live stream, which is worse than
+    leaving an airing unavailable until we have a verified mapping.
+    """
     # Xtream providers frequently prefix names as "US| HBO HD".  The region
     # label is not part of the channel's identity and prevents a clean match
     # against the existing Schedules Direct guide otherwise.
     value = re.sub(r'^\s*(?:US|USA)\s*[|:/-]\s*', '', value or '', flags=re.I)
     base = re.sub(r'[^a-z0-9]', '', value.lower())
-    base = base.replace('paramountwithshowtime', 'showtime')
     if base.startswith('sho2'):
         base = 'showtime2' + base[4:]
     geographic = ''
@@ -376,10 +381,14 @@ def get_eaglecast_channel_ids(guide_db_path=None):
     try:
         conn = sqlite3.connect(guide_db_path or _guide_db_path())
         rows = conn.execute(
-            "SELECT channel_id FROM provider_streams WHERE provider='eaglecast'"
+            '''SELECT channel_id, guide_channel_name, provider_channel_name
+               FROM provider_streams WHERE provider='eaglecast'''
         ).fetchall()
         conn.close()
-        return {row[0] for row in rows}
+        return {
+            row[0] for row in rows
+            if _channel_match_base(row[1]) == _channel_match_base(row[2])
+        }
     except Exception:
         return set()
 
@@ -390,12 +399,21 @@ def get_recordable_channel_ids(guide_db_path, movies_db_path):
 def _eaglecast_stream_for_channel(channel_id):
     try:
         conn = sqlite3.connect(_guide_db_path())
-        row = conn.execute('''SELECT stream_id, provider_channel_name, stream_extension
+        row = conn.execute('''SELECT stream_id, provider_channel_name, stream_extension,
+                                      guide_channel_name
                               FROM provider_streams
                               WHERE provider='eaglecast' AND channel_id=?''',
                            (channel_id,)).fetchone()
         conn.close()
-        return row
+        if not row:
+            return None
+        # Provider maps are created from names, not a stable provider channel
+        # ID.  Do not trust an old/over-broad match when the two canonical
+        # names differ.  This specifically blocks the stale "SHOWTIME HD"
+        # map that delivered V for Vendetta for a MobLand recording.
+        if _channel_match_base(row[1]) != _channel_match_base(row[3]):
+            return None
+        return row[:3]
     except Exception:
         return None
 

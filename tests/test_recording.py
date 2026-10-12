@@ -306,12 +306,12 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("checkWantedMovieUpgrade", server.HTML)
         self.assertIn("/epg-web/api/recommendations/movie-upgrade", server.HTML)
 
-    def test_showtime_rebrand_channel_aliases(self):
-        self.assertEqual(
+    def test_paramount_showtime_is_not_aliased_to_showtime(self):
+        self.assertNotEqual(
             server._channel_match_base("Paramount+ with Showtime HD"),
             server._channel_match_base("showtime.us"),
         )
-        self.assertEqual(
+        self.assertNotEqual(
             server._channel_match_base("Paramount+ with Showtime HD (Pacific)"),
             server._channel_match_base("showtimewest.us"),
         )
