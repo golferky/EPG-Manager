@@ -306,6 +306,11 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("checkWantedMovieUpgrade", server.HTML)
         self.assertIn("/epg-web/api/recommendations/movie-upgrade", server.HTML)
 
+    def test_plex_series_missing_episodes_show_guide_airings(self):
+        self.assertIn('_add_missing_episode_guide_airings', server.__dict__)
+        self.assertIn('Next guide airing:', server.HTML)
+        self.assertIn('Queued to record', server.HTML)
+
     def test_paramount_showtime_is_not_aliased_to_showtime(self):
         self.assertNotEqual(
             server._channel_match_base("Paramount+ with Showtime HD"),

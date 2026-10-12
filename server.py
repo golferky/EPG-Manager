@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261012a"
+VERSION = "v20261012b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4143,6 +4143,63 @@ def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key=''):
     shows.sort(key=lambda show: show['title'].lower())
     return shows
 
+
+def _add_missing_episode_guide_airings(shows, guide_db_path, tz_str='America/New_York'):
+    """Attach the next guide airing and queued recording to every missing episode.
+
+    This is deliberately informational: Plex Series tells the owner when an
+    episode is next on the guide, while the existing recurring-series rule is
+    still responsible for adding a recording only when the channel has a
+    verified, safe stream mapping.
+    """
+    from zoneinfo import ZoneInfo
+    now_utc = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    local_tz = ZoneInfo(tz_str)
+    try:
+        conn = sqlite3.connect(guide_db_path)
+        conn.row_factory = sqlite3.Row
+        for show in shows:
+            clean_title, _year = _plex_title_and_year(show['title'])
+            for season in show['seasons']:
+                airings = {}
+                for episode in season['missing']:
+                    queued = conn.execute('''SELECT start_ts, channel, status
+                        FROM recordings
+                        WHERE lower(title)=lower(?) AND season_num=? AND episode_num=?
+                          AND status NOT IN ('done','done_ts','cancelled','failed','error',
+                                             'skipped_existing_better','skipped_too_short')
+                        ORDER BY start_ts LIMIT 1''',
+                        (clean_title, season['season'], episode)).fetchone()
+                    row = conn.execute('''SELECT channel_id, channel_name, start_utc, end_utc
+                        FROM guide
+                        WHERE lower(title)=lower(?) AND season_num=? AND episode_num=?
+                          AND end_utc > ?
+                        ORDER BY start_utc LIMIT 1''',
+                        (clean_title, season['season'], episode, now_utc)).fetchone()
+                    item = {}
+                    if row:
+                        start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(
+                            tzinfo=timezone.utc)
+                        item.update({
+                            'next_start_ts': start.timestamp(),
+                            'next_channel': row['channel_name'] or row['channel_id'],
+                            'next_fmt': start.astimezone(local_tz).strftime('%a %b %-d, %-I:%M %p'),
+                        })
+                    if queued:
+                        queued_start = datetime.fromtimestamp(float(queued['start_ts']), timezone.utc)
+                        item.update({
+                            'queued': True,
+                            'queued_channel': queued['channel'] or '',
+                            'queued_fmt': queued_start.astimezone(local_tz).strftime('%a %b %-d, %-I:%M %p'),
+                        })
+                    if item:
+                        airings[str(episode)] = item
+                season['missing_airings'] = airings
+        conn.close()
+    except Exception as exc:
+        print(f'[Plex series] guide-airing lookup failed: {exc}')
+    return shows
+
 @app.route('/epg-web/api/plex/episodes')
 def api_plex_episodes():
     cfg = load_config()
@@ -4163,6 +4220,9 @@ def api_plex_series_inventory():
         tracked_titles = []
     shows = _plex_series_inventory(
         _plex_tv_path(cfg), tracked_titles, cfg.get('tmdb_key', '')
+    )
+    shows = _add_missing_episode_guide_airings(
+        shows, db_path, cfg.get('timezone', 'America/New_York')
     )
     return jsonify({
         'series': shows,
@@ -7899,9 +7959,16 @@ function renderPlexSeries() {
   list.innerHTML = shows.map(show => {
     const seasons = show.seasons.map(season => {
       const have = season.episodes.length ? season.episodes.map(number => 'E' + number).join(', ') : 'No episodes in Plex';
-      const missing = season.missing.length
-        ? `<span style="color:#fca5a5;font-weight:600;">Missing: ${season.missing.map(number => 'E' + number).join(', ')}</span>`
-        : '<span style="color:#86efac;">No gaps detected</span>';
+      const missing = season.missing.length ? (() => {
+        const details = season.missing.map(number => {
+          const airing = (season.missing_airings || {})[String(number)] || {};
+          const label = `E${number}`;
+          if (airing.queued) return `<div style="color:#86efac;">${label} · ✓ Queued to record ${esc(airing.queued_fmt)}${airing.queued_channel ? ' · ' + esc(airing.queued_channel) : ''}</div>`;
+          if (airing.next_fmt) return `<div style="color:#93c5fd;">${label} · Next guide airing: ${esc(airing.next_fmt)} · ${esc(airing.next_channel || '')}</div>`;
+          return `<div style="color:#fca5a5;">${label} · Not currently in the guide</div>`;
+        }).join('');
+        return `<span style="color:#fca5a5;font-weight:600;">Missing episodes</span><div style="padding:3px 0 0 10px;font-weight:400;">${details}</div>`;
+      })() : '<span style="color:#86efac;">No gaps detected</span>';
       return `<div style="padding:5px 0 5px 14px;color:#94a3b8;line-height:1.45;">
         <span style="color:#e2e8f0;font-weight:600;">Season ${season.season}</span> · ${have}<br>${missing}
       </div>`;
