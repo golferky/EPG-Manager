@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261012b"
+VERSION = "v20261012c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -4023,25 +4023,30 @@ def _tmdb_series_catalog(title, tmdb_key):
         from urllib.parse import quote
         search_url = (f'https://api.themoviedb.org/3/search/tv?api_key={tmdb_key}'
                       f'&query={quote(clean_title)}')
-        with urlreq.urlopen(search_url, timeout=6) as response:
+        # This powers an interactive page.  A slow metadata service should
+        # never make the Plex Series screen look frozen.
+        with urlreq.urlopen(search_url, timeout=2) as response:
             results = json.loads(response.read()).get('results', [])
         exact = next((item for item in results
                       if _norm_plex_show(item.get('name', '')) == cache_key), None)
         if not exact or not exact.get('id'):
+            _tmdb_series_catalog_cache[cache_key] = {'checked_at': time.time(), 'catalog': None}
             return None
         detail_url = f'https://api.themoviedb.org/3/tv/{exact["id"]}?api_key={tmdb_key}'
-        with urlreq.urlopen(detail_url, timeout=6) as response:
+        with urlreq.urlopen(detail_url, timeout=2) as response:
             details = json.loads(response.read())
         catalog = {
             int(season.get('season_number')): int(season.get('episode_count') or 0)
             for season in details.get('seasons', [])
             if int(season.get('season_number', 0)) > 0 and int(season.get('episode_count') or 0) > 0
         }
-        if catalog:
-            _tmdb_series_catalog_cache[cache_key] = {'checked_at': time.time(), 'catalog': catalog}
+        _tmdb_series_catalog_cache[cache_key] = {'checked_at': time.time(), 'catalog': catalog or None}
         return catalog or None
     except Exception as exc:
         print(f'[Plex series] TMDb catalog lookup failed for {title}: {exc}')
+        # Cache failures too.  Retrying every show on every refresh is the
+        # usual reason a disconnected TMDb lookup leaves the screen spinning.
+        _tmdb_series_catalog_cache[cache_key] = {'checked_at': time.time(), 'catalog': None}
         return None
 
 
@@ -4124,8 +4129,22 @@ def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key=''):
     # Use an exact TMDb match for every Plex show.  This identifies episodes
     # after the last local file (for example, having S01E01-E02 of a nine
     # episode season), which an internal filename-only gap scan cannot see.
+    # Look up independent show catalogues concurrently.  On a cold cache this
+    # turns a long sequence of network waits into one short bounded wait.
+    catalogues = {}
+    if tmdb_key and shows:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=min(6, len(shows)), thread_name_prefix='plex-catalog') as pool:
+            pending = {pool.submit(_tmdb_series_catalog, show['title'], tmdb_key): show
+                       for show in shows}
+            for future in as_completed(pending):
+                show = pending[future]
+                try:
+                    catalogues[_norm_plex_show(show['title'])] = future.result()
+                except Exception:
+                    catalogues[_norm_plex_show(show['title'])] = None
     for show in shows:
-        catalog = _tmdb_series_catalog(show['title'], tmdb_key)
+        catalog = catalogues.get(_norm_plex_show(show['title']))
         if not catalog:
             continue
         local = {row['season']: set(row['episodes']) for row in show['seasons']}

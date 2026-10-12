@@ -311,6 +311,12 @@ class RecordingTests(unittest.TestCase):
         self.assertIn('Next guide airing:', server.HTML)
         self.assertIn('Queued to record', server.HTML)
 
+    def test_plex_series_catalog_lookup_is_bounded_and_concurrent(self):
+        with open(server.__file__) as handle:
+            source = handle.read()
+        self.assertIn("urlreq.urlopen(search_url, timeout=2)", source)
+        self.assertIn("ThreadPoolExecutor(max_workers=min(6, len(shows))", source)
+
     def test_paramount_showtime_is_not_aliased_to_showtime(self):
         self.assertNotEqual(
             server._channel_match_base("Paramount+ with Showtime HD"),
