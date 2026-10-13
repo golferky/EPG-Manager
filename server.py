@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261012c"
+VERSION = "v20261013a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -912,6 +912,11 @@ _plex_info_cache = {}  # norm_title -> ffprobe result dict
 _stream_info_cache = {}  # channel_id -> (timestamp, safe ffprobe result)
 _plex_episode_cache = {'root': '', 'loaded_at': 0, 'episodes': set()}
 _tmdb_series_catalog_cache = {}
+_plex_series_scan_lock = threading.Lock()
+_plex_series_scan = {
+    'running': False, 'completed': 0, 'total': 0,
+    'phase': '', 'result': None, 'error': '',
+}
 _plex_title_cache = {
     'roots': (), 'loaded_at': 0, 'movies': set(), 'movie_versions': set(),
     'unyearred_movies': set(), 'shows': set(),
@@ -4050,7 +4055,7 @@ def _tmdb_series_catalog(title, tmdb_key):
         return None
 
 
-def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key=''):
+def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key='', progress_callback=None):
     """Read the Plex TV layout and compare it to exact TMDb show catalogues.
 
     The filename scan still supplies an internal-gap fallback, but an exact
@@ -4134,15 +4139,21 @@ def _plex_series_inventory(tv_root, tracked_titles=(), tmdb_key=''):
     catalogues = {}
     if tmdb_key and shows:
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        if progress_callback:
+            progress_callback(0, len(shows), 'Looking up episode catalogs')
         with ThreadPoolExecutor(max_workers=min(6, len(shows)), thread_name_prefix='plex-catalog') as pool:
             pending = {pool.submit(_tmdb_series_catalog, show['title'], tmdb_key): show
                        for show in shows}
+            completed = 0
             for future in as_completed(pending):
                 show = pending[future]
                 try:
                     catalogues[_norm_plex_show(show['title'])] = future.result()
                 except Exception:
                     catalogues[_norm_plex_show(show['title'])] = None
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, len(shows), 'Looking up episode catalogs')
     for show in shows:
         catalog = catalogues.get(_norm_plex_show(show['title']))
         if not catalog:
@@ -4248,6 +4259,67 @@ def api_plex_series_inventory():
         'series_count': len(shows),
         'missing_count': sum(show['missing_count'] for show in shows),
     })
+
+
+def _run_plex_series_scan():
+    """Build the Plex-series view in a worker so progress can be polled."""
+    try:
+        cfg = load_config()
+        db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+        try:
+            conn = sqlite3.connect(db_path)
+            tracked_titles = [row[0] for row in conn.execute(
+                'SELECT title FROM series_recordings WHERE active=1'
+            ).fetchall()]
+            conn.close()
+        except Exception:
+            tracked_titles = []
+
+        def progress(completed, total, phase):
+            with _plex_series_scan_lock:
+                _plex_series_scan.update({
+                    'completed': completed, 'total': total, 'phase': phase,
+                })
+
+        progress(0, 0, 'Reading Plex TV folders')
+        shows = _plex_series_inventory(
+            _plex_tv_path(cfg), tracked_titles, cfg.get('tmdb_key', ''), progress
+        )
+        progress(0, 0, 'Checking upcoming guide airings')
+        shows = _add_missing_episode_guide_airings(
+            shows, db_path, cfg.get('timezone', 'America/New_York')
+        )
+        result = {
+            'series': shows,
+            'series_count': len(shows),
+            'missing_count': sum(show['missing_count'] for show in shows),
+        }
+        with _plex_series_scan_lock:
+            _plex_series_scan.update({
+                'running': False, 'completed': _plex_series_scan['total'],
+                'phase': 'Scan complete', 'result': result, 'error': '',
+            })
+    except Exception as exc:
+        with _plex_series_scan_lock:
+            _plex_series_scan.update({
+                'running': False, 'phase': 'Scan failed', 'error': str(exc),
+            })
+
+
+@app.route('/epg-web/api/plex/series-scan', methods=['POST', 'GET'])
+def api_plex_series_scan():
+    if request.method == 'POST':
+        with _plex_series_scan_lock:
+            if not _plex_series_scan['running']:
+                _plex_series_scan.update({
+                    'running': True, 'completed': 0, 'total': 0,
+                    'phase': 'Starting scan', 'result': None, 'error': '',
+                })
+                threading.Thread(target=_run_plex_series_scan,
+                                 name='plex-series-scan', daemon=True).start()
+    with _plex_series_scan_lock:
+        status = dict(_plex_series_scan)
+    return jsonify(status)
 
 @app.route('/epg-web/api/plex/info')
 def api_plex_info():
@@ -6105,6 +6177,12 @@ tr:hover td{background:#141414;}
       <input id="plex-series-search" placeholder="Search your Plex series…" oninput="renderPlexSeries()">
     </div>
     <div id="plex-series-status" class="status-msg"></div>
+    <div id="plex-series-progress" style="display:none;max-width:440px;margin:8px 0 4px;">
+      <div style="height:7px;background:#1e293b;border-radius:99px;overflow:hidden;">
+        <div id="plex-series-progress-bar" style="height:100%;width:0%;background:#3b82f6;transition:width .2s ease;"></div>
+      </div>
+      <div id="plex-series-progress-label" style="font-size:11px;color:#93c5fd;margin-top:4px;"></div>
+    </div>
     <div id="plex-series-list" style="font-size:13px;"></div>
     <div style="font-size:11px;color:#64748b;margin-top:12px;">For a tracked series, missing episodes come from its episode catalog. Other Plex-only series show detected number gaps only (for example, E1 and E3 but not E2).</div>
   </div>
@@ -7950,18 +8028,46 @@ async function cancelRec(id, refreshSchedule=false) {
 
 // ── Plex Series ──────────────────────────────────────────────────────────────
 let _plexSeries = [];
+let _plexSeriesPoll = null;
 async function loadPlexSeries() {
   const status = document.getElementById('plex-series-status');
   const list = document.getElementById('plex-series-list');
-  status.textContent = 'Scanning your Plex TV folders…';
+  if (_plexSeriesPoll) clearTimeout(_plexSeriesPoll);
+  status.textContent = 'Starting Plex Series scan…';
   list.innerHTML = '';
   try {
-    const d = await (await fetch('/epg-web/api/plex/series-inventory')).json();
+    await post('/epg-web/api/plex/series-scan', {});
+    pollPlexSeriesScan();
+  } catch (e) {
+    setEl('plex-series-status', 'Could not scan Plex TV: ' + e.message, 'err');
+  }
+}
+function updatePlexSeriesProgress(scan) {
+  const wrap = document.getElementById('plex-series-progress');
+  const bar = document.getElementById('plex-series-progress-bar');
+  const label = document.getElementById('plex-series-progress-label');
+  const total = Number(scan.total || 0), completed = Number(scan.completed || 0);
+  const percent = total ? Math.min(100, Math.round(completed * 100 / total)) : (scan.running ? 8 : 100);
+  wrap.style.display = 'block';
+  bar.style.width = percent + '%';
+  label.textContent = total ? `${scan.phase || 'Scanning'} — ${completed} of ${total} series` : (scan.phase || 'Scanning');
+}
+async function pollPlexSeriesScan() {
+  try {
+    const d = await (await fetch('/epg-web/api/plex/series-scan')).json();
+    updatePlexSeriesProgress(d);
+    if (d.running) {
+      _plexSeriesPoll = setTimeout(pollPlexSeriesScan, 350);
+      return;
+    }
+    _plexSeriesPoll = null;
     if (d.error) { setEl('plex-series-status', d.error, 'err'); return; }
-    _plexSeries = d.series || [];
-    setEl('plex-series-status', `${d.series_count || 0} series · ${d.missing_count || 0} episode gap${d.missing_count === 1 ? '' : 's'} detected`, d.missing_count ? 'err' : 'ok');
+    const result = d.result || {};
+    _plexSeries = result.series || [];
+    setEl('plex-series-status', `${result.series_count || 0} series · ${result.missing_count || 0} episode gap${result.missing_count === 1 ? '' : 's'} detected`, result.missing_count ? 'err' : 'ok');
     renderPlexSeries();
   } catch (e) {
+    _plexSeriesPoll = null;
     setEl('plex-series-status', 'Could not scan Plex TV: ' + e.message, 'err');
   }
 }

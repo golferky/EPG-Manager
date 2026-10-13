@@ -317,6 +317,11 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("urlreq.urlopen(search_url, timeout=2)", source)
         self.assertIn("ThreadPoolExecutor(max_workers=min(6, len(shows))", source)
 
+    def test_plex_series_scan_reports_progress(self):
+        self.assertIn('/epg-web/api/plex/series-scan', server.__dict__['app'].url_map.__str__())
+        self.assertIn('plex-series-progress-bar', server.HTML)
+        self.assertIn('pollPlexSeriesScan()', server.HTML)
+
     def test_paramount_showtime_is_not_aliased_to_showtime(self):
         self.assertNotEqual(
             server._channel_match_base("Paramount+ with Showtime HD"),
