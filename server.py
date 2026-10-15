@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261015b"
+VERSION = "v20261015c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -148,6 +148,17 @@ def _channel_match_base(value):
     return base + geographic
 
 
+def _authority_id_matches(channel_id, epg_channel_id, provider_name=''):
+    """Allow an exact provider ID or a verified, same-name rebrand."""
+    if not epg_channel_id or str(epg_channel_id) == str(channel_id):
+        return True
+    # Some providers retain a former XMLTV ID after a network rebrand.  A
+    # matching human name (CINEMAX CLASSICS ↔ cinemaxclassics.us) is safe; a
+    # different name (SHOWTIME ↔ Paramount+ with Showtime) is not.
+    return bool(provider_name and
+                _channel_match_base(channel_id) == _channel_match_base(provider_name))
+
+
 def _primestream_authoritative_channel(channel_id, stream_id):
     """Return whether a stored PrimeStreams stream is safe for this guide ID.
 
@@ -162,16 +173,16 @@ def _primestream_authoritative_channel(channel_id, stream_id):
         cached = _provider_stream_authority_cache
         if cached['path'] != db_path or now - cached['loaded_at'] >= 300:
             conn = sqlite3.connect(db_path)
-            rows = conn.execute('''SELECT stream_id, epg_channel_id
+            rows = conn.execute('''SELECT stream_id, epg_channel_id, provider_name
                                    FROM provider_stream_authority
                                    WHERE provider='primestreams' ''').fetchall()
             conn.close()
             cached.update({
                 'path': db_path, 'loaded_at': now,
-                'by_stream': {str(row[0]): str(row[1]) for row in rows},
+                'by_stream': {str(row[0]): (str(row[1]), str(row[2] or '')) for row in rows},
             })
-        authoritative_id = cached['by_stream'].get(str(stream_id))
-        return not authoritative_id or authoritative_id == str(channel_id)
+        authority = cached['by_stream'].get(str(stream_id))
+        return not authority or _authority_id_matches(channel_id, *authority)
     except Exception:
         # Older databases can still use their existing mapping until the next
         # provider refresh records authoritative IDs.
@@ -358,12 +369,12 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         if not grows:
             grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
         try:
-            authority = {r[0]: r[1] for r in gconn.execute(
-                "SELECT stream_id, epg_channel_id FROM provider_stream_authority WHERE provider='primestreams'"
+            authority = {r[0]: (r[1], r[2] or '') for r in gconn.execute(
+                "SELECT stream_id, epg_channel_id, provider_name FROM provider_stream_authority WHERE provider='primestreams'"
             ).fetchall()}
             discovered_ids = {r[0] for r in gconn.execute(
                 'SELECT channel_id, stream_id FROM discovered_streams'
-            ).fetchall() if not authority.get(r[1]) or authority.get(r[1]) == r[0]}
+            ).fetchall() if not authority.get(r[1]) or _authority_id_matches(r[0], *authority[r[1]])}
         except sqlite3.OperationalError:
             authority = {}
             discovered_ids = set()
@@ -371,7 +382,7 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
 
         ps_guide_channels = {
             row[0] for row in mrows
-            if not authority.get(str(row[1])) or authority.get(str(row[1])) == row[0]
+            if not authority.get(str(row[1])) or _authority_id_matches(row[0], *authority[str(row[1])])
         }
 
         result = set(discovered_ids)

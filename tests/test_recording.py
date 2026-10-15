@@ -53,7 +53,7 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(server._is_quarantined_eaglecast_stream(
             ("92020", "US| SHOWTIME WEST HD", "ts")))
 
-    def test_provider_authority_rejects_mislabeled_stream(self):
+    def test_provider_authority_allows_verified_rebrand_but_rejects_wrong_feed(self):
         with tempfile.TemporaryDirectory() as temp:
             guide_db = os.path.join(temp, "guide.db")
             server.ensure_guide_db(guide_db)
@@ -63,10 +63,13 @@ class RecordingTests(unittest.TestCase):
                          VALUES ('primestreams','89057','5starmax.us','CINEMAX CLASSICS',0)''')
             conn.commit(); conn.close()
             with mock.patch.object(server, '_guide_db_path', return_value=guide_db):
-                self.assertFalse(server._primestream_authoritative_channel(
+                server._invalidate_provider_stream_authority_cache()
+                self.assertTrue(server._primestream_authoritative_channel(
                     'cinemaxclassics.us', '89057'))
                 self.assertTrue(server._primestream_authoritative_channel(
                     '5starmax.us', '89057'))
+                self.assertFalse(server._authority_id_matches(
+                    'paramountwithshowtime.us', 'showtime.us', 'SHOWTIME'))
 
     def test_program_modal_offers_plex_play_without_waiting_for_probe(self):
         self.assertIn('pm-plex-play-btn', server.HTML)
