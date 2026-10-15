@@ -68,6 +68,10 @@ class RecordingTests(unittest.TestCase):
                 self.assertTrue(server._primestream_authoritative_channel(
                     '5starmax.us', '89057'))
 
+    def test_program_modal_offers_plex_play_without_waiting_for_probe(self):
+        self.assertIn('pm-plex-play-btn', server.HTML)
+        self.assertIn("document.getElementById('pm-plex-info').textContent = 'Plex copy found'", server.HTML)
+
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
         self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))

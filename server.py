@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261015a"
+VERSION = "v20261015b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -157,16 +157,29 @@ def _primestream_authoritative_channel(channel_id, stream_id):
     as the source of truth and reject a conflicting legacy/name mapping.
     """
     try:
-        conn = sqlite3.connect(_guide_db_path())
-        row = conn.execute('''SELECT epg_channel_id FROM provider_stream_authority
-                              WHERE provider='primestreams' AND stream_id=?''',
-                           (str(stream_id),)).fetchone()
-        conn.close()
-        return not row or not row[0] or str(row[0]) == str(channel_id)
+        db_path = _guide_db_path()
+        now = time.time()
+        cached = _provider_stream_authority_cache
+        if cached['path'] != db_path or now - cached['loaded_at'] >= 300:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute('''SELECT stream_id, epg_channel_id
+                                   FROM provider_stream_authority
+                                   WHERE provider='primestreams' ''').fetchall()
+            conn.close()
+            cached.update({
+                'path': db_path, 'loaded_at': now,
+                'by_stream': {str(row[0]): str(row[1]) for row in rows},
+            })
+        authoritative_id = cached['by_stream'].get(str(stream_id))
+        return not authoritative_id or authoritative_id == str(channel_id)
     except Exception:
         # Older databases can still use their existing mapping until the next
         # provider refresh records authoritative IDs.
         return True
+
+
+def _invalidate_provider_stream_authority_cache():
+    _provider_stream_authority_cache.update({'path': '', 'loaded_at': 0, 'by_stream': {}})
 
 def _is_premium_channel(name):
     """Networks normally treated as premium in the Favorites guide section."""
@@ -836,6 +849,7 @@ def refresh_provider_live_epg(guide_db_path=None, *, limit=24):
                                 provider_name=excluded.provider_name,
                                 discovered_at=excluded.discovered_at''', exact_rows)
             conn.commit(); conn.close()
+            _invalidate_provider_stream_authority_cache()
         except Exception as exc:
             print(f'[provider-live-epg] authority map: {exc}')
 
@@ -1011,6 +1025,7 @@ _plex_info_cache = {}  # norm_title -> ffprobe result dict
 _stream_info_cache = {}  # channel_id -> (timestamp, safe ffprobe result)
 _plex_episode_cache = {'root': '', 'loaded_at': 0, 'episodes': set()}
 _tmdb_series_catalog_cache = {}
+_provider_stream_authority_cache = {'path': '', 'loaded_at': 0, 'by_stream': {}}
 _plex_series_scan_lock = threading.Lock()
 _plex_series_scan = {
     'running': False, 'completed': 0, 'total': 0,
@@ -2442,6 +2457,7 @@ def api_toggle_favorite():
         )
         gconn.commit()
         gconn.close()
+        _invalidate_provider_stream_authority_cache()
         return jsonify({'ok': True, 'favorite': bool(new_fav)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2573,6 +2589,7 @@ def api_sync_streams():
                 unmatched_guide.append(channel_name)
         gconn.commit()
         gconn.close()
+        _invalidate_provider_stream_authority_cache()
     except Exception as e:
         return jsonify({'error': f'Guide discovery error: {e}'}), 500
 
@@ -6228,6 +6245,7 @@ tr:hover td{background:#141414;}
       <div id="pm-plex-wrap" style="display:none;border-top:1px solid #2d1f5e;padding:9px 20px;background:#0d0d1f;">
         <span style="font-size:10px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">▶ PLEX</span>
         <span id="pm-plex-info" style="font-size:12px;color:#a78bfa;font-family:monospace;"></span>
+        <button id="pm-plex-play-btn" class="btn btn-ghost btn-sm" style="float:right;margin:0;border-color:#7c3aed;color:#c4b5fd;" onclick="playPlex(_currentProg.title)">▶ Play Plex copy</button>
       </div>
       <!-- Actual incoming stream quality, sampled from the recordable channel -->
       <div id="pm-stream-wrap" style="display:none;border-top:1px solid #17365d;padding:9px 20px;background:#0b1726;">
@@ -7450,17 +7468,11 @@ async function openProg(p) {
   document.getElementById('pm-content').style.display = 'none';
   document.getElementById('pm-status').textContent = '';
 
-  // Check if already being recorded
+  // Fetch these independent pieces together.  Waiting for metadata before the
+  // recording state made a live programme window feel slow to open.
   const now = Date.now() / 1000;
-  const recStatus = await fetchJsonWithin('/epg-web/api/record/status') || {recordings:{}};
-  const alreadyRec = Object.values(recStatus.recordings || {}).some(r =>
-    r.title === p.title && r.channel_id === p.channel_id &&
-    Math.abs(r.start_ts - p.start_ts) < 60 &&
-    ['queued','scheduled','recording'].includes(r.status)
-  );
-
-  // Fetch enriched info (skip OMDB/TMDB for news/sports/talk/live)
-  let info = {};
+  const recStatusPromise = fetchJsonWithin('/epg-web/api/record/status');
+  let infoPromise = Promise.resolve({});
   try {
     const params = new URLSearchParams({title: p.title});
     if (p.desc)     params.set('desc', p.desc);
@@ -7469,8 +7481,18 @@ async function openProg(p) {
     if (p.stop_ts && p.start_ts) params.set('duration', Math.max(0, p.stop_ts - p.start_ts));
     if (p.start_ts) params.set('start_ts', p.start_ts);
     if (p.channel_id) params.set('channel_id', p.channel_id);
-    info = await fetchJsonWithin(`/epg-web/api/prog-info?${params}`) || {};
+    infoPromise = fetchJsonWithin(`/epg-web/api/prog-info?${params}`);
   } catch(e) {}
+  const [recStatusData, infoData] = await Promise.all([recStatusPromise, infoPromise]);
+  const recStatus = recStatusData || {recordings:{}};
+  const alreadyRec = Object.values(recStatus.recordings || {}).some(r =>
+    r.title === p.title && r.channel_id === p.channel_id &&
+    Math.abs(r.start_ts - p.start_ts) < 60 &&
+    ['queued','scheduled','recording'].includes(r.status)
+  );
+
+  // Metadata is optional: a guide title is enough to open the controls.
+  let info = infoData || {};
 
   // Populate modal
   document.getElementById('pm-title').textContent = info.title || p.title;
@@ -7519,8 +7541,11 @@ async function openProg(p) {
   const plexWrap = document.getElementById('pm-plex-wrap');
   plexWrap.style.display = 'none';
   if (_plexTitles.has(_plexNorm(p.title))) {
-    try {
-      const pr = await fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}`);
+    plexWrap.style.display = 'block';
+    document.getElementById('pm-plex-info').textContent = 'Plex copy found';
+    // File probing can take several seconds on the NAS.  It is display-only,
+    // so do not hold up the live Play/Record controls for it.
+    fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}`).then(async pr => {
       const pi = await pr.json();
       if (pi.found) {
         const parts = [];
@@ -7532,7 +7557,7 @@ async function openProg(p) {
         document.getElementById('pm-plex-info').textContent = parts.join(' · ') || pi.file;
         plexWrap.style.display = 'block';
       }
-    } catch(e) {}
+    }).catch(() => {});
   }
 
   // This is not the guide's quality hint: it is a brief ffprobe of the exact
