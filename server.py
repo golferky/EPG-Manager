@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261015d"
+VERSION = "v20261015e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -553,6 +553,14 @@ def ensure_guide_db(db_path):
     conn.execute('''
         CREATE UNIQUE INDEX IF NOT EXISTS idx_guide_unique
         ON guide(channel_id, start_utc, title)
+    ''')
+    # Programme details frequently look up every future airing of one title.
+    # The guide has millions of rows, so the expression index is essential:
+    # ``lower(title)=lower(?)`` otherwise scans the entire guide and makes the
+    # programme panel feel frozen.
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_guide_title_ci_time
+        ON guide(lower(title), start_utc, end_utc)
     ''')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS guide_channels (
@@ -7490,9 +7498,52 @@ async function openProg(p) {
   document.getElementById('pm-content').style.display = 'none';
   document.getElementById('pm-status').textContent = '';
 
+  // Opening a guide tile must be immediate.  Render what the guide already
+  // knows before asking OMDb, Plex, or the future-airings endpoint for any
+  // optional extras.  This also leaves a working Play control available while
+  // the guide database is being refreshed.
+  const now = Date.now() / 1000;
+  document.getElementById('pm-title').textContent = p.title || '';
+  document.getElementById('pm-air').textContent =
+    (p.channel || p.channel_name || p.channel_id || '') + '  ·  ' +
+    (p.start_fmt || '') + ' – ' + (p.stop_fmt || '');
+  document.getElementById('pm-plot').textContent = p.desc || p.category || '';
+  ['pm-year','pm-rated','pm-genre','pm-imdb','pm-actors','pm-director'].forEach(id => {
+    document.getElementById(id).textContent = '';
+  });
+  document.getElementById('pm-imdb-link').style.display = 'none';
+  document.getElementById('pm-poster-wrap').style.display = 'none';
+  const quickEpParts = [];
+  if (p.season_num != null) quickEpParts.push(`S${p.season_num}${p.episode_num != null ? 'E'+p.episode_num : ''}`);
+  if (p.episode_title) quickEpParts.push(p.episode_title);
+  const quickEp = document.getElementById('pm-ep');
+  quickEp.textContent = quickEpParts.join(' · ');
+  quickEp.style.display = quickEpParts.length ? '' : 'none';
+  document.getElementById('pm-loading').style.display = 'none';
+  document.getElementById('pm-content').style.display = 'block';
+
+  const initiallyLive = Number(p.start_ts || 0) <= now && Number(p.stop_ts || 0) > now;
+  if (initiallyLive && p.channel_id) {
+    _nextAiring = {
+      channel_id: p.channel_id,
+      channel_name: p.channel || p.channel_name || p.channel_id,
+      start_ts: p.start_ts, stop_ts: p.stop_ts, stop_fmt: p.stop_fmt || '',
+      on_now: true, _title: p.title
+    };
+    document.getElementById('pm-next-heading').textContent = '📡 Live now';
+    document.getElementById('pm-next-info').textContent =
+      `ON NOW  ·  ${_nextAiring.channel_name}${p.stop_fmt ? `  (until ${p.stop_fmt})` : ''}`;
+    const quickPlay = document.getElementById('pm-play-btn');
+    const alreadyPlaying = !!_activeStreams[p.channel_id];
+    quickPlay.style.display = '';
+    quickPlay.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
+    quickPlay.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
+    document.getElementById('pm-rec-next-btn').style.display = 'none';
+    document.getElementById('pm-next-wrap').style.display = 'block';
+  }
+
   // Fetch these independent pieces together.  Waiting for metadata before the
   // recording state made a live programme window feel slow to open.
-  const now = Date.now() / 1000;
   const recStatusPromise = fetchJsonWithin('/epg-web/api/record/status');
   let infoPromise = Promise.resolve({});
   try {
