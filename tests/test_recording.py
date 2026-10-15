@@ -53,6 +53,21 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(server._is_quarantined_eaglecast_stream(
             ("92020", "US| SHOWTIME WEST HD", "ts")))
 
+    def test_provider_authority_rejects_mislabeled_stream(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            conn = sqlite3.connect(guide_db)
+            conn.execute('''INSERT INTO provider_stream_authority
+                         (provider,stream_id,epg_channel_id,provider_name,checked_at)
+                         VALUES ('primestreams','89057','5starmax.us','CINEMAX CLASSICS',0)''')
+            conn.commit(); conn.close()
+            with mock.patch.object(server, '_guide_db_path', return_value=guide_db):
+                self.assertFalse(server._primestream_authoritative_channel(
+                    'cinemaxclassics.us', '89057'))
+                self.assertTrue(server._primestream_authoritative_channel(
+                    '5starmax.us', '89057'))
+
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
         self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))

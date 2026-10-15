@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261013a"
+VERSION = "v20261015a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -146,6 +146,27 @@ def _channel_match_base(value):
                 changed = True
                 break
     return base + geographic
+
+
+def _primestream_authoritative_channel(channel_id, stream_id):
+    """Return whether a stored PrimeStreams stream is safe for this guide ID.
+
+    Provider display labels are not reliable identifiers: one stream labelled
+    ``CINEMAX CLASSICS`` identified itself as ``5starmax.us`` and played the
+    wrong channel.  When the provider supplies its XMLTV channel ID, use it
+    as the source of truth and reject a conflicting legacy/name mapping.
+    """
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        row = conn.execute('''SELECT epg_channel_id FROM provider_stream_authority
+                              WHERE provider='primestreams' AND stream_id=?''',
+                           (str(stream_id),)).fetchone()
+        conn.close()
+        return not row or not row[0] or str(row[0]) == str(channel_id)
+    except Exception:
+        # Older databases can still use their existing mapping until the next
+        # provider refresh records authoritative IDs.
+        return True
 
 def _is_premium_channel(name):
     """Networks normally treated as premium in the Favorites guide section."""
@@ -307,10 +328,9 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         # All Movies.db guide_channels with a stream
         mconn = sqlite3.connect(movies_db_path)
         mrows = mconn.execute(
-            'SELECT guide_channel FROM channels WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL AND guide_channel != ""'
+            'SELECT guide_channel, stream_id FROM channels WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL AND guide_channel != ""'
         ).fetchall()
         mconn.close()
-        ps_guide_channels = {r[0] for r in mrows}
 
         gconn = sqlite3.connect(guide_db_path)
         # guide has millions of programme rows.  Reading DISTINCT channel pairs
@@ -325,12 +345,21 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         if not grows:
             grows = gconn.execute('SELECT DISTINCT channel_id, channel_name FROM guide').fetchall()
         try:
-            discovered_ids = {r[0] for r in gconn.execute(
-                'SELECT channel_id FROM discovered_streams'
+            authority = {r[0]: r[1] for r in gconn.execute(
+                "SELECT stream_id, epg_channel_id FROM provider_stream_authority WHERE provider='primestreams'"
             ).fetchall()}
+            discovered_ids = {r[0] for r in gconn.execute(
+                'SELECT channel_id, stream_id FROM discovered_streams'
+            ).fetchall() if not authority.get(r[1]) or authority.get(r[1]) == r[0]}
         except sqlite3.OperationalError:
+            authority = {}
             discovered_ids = set()
         gconn.close()
+
+        ps_guide_channels = {
+            row[0] for row in mrows
+            if not authority.get(str(row[1])) or authority.get(str(row[1])) == row[0]
+        }
 
         result = set(discovered_ids)
         # Build lookup dicts
@@ -531,6 +560,18 @@ def ensure_guide_db(db_path):
             stream_id TEXT NOT NULL,
             provider_name TEXT,
             discovered_at REAL NOT NULL
+        )
+    ''')
+    # The provider's `epg_channel_id` is a stable identity for a stream.  Its
+    # human-readable name is only a label and is sometimes wrong.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS provider_stream_authority (
+            provider TEXT NOT NULL,
+            stream_id TEXT NOT NULL,
+            epg_channel_id TEXT NOT NULL,
+            provider_name TEXT,
+            checked_at REAL NOT NULL,
+            PRIMARY KEY(provider, stream_id)
         )
     ''')
     # A second provider map is intentionally separate from PrimeStreams'
@@ -746,6 +787,58 @@ def refresh_provider_live_epg(guide_db_path=None, *, limit=24):
             return {'updated': 0, 'channels': 0, 'skipped': 0,
                     'error': f'Provider live-channel lookup failed: {exc}'}
 
+        # Save the provider's authoritative channel identity before any name
+        # matching happens.  This both repairs correct exact mappings and
+        # removes older discovered mappings whose label merely looked similar.
+        try:
+            ensure_guide_db(guide_db_path)
+            conn = sqlite3.connect(guide_db_path, timeout=30)
+            guide_ids = {row[0] for row in conn.execute(
+                'SELECT channel_id FROM guide_channels'
+            ).fetchall()}
+            authority_rows = [
+                ('primestreams', str(stream.get('stream_id') or ''),
+                 str(stream.get('epg_channel_id') or '').strip(),
+                 str(stream.get('name') or '').strip(), time.time())
+                for stream in live_streams
+                if str(stream.get('stream_id') or '').strip()
+                and str(stream.get('epg_channel_id') or '').strip()
+            ]
+            conn.executemany('''INSERT INTO provider_stream_authority
+                              (provider,stream_id,epg_channel_id,provider_name,checked_at)
+                              VALUES (?,?,?,?,?)
+                              ON CONFLICT(provider,stream_id) DO UPDATE SET
+                                epg_channel_id=excluded.epg_channel_id,
+                                provider_name=excluded.provider_name,
+                                checked_at=excluded.checked_at''', authority_rows)
+            # A discovery is usable only when it agrees with that identity.
+            conn.execute('''DELETE FROM discovered_streams
+                            WHERE EXISTS (
+                              SELECT 1 FROM provider_stream_authority authority
+                              WHERE authority.provider='primestreams'
+                                AND authority.stream_id=discovered_streams.stream_id
+                                AND authority.epg_channel_id != discovered_streams.channel_id
+                            )''')
+            exact_rows = [
+                (str(stream.get('epg_channel_id')).strip(),
+                 str(stream.get('name') or '').strip(),
+                 str(stream.get('stream_id') or '').strip(),
+                 str(stream.get('name') or '').strip(), time.time())
+                for stream in live_streams
+                if str(stream.get('epg_channel_id') or '').strip() in guide_ids
+            ]
+            conn.executemany('''INSERT INTO discovered_streams
+                              (channel_id,channel_name,stream_id,provider_name,discovered_at)
+                              VALUES (?,?,?,?,?)
+                              ON CONFLICT(channel_id) DO UPDATE SET
+                                channel_name=excluded.channel_name,
+                                stream_id=excluded.stream_id,
+                                provider_name=excluded.provider_name,
+                                discovered_at=excluded.discovered_at''', exact_rows)
+            conn.commit(); conn.close()
+        except Exception as exc:
+            print(f'[provider-live-epg] authority map: {exc}')
+
         # The provider's own epg_channel_id is the authoritative mapping.  It
         # corrects legacy stream IDs (including channels whose names are too
         # similar for name matching) before the short EPG is requested.
@@ -767,7 +860,13 @@ def refresh_provider_live_epg(guide_db_path=None, *, limit=24):
         for row in favorites:
             channel_id = str(row['guide_channel'])
             stream = by_epg_id.get(channel_id)
-            stream_id = str((stream or {}).get('stream_id') or row['stream_id'] or '').strip()
+            # Do not use a legacy stream ID when the provider says it belongs
+            # to a different XMLTV channel.  A missing verified stream is
+            # safer than playing or recording the wrong programme.
+            legacy_id = str(row['stream_id'] or '').strip()
+            stream_id = str((stream or {}).get('stream_id') or '').strip()
+            if not stream_id and _primestream_authoritative_channel(channel_id, legacy_id):
+                stream_id = legacy_id
             if not stream_id:
                 continue
             if stream and str(row['stream_id'] or '') != stream_id:
@@ -1273,7 +1372,7 @@ def _stream_url(channel_id, preferred_provider=None):
             (channel_id,)
         ).fetchone()
         gconn.close()
-        if discovered:
+        if discovered and _primestream_authoritative_channel(channel_id, discovered[0]):
             sid, mapped_name = discovered
             debug.update({'method': 'provider discovery',
                           'matched_guide_channel': mapped_name or channel_id,
@@ -1286,10 +1385,11 @@ def _stream_url(channel_id, preferred_provider=None):
         'SELECT stream_id, guide_channel FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
         (channel_id,)
     )
-    if rows:
+    if rows and _primestream_authoritative_channel(channel_id, rows[0]['stream_id']):
         debug['method'] = 'direct'
         debug['matched_guide_channel'] = rows[0]['guide_channel']
     else:
+        rows = []
         # Fallback: look up ALL channel_names for this channel_id from guide.db,
         # then try prefix-matching each against Movies.db guide_channel values.
         # Using all names matters — e.g. channel_id 18086 has both "SHOWX" (short,
@@ -1313,6 +1413,8 @@ def _stream_url(channel_id, preferred_provider=None):
                     if len(ch_norm) < 3:
                         continue
                     for mr, base in mc:
+                        if not _primestream_authoritative_channel(channel_id, mr['stream_id']):
+                            continue
                         if len(base) < 3:
                             continue
                         if base.startswith(ch_norm) or ch_norm.startswith(base):
@@ -2394,11 +2496,22 @@ def api_sync_streams():
     except Exception as e:
         return jsonify({'error': f'PrimeStreams API error: {e}'}), 500
 
-    # Build normalized-name → (stream_id, name) map; prefer exact over prefix
+    # Keep the provider's XMLTV identity separate from display-name matching.
+    # Display labels can be inaccurate (e.g. a stream labelled Cinemax
+    # Classics that identifies itself as 5StarMax).
+    authoritative = {}
+    authority_rows = []
+    # Build normalized-name → (stream_id, name) only for streams which do not
+    # supply an authoritative EPG channel ID.
     ps_map = {}
     for s in ps_streams:
         sid  = str(s.get('stream_id',''))
         name = s.get('name','').strip()
+        epg_channel_id = str(s.get('epg_channel_id') or '').strip()
+        if sid and epg_channel_id:
+            authoritative[epg_channel_id] = (sid, name)
+            authority_rows.append(('primestreams', sid, epg_channel_id, name, time.time()))
+            continue
         # Strip prefixes like "UK: ", "UHD: "
         name = _re.sub(r'^(UK|UHD|HD|SD):\s*', '', name, flags=_re.IGNORECASE).strip()
         # Strip suffixes like "| VIP", "UHD/4K", "4K"
@@ -2414,13 +2527,29 @@ def api_sync_streams():
     try:
         ensure_guide_db(guide_db_path)
         gconn = sqlite3.connect(guide_db_path)
+        gconn.executemany('''INSERT INTO provider_stream_authority
+                          (provider,stream_id,epg_channel_id,provider_name,checked_at)
+                          VALUES (?,?,?,?,?)
+                          ON CONFLICT(provider,stream_id) DO UPDATE SET
+                            epg_channel_id=excluded.epg_channel_id,
+                            provider_name=excluded.provider_name,
+                            checked_at=excluded.checked_at''', authority_rows)
+        gconn.execute('''DELETE FROM discovered_streams
+                         WHERE EXISTS (
+                           SELECT 1 FROM provider_stream_authority authority
+                           WHERE authority.provider='primestreams'
+                             AND authority.stream_id=discovered_streams.stream_id
+                             AND authority.epg_channel_id != discovered_streams.channel_id
+                         )''')
         guide_rows = gconn.execute(
             'SELECT channel_id, channel_name FROM guide_channels'
         ).fetchall()
         discovered, unmatched_guide = [], []
         for channel_id, channel_name in guide_rows:
+            match = authoritative.get(str(channel_id))
             key = _channel_match_base(channel_name)
-            match = ps_map.get(key)
+            if not match:
+                match = ps_map.get(key)
             if not match:
                 candidates = [(abs(len(ps_key) - len(key)), value)
                               for ps_key, value in ps_map.items()
@@ -2466,7 +2595,7 @@ def api_sync_streams():
         gc   = row['guide_channel']
         old  = str(row['stream_id'] or '')
         key  = _base(_norm(gc))
-        match = ps_map.get(key)
+        match = authoritative.get(str(gc)) or ps_map.get(key)
         if not match:
             # Try prefix match
             for ps_key, (sid, pname) in ps_map.items():
