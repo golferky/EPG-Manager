@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261015c"
+VERSION = "v20261015d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -1236,7 +1236,10 @@ def _channel_recording_reliability(days=30):
     since = time.time() - days * 86400
     outcomes = {}
     try:
-        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        # This is only a guide decoration.  During a guide rebuild it must not
+        # hold up the programme window waiting for the writer's database lock.
+        conn = sqlite3.connect(_guide_db_path(), timeout=1)
+        conn.execute('PRAGMA busy_timeout=1000')
         conn.row_factory = sqlite3.Row
         rows = conn.execute('''SELECT channel_id,status FROM recordings
                                WHERE start_ts >= ? AND channel_id IS NOT NULL
@@ -1476,7 +1479,10 @@ def _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id=''):
     active = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting',
               'recording', 'converting', 'awaiting_transfer', 'transferring')
     try:
-        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        # Source selection is also used by the programme-detail panel.  A
+        # temporary guide refresh must not make that panel appear frozen.
+        conn = sqlite3.connect(_guide_db_path(), timeout=1)
+        conn.execute('PRAGMA busy_timeout=1000')
         row = conn.execute('''SELECT title, channel, start_ts, stop_ts FROM recordings
                               WHERE COALESCE(stream_provider,'primestreams')='eaglecast'
                                 AND status IN ({}) AND start_ts < ? AND stop_ts > ?
@@ -4985,7 +4991,11 @@ def api_airings():
     clean_title = m2.group(1).strip() if m2 else title
 
     try:
-        conn = sqlite3.connect(db_path)
+        # The guide can be swapped while a refresh is in progress.  Return no
+        # extra airings quickly in that brief window; the clicked programme
+        # still opens and remains playable instead of a modal stuck loading.
+        conn = sqlite3.connect(db_path, timeout=1)
+        conn.execute('PRAGMA busy_timeout=1000')
         conn.row_factory = sqlite3.Row
         # Search both full title and cleaned title
         rows = conn.execute('''
@@ -7472,6 +7482,7 @@ async function fetchJsonWithin(url, milliseconds=6000) {
 async function openProg(p) {
   hideTip();
   _currentProg = p;
+  _nextAiring = null;
   // Show overlay in loading state
   const overlay = document.getElementById('prog-modal-overlay');
   overlay.style.display = 'flex';
@@ -7494,7 +7505,12 @@ async function openProg(p) {
     if (p.channel_id) params.set('channel_id', p.channel_id);
     infoPromise = fetchJsonWithin(`/epg-web/api/prog-info?${params}`);
   } catch(e) {}
-  const [recStatusData, infoData] = await Promise.all([recStatusPromise, infoPromise]);
+  // The panel itself is useful even if an optional background lookup is
+  // briefly blocked by a guide refresh.  Never leave the user at “Loading…”.
+  const [recStatusData, infoData] = await Promise.all([
+    recStatusPromise.catch(() => null),
+    infoPromise.catch(() => null)
+  ]);
   const recStatus = recStatusData || {recordings:{}};
   const alreadyRec = Object.values(recStatus.recordings || {}).some(r =>
     r.title === p.title && r.channel_id === p.channel_id &&
@@ -7548,6 +7564,32 @@ async function openProg(p) {
   document.getElementById('pm-loading').style.display = 'none';
   document.getElementById('pm-content').style.display = 'block';
 
+  // A programme that is live in the grid gets an immediate Play action.  The
+  // fuller airings lookup below refines this later, but it must never be the
+  // reason a known-live programme has no button while the guide is busy.
+  const clickedIsLive = Number(p.start_ts || 0) <= now && Number(p.stop_ts || 0) > now;
+  if (clickedIsLive && p.channel_id) {
+    _nextAiring = {
+      channel_id: p.channel_id,
+      channel_name: p.channel || p.channel_name || p.channel_id,
+      start_ts: p.start_ts,
+      stop_ts: p.stop_ts,
+      stop_fmt: p.stop_fmt || '',
+      on_now: true,
+      _title: p.title
+    };
+    document.getElementById('pm-next-heading').textContent = '📡 Live now';
+    document.getElementById('pm-next-info').textContent =
+      `ON NOW  ·  ${_nextAiring.channel_name}${p.stop_fmt ? `  (until ${p.stop_fmt})` : ''}`;
+    const pBtn = document.getElementById('pm-play-btn');
+    const alreadyPlaying = !!_activeStreams[p.channel_id];
+    pBtn.style.display = '';
+    pBtn.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
+    pBtn.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
+    document.getElementById('pm-rec-next-btn').style.display = 'none';
+    document.getElementById('pm-next-wrap').style.display = 'block';
+  }
+
   // Plex file info
   const plexWrap = document.getElementById('pm-plex-wrap');
   plexWrap.style.display = 'none';
@@ -7598,9 +7640,12 @@ async function openProg(p) {
   // Fetch future airings
   document.getElementById('pm-next-wrap').style.display    = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
-  _nextAiring = null;
   try {
-    const ar = await (await fetch(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`)).json();
+    // Future-airing discovery can involve a guide database that is actively
+    // refreshing.  It is secondary to opening/playing this programme, so
+    // time out rather than leaving the detail panel in an indeterminate state.
+    const ar = await fetchJsonWithin(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`, 5000);
+    if (!ar) throw new Error('Airings lookup timed out');
     if (ar.airings && ar.airings.length > 0) {
       const isSeries = !!ar.is_series;
       // A title can be both a movie and a TV series (for example Bewitched).
