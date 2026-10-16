@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261015e"
+VERSION = "v20261016a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -145,7 +145,17 @@ def _channel_match_base(value):
                 base = base[:-len(suffix)]
                 changed = True
                 break
-    return base + geographic
+    base += geographic
+    # These are the provider's established short IDs for the branded Movie
+    # Channel feeds.  Schedules Direct spells the same networks out in full.
+    # Treat only these exact, unambiguous forms as aliases; broad fuzzy
+    # matching is deliberately avoided because it caused wrong-program plays.
+    return {
+        'themoviechannel': 'tmc',
+        'themoviechannelwest': 'tmcwest',
+        'themoviechannelextra': 'tmcxtra',
+        'themoviechannelextrawest': 'tmcxtrawest',
+    }.get(base, base)
 
 
 def _authority_id_matches(channel_id, epg_channel_id, provider_name=''):
@@ -159,7 +169,7 @@ def _authority_id_matches(channel_id, epg_channel_id, provider_name=''):
                 _channel_match_base(channel_id) == _channel_match_base(provider_name))
 
 
-def _primestream_authoritative_channel(channel_id, stream_id):
+def _primestream_authoritative_channel(channel_id, stream_id, guide_name=''):
     """Return whether a stored PrimeStreams stream is safe for this guide ID.
 
     Provider display labels are not reliable identifiers: one stream labelled
@@ -182,7 +192,16 @@ def _primestream_authoritative_channel(channel_id, stream_id):
                 'by_stream': {str(row[0]): (str(row[1]), str(row[2] or '')) for row in rows},
             })
         authority = cached['by_stream'].get(str(stream_id))
-        return not authority or _authority_id_matches(channel_id, *authority)
+        if not authority:
+            return True
+        epg_channel_id, provider_name = authority
+        # Numeric Schedules Direct station IDs cannot be compared with the
+        # provider XMLTV ID.  A strict canonical display-name match is safe,
+        # and lets "The Movie Channel Extra HD" use its verified tmcxtra
+        # stream without reintroducing broad, unsafe name matching.
+        return (_authority_id_matches(channel_id, epg_channel_id, provider_name)
+                or bool(guide_name and
+                        _channel_match_base(guide_name) == _channel_match_base(provider_name)))
     except Exception:
         # Older databases can still use their existing mapping until the next
         # provider refresh records authoritative IDs.
@@ -1450,7 +1469,7 @@ def _stream_url(channel_id, preferred_provider=None):
                     if len(ch_norm) < 3:
                         continue
                     for mr, base in mc:
-                        if not _primestream_authoritative_channel(channel_id, mr['stream_id']):
+                        if not _primestream_authoritative_channel(channel_id, mr['stream_id'], name):
                             continue
                         if len(base) < 3:
                             continue
@@ -2283,6 +2302,7 @@ def api_guide():
             # bypass it.
             prog['can_record'] = (prog['channel_id'] in recordable_ids
                                   and not _is_foreign_recording_feed(prog.get('channel_name', '')))
+            prog['can_play'] = prog['channel_id'] in recordable_ids
             prog['stream_provider'] = ('eaglecast' if prog['channel_id'] in eaglecast_ids
                                        else 'primestreams') if prog['can_record'] else ''
             if prog['can_record'] and prog['channel_id'] in quality_by_id:
@@ -2290,6 +2310,7 @@ def api_guide():
     except Exception:
         for prog in progs_in_window:
             prog['can_record'] = False
+            prog['can_play'] = False
 
     return jsonify({
         'window_start': ws.astimezone(local_tz).isoformat(),
@@ -7522,7 +7543,7 @@ async function openProg(p) {
   document.getElementById('pm-loading').style.display = 'none';
   document.getElementById('pm-content').style.display = 'block';
 
-  const initiallyLive = Number(p.start_ts || 0) <= now && Number(p.stop_ts || 0) > now;
+  const initiallyLive = p.can_play && Number(p.start_ts || 0) <= now && Number(p.stop_ts || 0) > now;
   if (initiallyLive && p.channel_id) {
     _nextAiring = {
       channel_id: p.channel_id,
@@ -7745,7 +7766,11 @@ async function openProg(p) {
       // the next future one (for Record).
       const livePS   = ar.airings.find(a => (a.can_play || a.can_record) && a.on_now);
       const futurePS = ar.airings.find(a => a.can_record && !a.on_now);
-      const featPS   = selectedAiring || livePS || futurePS;
+      // Do not preserve a clicked guide-only row simply because it was
+      // clicked: it may not have a verified stream.  A Play button must never
+      // promise a channel that the server will later reject.
+      const featPS = (selectedAiring && (selectedAiring.can_play || selectedAiring.can_record))
+        ? selectedAiring : livePS || futurePS;
       if (featPS) {
         _nextAiring = featPS;
         _nextAiring._title = p.title;
