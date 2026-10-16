@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261016b"
+VERSION = "v20261016c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -6329,6 +6329,13 @@ tr:hover td{background:#141414;}
         </div>
         <div id="pm-airings-list" style="max-height:160px;overflow-y:auto;"></div>
       </div>
+      <!-- Shown only when the guide has no later airing to record. -->
+      <div id="pm-wanted-wrap" style="display:none;border-top:1px solid #1e293b;padding:12px 20px;background:#101827;">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <span style="color:#94a3b8;font-size:12px;flex:1;">No future airings are currently in the guide.</span>
+          <button id="pm-wanted-btn" class="btn btn-ghost btn-sm" onclick="addCurrentProgToWanted()" style="border-color:#fbbf24;color:#fcd34d;">☆ Add to Wanted</button>
+        </div>
+      </div>
       <!-- Footer -->
       <div style="padding:12px 20px;border-top:1px solid #1e293b;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
         <button class="btn btn-ghost" onclick="closeProg()">Close</button>
@@ -7527,6 +7534,7 @@ async function openProg(p) {
   document.getElementById('pm-loading').style.display = 'block';
   document.getElementById('pm-content').style.display = 'none';
   document.getElementById('pm-status').textContent = '';
+  document.getElementById('pm-wanted-wrap').style.display = 'none';
 
   // Opening a guide tile must be immediate.  Render what the guide already
   // knows before asking OMDb, Plex, or the future-airings endpoint for any
@@ -7729,6 +7737,7 @@ async function openProg(p) {
     if (!ar) throw new Error('Airings lookup timed out');
     if (ar.airings && ar.airings.length > 0) {
       const isSeries = !!ar.is_series;
+      window._currentProgWantedType = isSeries ? 'series' : 'movie';
       // A title can be both a movie and a TV series (for example Bewitched).
       // Once the guide confirms this is a series, refresh the artwork/details
       // explicitly as a series instead of leaving a same-named movie selected.
@@ -7907,6 +7916,16 @@ async function openProg(p) {
       };
       renderAiringsList();
       document.getElementById('pm-airings-wrap').style.display = 'block';
+
+      // The current airing is useful, but it is not a future chance to catch
+      // the programme.  Offer Wanted only when nothing later is in the guide.
+      const hasFutureAiring = ar.airings.some(a => Number(a.start_ts || 0) > now + 60);
+      if (!hasFutureAiring) {
+        const wantedBtn = document.getElementById('pm-wanted-btn');
+        wantedBtn.textContent = isSeries ? '☆ Add series to Wanted' : '☆ Add movie to Wanted';
+        wantedBtn.disabled = false;
+        document.getElementById('pm-wanted-wrap').style.display = 'block';
+      }
     }
   } catch(e) {}
 }
@@ -8503,27 +8522,35 @@ async function addWanted(type) {
   return findWantedTitle(title.trim(), type);
 }
 
-async function findWantedTitle(query, type) {
+async function findWantedTitle(query, type, statusId='rec-status') {
   const kind = type === 'series' ? 'series' : 'movie';
-  setEl('rec-status', `Looking up IMDb ${kind} choices…`, '');
+  setEl(statusId, `Looking up IMDb ${kind} choices…`, '');
   try {
     const d = await (await fetch(`/epg-web/api/wanted/movie-matches?q=${encodeURIComponent(query)}&type=${kind}`)).json();
-    if (d.error) { setEl('rec-status', d.error, 'err'); return; }
+    if (d.error) { setEl(statusId, d.error, 'err'); return; }
     if (!d.matches || !d.matches.length) {
-      setEl('rec-status', d.message || `No IMDb ${kind} choices found for “${query}”. Nothing was added.`, 'err');
+      setEl(statusId, d.message || `No IMDb ${kind} choices found for “${query}”. Nothing was added.`, 'err');
       return;
     }
-    showWantedTitlePicker(query, d.matches, kind);
+    showWantedTitlePicker(query, d.matches, kind, statusId);
   } catch (e) {
-    setEl('rec-status', 'Could not look up movie choices: ' + e.message, 'err');
+    setEl(statusId, 'Could not look up movie choices: ' + e.message, 'err');
   }
 }
 
-function showWantedTitlePicker(query, matches, type) {
+function addCurrentProgToWanted() {
+  const title = (_currentProg && _currentProg.title || '').trim();
+  if (!title) return;
+  const type = window._currentProgWantedType === 'series' ? 'series' : 'movie';
+  return findWantedTitle(title, type, 'pm-status');
+}
+
+function showWantedTitlePicker(query, matches, type, statusId='rec-status') {
   const old = document.getElementById('wanted-movie-picker');
   if (old) old.remove();
   window._wantedMovieMatches = matches;
   window._wantedTitleType = type;
+  window._wantedStatusId = statusId;
   const cards = matches.map((m, index) => {
     const poster = m.poster
       ? `<img src="${esc(m.poster)}" alt="" style="width:72px;height:108px;object-fit:cover;background:#0d1117;border-radius:5px;">`
@@ -8555,20 +8582,22 @@ function showWantedTitlePicker(query, matches, type) {
     ${cards}
   </div>`;
   document.body.appendChild(overlay);
-  setEl('rec-status', 'Choose the correct movie from IMDb.', '');
+  setEl(statusId, `Choose the correct ${type === 'series' ? 'series' : 'movie'} from IMDb.`, '');
 }
 
 async function chooseWantedMovie(index) {
   const movie = (window._wantedMovieMatches || [])[index];
   const type = window._wantedTitleType === 'series' ? 'series' : 'movie';
+  const statusId = window._wantedStatusId || 'rec-status';
   if (!movie) return;
   const picker = document.getElementById('wanted-movie-picker');
   if (picker) picker.remove();
   const response = await post('/epg-web/api/wanted', {
     action:'add', title:movie.title, year:movie.year, imdb_id:movie.imdb_id, type
   });
-  if (response && response.error) { setEl('rec-status', response.error, 'err'); return; }
-  setEl('rec-status', `Added ${type === 'series' ? 'series' : 'movie'} “${movie.title}” (${movie.year}) to Wanted.`, 'ok');
+  if (response && response.error) { setEl(statusId, response.error, 'err'); return; }
+  setEl(statusId, `Added ${type === 'series' ? 'series' : 'movie'} “${movie.title}” (${movie.year}) to Wanted.`, 'ok');
+  if (statusId === 'pm-status') document.getElementById('pm-wanted-wrap').style.display = 'none';
   loadRecs();
 }
 
