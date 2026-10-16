@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261016c"
+VERSION = "v20261016d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -338,7 +338,16 @@ def db_run(sql, params=()):
 # ── EPG Parsing ───────────────────────────────────────────────────────────────
 
 _epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'loaded': None}
-_startup_status = {'loading': False}
+_startup_status = {
+    'loading': False,
+    # The first visible guide window is available before the full multi-week
+    # guide has been prepared.  Keeping this separate prevents a restart from
+    # presenting an empty web page while a large database is read.
+    'background_loading': False,
+    'phase': '',
+    'completed': 0,
+    'total': 0,
+}
 _ps_channel_cache = {'paths': (), 'loaded_at': 0, 'ids': set()}
 _provider_live_epg_lock = threading.Lock()
 _stream_quality_scan = {'running': False, 'completed': 0, 'total': 0}
@@ -715,8 +724,14 @@ def import_xml_to_guide_db(xml_path, db_path):
     conn.close()
     return inserted
 
-def load_epg_from_db(db_path, tz_str='America/New_York'):
-    """Load all accumulated guide data from guide.db into memory."""
+def load_epg_from_db(db_path, tz_str='America/New_York', *,
+                     window_start=None, window_hours=None, progress=None):
+    """Load guide data from guide.db into memory.
+
+    ``window_start``/``window_hours`` loads just the first visible guide
+    window.  That gives the browser a complete grid immediately after a
+    restart while the complete multi-week guide is loaded in the background.
+    """
     from zoneinfo import ZoneInfo
     local_tz = ZoneInfo(tz_str)
 
@@ -731,8 +746,27 @@ def load_epg_from_db(db_path, tz_str='America/New_York'):
         channels.append({'id': cid, 'name': name, 'icon': icon})
         channel_map[cid] = name
 
+    query = ('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category, '
+             'episode_title, season_num, episode_num, prog_type FROM guide')
+    params = ()
+    if window_start is not None and window_hours:
+        window_end = window_start + timedelta(hours=window_hours)
+        query += ' WHERE end_utc > ? AND start_utc < ?'
+        params = (window_start.strftime('%Y%m%d%H%M%S'),
+                  window_end.strftime('%Y%m%d%H%M%S'))
+    query += ' ORDER BY start_utc'
+    total = 0
+    if progress:
+        count_query = 'SELECT COUNT(*) FROM guide'
+        count_params = ()
+        if params:
+            count_query += ' WHERE end_utc > ? AND start_utc < ?'
+            count_params = params
+        total = conn.execute(count_query, count_params).fetchone()[0]
+        progress('Reading guide listings', 0, total)
+
     programmes = []
-    for row in conn.execute('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category, episode_title, season_num, episode_num, prog_type FROM guide ORDER BY start_utc'):
+    for row in conn.execute(query, params):
         try:
             su = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             eu = datetime.strptime(row['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -757,12 +791,16 @@ def load_epg_from_db(db_path, tz_str='America/New_York'):
             'episode_num':   row['episode_num'],
             'prog_type':     row['prog_type'] or '',
         })
+        if progress and len(programmes) % 25000 == 0:
+            progress('Reading guide listings', len(programmes), total)
 
     conn.close()
 
     # Propagate prog_type + episode data from SD rows to XMLTV rows
     # SD rows have numeric channel_ids; XMLTV rows have domain-style channel_ids
     # Match by title (for prog_type) and title+start_ts±15min (for episode details)
+    if progress:
+        progress('Finishing programme details', len(programmes), len(programmes))
     title_pt   = {}   # title → prog_type
     # title → list of (start_ts, season_num, episode_num, episode_title)
     title_eps  = {}
@@ -796,6 +834,8 @@ def load_epg_from_db(db_path, tz_str='America/New_York'):
     _epg['channel_map'] = channel_map
     _epg['programmes']  = programmes
     _epg['loaded']      = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if progress:
+        progress('Guide ready', len(programmes), len(programmes))
     return len(programmes)
 
 def _decode_provider_epg_text(value):
@@ -1799,7 +1839,11 @@ def api_status():
         extra = {'range_first': first, 'range_last': last}
     return jsonify({'ok': True, 'time': datetime.now().strftime('%I:%M:%S %p'),
                     'loaded': _epg['loaded'], 'programmes': len(progs),
-                    'starting': _startup_status['loading'], **extra})
+                    'starting': _startup_status['loading'],
+                    'background_loading': _startup_status['background_loading'],
+                    'guide_phase': _startup_status['phase'],
+                    'guide_completed': _startup_status['completed'],
+                    'guide_total': _startup_status['total'], **extra})
 
 @app.route('/epg-web/api/disk')
 def api_disk():
@@ -6681,8 +6725,11 @@ async function refreshStatus() {
     }
     if (d.programmes) {
       document.getElementById('live-badge').textContent =
-        `● Server live · ${d.programmes.toLocaleString()} prog`;
+        d.background_loading
+          ? '● Server live · current guide ready'
+          : `● Server live · ${d.programmes.toLocaleString()} prog`;
     }
+    if (d.background_loading) pollCompleteGuide();
   } catch(e) {}
 }
 setInterval(refreshStatus, 30000);
@@ -6694,6 +6741,7 @@ async function autoLoad() {
     const s = await (await fetch('/epg-web/api/status')).json();
     if (s.programmes > 0) {
       await fetchAndRenderGuide();
+      if (s.background_loading) pollCompleteGuide();
     } else if (s.starting) {
       setGS('Preparing the guide after restart…', '');
       setTimeout(autoLoad, 1200);
@@ -6766,11 +6814,36 @@ async function saveSettings() {
 
 // ── Guide ─────────────────────────────────────────────────────────────────────
 let _qualityPoll = null;
+let _completeGuidePoll = null;
 function setGuideProgress(pct, text, show=true) {
   const wrap = document.getElementById('guide-progress');
   wrap.style.display = show ? '' : 'none';
   document.getElementById('guide-progress-bar').style.width = `${Math.max(0, Math.min(100, pct))}%`;
   document.getElementById('guide-progress-text').textContent = text || '';
+}
+async function pollCompleteGuide() {
+  if (_completeGuidePoll) return;
+  const check = async () => {
+    try {
+      const d = await (await fetch('/epg-web/api/status')).json();
+      if (!d.background_loading) {
+        _completeGuidePoll = null;
+        setGuideProgress(100, 'Complete guide is ready.');
+        setTimeout(() => { if (!_qualityPoll) setGuideProgress(0, '', false); }, 3500);
+        return;
+      }
+      const total = Number(d.guide_total || 0);
+      const done = Number(d.guide_completed || 0);
+      const pct = total ? Math.max(3, Math.min(99, Math.round(done / total * 100))) : 3;
+      const count = total ? ` ${done.toLocaleString()} of ${total.toLocaleString()}` : '';
+      setGuideProgress(pct, `Guide is usable now — ${d.guide_phase || 'loading the rest in background'}${count}.`);
+      _completeGuidePoll = setTimeout(() => { _completeGuidePoll = null; pollCompleteGuide(); }, 1200);
+    } catch (e) {
+      _completeGuidePoll = setTimeout(() => { _completeGuidePoll = null; pollCompleteGuide(); }, 2000);
+    }
+  };
+  _completeGuidePoll = true;
+  await check();
 }
 async function pollStreamQuality() {
   try {
@@ -7168,13 +7241,9 @@ async function playPlex(title) {
 }
 
 let _chIdFilter = '';
+let _guideFetchId = 0;
 async function fetchAndRenderGuide() {
-  // The NAS can reconnect after this page first loads.  Re-read the small
-  // movie-folder index on later guide refreshes so Plex badges recover without
-  // requiring a browser reload.
-  if (!_plexTitlesReady && _plexTitlesPromise) await _plexTitlesPromise;
-  else await loadPlexTitles();
-  if (_plexEpisodesPromise) await _plexEpisodesPromise;
+  const requestId = ++_guideFetchId;
   const params = new URLSearchParams();
   if (_guideWindowStart) params.set('start', _guideWindowStart);
   params.set('hours', _guideHours);
@@ -7192,16 +7261,16 @@ async function fetchAndRenderGuide() {
   if (!document.getElementById('hide-sd-duplicates').checked) params.set('hide_sd', '0');
   params.set('ch_offset', _chOffset);
   try {
-    const [r] = await Promise.all([
-      fetch('/epg-web/api/guide?' + params),
-      refreshGuideRecMap()
-    ]);
+    // Draw the guide as soon as its own response arrives.  Plex badges and
+    // recording dots are useful extras, but a NAS lookup must never hold the
+    // visible programme grid hostage.
+    const r = await fetch('/epg-web/api/guide?' + params);
     const d = await r.json();
     if (d.error) { setGS(d.error,'err'); return; }
+    if (requestId !== _guideFetchId) return;
     _guideData = d;
     if (!_guideWindowStart) _guideWindowStart = d.window_start;
     renderGuide();
-    updatePlexQuality();
     // Update channel page nav
     const total = d.total_channels || 0;
     const offset = d.ch_offset || 0;
@@ -7216,6 +7285,19 @@ async function fetchAndRenderGuide() {
       prevEl.style.display = offset > 0 ? '' : 'none';
       nextEl.style.display = offset + cap < total ? '' : 'none';
     }
+
+    // Complete the small optional indexes after the grid is already visible,
+    // then repaint only if this is still the guide window the user is viewing.
+    const plexWork = (!_plexTitlesReady && _plexTitlesPromise)
+      ? _plexTitlesPromise : loadPlexTitles();
+    Promise.all([plexWork, _plexEpisodesPromise || Promise.resolve()]).then(() => {
+      if (requestId !== _guideFetchId) return;
+      renderGuide();
+      updatePlexQuality();
+    }).catch(() => {});
+    refreshGuideRecMap().then(() => {
+      if (requestId === _guideFetchId) renderGuide();
+    });
   } catch(e) { setGS('Failed: '+e.message,'err'); }
 }
 function chPagePrev() { _chOffset = Math.max(0, _chOffset - 200); fetchAndRenderGuide(); }
@@ -9473,14 +9555,46 @@ def _startup_load():
         sd_user = cfg.get('sd_user', '')
         sd_pass = cfg.get('sd_pass', '')
 
-        # Load whatever's already in guide.db after Flask begins listening.
-        # A large accumulated guide can take minutes to prepare; it must not
-        # make the whole website look offline after a normal restart.
+        # Load the first visible 12-hour window before anything else.  The
+        # browser can render its complete on-screen grid from this small slice;
+        # loading every saved programme is deliberately deferred below.
         if os.path.exists(db_path):
             try:
-                count = load_epg_from_db(db_path, tz_str)
+                initial_start = datetime.now(timezone.utc).replace(
+                    minute=0, second=0, microsecond=0)
+                count = load_epg_from_db(
+                    db_path, tz_str, window_start=initial_start, window_hours=12
+                )
                 _schedule_active_series(db_path)
-                print(f'[startup] Loaded {count} programmes from guide.db')
+                print(f'[startup] Loaded {count} programmes for the first guide window')
+
+                # Make the usable first grid visible before reading the full
+                # database.  Status polling reports real progress underneath
+                # the guide while this worker completes.
+                _startup_status.update({
+                    'loading': False, 'background_loading': True,
+                    'phase': 'Starting complete guide load', 'completed': 0, 'total': 0,
+                })
+
+                def _load_complete_guide():
+                    def progress(phase, completed, total):
+                        _startup_status.update({
+                            'phase': phase, 'completed': completed, 'total': total,
+                        })
+                    try:
+                        total = load_epg_from_db(db_path, tz_str, progress=progress)
+                        _schedule_active_series(db_path)
+                        print(f'[startup] Complete guide ready — {total} programmes loaded')
+                    except Exception as exc:
+                        print(f'[startup] complete guide load failed: {exc}')
+                    finally:
+                        _startup_status.update({
+                            'background_loading': False, 'phase': '',
+                            'completed': 0, 'total': 0,
+                        })
+                threading.Thread(target=_load_complete_guide,
+                                 name='epg-complete-guide-load', daemon=True).start()
+
                 # The provider's bulk XML can lag while the live player API is
                 # current.  Refresh favourite-channel windows in the
                 # background so a normal restart repairs those gaps without
@@ -9501,12 +9615,21 @@ def _startup_load():
             except Exception as e:
                 print(f'[startup] guide.db load failed: {e}')
 
-        # If SD credentials exist and guide is empty or stale (last entry < 24h from now), auto-fetch
+        # If SD credentials exist and guide is empty or stale (last entry < 24h
+        # from now), auto-fetch.  Check the database rather than the initial
+        # on-screen slice, which intentionally only reaches 12 hours ahead.
         if sd_user and sd_pass:
             stale = True
-            if _epg['programmes']:
-                last_ts = _epg['programmes'][-1]['stop_ts']
-                stale = last_ts < (time.time() + 86400)  # less than 1 day of future data
+            try:
+                conn = sqlite3.connect(db_path)
+                last = conn.execute('SELECT MAX(end_utc) FROM guide').fetchone()[0]
+                conn.close()
+                if last:
+                    last_ts = datetime.strptime(last, '%Y%m%d%H%M%S').replace(
+                        tzinfo=timezone.utc).timestamp()
+                    stale = last_ts < (time.time() + 86400)
+            except Exception:
+                pass
             if stale:
                 print('[startup] Guide stale — auto-fetching from Schedules Direct…')
                 _sd_status['running'] = True
