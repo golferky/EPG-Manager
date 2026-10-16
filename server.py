@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261016a"
+VERSION = "v20261016b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5202,7 +5202,16 @@ def api_play():
             vlc_exe = next((p for p in vlc_paths if os.path.exists(p)), 'vlc')
             parts = [p for p in [title, ch_label] if p]
             display_title = '  —  '.join(parts) if parts else channel_id
+            # Live MPEG-TS feeds can arrive with uneven timestamps.  Give VLC
+            # a small, stable buffer and use the stream timestamps directly;
+            # this prevents its adaptive clock from slowly drifting audio away
+            # from video during live playback.  These flags are for playback
+            # only and do not change the recording pipeline.
             cmd = [vlc_exe, url,
+                   '--network-caching', '1500',
+                   '--live-caching', '1500',
+                   '--clock-jitter', '0',
+                   '--clock-synchro', '0',
                    '--meta-title', display_title,
                    '--video-title', display_title,
                    '--video-title-timeout', '5000']
