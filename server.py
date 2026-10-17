@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261016d"
+VERSION = "v20261017a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -158,13 +158,31 @@ def _channel_match_base(value):
     }.get(base, base)
 
 
+def _same_linear_channel_name(left, right):
+    """Return whether two display names are the same verified linear feed.
+
+    Paramount+ with Showtime is the current name of the Showtime linear
+    channel.  The exact east/west rebrand is safe to bridge for PrimeStreams;
+    it is deliberately not a broad Paramount/Showtime fuzzy match.
+    """
+    left_base = _channel_match_base(left)
+    right_base = _channel_match_base(right)
+    if left_base == right_base:
+        return True
+    return (left_base, right_base) in {
+        ('paramountwithshowtime', 'showtime'),
+        ('showtime', 'paramountwithshowtime'),
+        ('paramountwithshowtimewest', 'showtimewest'),
+        ('showtimewest', 'paramountwithshowtimewest'),
+    }
+
+
 def _authority_id_matches(channel_id, epg_channel_id, provider_name=''):
     """Allow an exact provider ID or a verified, same-name rebrand."""
     if not epg_channel_id or str(epg_channel_id) == str(channel_id):
         return True
     # Some providers retain a former XMLTV ID after a network rebrand.  A
-    # matching human name (CINEMAX CLASSICS ↔ cinemaxclassics.us) is safe; a
-    # different name (SHOWTIME ↔ Paramount+ with Showtime) is not.
+    # matching human name (CINEMAX CLASSICS ↔ cinemaxclassics.us) is safe.
     return bool(provider_name and
                 _channel_match_base(channel_id) == _channel_match_base(provider_name))
 
@@ -201,7 +219,7 @@ def _primestream_authoritative_channel(channel_id, stream_id, guide_name=''):
         # stream without reintroducing broad, unsafe name matching.
         return (_authority_id_matches(channel_id, epg_channel_id, provider_name)
                 or bool(guide_name and
-                        _channel_match_base(guide_name) == _channel_match_base(provider_name)))
+                        _same_linear_channel_name(guide_name, provider_name)))
     except Exception:
         # Older databases can still use their existing mapping until the next
         # provider refresh records authoritative IDs.
@@ -1513,7 +1531,8 @@ def _stream_url(channel_id, preferred_provider=None):
                             continue
                         if len(base) < 3:
                             continue
-                        if base.startswith(ch_norm) or ch_norm.startswith(base):
+                        if (_same_linear_channel_name(name, mr['guide_channel']) or
+                                base.startswith(ch_norm) or ch_norm.startswith(base)):
                             diff = abs(len(base) - len(ch_norm))
                             if diff < best_diff:
                                 best_diff = diff
