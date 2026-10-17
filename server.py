@@ -7858,6 +7858,15 @@ async function openProg(p) {
   const keepImmediateLivePlay = !!(_nextAiring && _nextAiring.on_now);
   if (!keepImmediateLivePlay) document.getElementById('pm-next-wrap').style.display = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
+  // Wanted must not depend on the optional airing lookup succeeding.  It is
+  // especially useful for an on-now programme with no later guide listing.
+  const showWantedAction = (isSeries = p.season_num != null) => {
+    window._currentProgWantedType = isSeries ? 'series' : 'movie';
+    const wantedBtn = document.getElementById('pm-wanted-btn');
+    wantedBtn.textContent = isSeries ? '☆ Add series to Wanted' : '☆ Add movie to Wanted';
+    wantedBtn.disabled = false;
+    document.getElementById('pm-wanted-wrap').style.display = 'block';
+  };
   try {
     // Future-airing discovery can involve a guide database that is actively
     // refreshing.  It is secondary to opening/playing this programme, so
@@ -8050,13 +8059,16 @@ async function openProg(p) {
       // the programme.  Offer Wanted only when nothing later is in the guide.
       const hasFutureAiring = ar.airings.some(a => Number(a.start_ts || 0) > now + 60);
       if (!hasFutureAiring) {
-        const wantedBtn = document.getElementById('pm-wanted-btn');
-        wantedBtn.textContent = isSeries ? '☆ Add series to Wanted' : '☆ Add movie to Wanted';
-        wantedBtn.disabled = false;
-        document.getElementById('pm-wanted-wrap').style.display = 'block';
+        showWantedAction(isSeries);
       }
+    } else {
+      showWantedAction();
     }
-  } catch(e) {}
+  } catch(e) {
+    // A temporary guide refresh must not take away the user's ability to add
+    // something to Wanted for a later automatic match.
+    showWantedAction();
+  }
 }
 
 let _nextAiring = null;
