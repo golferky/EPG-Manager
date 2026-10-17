@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261017e"
+VERSION = "v20261017f"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -520,13 +520,7 @@ def _eaglecast_verified_override(channel_id, guide_db_path=None):
     return None
 
 def get_eaglecast_channel_ids(guide_db_path=None):
-    """Guide IDs with an individually verified Eaglecast playback source.
-
-    Eaglecast does not give us a stable channel identity.  Its old automatic
-    name map was useful for discovery, but it cannot authorize playback: an
-    exact-looking Showtime label delivered the wrong programme.  Only a
-    frame-verified override can put an Eaglecast source in the playable set.
-    """
+    """Guide channel ids with a locally verified Eaglecast live-stream map."""
     db_path = guide_db_path or _guide_db_path()
     try:
         conn = sqlite3.connect(db_path, timeout=3)
@@ -541,6 +535,21 @@ def get_eaglecast_channel_ids(guide_db_path=None):
         channel_id for channel_id, channel_name in guide_rows
         if _channel_match_base(channel_name) in EAGLECAST_VERIFIED_STREAM_OVERRIDES
     }
+    try:
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.execute('PRAGMA busy_timeout=3000')
+        rows = conn.execute(
+            '''SELECT channel_id, guide_channel_name, provider_channel_name, stream_id
+               FROM provider_streams WHERE provider='eaglecast'''
+        ).fetchall()
+        conn.close()
+        verified.update(
+            row[0] for row in rows
+            if (_channel_match_base(row[1]) == _channel_match_base(row[2])
+                and not _is_quarantined_eaglecast_stream(row[3]))
+        )
+    except Exception:
+        pass
     return verified
 
 def get_recordable_channel_ids(guide_db_path, movies_db_path):
@@ -548,10 +557,25 @@ def get_recordable_channel_ids(guide_db_path, movies_db_path):
     return get_ps_channel_ids(guide_db_path, movies_db_path) | get_eaglecast_channel_ids(guide_db_path)
 
 def _eaglecast_stream_for_channel(channel_id):
-    # provider_streams remains a discovery inventory, not a playback map.
-    # Names alone cannot establish that an Eaglecast feed is the same linear
-    # channel as the guide; use only individually verified overrides here.
-    return _eaglecast_verified_override(channel_id)
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        row = conn.execute('''SELECT stream_id, provider_channel_name, stream_extension,
+                                      guide_channel_name
+                              FROM provider_streams
+                              WHERE provider='eaglecast' AND channel_id=?''',
+                           (channel_id,)).fetchone()
+        conn.close()
+        if not row:
+            return _eaglecast_verified_override(channel_id)
+        # Provider maps are created from names, not a stable provider channel
+        # ID.  Do not trust an old/over-broad match when the two canonical
+        # names differ.  This specifically blocks the stale "SHOWTIME HD"
+        # map that delivered V for Vendetta for a MobLand recording.
+        if _channel_match_base(row[1]) != _channel_match_base(row[3]):
+            return _eaglecast_verified_override(channel_id)
+        return row[:3]
+    except Exception:
+        return _eaglecast_verified_override(channel_id)
 
 
 def _is_quarantined_eaglecast_stream(stream):
@@ -576,7 +600,7 @@ def _eaglecast_stream_url(stream_id, extension='ts'):
             f"/{quote(str(cfg['password']), safe='')}/{stream_id}.{str(extension or 'ts').lstrip('.')}")
 
 def _map_eaglecast_streams():
-    """Build an Eaglecast discovery inventory; never authorize playback by name."""
+    """Match US Eaglecast channels to existing guide rows, never import its guide."""
     cfg = _load_eaglecast_test_config()
     if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
         raise ValueError('Save and test Eaglecast on the private setup page first.')
