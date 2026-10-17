@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261017f"
+VERSION = "v20261017g"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -269,6 +269,38 @@ def _is_commercial_free_channel(name):
 def _is_premium_movie_channel(name):
     """Premium, commercial-free movie networks for the Eaglecast premium view."""
     return _is_premium_channel(name)
+
+
+def _guide_program_matches_content(program, content):
+    """Return whether a guide programme belongs in a user-facing content view.
+
+    Guide suppliers are not perfectly consistent about categories, so these
+    checks intentionally accept the common variants instead of relying on a
+    single provider-specific label.  ``premium_movies`` is handled as a
+    channel filter by ``api_guide`` because it means premium movie networks,
+    not merely programmes tagged as movies.
+    """
+    if not content or content == 'all' or content == 'premium_movies':
+        return True
+    category = str(program.get('category') or '').lower()
+    prog_type = str(program.get('prog_type') or '').upper()
+    text = f'{category} {program.get("title") or ""}'.lower()
+    if content == 'movies':
+        return prog_type == 'MV' or bool(re.search(r'\b(movie|movies|film|cinema)\b', category))
+    if content == 'sports':
+        return bool(re.search(r'\b(sport|nfl|nba|wnba|mlb|nhl|nca[ab]|football|baseball|basketball|hockey|soccer|golf|tennis|wrestling|ufc|mma|boxing|racing|nascar|formula)\b', text))
+    if content == 'news':
+        return bool(re.search(r'\b(news|weather|politic|business news)\b', text))
+    if content == 'docs':
+        return bool(re.search(r'\b(documentary|history|nature|science|biography|docuseries)\b', text))
+    if content == 'reality':
+        return bool(re.search(r'\b(reality|game show|talk show|talk)\b', text))
+    if content == 'tv':
+        # Series and episodic programming normally carries an episode marker.
+        # Keep broad TV categories too, while excluding the dedicated views.
+        return (prog_type in {'EP', 'SH'} or program.get('season_num') is not None
+                or bool(re.search(r'\b(tv|series|drama|comedy|scripted|children|animation)\b', category)))
+    return True
 
 
 def _is_foreign_recording_feed(name):
@@ -2200,6 +2232,10 @@ def api_guide():
     ps_only    = request.args.get('ps',  '0') == '1'
     eagle_only = request.args.get('eagle', '0') == '1'
     eagle_movie_only = request.args.get('eagle_movie', '0') == '1'
+    content_filter = request.args.get('content', 'all').lower()
+    valid_content_filters = {'all', 'sports', 'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality'}
+    if content_filter not in valid_content_filters:
+        content_filter = 'all'
     eagle_only = eagle_only or eagle_movie_only
     ps_episode_only = request.args.get('ps_episode', '0') == '1'
     sd_only    = request.args.get('sd',  '0') == '1'
@@ -2270,6 +2306,16 @@ def api_guide():
         # Needed only to annotate normal guide rows with their star state.
         movie_favorites = set()
 
+    if content_filter == 'premium_movies':
+        # This is deliberately a channel group, rather than a title/category
+        # search: it gives the familiar premium-movie-network view regardless
+        # of a supplier's individual programme tag.
+        premium_ids = {
+            str(channel.get('id') or '') for channel in _epg.get('channels', [])
+            if _is_premium_movie_channel(str(channel.get('name') or ''))
+        }
+        allowed_ch_ids = premium_ids if allowed_ch_ids is None else allowed_ch_ids & premium_ids
+
     if not movie_favorites:
         movie_favorites = {r['guide_channel'] for r in db_rows(
             'SELECT guide_channel FROM channels WHERE favorite=1 AND guide_channel IS NOT NULL'
@@ -2296,6 +2342,8 @@ def api_guide():
         if ch_id_filter and p['channel_id'].lower() != ch_id_filter:
             continue
         if not ch_id_filter and ch_filter and ch_filter not in p['channel'].lower():
+            continue
+        if not _guide_program_matches_content(p, content_filter):
             continue
         ch_set.add(p['channel_id'])
         progs_in_window.append({
@@ -6352,6 +6400,16 @@ tr:hover td{background:#141414;}
       <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
     </select>
+    <select id="guide-content-filter" onchange="localStorage.setItem('epg_guide_content',this.value);_chOffset=0;fetchAndRenderGuide()" title="Choose the kind of programming to show" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
+      <option value="all">All programming</option>
+      <option value="sports">🏆 Sports</option>
+      <option value="premium_movies">⭐ Premium movies</option>
+      <option value="movies">🎬 All movies</option>
+      <option value="news">📰 News</option>
+      <option value="tv">📺 TV & series</option>
+      <option value="docs">🎓 Documentaries</option>
+      <option value="reality">🎭 Reality & talk</option>
+    </select>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide redundant SD/HD channel-name duplicates; East, West, and Pacific stay visible">
       <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide quality duplicates
     </label>
@@ -6858,6 +6916,8 @@ async function autoLoad() {
 (function() {
   const saved = localStorage.getItem('epg_guide_mode');
   if (saved) { const el = document.getElementById('guide-ch-mode'); if (el) el.value = saved; }
+  const savedContent = localStorage.getItem('epg_guide_content');
+  if (savedContent) { const el = document.getElementById('guide-content-filter'); if (el) el.value = savedContent; }
   const hideSd = document.getElementById('hide-sd-duplicates');
   if (hideSd) hideSd.checked = localStorage.getItem('epg_hide_sd_duplicates') !== '0';
 })();
@@ -7345,6 +7405,7 @@ async function fetchAndRenderGuide() {
   if (_chIdFilter) params.set('ch_id', _chIdFilter);
   else if (ch) params.set('ch', ch);
   const mode = document.getElementById('guide-ch-mode').value;
+  const content = document.getElementById('guide-content-filter').value;
   if (mode === 'fav')   params.set('fav',   '1');
   if (mode === 'movie') params.set('movie', '1');
   if (mode === 'ps')    params.set('ps',    '1');
@@ -7352,6 +7413,7 @@ async function fetchAndRenderGuide() {
   if (mode === 'eagle_movie') params.set('eagle_movie', '1');
   if (mode === 'ps_episode') params.set('ps_episode', '1');
   if (mode === 'sd')    params.set('sd',    '1');
+  if (content !== 'all') params.set('content', content);
   if (!document.getElementById('hide-sd-duplicates').checked) params.set('hide_sd', '0');
   params.set('ch_offset', _chOffset);
   try {
