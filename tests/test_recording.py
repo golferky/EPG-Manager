@@ -358,6 +358,18 @@ class RecordingTests(unittest.TestCase):
             server._channel_match_base("showtime2.us"),
         )
 
+    def test_verified_legacy_premium_channel_ids_are_normalized(self):
+        # These exact old provider IDs were checked against the provider's
+        # authoritative XMLTV IDs, not inferred from a display-label match.
+        self.assertEqual(server._channel_match_base("Cinemax Action"), "actionmax")
+        self.assertEqual(server._channel_match_base("Cinemax Hits"), "moremax")
+        self.assertEqual(server._channel_match_base("HBO Drama"), "hbosignature")
+        self.assertEqual(server._channel_match_base("HBO Movies"), "hbozone")
+
+    def test_live_play_button_survives_optional_airings_lookup(self):
+        self.assertIn("const keepImmediateLivePlay", server.HTML)
+        self.assertIn("if (!keepImmediateLivePlay) document.getElementById('pm-next-wrap').style.display = 'none';", server.HTML)
+
     def test_airings_ui_lists_playable_rows_and_uses_series_flag(self):
         self.assertIn("const isSeries = !!ar.is_series;", server.HTML)
         # A live usable stream remains playable even when it is not eligible

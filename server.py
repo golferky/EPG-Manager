@@ -160,6 +160,13 @@ def _channel_match_base(value):
         # retains its original internal channel IDs.
         'cinemaxaction': 'actionmax',
         'cinemaxactionwest': 'actionmaxwest',
+        'cinemaxhits': 'moremax',
+        'cinemaxhitswest': 'moremaxwest',
+        'hbodrama': 'hbosignature',
+        # HBO Drama's west feed reports an ambiguous provider ID.  Do not
+        # add it until that source has identified itself consistently.
+        'hbomovies': 'hbozone',
+        'hbomovieswest': 'hbozonewest',
     }.get(base, base)
 
 
@@ -5102,8 +5109,11 @@ def api_airings():
         # The guide can be swapped while a refresh is in progress.  Return no
         # extra airings quickly in that brief window; the clicked programme
         # still opens and remains playable instead of a modal stuck loading.
-        conn = sqlite3.connect(db_path, timeout=1)
-        conn.execute('PRAGMA busy_timeout=1000')
+        # A read must be allowed to wait briefly while a guide refresh
+        # commits.  Returning an empty result here hid the Play button even
+        # for a channel the grid had already verified as live.
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.execute('PRAGMA busy_timeout=3000')
         conn.row_factory = sqlite3.Row
         # Search both full title and cleaned title
         rows = conn.execute('''
@@ -7773,7 +7783,7 @@ async function openProg(p) {
   // A programme that is live in the grid gets an immediate Play action.  The
   // fuller airings lookup below refines this later, but it must never be the
   // reason a known-live programme has no button while the guide is busy.
-  const clickedIsLive = Number(p.start_ts || 0) <= now && Number(p.stop_ts || 0) > now;
+  const clickedIsLive = p.can_play && Number(p.start_ts || 0) <= now && Number(p.stop_ts || 0) > now;
   if (clickedIsLive && p.channel_id) {
     _nextAiring = {
       channel_id: p.channel_id,
@@ -7843,8 +7853,10 @@ async function openProg(p) {
     } catch (e) { /* Quality information is optional; recording still works. */ }
   }
 
-  // Fetch future airings
-  document.getElementById('pm-next-wrap').style.display    = 'none';
+  // Fetch future airings.  Keep a verified live button on screen while this
+  // optional lookup runs (or if a guide refresh temporarily locks the DB).
+  const keepImmediateLivePlay = !!(_nextAiring && _nextAiring.on_now);
+  if (!keepImmediateLivePlay) document.getElementById('pm-next-wrap').style.display = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
   try {
     // Future-airing discovery can involve a guide database that is actively
