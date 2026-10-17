@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261017a"
+VERSION = "v20261017b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -155,15 +155,21 @@ def _channel_match_base(value):
         'themoviechannelwest': 'tmcwest',
         'themoviechannelextra': 'tmcxtra',
         'themoviechannelextrawest': 'tmcxtrawest',
+        # These are established provider XMLTV IDs, not fuzzy guesses.  The
+        # SD guide uses the current public network names while the provider
+        # retains its original internal channel IDs.
+        'cinemaxaction': 'actionmax',
+        'cinemaxactionwest': 'actionmaxwest',
     }.get(base, base)
 
 
 def _same_linear_channel_name(left, right):
     """Return whether two display names are the same verified linear feed.
 
+    The aliases in ``_channel_match_base`` cover only verified provider IDs.
     Paramount+ with Showtime is the current name of the Showtime linear
-    channel.  The exact east/west rebrand is safe to bridge for PrimeStreams;
-    it is deliberately not a broad Paramount/Showtime fuzzy match.
+    channel; bridge only that exact east/west rebrand, never a broad fuzzy
+    Paramount/Showtime match.
     """
     left_base = _channel_match_base(left)
     right_base = _channel_match_base(right)
@@ -213,13 +219,14 @@ def _primestream_authoritative_channel(channel_id, stream_id, guide_name=''):
         if not authority:
             return True
         epg_channel_id, provider_name = authority
-        # Numeric Schedules Direct station IDs cannot be compared with the
-        # provider XMLTV ID.  A strict canonical display-name match is safe,
-        # and lets "The Movie Channel Extra HD" use its verified tmcxtra
-        # stream without reintroducing broad, unsafe name matching.
+        # Numeric Schedules Direct station IDs cannot be compared directly.
+        # Compare the guide display name to the provider's *authoritative
+        # XMLTV ID*, never just its display label.  A prior provider labelled
+        # a 5StarMax stream "CINEMAX CLASSICS" while serving the wrong feed;
+        # trusting that label is what caused wrong-program playback.
         return (_authority_id_matches(channel_id, epg_channel_id, provider_name)
                 or bool(guide_name and
-                        _same_linear_channel_name(guide_name, provider_name)))
+                        _same_linear_channel_name(guide_name, epg_channel_id)))
     except Exception:
         # Older databases can still use their existing mapping until the next
         # provider refresh records authoritative IDs.
@@ -584,6 +591,15 @@ def _map_eaglecast_streams():
 def ensure_guide_db(db_path):
     """Create guide.db with schema if it doesn't exist."""
     conn = sqlite3.connect(db_path)
+    # The web guide has many short reads while recording/agent jobs write
+    # status updates.  WAL lets those coexist; the default rollback journal
+    # was intermittently making programme details return no playable airing.
+    try:
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+    except sqlite3.DatabaseError:
+        # Keep compatibility with any unusual read-only/network database.
+        pass
     conn.execute('''
         CREATE TABLE IF NOT EXISTS guide (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
