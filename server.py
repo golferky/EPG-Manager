@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261017g"
+VERSION = "v20261017h"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -529,6 +529,11 @@ EAGLECAST_VERIFIED_STREAM_OVERRIDES = {
     # Checked 2026-10-17 against the live SD listing: Halloween: The Curse of
     # Michael Myers on Cinemax Classics.
     'cinemaxclassics': ('2151813', 'TV| CINEMAX CLASSICS RAW', 'ts'),
+    # Checked 2026-10-17 against the live SD listing: College Football on
+    # local ABC 7 Los Angeles / KABC.  This affiliate must not be inferred
+    # from a generic ABC name; the provider feed explicitly identifies KABC.
+    'kabc': ('172930', 'US| ABC 7 LOS ANGELES CA (KABC)', 'ts'),
+    'kabcdt': ('172930', 'US| ABC 7 LOS ANGELES CA (KABC)', 'ts'),
 }
 
 def _eaglecast_verified_override(channel_id, guide_db_path=None):
@@ -2390,9 +2395,11 @@ def api_guide():
             ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in hidden_quality_ids]
             progs_in_window = [p for p in progs_in_window if p['channel_id'] not in hidden_quality_ids]
 
-    # When a filter is active (fav/movie/ps), also include matching channels that
-    # have NO current programming — they show as empty rows (guide data expired)
-    if allowed_ch_ids is not None:
+    # Source/channel views retain empty rows so an expired guide is visible.
+    # A programme-content view (Sports, News, etc.) must not do that: an empty
+    # premium movie row is not evidence that it carries sports, and was making
+    # the filtered guide look broken while the background guide load ran.
+    if allowed_ch_ids is not None and content_filter in {'all', 'premium_movies'}:
         present_ids = {c['id'] for c in ordered_channels_raw}
         for c in _epg['channels']:
             if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
