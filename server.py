@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261017h"
+VERSION = "v20261017i"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -577,7 +577,7 @@ def get_eaglecast_channel_ids(guide_db_path=None):
         conn.execute('PRAGMA busy_timeout=3000')
         rows = conn.execute(
             '''SELECT channel_id, guide_channel_name, provider_channel_name, stream_id
-               FROM provider_streams WHERE provider='eaglecast'''
+               FROM provider_streams WHERE provider=?''', ('eaglecast',)
         ).fetchall()
         conn.close()
         verified.update(
