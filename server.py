@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261017c"
+VERSION = "v20261017d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -541,14 +541,15 @@ def get_eaglecast_channel_ids(guide_db_path=None):
         conn = sqlite3.connect(db_path, timeout=3)
         conn.execute('PRAGMA busy_timeout=3000')
         rows = conn.execute(
-            '''SELECT channel_id, guide_channel_name, provider_channel_name
+            '''SELECT channel_id, guide_channel_name, provider_channel_name, stream_id
                FROM provider_streams WHERE provider='eaglecast'''
         ).fetchall()
         conn.close()
         verified = {
             *verified,
             *(row[0] for row in rows
-            if _channel_match_base(row[1]) == _channel_match_base(row[2])
+            if (_channel_match_base(row[1]) == _channel_match_base(row[2])
+                and not _is_quarantined_eaglecast_stream(row[3]))
             ),
         }
         return verified
@@ -1543,7 +1544,9 @@ def _stream_url(channel_id, preferred_provider=None):
     # the owner.  PrimeStreams remains the automatic fallback.
     if preferred_provider in (None, 'eaglecast'):
         eaglecast = _eaglecast_stream_for_channel(channel_id)
-        if eaglecast:
+        # A source that has once delivered the wrong programme must be blocked
+        # for manual live playback as well as unattended recordings.
+        if eaglecast and not _is_quarantined_eaglecast_stream(eaglecast):
             sid, mapped_name, extension = eaglecast
             debug.update({'method': 'Eaglecast map', 'matched_guide_channel': mapped_name or channel_id,
                           'stream_id': str(sid), 'provider': 'eaglecast',
