@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261018a"
+VERSION = "v20261018b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2399,7 +2399,13 @@ def api_guide():
     # A programme-content view (Sports, News, etc.) must not do that: an empty
     # premium movie row is not evidence that it carries sports, and was making
     # the filtered guide look broken while the background guide load ran.
-    if allowed_ch_ids is not None and content_filter in {'all', 'premium_movies'}:
+    # Eaglecast All is a usable programme guide, not an inventory dump.  A
+    # mapped live feed without a listing cannot be scheduled from this grid,
+    # so keep it out of the normal view rather than filling the screen with
+    # hundreds of "No guide data" rows.  Other filtered views retain their
+    # empty rows to make an expired favourite/source visible.
+    if (allowed_ch_ids is not None and not eagle_only
+            and content_filter in {'all', 'premium_movies'}):
         present_ids = {c['id'] for c in ordered_channels_raw}
         for c in _epg['channels']:
             if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
