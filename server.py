@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261018b"
+VERSION = "v20261018c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -635,6 +635,99 @@ def _eaglecast_stream_url(stream_id, extension='ts'):
     from urllib.parse import quote
     return (f"{cfg['server_url'].rstrip('/')}/live/{quote(str(cfg['username']), safe='')}"
             f"/{quote(str(cfg['password']), safe='')}/{stream_id}.{str(extension or 'ts').lstrip('.')}")
+
+
+def _strict_channel_identity(name):
+    """Normalize a channel name for safe old-ID → current-ID reconciliation.
+
+    Unlike the broad provider match key, this preserves meaningful branding:
+    AMC+ remains distinct from AMC, and geographic wording remains distinct.
+    Only routine formatting and quality suffixes are ignored.
+    """
+    value = re.sub(r'^\s*(?:US|USA)\s*[|:/-]\s*', '', str(name or ''), flags=re.I)
+    value = value.replace('+', ' plus ')
+    value = re.sub(r'\b(?:UHD|HD|SD)\b', ' ', value, flags=re.I)
+    return re.sub(r'[^a-z0-9]+', '', value.lower())
+
+
+def _reconcile_stale_eaglecast_channel_ids(db_path=None, *, now=None):
+    """Move unambiguous old Eaglecast maps onto their current guide IDs.
+
+    A previous XMLTV guide used domain-style IDs while Schedules Direct uses
+    current station IDs.  Keep a mapping only when its old ID has no upcoming
+    listings and exactly one same-identity current channel exists.  This is a
+    mapping cleanup, not a history deletion: past guide and recording records
+    remain available for diagnostics.
+    """
+    db_path = db_path or _guide_db_path()
+    now = now or datetime.now(timezone.utc)
+    start = now.strftime('%Y%m%d%H%M%S')
+    horizon = (now + timedelta(days=14)).strftime('%Y%m%d%H%M%S')
+    result = {'moved': 0, 'removed_alias': 0, 'ambiguous': 0, 'already_current': 0}
+    conn = sqlite3.connect(db_path, timeout=15)
+    try:
+        conn.execute('PRAGMA busy_timeout=15000')
+        active_ids = {row[0] for row in conn.execute(
+            '''SELECT DISTINCT channel_id FROM guide
+               WHERE end_utc > ? AND start_utc < ?''', (start, horizon)
+        ).fetchall()}
+        channels = conn.execute(
+            'SELECT channel_id, channel_name FROM guide_channels'
+        ).fetchall()
+        active_by_identity = {}
+        for channel_id, channel_name in channels:
+            if channel_id in active_ids:
+                active_by_identity.setdefault(_strict_channel_identity(channel_name), []).append(
+                    (channel_id, channel_name)
+                )
+        maps = conn.execute('''SELECT channel_id, guide_channel_name,
+                                      provider_channel_name, stream_id, stream_extension, mapped_at
+                               FROM provider_streams WHERE provider=?''', ('eaglecast',)).fetchall()
+        mapped_by_id = {row[0]: row for row in maps}
+        for old_id, old_name, provider_name, stream_id, extension, mapped_at in maps:
+            if old_id in active_ids:
+                result['already_current'] += 1
+                continue
+            candidates = active_by_identity.get(_strict_channel_identity(old_name), [])
+            if len(candidates) != 1:
+                if candidates:
+                    result['ambiguous'] += 1
+                continue
+            current_id, current_name = candidates[0]
+            # Never overwrite another current mapping.  It may be a separate
+            # verified feed, and requires an explicit review rather than a
+            # name-based decision.
+            existing = mapped_by_id.get(current_id)
+            if existing:
+                # If both entries already resolve to the identical provider
+                # stream, the old row is only a duplicate alias.  Removing it
+                # cannot change playback or recording behavior.
+                if str(existing[3]) == str(stream_id):
+                    conn.execute('DELETE FROM provider_streams WHERE provider=? AND channel_id=?',
+                                 ('eaglecast', old_id))
+                    mapped_by_id.pop(old_id, None)
+                    result['removed_alias'] += 1
+                else:
+                    result['ambiguous'] += 1
+                continue
+            conn.execute('''INSERT INTO provider_streams
+                            (provider, channel_id, guide_channel_name, provider_channel_name,
+                             stream_id, stream_extension, mapped_at)
+                            VALUES (?,?,?,?,?,?,?)''',
+                         ('eaglecast', current_id, current_name, provider_name,
+                          stream_id, extension or 'ts', mapped_at or time.time()))
+            conn.execute('DELETE FROM provider_streams WHERE provider=? AND channel_id=?',
+                         ('eaglecast', old_id))
+            mapped_by_id.pop(old_id, None)
+            mapped_by_id[current_id] = (
+                current_id, current_name, provider_name, stream_id,
+                extension or 'ts', mapped_at or time.time(),
+            )
+            result['moved'] += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return result
 
 def _map_eaglecast_streams():
     """Match US Eaglecast channels to existing guide rows, never import its guide."""
@@ -9758,6 +9851,13 @@ def _startup_load():
         # loading every saved programme is deliberately deferred below.
         if os.path.exists(db_path):
             try:
+                reconciliation = _reconcile_stale_eaglecast_channel_ids(db_path)
+                if (reconciliation['moved'] or reconciliation['removed_alias']
+                        or reconciliation['ambiguous']):
+                    print('[eaglecast] reconciled stale channel IDs: '
+                          f"moved={reconciliation['moved']} "
+                          f"removed_aliases={reconciliation['removed_alias']} "
+                          f"needs_review={reconciliation['ambiguous']}")
                 initial_start = datetime.now(timezone.utc).replace(
                     minute=0, second=0, microsecond=0)
                 count = load_epg_from_db(
