@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261017i"
+VERSION = "v20261018a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2405,6 +2405,21 @@ def api_guide():
             if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
                 if not ch_filter or ch_filter in c['name'].lower():
                     ordered_channels_raw.append(dict(c, no_data=True))
+
+    # A legacy XMLTV ID (for example ``axstv.us``) can retain an old provider
+    # map after its current Schedules Direct numeric counterpart has taken
+    # over.  Never show that empty legacy row beside a live, scheduled row
+    # with the same channel name; it is duplicate clutter, not a missing
+    # channel or an unavailable Eaglecast source.
+    active_channel_keys = {
+        _channel_match_base(c.get('name', '')) for c in ordered_channels_raw
+        if not c.get('no_data')
+    }
+    ordered_channels_raw = [
+        c for c in ordered_channels_raw
+        if not c.get('no_data')
+        or _channel_match_base(c.get('name', '')) not in active_channel_keys
+    ]
 
     if hide_sd_duplicates and not sd_only:
         quality_by_base = {}
