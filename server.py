@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261019a"
+VERSION = "v20261019b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5468,6 +5468,8 @@ MAX_STREAMS = 6
 # _vlc_streams: { channel_id: {'pid': int, 'ch_name': str, 'title': str} }
 _vlc_streams = {}
 _vlc_lock    = threading.Lock()
+_eaglecast_sports_cache = {'at': 0, 'items': []}
+_eaglecast_sports_lock = threading.Lock()
 
 def _proc_dead(pid):
     """Return True if the process with this PID is no longer running."""
@@ -5477,17 +5479,9 @@ def _proc_dead(pid):
     except (ProcessLookupError, OSError):
         return True
 
-@app.route('/epg-web/api/play', methods=['POST'])
-def api_play():
+def _start_vlc_stream(channel_id, url, title='', ch_label='', ch_name=''):
+    """Start one locally-authenticated stream in VLC and return its snapshot."""
     import signal as _sig
-    data       = request.json or {}
-    channel_id = data.get('channel_id', '')
-    title      = data.get('title', '')
-    ch_label   = data.get('ch_label', '')
-    ch_name    = data.get('ch_name', channel_id)
-    url, err, dbg = _stream_url(channel_id)
-    if err:
-        return jsonify({'error': err, 'debug': dbg}), 400
     with _vlc_lock:
         # Purge any VLC processes that have already exited
         dead = [cid for cid, v in _vlc_streams.items()
@@ -5501,7 +5495,7 @@ def api_play():
             del _vlc_streams[channel_id]
         # Enforce max streams
         if len(_vlc_streams) >= MAX_STREAMS:
-            return jsonify({'error': f'Max {MAX_STREAMS} streams already playing'}), 400
+            return None, f'Max {MAX_STREAMS} streams already playing'
         try:
             vlc_paths = [
                 '/Applications/VLC.app/Contents/MacOS/VLC',
@@ -5528,11 +5522,101 @@ def api_play():
             _vlc_streams[channel_id] = {'pid': proc.pid, 'ch_name': ch_name, 'title': title}
             streams_snapshot = dict(_vlc_streams)
         except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return jsonify({'ok': True, 'streams': [
+            return None, str(e)
+    return streams_snapshot, None
+
+def _streams_payload(streams_snapshot):
+    return {'ok': True, 'streams': [
         {'channel_id': cid, 'ch_name': v['ch_name'], 'title': v['title']}
         for cid, v in streams_snapshot.items()
-    ]})
+    ]}
+
+@app.route('/epg-web/api/play', methods=['POST'])
+def api_play():
+    data       = request.json or {}
+    channel_id = data.get('channel_id', '')
+    title      = data.get('title', '')
+    ch_label   = data.get('ch_label', '')
+    ch_name    = data.get('ch_name', channel_id)
+    url, err, dbg = _stream_url(channel_id)
+    if err:
+        return jsonify({'error': err, 'debug': dbg}), 400
+    streams_snapshot, start_error = _start_vlc_stream(channel_id, url, title, ch_label, ch_name)
+    if start_error:
+        return jsonify({'error': start_error}), 500
+    return jsonify(_streams_payload(streams_snapshot))
+
+def _eaglecast_sports_terms(value):
+    return bool(re.search(
+        r'\b(?:sport|nfl|nba|nhl|mlb|ncaa|espn|fox\s*soccer|golf|tennis|cricket|rugby|soccer|football|baseball|basketball|hockey|mma|ufc|boxing|wwe|wrestling|racing|motorsport|nascar|formula\s*1|fubo)\b',
+        str(value or ''), re.I))
+
+def _eaglecast_live_sports():
+    """Extra US Eaglecast sports feeds, safe for live VLC playback only.
+
+    These feeds deliberately do not become guide mappings or recording sources:
+    a matching display name is not proof that an IPTV stream carries a guide
+    station.  The short cache prevents opening the provider's large catalogue
+    on every browser repaint.
+    """
+    now = time.time()
+    with _eaglecast_sports_lock:
+        if now - _eaglecast_sports_cache['at'] < 300:
+            return list(_eaglecast_sports_cache['items'])
+        cfg = _load_eaglecast_test_config()
+        if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+            return []
+        raw = _eaglecast_live_streams(cfg)
+        seen, items = set(), []
+        for stream in raw:
+            name = str(stream.get('name') or '').strip()
+            stream_id = str(stream.get('stream_id') or '').strip()
+            # The full provider catalogue is international and enormous.  This
+            # is the US/USA labelled sports portion the guide is intended for.
+            if not re.match(r'^\s*(?:US|USA)\s*[|:/-]\s*', name, re.I):
+                continue
+            clean = re.sub(r'^\s*(?:US|USA)\s*[|:/-]\s*', '', name, flags=re.I).strip()
+            if not stream_id or not _eaglecast_sports_terms(clean):
+                continue
+            # Provider returns exact duplicate aliases; retain real regional
+            # variants but collapse identical feed names.
+            key = _strict_channel_identity(clean)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append({'stream_id': stream_id, 'name': clean,
+                          'extension': str(stream.get('container_extension') or 'ts')})
+        items.sort(key=lambda item: item['name'].lower())
+        _eaglecast_sports_cache.update({'at': now, 'items': items})
+        return list(items)
+
+@app.route('/epg-web/api/eaglecast/live-sports')
+def api_eaglecast_live_sports():
+    try:
+        items = _eaglecast_live_sports()
+        return jsonify({'items': items, 'total': len(items)})
+    except Exception as exc:
+        return jsonify({'error': f'Could not load Eaglecast live sports: {exc}'}), 502
+
+@app.route('/epg-web/api/play/eaglecast-live', methods=['POST'])
+def api_play_eaglecast_live():
+    data = request.json or {}
+    stream_id = str(data.get('stream_id') or '')
+    # Never accept an arbitrary stream ID from a browser request.  It must be
+    # one enumerated by the live-only sports catalogue in this server process.
+    item = next((entry for entry in _eaglecast_live_sports()
+                 if entry['stream_id'] == stream_id), None)
+    if not item:
+        return jsonify({'error': 'That Eaglecast sports feed is no longer available. Reload the catalog.'}), 404
+    url = _eaglecast_stream_url(item['stream_id'], item['extension'])
+    if not url:
+        return jsonify({'error': 'Eaglecast playback is not configured on this Mac.'}), 503
+    channel_id = 'eaglecast-live:' + item['stream_id']
+    streams_snapshot, start_error = _start_vlc_stream(
+        channel_id, url, data.get('title', ''), 'Eaglecast live-only', item['name'])
+    if start_error:
+        return jsonify({'error': start_error}), 500
+    return jsonify(_streams_payload(streams_snapshot))
 
 @app.route('/epg-web/api/play/stop', methods=['POST'])
 def api_play_stop():
@@ -6520,6 +6604,7 @@ tr:hover td{background:#141414;}
       <option value="ps">▶ All playable · Prime + Eaglecast</option>
       <option value="eagle">🦅 Eaglecast All (mapped)</option>
       <option value="eagle_movie">🦅 Eaglecast Premium Movies</option>
+      <option value="eagle_live_sports">🦅 Eaglecast Sports · live-only</option>
       <option value="ps_episode">📺 PS · S/E Ready</option>
       <option value="sd">📺 SD Only</option>
     </select>
@@ -6574,6 +6659,7 @@ tr:hover td{background:#141414;}
   <div class="guide-wrap" id="guide-wrap" style="display:none;">
     <div id="guide-inner"></div>
   </div>
+  <div id="eagle-live-catalog" style="display:none;"></div>
   <!-- Recordings panel -->
   <div id="rec-panel" style="margin-top:16px;display:none;">
     <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">🔴 Active Recordings</h3>
@@ -7529,6 +7615,11 @@ async function fetchAndRenderGuide() {
   else if (ch) params.set('ch', ch);
   const mode = document.getElementById('guide-ch-mode').value;
   const content = document.getElementById('guide-content-filter').value;
+  if (mode === 'eagle_live_sports') {
+    fetchAndRenderEaglecastLiveSports(requestId);
+    return;
+  }
+  document.getElementById('eagle-live-catalog').style.display = 'none';
   if (mode === 'fav')   params.set('fav',   '1');
   if (mode === 'movie') params.set('movie', '1');
   if (mode === 'ps')    params.set('ps',    '1');
@@ -7578,6 +7669,48 @@ async function fetchAndRenderGuide() {
       if (requestId === _guideFetchId) renderGuide();
     });
   } catch(e) { setGS('Failed: '+e.message,'err'); }
+}
+
+async function fetchAndRenderEaglecastLiveSports(requestId) {
+  const catalog = document.getElementById('eagle-live-catalog');
+  document.getElementById('guide-wrap').style.display = 'none';
+  document.getElementById('guide-window').textContent = 'Live Eaglecast sports catalog';
+  catalog.style.display = 'block';
+  catalog.innerHTML = '<div style="padding:24px;color:#94a3b8;">Loading Eaglecast sports feeds…</div>';
+  try {
+    const r = await fetch('/epg-web/api/eaglecast/live-sports');
+    const d = await r.json();
+    if (requestId !== _guideFetchId) return;
+    if (!r.ok || d.error) throw new Error(d.error || 'Could not load live sports');
+    const query = document.getElementById('ch-filter').value.trim().toLowerCase();
+    const items = (d.items || []).filter(item => !query || item.name.toLowerCase().includes(query));
+    const rows = items.map(item => {
+      const channelId = 'eaglecast-live:' + item.stream_id;
+      const playing = !!_activeStreams[channelId];
+      const action = playing
+        ? `<button class="btn btn-ghost btn-sm" onclick="stopStream('${channelId}')">■ Stop</button>`
+        : `<button class="btn btn-primary btn-sm" onclick="playEaglecastLiveSport('${item.stream_id}')">▶ Play live</button>`;
+      return `<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-top:1px solid #1e293b;">
+        <div style="min-width:0;"><div style="font-weight:600;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(item.name)}</div><div style="font-size:11px;color:#64748b;margin-top:2px;">Eaglecast live-only · not tied to a guide schedule</div></div>${action}</div>`;
+    }).join('');
+    catalog.innerHTML = `<div style="border:1px solid #1e293b;border-radius:8px;overflow:hidden;max-width:980px;">
+      <div style="padding:16px 14px;background:#111827;">
+        <div style="font-size:17px;font-weight:700;color:#e2e8f0;">🦅 Eaglecast Sports — Live Only</div>
+        <div style="font-size:12px;color:#94a3b8;margin-top:5px;">${d.total} US Eaglecast sports feeds${query ? ` · ${items.length} matching your search` : ''}. These can play live in VLC; they cannot record until a feed is verified against a guide channel.</div>
+      </div>${rows || '<div style="padding:18px;color:#94a3b8;">No live sports feeds match that search.</div>'}</div>`;
+  } catch (e) {
+    if (requestId === _guideFetchId) catalog.innerHTML = `<div class="status-msg err">❌ ${esc(e.message)}</div>`;
+  }
+}
+
+async function playEaglecastLiveSport(streamId) {
+  const channelId = 'eaglecast-live:' + streamId;
+  try {
+    const r = await post('/epg-web/api/play/eaglecast-live', {stream_id: streamId});
+    if (!r.ok) { alert('Could not start VLC: ' + (r.error || 'unknown error')); return; }
+    _updateNowPlaying(r.streams);
+    fetchAndRenderGuide();
+  } catch (e) { alert('Could not start VLC: ' + e.message); }
 }
 function chPagePrev() { _chOffset = Math.max(0, _chOffset - 200); fetchAndRenderGuide(); }
 function chPageNext() { _chOffset += 200; fetchAndRenderGuide(); }
