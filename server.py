@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261019b"
+VERSION = "v20261019c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -7673,10 +7673,11 @@ async function fetchAndRenderGuide() {
 
 async function fetchAndRenderEaglecastLiveSports(requestId) {
   const catalog = document.getElementById('eagle-live-catalog');
-  document.getElementById('guide-wrap').style.display = 'none';
-  document.getElementById('guide-window').textContent = 'Live Eaglecast sports catalog';
-  catalog.style.display = 'block';
-  catalog.innerHTML = '<div style="padding:24px;color:#94a3b8;">Loading Eaglecast sports feeds…</div>';
+  const wrap = document.getElementById('guide-wrap');
+  catalog.style.display = 'none';
+  wrap.style.display = 'block';
+  document.getElementById('guide-window').textContent = 'Live Eaglecast sports — all feeds';
+  document.getElementById('guide-inner').innerHTML = '<div style="padding:24px;color:#94a3b8;">Loading Eaglecast sports feeds…</div>';
   try {
     const r = await fetch('/epg-web/api/eaglecast/live-sports');
     const d = await r.json();
@@ -7684,22 +7685,37 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
     if (!r.ok || d.error) throw new Error(d.error || 'Could not load live sports');
     const query = document.getElementById('ch-filter').value.trim().toLowerCase();
     const items = (d.items || []).filter(item => !query || item.name.toLowerCase().includes(query));
+    const now = Date.now() / 1000;
+    const hours = _guideHours || 4;
+    const wsTs = Math.floor(now / 1800) * 1800;
+    const weTs = wsTs + hours * 3600;
+    const totalPx = hours * 60 * PX_PER_MIN;
+    let timeHTML = `<div class="time-header"><div class="ch-name-hdr"></div>`;
+    for (let t = wsTs; t < weTs; t += 1800) {
+      timeHTML += `<div class="time-slot" style="width:${30*PX_PER_MIN}px;">${new Date(t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>`;
+    }
+    timeHTML += '</div>';
     const rows = items.map(item => {
       const channelId = 'eaglecast-live:' + item.stream_id;
       const playing = !!_activeStreams[channelId];
       const action = playing
-        ? `<button class="btn btn-ghost btn-sm" onclick="stopStream('${channelId}')">■ Stop</button>`
-        : `<button class="btn btn-primary btn-sm" onclick="playEaglecastLiveSport('${item.stream_id}')">▶ Play live</button>`;
-      return `<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-top:1px solid #1e293b;">
-        <div style="min-width:0;"><div style="font-weight:600;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(item.name)}</div><div style="font-size:11px;color:#64748b;margin-top:2px;">Eaglecast live-only · not tied to a guide schedule</div></div>${action}</div>`;
+        ? `<button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();stopStream('${channelId}')">■ Stop</button>`
+        : `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();playEaglecastLiveSport('${item.stream_id}')">▶ Play</button>`;
+      return `<div class="guide-row">
+        <div class="ch-name" title="${esc(item.name)} — Eaglecast live-only" style="display:flex;align-items:center;">🦅&nbsp;<span class="ch-name-label">${esc(item.name)}</span></div>
+        <div class="prog-row" style="width:${totalPx}px;">
+          <div class="now-line" style="left:0;"></div>
+          <div class="prog-block now cat-sports" style="left:0;width:${totalPx-2}px;cursor:default;">
+            <div class="prog-row-top"><span class="cat-badge">LIVE</span><span class="prog-title">${esc(item.name)}</span><span style="margin-left:8px;color:#94a3b8;font-size:11px;">Live-only · no guide schedule</span><span style="margin-left:auto;padding-right:6px;">${action}</span></div>
+          </div>
+        </div>
+      </div>`;
     }).join('');
-    catalog.innerHTML = `<div style="border:1px solid #1e293b;border-radius:8px;overflow:hidden;max-width:980px;">
-      <div style="padding:16px 14px;background:#111827;">
-        <div style="font-size:17px;font-weight:700;color:#e2e8f0;">🦅 Eaglecast Sports — Live Only</div>
-        <div style="font-size:12px;color:#94a3b8;margin-top:5px;">${d.total} US Eaglecast sports feeds${query ? ` · ${items.length} matching your search` : ''}. These can play live in VLC; they cannot record until a feed is verified against a guide channel.</div>
-      </div>${rows || '<div style="padding:18px;color:#94a3b8;">No live sports feeds match that search.</div>'}</div>`;
+    document.getElementById('guide-inner').innerHTML = rows
+      ? timeHTML + rows
+      : '<div style="padding:18px;color:#94a3b8;">No live sports feeds match that search.</div>';
   } catch (e) {
-    if (requestId === _guideFetchId) catalog.innerHTML = `<div class="status-msg err">❌ ${esc(e.message)}</div>`;
+    if (requestId === _guideFetchId) document.getElementById('guide-inner').innerHTML = `<div class="status-msg err">❌ ${esc(e.message)}</div>`;
   }
 }
 
