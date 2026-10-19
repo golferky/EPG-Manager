@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261019c"
+VERSION = "v20261019d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -5590,6 +5590,25 @@ def _eaglecast_live_sports():
         _eaglecast_sports_cache.update({'at': now, 'items': items})
         return list(items)
 
+def _eaglecast_stream_is_playable(stream_url):
+    """Confirm a live feed supplies video before opening an empty VLC window.
+
+    IPTV catalogues can retain regional aliases after their underlying feed has
+    stopped.  A short local ffprobe costs a few seconds only when the user
+    presses Play, and prevents an optimistic UI from reporting a blank player
+    as successful playback.  Do not include the signed URL in any response or
+    log because it contains provider credentials.
+    """
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-rw_timeout', '8000000',
+             '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', stream_url],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=10)
+        return probe.returncode == 0 and 'video' in (probe.stdout or '').lower()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
 @app.route('/epg-web/api/eaglecast/live-sports')
 def api_eaglecast_live_sports():
     try:
@@ -5611,6 +5630,8 @@ def api_play_eaglecast_live():
     url = _eaglecast_stream_url(item['stream_id'], item['extension'])
     if not url:
         return jsonify({'error': 'Eaglecast playback is not configured on this Mac.'}), 503
+    if not _eaglecast_stream_is_playable(url):
+        return jsonify({'error': 'This Eaglecast feed is not responding with video right now. Choose another feed; VLC was not opened.'}), 503
     channel_id = 'eaglecast-live:' + item['stream_id']
     streams_snapshot, start_error = _start_vlc_stream(
         channel_id, url, data.get('title', ''), 'Eaglecast live-only', item['name'])
