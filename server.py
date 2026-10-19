@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261018c"
+VERSION = "v20261019a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2327,6 +2327,8 @@ def api_guide():
     ch_id_filter = request.args.get('ch_id', '').lower()  # exact channel_id match from search
     fav_only   = request.args.get('fav', '0') == '1'
     movie_only = request.args.get('movie', '0') == '1'
+    # ``ps`` is the legacy query name for the combined playable-source view:
+    # PrimeStreams plus verified Eaglecast mappings.
     ps_only    = request.args.get('ps',  '0') == '1'
     eagle_only = request.args.get('eagle', '0') == '1'
     eagle_movie_only = request.args.get('eagle_movie', '0') == '1'
@@ -6515,7 +6517,7 @@ tr:hover td{background:#141414;}
       <option value="all">All Channels</option>
       <option value="fav">★ Favorites</option>
       <option value="movie">🎬 Movie Channels</option>
-      <option value="ps">📡 PrimeStreams Only</option>
+      <option value="ps">▶ All playable · Prime + Eaglecast</option>
       <option value="eagle">🦅 Eaglecast All (mapped)</option>
       <option value="eagle_movie">🦅 Eaglecast Premium Movies</option>
       <option value="ps_episode">📺 PS · S/E Ready</option>
