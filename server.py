@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261020a"
+VERSION = "v20261020b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -636,6 +636,20 @@ def _is_quarantined_primestream_stream(stream_id):
     unverified stream to masquerade as that linear channel.
     """
     return str(stream_id or '') in {'114269'}
+
+def _primestream_verified_override(channel_id):
+    """Return a locally verified PrimeStreams correction, when one exists.
+
+    The provider's Hollywood Suite labels are shifted: its stream 114269 is
+    labelled/EPG-tagged as 00s but currently carries unrelated content, while
+    114268 is the feed actually carrying the 00s schedule (verified against
+    *Lucky Number Slevin* on Oct. 20, 2026).  This explicit correction wins
+    over the provider's misleading metadata and survives its next refresh.
+    """
+    overrides = {
+        'hollywoodsuite2000.ca': ('114268', 'HOLLYWOOD SUITE 00S'),
+    }
+    return overrides.get(str(channel_id or ''))
 
 def _eaglecast_stream_url(stream_id, extension='ts'):
     """Build an internal-only Eaglecast stream URL for probes/local playback."""
@@ -1676,6 +1690,14 @@ def _stream_url(channel_id, preferred_provider=None):
     cfg  = load_config()
     debug = {'channel_id': channel_id, 'matched_guide_channel': None, 'stream_id': None,
              'method': None, 'provider': None, 'stream_extension': 'ts'}
+    verified_override = _primestream_verified_override(channel_id)
+    if verified_override and preferred_provider != 'eaglecast':
+        sid, mapped_name = verified_override
+        debug.update({'method': 'verified PrimeStreams correction',
+                      'matched_guide_channel': mapped_name, 'stream_id': sid,
+                      'provider': 'primestreams'})
+        return (f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/"
+                f"{cfg['epg_pass']}/{sid}.ts"), None, debug
     # Eaglecast is the preferred source once it has been explicitly mapped by
     # the owner.  PrimeStreams remains the automatic fallback.
     if preferred_provider in (None, 'eaglecast'):
