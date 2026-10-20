@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261019d"
+VERSION = "v20261020a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -626,6 +626,16 @@ def _is_quarantined_eaglecast_stream(stream):
     """
     return bool(stream and str(stream[0] if not isinstance(stream, dict)
                                else stream.get('stream_id', '')) == '45503')
+
+def _is_quarantined_primestream_stream(stream_id):
+    """Block a confirmed wrong PrimeStreams feed from play and recording.
+
+    Stream 114269 is currently mapped to the Hollywood Suite 00s guide ID but
+    played an unrelated Lucha Libre programme while *Lucky Number Slevin* was
+    scheduled on Oct. 20, 2026.  Keep the guide listing, but do not allow this
+    unverified stream to masquerade as that linear channel.
+    """
+    return str(stream_id or '') in {'114269'}
 
 def _eaglecast_stream_url(stream_id, extension='ts'):
     """Build an internal-only Eaglecast stream URL for probes/local playback."""
@@ -1688,7 +1698,8 @@ def _stream_url(channel_id, preferred_provider=None):
             (channel_id,)
         ).fetchone()
         gconn.close()
-        if discovered and _primestream_authoritative_channel(channel_id, discovered[0]):
+        if (discovered and not _is_quarantined_primestream_stream(discovered[0])
+                and _primestream_authoritative_channel(channel_id, discovered[0])):
             sid, mapped_name = discovered
             debug.update({'method': 'provider discovery',
                           'matched_guide_channel': mapped_name or channel_id,
@@ -1701,7 +1712,8 @@ def _stream_url(channel_id, preferred_provider=None):
         'SELECT stream_id, guide_channel FROM channels WHERE guide_channel=? AND stream_id IS NOT NULL AND stream_id!="" LIMIT 1',
         (channel_id,)
     )
-    if rows and _primestream_authoritative_channel(channel_id, rows[0]['stream_id']):
+    if (rows and not _is_quarantined_primestream_stream(rows[0]['stream_id'])
+            and _primestream_authoritative_channel(channel_id, rows[0]['stream_id'])):
         debug['method'] = 'direct'
         debug['matched_guide_channel'] = rows[0]['guide_channel']
     else:
@@ -1729,7 +1741,8 @@ def _stream_url(channel_id, preferred_provider=None):
                     if len(ch_norm) < 3:
                         continue
                     for mr, base in mc:
-                        if not _primestream_authoritative_channel(channel_id, mr['stream_id'], name):
+                        if (_is_quarantined_primestream_stream(mr['stream_id']) or
+                                not _primestream_authoritative_channel(channel_id, mr['stream_id'], name)):
                             continue
                         if len(base) < 3:
                             continue
@@ -1757,6 +1770,8 @@ def _stream_url(channel_id, preferred_provider=None):
             return url, None if url else 'Eaglecast settings are incomplete', debug
         return None, 'No stream_id found for channel', debug
     sid = rows[0]['stream_id']
+    if _is_quarantined_primestream_stream(sid):
+        return None, 'This PrimeStreams feed is blocked because it delivered the wrong programme.', debug
     debug['stream_id'] = sid
     debug['provider'] = 'primestreams'
     url = f"{cfg['epg_url'].rstrip('/')}/live/{cfg['epg_user']}/{cfg['epg_pass']}/{sid}.ts"
