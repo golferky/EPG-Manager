@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261021c"
+VERSION = "v20261021d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -6661,12 +6661,11 @@ tr:hover td{background:#141414;}
 <div id="pane-guide" class="pane active">
   <div class="guide-toolbar">
     <button class="btn btn-ghost btn-sm" onclick="guideNav(-4)">◀ Earlier</button>
-    <span id="guide-window" style="font-size:13px;color:#555;"></span>
-    <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
-    <button id="guide-now-btn" class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;" title="Jump to the current time in the guide">⬤ Now</button>
     <input id="guide-date" type="date" onchange="guideJumpDate(this.value)" aria-label="Choose guide date" style="position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;">
     <button id="guide-date-btn" class="btn btn-ghost btn-sm" onclick="openGuideDatePicker()" title="Choose a day from the calendar">📅 Choose date</button>
-    <button class="btn btn-ghost btn-sm" onclick="guideJumpSaturday()" title="Jump to the next Saturday">Sat</button>
+    <span id="guide-window" style="font-size:13px;color:#94a3b8;white-space:nowrap;"></span>
+    <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
+    <button id="guide-now-btn" class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;" title="Jump to the current time in the guide">⬤ Now</button>
     <select id="favorite-team-select" onchange="chooseFavoriteTeam(this.value)" title="Search one of your favorite teams" style="display:none;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:5px 10px;font-size:13px;"></select>
     <button id="favorite-team-manage" class="btn btn-ghost btn-sm" onclick="openFavoriteTeams()">🏆 My teams</button>
     <select id="guide-ch-mode" onchange="localStorage.setItem('epg_guide_mode',this.value);fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
@@ -7444,7 +7443,14 @@ function guideJumpDate(value) {
   // Constructing an explicit local midnight avoids JavaScript treating the
   // YYYY-MM-DD picker value as UTC and landing on the prior evening.
   _guideWindowStart = new Date(value + 'T00:00:00').toISOString();
+  updateGuideDateButton(new Date(value + 'T00:00:00'));
   fetchAndRenderGuide();
+}
+function updateGuideDateButton(date) {
+  const picker = document.getElementById('guide-date');
+  const button = document.getElementById('guide-date-btn');
+  if (picker) picker.value = date.getFullYear() + '-' + String(date.getMonth()+1).padStart(2,'0') + '-' + String(date.getDate()).padStart(2,'0');
+  if (button) button.textContent = '📅 ' + date.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'});
 }
 function openGuideDatePicker() {
   const picker = document.getElementById('guide-date');
@@ -7459,8 +7465,7 @@ function guideJumpSaturday() {
   current.setDate(current.getDate() + daysUntilSaturday);
   current.setHours(0, 0, 0, 0);
   _guideWindowStart = current.toISOString();
-  const picker = document.getElementById('guide-date');
-  if (picker) picker.value = current.getFullYear() + '-' + String(current.getMonth()+1).padStart(2,'0') + '-' + String(current.getDate()).padStart(2,'0');
+  updateGuideDateButton(current);
   fetchAndRenderGuide();
 }
 function getFavoriteTeams() {
@@ -7845,6 +7850,7 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
   catalog.style.display = 'none';
   wrap.style.display = 'block';
   document.getElementById('guide-window').textContent = 'Live Eaglecast sports — all feeds';
+  updateGuideDateButton(new Date());
   document.getElementById('guide-inner').innerHTML = '<div style="padding:24px;color:#94a3b8;">Loading Eaglecast sports feeds…</div>';
   try {
     const r = await fetch('/epg-web/api/eaglecast/live-sports');
@@ -7916,15 +7922,9 @@ function renderGuide() {
   const ws = new Date(d.window_start);
   const we = new Date(d.window_end);
   document.getElementById('guide-window').textContent =
-    ws.toLocaleString([], {weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
+    ws.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
     + ' – ' + we.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-  const datePicker = document.getElementById('guide-date');
-  if (datePicker) {
-    const y = ws.getFullYear(), m = String(ws.getMonth() + 1).padStart(2, '0'), day = String(ws.getDate()).padStart(2, '0');
-    datePicker.value = `${y}-${m}-${day}`;
-    const dateBtn = document.getElementById('guide-date-btn');
-    if (dateBtn) dateBtn.textContent = '📅 ' + ws.toLocaleDateString([], {month:'short', day:'numeric'});
-  }
+  updateGuideDateButton(ws);
 
   // Channels already filtered server-side
   const channels = d.channels;
