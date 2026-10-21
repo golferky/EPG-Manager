@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261021g"
+VERSION = "v20261021h"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
+from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
@@ -401,7 +402,7 @@ def db_run(sql, params=()):
 
 # ── EPG Parsing ───────────────────────────────────────────────────────────────
 
-_epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'loaded': None}
+_epg = {'channels': [], 'channel_map': {}, 'programmes': [], 'programme_starts': [], 'loaded': None}
 _startup_status = {
     'loading': False,
     # The first visible guide window is available before the full multi-week
@@ -1142,6 +1143,7 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
     _epg['channels']    = channels
     _epg['channel_map'] = channel_map
     _epg['programmes']  = programmes
+    _epg['programme_starts'] = [p['start_ts'] for p in programmes]
     _epg['loaded']      = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if progress:
         progress('Guide ready', len(programmes), len(programmes))
@@ -1401,6 +1403,7 @@ def load_epg(path, tz_str='America/New_York'):
     _epg['channels']    = channels
     _epg['channel_map'] = channel_map
     _epg['programmes']  = programmes
+    _epg['programme_starts'] = [p['start_ts'] for p in programmes]
     _epg['loaded']      = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     return len(programmes)
 
@@ -2531,10 +2534,25 @@ def api_guide():
         rows = db_rows('SELECT guide_channel FROM channels WHERE guide_channel IS NOT NULL AND guide_channel != ""')
         excluded_ch_ids = {r['guide_channel'] for r in rows}
 
+    # Collect only the requested window.  The complete guide has millions of
+    # rows; walking every programme on each browser refresh caused the grid to
+    # remain blank while a sports/date filter was loading.  The listings are
+    # ordered by start time, so a binary-search slice is enough.  Start one
+    # day early to retain long live sports events that began before the window.
+    all_programmes = _epg['programmes']
+    starts = _epg.get('programme_starts') or []
+    if len(starts) == len(all_programmes):
+        lo = bisect_left(starts, ws_ts - 86400)
+        hi = bisect_left(starts, we_ts)
+        window_programmes = all_programmes[lo:hi]
+    else:
+        # Defensive fallback for an in-progress first load on an older cache.
+        window_programmes = all_programmes
+
     # Collect channels present in window
     ch_set = set()
     progs_in_window = []
-    for p in _epg['programmes']:
+    for p in window_programmes:
         if p['stop_ts'] <= ws_ts or p['start_ts'] >= we_ts:
             continue
         if allowed_ch_ids is not None and p['channel_id'] not in allowed_ch_ids:
