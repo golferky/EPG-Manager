@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261021f"
+VERSION = "v20261021g"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -934,6 +934,7 @@ _TEAM_CATALOG_CATEGORIES = (
 # search term, but display the recognizable team name in the picker.
 _TEAM_CATALOG_DISPLAY_ALIASES = {
     ('football', 'cincinnati'): 'Cincinnati Bearcats',
+    ('football', 'kentucky'): 'Kentucky Wildcats',
 }
 
 def refresh_sports_team_catalog(db_path=None):
@@ -965,9 +966,8 @@ def refresh_sports_team_catalog(db_path=None):
             entry = found.setdefault(key, [team, category or '', 0, end_utc])
             entry[2] += 1
             entry[3] = max(entry[3], end_utc)
-    # Replace the old short Cincinnati label with the recognizable Bearcats
-    # name once it has been learned from the guide.
-    conn.execute("DELETE FROM sports_team_catalog WHERE team_name='Cincinnati' AND lower(league_hint)='football'")
+    # Replace provider-shortened college labels with their recognizable names.
+    conn.execute("DELETE FROM sports_team_catalog WHERE team_name IN ('Cincinnati', 'Kentucky') AND lower(league_hint)='football'")
     conn.executemany('''INSERT INTO sports_team_catalog(team_name,league_hint,seen_count,last_seen_utc)
                         VALUES (?,?,?,?)
                         ON CONFLICT(team_name) DO UPDATE SET
@@ -7632,7 +7632,10 @@ function searchFavoriteTeam(team) {
   const input = document.getElementById('ch-filter');
   if (!input) return;
   // The provider shortens a few college teams in its matchup text.
-  const guideSearch = {'cincinnati bearcats': 'Cincinnati'}[String(team).toLowerCase()] || team;
+  const guideSearch = {
+    'cincinnati bearcats': 'Cincinnati',
+    'kentucky wildcats': 'Kentucky',
+  }[String(team).toLowerCase()] || team;
   input.value = guideSearch;
   updateSearchClear();
   onSearchInput(guideSearch);
