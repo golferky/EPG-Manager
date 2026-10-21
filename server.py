@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261020b"
+VERSION = "v20261021a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2748,7 +2748,7 @@ def api_search():
         ep_filter     = request.args.get('ep', '').strip()
 
         extra_where = ''
-        params = [like_word[0], like_word[1], now_str]
+        params = [like_word[0], like_word[1], like, like, now_str]
         if ep_q:
             extra_where += ' AND (episode_title LIKE ? OR episode_title IS NULL)'
             params.append(f'%{ep_q}%')
@@ -2763,9 +2763,10 @@ def api_search():
 
         prog_rows = conn.execute(f'''
             SELECT title, channel_id, channel_name, start_utc, end_utc, category,
-                   episode_title, season_num, episode_num
+                   episode_title, season_num, episode_num, desc
             FROM guide
-            WHERE (title LIKE ? OR title LIKE ?) AND end_utc > ?{extra_where}
+            WHERE (title LIKE ? OR title LIKE ? OR episode_title LIKE ? OR desc LIKE ?)
+              AND end_utc > ?{extra_where}
             ORDER BY start_utc
             LIMIT 40
         ''', params).fetchall()
@@ -2790,6 +2791,7 @@ def api_search():
                     'category':     r['category'] or '',
                     'on_now':       on_now,
                     'episode_title': r['episode_title'] or '',
+                    'match_detail': (r['episode_title'] or r['desc'] or '')[:140],
                     'season_num':   r['season_num'],
                     'episode_num':  r['episode_num'],
                     'has_stream':   r['channel_id'] in playable_ids,
@@ -6655,6 +6657,8 @@ tr:hover td{background:#141414;}
     <span id="guide-window" style="font-size:13px;color:#555;"></span>
     <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
     <button id="guide-now-btn" class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;" title="Jump to the current time in the guide">⬤ Now</button>
+    <label title="Jump directly to this date" style="display:flex;align-items:center;gap:5px;color:#94a3b8;font-size:12px;white-space:nowrap;">📅 <input id="guide-date" type="date" onchange="guideJumpDate(this.value)" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:4px 7px;font-size:12px;"></label>
+    <button class="btn btn-ghost btn-sm" onclick="guideJumpSaturday()" title="Jump to the next Saturday">Sat</button>
     <select id="guide-ch-mode" onchange="localStorage.setItem('epg_guide_mode',this.value);fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
       <option value="all">All Channels</option>
       <option value="fav">★ Favorites</option>
@@ -6689,6 +6693,7 @@ tr:hover td{background:#141414;}
     <button id="ch-page-next" class="btn btn-ghost btn-sm" onclick="chPageNext()" style="display:none;">Next 200 ▶</button>
     <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 21 days from Schedules Direct">📡 Fetch SD</button>
   </div>
+  <div id="favorite-teams-bar" style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:0 4px 8px;"></div>
   <div class="guide-legend-bar" title="Program colors come from the guide's content classification">
     <span class="guide-legend-title">Guide colors</span>
     <span class="guide-legend-item"><i class="guide-legend-swatch"></i>General</span>
@@ -7187,6 +7192,7 @@ async function autoLoad() {
   if (savedContent) { const el = document.getElementById('guide-content-filter'); if (el) el.value = savedContent; }
   const hideSd = document.getElementById('hide-sd-duplicates');
   if (hideSd) hideSd.checked = localStorage.getItem('epg_hide_sd_duplicates') !== '0';
+  renderFavoriteTeams();
 })();
 autoLoad();
 loadStorageBar();
@@ -7409,6 +7415,50 @@ function guideJumpNow() {
     btn.style.color = '#22c55e';
   });
 }
+function guideJumpDate(value) {
+  if (!value) return;
+  // Constructing an explicit local midnight avoids JavaScript treating the
+  // YYYY-MM-DD picker value as UTC and landing on the prior evening.
+  _guideWindowStart = new Date(value + 'T00:00:00').toISOString();
+  fetchAndRenderGuide();
+}
+function guideJumpSaturday() {
+  const current = _guideWindowStart ? new Date(_guideWindowStart) : new Date();
+  const daysUntilSaturday = (6 - current.getDay() + 7) % 7 || 7;
+  current.setDate(current.getDate() + daysUntilSaturday);
+  current.setHours(0, 0, 0, 0);
+  _guideWindowStart = current.toISOString();
+  const picker = document.getElementById('guide-date');
+  if (picker) picker.value = current.getFullYear() + '-' + String(current.getMonth()+1).padStart(2,'0') + '-' + String(current.getDate()).padStart(2,'0');
+  fetchAndRenderGuide();
+}
+function getFavoriteTeams() {
+  try { return JSON.parse(localStorage.getItem('epg_favorite_teams') || '[]'); }
+  catch (_) { return []; }
+}
+function renderFavoriteTeams() {
+  const bar = document.getElementById('favorite-teams-bar');
+  if (!bar) return;
+  const teams = getFavoriteTeams();
+  const chips = teams.map(team => `<button class="btn btn-ghost btn-sm" onclick="searchFavoriteTeam(${JSON.stringify(team).replace(/"/g,'&quot;')})" title="Find upcoming games for ${esc(team)}">🏆 ${esc(team)}</button>`).join('');
+  bar.innerHTML = `<span style="font-size:12px;color:#94a3b8;font-weight:600;">My teams:</span>${chips || '<span style="font-size:12px;color:#64748b;">Add teams to get one-click game searches.</span>'}<button class="btn btn-ghost btn-sm" onclick="editFavoriteTeams()">${teams.length ? 'Edit teams' : '+ Add teams'}</button>`;
+}
+function editFavoriteTeams() {
+  const current = getFavoriteTeams().join(', ');
+  const entered = window.prompt('Favorite teams — separate names with commas:', current);
+  if (entered === null) return;
+  const teams = [...new Set(entered.split(',').map(x => x.trim()).filter(Boolean))].slice(0, 20);
+  localStorage.setItem('epg_favorite_teams', JSON.stringify(teams));
+  renderFavoriteTeams();
+}
+function searchFavoriteTeam(team) {
+  const input = document.getElementById('ch-filter');
+  if (!input) return;
+  input.value = team;
+  updateSearchClear();
+  onSearchInput(team);
+  input.focus();
+}
 let _searchTimer = null, _searchSeq = 0;
 function onSearchInput(val) {
   clearTimeout(_searchTimer);
@@ -7446,7 +7496,7 @@ function onSearchInput(val) {
       html += d.programs.map((p, index) =>
         `<div class="sr" onclick="openProg(window._searchProgramRows[${index}])" style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:10px;">
           <span style="font-size:12px;min-width:70px;color:${p.on_now?'#22c55e':'#94a3b8'};font-weight:${p.on_now?'600':'400'};">${esc(p.start_fmt)}</span>
-          <span style="flex:1;font-size:13px;color:#e2e8f0;">${esc(p.title)}</span>
+          <span style="flex:1;min-width:0;font-size:13px;color:#e2e8f0;"><span>${esc(p.title)}</span>${p.match_detail ? `<small style="display:block;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(p.match_detail)}</small>` : ''}</span>
           <span style="font-size:11px;color:#64748b;text-align:right;">${p.has_stream ? '📡 ' : ''}${esc(p.channel_name)}</span>
         </div>`
       ).join('');
@@ -7808,6 +7858,11 @@ function renderGuide() {
   document.getElementById('guide-window').textContent =
     ws.toLocaleString([], {weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
     + ' – ' + we.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  const datePicker = document.getElementById('guide-date');
+  if (datePicker) {
+    const y = ws.getFullYear(), m = String(ws.getMonth() + 1).padStart(2, '0'), day = String(ws.getDate()).padStart(2, '0');
+    datePicker.value = `${y}-${m}-${day}`;
+  }
 
   // Channels already filtered server-side
   const channels = d.channels;
