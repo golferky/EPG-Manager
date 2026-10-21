@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261021h"
+VERSION = "v20261021i"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -290,6 +290,18 @@ def _guide_program_matches_content(program, content):
         return prog_type == 'MV' or bool(re.search(r'\b(movie|movies|film|cinema)\b', category))
     if content == 'sports':
         return bool(re.search(r'\b(sport|nfl|nba|wnba|mlb|nhl|nca[ab]|football|baseball|basketball|hockey|soccer|golf|tennis|wrestling|ufc|mma|boxing|racing|nascar|formula)\b', text))
+    sport_filters = {
+        'sports_football':   r'\b(football|nfl|ncaaf|college football|cfb|super bowl)\b',
+        'sports_basketball': r'\b(basketball|nba|wnba|ncaab|march madness)\b',
+        'sports_baseball':   r'\b(baseball|mlb|minor league baseball)\b',
+        'sports_golf':       r'\b(golf|pga|lpga)\b',
+        'sports_hockey':     r'\b(hockey|nhl|ahl)\b',
+        'sports_soccer':     r'\b(soccer|mls|premier league|champions league|serie a|bundesliga)\b',
+        'sports_tennis':     r'\b(tennis|atp|wta)\b',
+        'sports_racing':     r'\b(racing|nascar|formula 1|indycar|motogp)\b',
+    }
+    if content in sport_filters:
+        return bool(re.search(sport_filters[content], text))
     if content == 'news':
         return bool(re.search(r'\b(news|weather|politic|business news)\b', text))
     if content == 'docs':
@@ -2440,7 +2452,11 @@ def api_guide():
     eagle_only = request.args.get('eagle', '0') == '1'
     eagle_movie_only = request.args.get('eagle_movie', '0') == '1'
     content_filter = request.args.get('content', 'all').lower()
-    valid_content_filters = {'all', 'sports', 'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality'}
+    valid_content_filters = {
+        'all', 'sports', 'sports_football', 'sports_basketball', 'sports_baseball',
+        'sports_golf', 'sports_hockey', 'sports_soccer', 'sports_tennis', 'sports_racing',
+        'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality',
+    }
     if content_filter not in valid_content_filters:
         content_filter = 'all'
     eagle_only = eagle_only or eagle_movie_only
@@ -6797,6 +6813,14 @@ tr:hover td{background:#141414;}
     <select id="guide-content-filter" onchange="localStorage.setItem('epg_guide_content',this.value);_chOffset=0;fetchAndRenderGuide()" title="Choose the kind of programming to show" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
       <option value="all">All programming</option>
       <option value="sports">🏆 Sports</option>
+      <option value="sports_football">🏈 Football</option>
+      <option value="sports_basketball">🏀 Basketball</option>
+      <option value="sports_baseball">⚾ Baseball</option>
+      <option value="sports_golf">⛳ Golf</option>
+      <option value="sports_hockey">🏒 Hockey</option>
+      <option value="sports_soccer">⚽ Soccer</option>
+      <option value="sports_tennis">🎾 Tennis</option>
+      <option value="sports_racing">🏎 Racing</option>
       <option value="premium_movies">⭐ Premium movies</option>
       <option value="movies">🎬 All movies</option>
       <option value="news">📰 News</option>
