@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261021a"
+VERSION = "v20261021b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -2772,6 +2772,7 @@ def api_search():
         ''', params).fetchall()
 
         programs = []
+        query_folded = q.casefold()
         for r in prog_rows:
             try:
                 su = datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
@@ -2779,6 +2780,10 @@ def api_search():
                 sl = su.astimezone(local_tz)
                 el = eu.astimezone(local_tz)
                 on_now = su <= now_utc < eu
+                episode_text = r['episode_title'] or ''
+                # A team in an episode title is a real matchup; a team only in
+                # the long description can be incidental pre-game context.
+                matchup = query_folded in (str(r['title'] or '') + ' ' + episode_text).casefold()
                 programs.append({
                     'title':          r['title'],
                     'channel_id':     r['channel_id'],
@@ -2792,6 +2797,7 @@ def api_search():
                     'on_now':       on_now,
                     'episode_title': r['episode_title'] or '',
                     'match_detail': (r['episode_title'] or r['desc'] or '')[:140],
+                    'matchup':       matchup,
                     'season_num':   r['season_num'],
                     'episode_num':  r['episode_num'],
                     'has_stream':   r['channel_id'] in playable_ids,
@@ -2804,7 +2810,8 @@ def api_search():
             key = (p['start_ts'], p['channel_name'].upper().strip())
             if key not in seen or (p['has_stream'] and not seen[key]['has_stream']):
                 seen[key] = p
-        results['programs'] = list(seen.values())
+        results['programs'] = sorted(seen.values(), key=lambda item: (
+            not item.get('matchup', False), item['start_ts']))
         conn.close()
     except Exception as e:
         print(f'[search] {e}')
@@ -7496,7 +7503,7 @@ function onSearchInput(val) {
       html += d.programs.map((p, index) =>
         `<div class="sr" onclick="openProg(window._searchProgramRows[${index}])" style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:10px;">
           <span style="font-size:12px;min-width:70px;color:${p.on_now?'#22c55e':'#94a3b8'};font-weight:${p.on_now?'600':'400'};">${esc(p.start_fmt)}</span>
-          <span style="flex:1;min-width:0;font-size:13px;color:#e2e8f0;"><span>${esc(p.title)}</span>${p.match_detail ? `<small style="display:block;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(p.match_detail)}</small>` : ''}</span>
+          <span style="flex:1;min-width:0;font-size:13px;color:#e2e8f0;"><span>${p.matchup ? '<b style="color:#fbbf24;font-size:10px;margin-right:5px;">MATCHUP</b>' : ''}${esc(p.title)}</span>${p.match_detail ? `<small style="display:block;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(p.match_detail)}</small>` : ''}</span>
           <span style="font-size:11px;color:#64748b;text-align:right;">${p.has_stream ? '📡 ' : ''}${esc(p.channel_name)}</span>
         </div>`
       ).join('');
