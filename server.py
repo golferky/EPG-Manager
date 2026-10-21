@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261021d"
+VERSION = "v20261021e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from datetime import datetime, timezone, timedelta
@@ -908,8 +908,64 @@ def ensure_guide_db(db_path):
             PRIMARY KEY(title, channel_id, start_ts)
         )
     ''')
+    # A local, searchable catalog of teams seen in the sports guide.  It lets
+    # the web UI offer real names instead of making the user type each team.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sports_team_catalog (
+            team_name TEXT PRIMARY KEY COLLATE NOCASE,
+            league_hint TEXT,
+            seen_count INTEGER NOT NULL DEFAULT 1,
+            last_seen_utc TEXT NOT NULL
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_sports_team_catalog_seen
+        ON sports_team_catalog(seen_count DESC, team_name COLLATE NOCASE)
+    ''')
     conn.commit()
     conn.close()
+
+_TEAM_MATCHUP_RE = re.compile(r'^\s*(.+?)\s+(?:at|vs\.?|v\.)\s+(.+?)\s*$', re.I)
+_TEAM_CATALOG_CATEGORIES = (
+    'football', 'basketball', 'baseball', 'hockey', 'soccer', 'golf',
+    'tennis', 'boxing', 'mixed martial arts', 'racing', 'sports',
+)
+
+def refresh_sports_team_catalog(db_path=None):
+    """Learn team names from upcoming, explicitly sports-classified matchups."""
+    db_path = db_path or _guide_db_path()
+    ensure_guide_db(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    now_utc = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    marks = ','.join('?' * len(_TEAM_CATALOG_CATEGORIES))
+    rows = conn.execute(f'''SELECT episode_title, category, end_utc FROM guide
+                            WHERE end_utc > ? AND lower(category) IN ({marks})
+                              AND episode_title IS NOT NULL AND length(trim(episode_title)) > 0''',
+                        (now_utc, *_TEAM_CATALOG_CATEGORIES)).fetchall()
+    found = {}
+    for episode_title, category, end_utc in rows:
+        match = _TEAM_MATCHUP_RE.match(episode_title or '')
+        if not match:
+            continue
+        for team in match.groups():
+            team = re.sub(r'\s+', ' ', team).strip(' -–—:;,')
+            # A real team name has enough substance; this also avoids storing
+            # generic programme fragments when a listing happens to use "at".
+            if len(team) < 3 or len(team) > 80 or team.lower() in {'home', 'away', 'tba'}:
+                continue
+            key = team.casefold()
+            entry = found.setdefault(key, [team, category or '', 0, end_utc])
+            entry[2] += 1
+            entry[3] = max(entry[3], end_utc)
+    conn.executemany('''INSERT INTO sports_team_catalog(team_name,league_hint,seen_count,last_seen_utc)
+                        VALUES (?,?,?,?)
+                        ON CONFLICT(team_name) DO UPDATE SET
+                          league_hint=excluded.league_hint,
+                          seen_count=sports_team_catalog.seen_count + excluded.seen_count,
+                          last_seen_utc=MAX(sports_team_catalog.last_seen_utc, excluded.last_seen_utc)''',
+                     list(found.values()))
+    conn.commit(); conn.close()
+    return len(found)
 
 _bootstrap()
 
@@ -2816,6 +2872,36 @@ def api_search():
     except Exception as e:
         print(f'[search] {e}')
     return jsonify(results)
+
+@app.route('/epg-web/api/sports-teams')
+def api_sports_teams():
+    """Return the locally learned sports-team catalog for the picker."""
+    q = request.args.get('q', '').strip()
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    try:
+        ensure_guide_db(db_path)
+        conn = sqlite3.connect(db_path, timeout=10)
+        # Populate an older installation the first time the team picker is
+        # opened.  Subsequent reads are a fast indexed catalog lookup.
+        count = conn.execute('SELECT COUNT(*) FROM sports_team_catalog').fetchone()[0]
+        conn.close()
+        if not count:
+            refresh_sports_team_catalog(db_path)
+        conn = sqlite3.connect(db_path, timeout=10)
+        if q:
+            rows = conn.execute('''SELECT team_name, league_hint FROM sports_team_catalog
+                                   WHERE team_name LIKE ?
+                                   ORDER BY seen_count DESC, team_name COLLATE NOCASE LIMIT 80''',
+                                (f'%{q}%',)).fetchall()
+        else:
+            rows = conn.execute('''SELECT team_name, league_hint FROM sports_team_catalog
+                                   ORDER BY seen_count DESC, team_name COLLATE NOCASE LIMIT 250''').fetchall()
+        conn.close()
+        return jsonify({'teams': [{'name': r[0], 'sport': r[1] or ''} for r in rows]})
+    except Exception as exc:
+        print(f'[sports-teams] {exc}')
+        return jsonify({'teams': []})
 
 @app.route('/epg-web/api/channel/favorite', methods=['POST'])
 def api_toggle_favorite():
@@ -6753,7 +6839,8 @@ tr:hover td{background:#141414;}
     <p style="margin:0 0 16px;color:#94a3b8;font-size:13px;">Add teams once, then choose one from the guide dropdown to find its upcoming games.</p>
     <div id="favorite-team-list" style="display:flex;gap:7px;flex-wrap:wrap;min-height:34px;margin-bottom:14px;"></div>
     <div style="display:flex;gap:8px;">
-      <input id="favorite-team-new" placeholder="e.g. Kentucky Wildcats" onkeydown="if(event.key==='Enter')addFavoriteTeam()" style="flex:1;background:#0f172a;border:1px solid #475569;border-radius:7px;color:#e2e8f0;padding:9px 10px;font-size:14px;">
+      <input id="favorite-team-new" list="favorite-team-suggestions" placeholder="Start typing a team, e.g. Kentucky" oninput="loadTeamSuggestions(this.value)" onkeydown="if(event.key==='Enter')addFavoriteTeam()" style="flex:1;background:#0f172a;border:1px solid #475569;border-radius:7px;color:#e2e8f0;padding:9px 10px;font-size:14px;">
+      <datalist id="favorite-team-suggestions"></datalist>
       <button class="btn btn-primary btn-sm" onclick="addFavoriteTeam()">Add</button>
     </div>
     <div style="display:flex;justify-content:flex-end;margin-top:18px;"><button class="btn btn-ghost btn-sm" onclick="closeFavoriteTeams()">Done</button></div>
@@ -7492,6 +7579,7 @@ function openFavoriteTeams() {
   renderFavoriteTeamEditor();
   const overlay = document.getElementById('favorite-teams-overlay');
   overlay.style.display = 'flex';
+  loadTeamSuggestions('');
   setTimeout(() => document.getElementById('favorite-team-new')?.focus(), 0);
 }
 function closeFavoriteTeams() { document.getElementById('favorite-teams-overlay').style.display = 'none'; }
@@ -7515,6 +7603,19 @@ function removeFavoriteTeam(index) {
   const teams = getFavoriteTeams(); teams.splice(index, 1);
   localStorage.setItem('epg_favorite_teams', JSON.stringify(teams));
   renderFavoriteTeams(); renderFavoriteTeamEditor();
+}
+let _teamSuggestionTimer = null;
+async function loadTeamSuggestions(query) {
+  clearTimeout(_teamSuggestionTimer);
+  _teamSuggestionTimer = setTimeout(async () => {
+    try {
+      const data = await (await fetch('/epg-web/api/sports-teams?q=' + encodeURIComponent(query || ''))).json();
+      const choices = document.getElementById('favorite-team-suggestions');
+      if (!choices) return;
+      choices.innerHTML = (data.teams || []).map(team =>
+        `<option value="${esc(team.name).replace(/\"/g,'&quot;')}">${esc(team.sport || '')}</option>`).join('');
+    } catch (_) { /* The add field remains usable if the catalog is unavailable. */ }
+  }, query ? 160 : 0);
 }
 function searchFavoriteTeam(team) {
   const input = document.getElementById('ch-filter');
@@ -10218,6 +10319,17 @@ def _startup_load():
                         })
                 threading.Thread(target=_load_complete_guide,
                                  name='epg-complete-guide-load', daemon=True).start()
+
+                # Build the team picker independently of the visible guide.
+                # It scans only upcoming, sports-classified matchup listings.
+                def _refresh_team_catalog():
+                    try:
+                        count = refresh_sports_team_catalog(db_path)
+                        print(f'[startup] Sports team catalog refreshed: {count} teams')
+                    except Exception as exc:
+                        print(f'[startup] sports team catalog refresh failed: {exc}')
+                threading.Thread(target=_refresh_team_catalog,
+                                 name='epg-sports-team-catalog', daemon=True).start()
 
                 # The provider's bulk XML can lag while the live player API is
                 # current.  Refresh favourite-channel windows in the
