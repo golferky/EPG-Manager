@@ -6664,8 +6664,11 @@ tr:hover td{background:#141414;}
     <span id="guide-window" style="font-size:13px;color:#555;"></span>
     <button class="btn btn-ghost btn-sm" onclick="guideNav(4)">Later ▶</button>
     <button id="guide-now-btn" class="btn btn-ghost btn-sm" onclick="guideJumpNow()" style="color:#22c55e;" title="Jump to the current time in the guide">⬤ Now</button>
-    <label title="Jump directly to this date" style="display:flex;align-items:center;gap:5px;color:#94a3b8;font-size:12px;white-space:nowrap;">📅 <input id="guide-date" type="date" onchange="guideJumpDate(this.value)" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:4px 7px;font-size:12px;"></label>
+    <input id="guide-date" type="date" onchange="guideJumpDate(this.value)" aria-label="Choose guide date" style="position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;">
+    <button id="guide-date-btn" class="btn btn-ghost btn-sm" onclick="openGuideDatePicker()" title="Choose a day from the calendar">📅 Choose date</button>
     <button class="btn btn-ghost btn-sm" onclick="guideJumpSaturday()" title="Jump to the next Saturday">Sat</button>
+    <select id="favorite-team-select" onchange="chooseFavoriteTeam(this.value)" title="Search one of your favorite teams" style="display:none;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:5px 10px;font-size:13px;"></select>
+    <button id="favorite-team-manage" class="btn btn-ghost btn-sm" onclick="openFavoriteTeams()">🏆 My teams</button>
     <select id="guide-ch-mode" onchange="localStorage.setItem('epg_guide_mode',this.value);fetchAndRenderGuide()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#94a3b8;padding:5px 10px;font-size:13px;">
       <option value="all">All Channels</option>
       <option value="fav">★ Favorites</option>
@@ -6700,7 +6703,6 @@ tr:hover td{background:#141414;}
     <button id="ch-page-next" class="btn btn-ghost btn-sm" onclick="chPageNext()" style="display:none;">Next 200 ▶</button>
     <button class="btn btn-ghost btn-sm" onclick="fetchSD()" id="btn-sd" title="Pull 21 days from Schedules Direct">📡 Fetch SD</button>
   </div>
-  <div id="favorite-teams-bar" style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:0 4px 8px;"></div>
   <div class="guide-legend-bar" title="Program colors come from the guide's content classification">
     <span class="guide-legend-title">Guide colors</span>
     <span class="guide-legend-item"><i class="guide-legend-swatch"></i>General</span>
@@ -6743,6 +6745,21 @@ tr:hover td{background:#141414;}
 </div>
 
 <!-- Programme detail modal -->
+<div id="favorite-teams-overlay" onclick="if(event.target===this)closeFavoriteTeams()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1050;align-items:center;justify-content:center;">
+  <div style="background:#111827;border:1px solid #334155;border-radius:14px;width:min(480px,92vw);box-shadow:0 24px 80px rgba(0,0,0,.7);padding:24px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <h3 style="margin:0;color:#f1f5f9;font-size:19px;">🏆 My favorite teams</h3>
+      <button onclick="closeFavoriteTeams()" style="background:none;border:0;color:#94a3b8;font-size:24px;cursor:pointer;">✕</button>
+    </div>
+    <p style="margin:0 0 16px;color:#94a3b8;font-size:13px;">Add teams once, then choose one from the guide dropdown to find its upcoming games.</p>
+    <div id="favorite-team-list" style="display:flex;gap:7px;flex-wrap:wrap;min-height:34px;margin-bottom:14px;"></div>
+    <div style="display:flex;gap:8px;">
+      <input id="favorite-team-new" placeholder="e.g. Kentucky Wildcats" onkeydown="if(event.key==='Enter')addFavoriteTeam()" style="flex:1;background:#0f172a;border:1px solid #475569;border-radius:7px;color:#e2e8f0;padding:9px 10px;font-size:14px;">
+      <button class="btn btn-primary btn-sm" onclick="addFavoriteTeam()">Add</button>
+    </div>
+    <div style="display:flex;justify-content:flex-end;margin-top:18px;"><button class="btn btn-ghost btn-sm" onclick="closeFavoriteTeams()">Done</button></div>
+  </div>
+</div>
 <div id="prog-modal-overlay" onclick="if(event.target===this)closeProg()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center;">
   <div style="background:#111827;border:1px solid #1e2d3d;border-radius:14px;width:90%;max-width:620px;box-shadow:0 24px 80px rgba(0,0,0,.7);overflow:hidden;position:relative;">
     <!-- Close -->
@@ -7429,6 +7446,13 @@ function guideJumpDate(value) {
   _guideWindowStart = new Date(value + 'T00:00:00').toISOString();
   fetchAndRenderGuide();
 }
+function openGuideDatePicker() {
+  const picker = document.getElementById('guide-date');
+  if (!picker) return;
+  // Chrome's native calendar is much easier to use than treating the date as text.
+  if (typeof picker.showPicker === 'function') picker.showPicker();
+  else { picker.style.position = 'static'; picker.style.opacity = '1'; picker.style.pointerEvents = 'auto'; picker.focus(); picker.click(); }
+}
 function guideJumpSaturday() {
   const current = _guideWindowStart ? new Date(_guideWindowStart) : new Date();
   const daysUntilSaturday = (6 - current.getDay() + 7) % 7 || 7;
@@ -7444,19 +7468,48 @@ function getFavoriteTeams() {
   catch (_) { return []; }
 }
 function renderFavoriteTeams() {
-  const bar = document.getElementById('favorite-teams-bar');
-  if (!bar) return;
   const teams = getFavoriteTeams();
-  const chips = teams.map(team => `<button class="btn btn-ghost btn-sm" onclick="searchFavoriteTeam(${JSON.stringify(team).replace(/"/g,'&quot;')})" title="Find upcoming games for ${esc(team)}">🏆 ${esc(team)}</button>`).join('');
-  bar.innerHTML = `<span style="font-size:12px;color:#94a3b8;font-weight:600;">My teams:</span>${chips || '<span style="font-size:12px;color:#64748b;">Add teams to get one-click game searches.</span>'}<button class="btn btn-ghost btn-sm" onclick="editFavoriteTeams()">${teams.length ? 'Edit teams' : '+ Add teams'}</button>`;
+  const select = document.getElementById('favorite-team-select');
+  const manage = document.getElementById('favorite-team-manage');
+  if (select) {
+    select.innerHTML = `<option value="">🏆 My teams</option>${teams.map(t => `<option value="${esc(t).replace(/\"/g,'&quot;')}">${esc(t)}</option>`).join('')}<option value="__manage__">Manage teams…</option>`;
+    select.style.display = 'inline-block';
+  }
+  if (manage) manage.style.display = teams.length ? 'none' : 'inline-block';
 }
-function editFavoriteTeams() {
-  const current = getFavoriteTeams().join(', ');
-  const entered = window.prompt('Favorite teams — separate names with commas:', current);
-  if (entered === null) return;
-  const teams = [...new Set(entered.split(',').map(x => x.trim()).filter(Boolean))].slice(0, 20);
+function chooseFavoriteTeam(value) {
+  const select = document.getElementById('favorite-team-select');
+  if (select) select.value = '';
+  if (value === '__manage__') return openFavoriteTeams();
+  if (value) searchFavoriteTeam(value);
+}
+function openFavoriteTeams() {
+  renderFavoriteTeamEditor();
+  const overlay = document.getElementById('favorite-teams-overlay');
+  overlay.style.display = 'flex';
+  setTimeout(() => document.getElementById('favorite-team-new')?.focus(), 0);
+}
+function closeFavoriteTeams() { document.getElementById('favorite-teams-overlay').style.display = 'none'; }
+function renderFavoriteTeamEditor() {
+  const target = document.getElementById('favorite-team-list');
+  if (!target) return;
+  const teams = getFavoriteTeams();
+  target.innerHTML = teams.length ? teams.map((team, i) => `<span style="display:inline-flex;align-items:center;gap:6px;background:#1e3a5f;color:#dbeafe;border-radius:999px;padding:5px 8px 5px 10px;font-size:13px;">${esc(team)} <button onclick="removeFavoriteTeam(${i})" title="Remove ${esc(team)}" style="background:none;border:0;color:#93c5fd;cursor:pointer;font-size:16px;line-height:1;padding:0;">×</button></span>`).join('') : '<span style="color:#64748b;font-size:13px;">No teams added yet.</span>';
+}
+function addFavoriteTeam() {
+  const input = document.getElementById('favorite-team-new');
+  const value = input?.value.trim();
+  if (!value) return;
+  const teams = getFavoriteTeams();
+  if (!teams.some(t => t.toLowerCase() === value.toLowerCase())) teams.push(value);
+  localStorage.setItem('epg_favorite_teams', JSON.stringify(teams.slice(0, 20)));
+  input.value = '';
+  renderFavoriteTeams(); renderFavoriteTeamEditor(); input.focus();
+}
+function removeFavoriteTeam(index) {
+  const teams = getFavoriteTeams(); teams.splice(index, 1);
   localStorage.setItem('epg_favorite_teams', JSON.stringify(teams));
-  renderFavoriteTeams();
+  renderFavoriteTeams(); renderFavoriteTeamEditor();
 }
 function searchFavoriteTeam(team) {
   const input = document.getElementById('ch-filter');
@@ -7869,6 +7922,8 @@ function renderGuide() {
   if (datePicker) {
     const y = ws.getFullYear(), m = String(ws.getMonth() + 1).padStart(2, '0'), day = String(ws.getDate()).padStart(2, '0');
     datePicker.value = `${y}-${m}-${day}`;
+    const dateBtn = document.getElementById('guide-date-btn');
+    if (dateBtn) dateBtn.textContent = '📅 ' + ws.toLocaleDateString([], {month:'short', day:'numeric'});
   }
 
   // Channels already filtered server-side
