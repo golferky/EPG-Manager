@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261022c"
+VERSION = "v20261022d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -6252,9 +6252,10 @@ def api_record():
         return jsonify({'ok': False,
                         'error': f'{channel_name} is excluded because it is a non-English feed.'}), 400
 
-    # Movies are recorded only from commercial-free channels.  Do this on the
-    # server as well as in the airing picker: a guide refresh or an old open
-    # browser tab must not be able to queue a TNT/FXM-style movie by mistake.
+    # Movies are normally recorded only from commercial-free channels.  The
+    # one exception is an explicit, currently-live "Record remaining" action:
+    # the user may choose to keep what is left of a film they are watching,
+    # but the scheduler must not automatically queue a future commercial feed.
     is_series_request = bool(data.get('is_series', False) or season_num is not None
                              or episode_num is not None)
     if not is_series_request:
@@ -6277,7 +6278,10 @@ def api_record():
             # If the guide is temporarily unavailable, retain the conservative
             # movie rule rather than recording a commercial-supported feed.
             is_series_request = False
-    if not is_series_request and not _is_commercial_free_channel(channel_name):
+    live_manual_movie = (bool(data.get('allow_commercial_movie')) and
+                         start_ts <= time.time() < stop_ts)
+    if (not is_series_request and not _is_commercial_free_channel(channel_name)
+            and not live_manual_movie):
         return jsonify({'ok': False,
                         'error': f'{channel_name} carries commercials, so movies are not recorded there.'}), 400
 
@@ -8458,7 +8462,11 @@ async function openProg(p) {
     quickPlay.style.display = '';
     quickPlay.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
     quickPlay.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
-    document.getElementById('pm-rec-next-btn').style.display = 'none';
+    const quickRecord = document.getElementById('pm-rec-next-btn');
+    quickRecord.textContent = '● Record remaining';
+    quickRecord.disabled = false;
+    quickRecord.style.display = '';
+    quickRecord.onclick = () => recordAiring(_nextAiring, p.title, quickRecord, true);
     document.getElementById('pm-next-wrap').style.display = 'block';
   }
 
@@ -8557,7 +8565,11 @@ async function openProg(p) {
     pBtn.style.display = '';
     pBtn.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
     pBtn.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
-    document.getElementById('pm-rec-next-btn').style.display = 'none';
+    const immediateRecord = document.getElementById('pm-rec-next-btn');
+    immediateRecord.textContent = '● Record remaining';
+    immediateRecord.disabled = false;
+    immediateRecord.style.display = '';
+    immediateRecord.onclick = () => recordAiring(_nextAiring, p.title, immediateRecord, true);
     document.getElementById('pm-next-wrap').style.display = 'block';
   }
 
@@ -8702,11 +8714,21 @@ async function openProg(p) {
           pBtn.onclick     = alreadyPlaying ? () => stopStream(featPS.channel_id) : playStream;
         }
 
-        // Record button: only for future airings
+        // A live programme can be captured from this point forward.  Keep
+        // automatic future movie recordings conservative, but do not hide a
+        // deliberate "Record remaining" action for the programme the user
+        // is already watching.
         const rBtn = document.getElementById('pm-rec-next-btn');
         const key = featPS.channel_id + '|' + featPS.start_ts;
         if (featPS.on_now) {
-          rBtn.style.display = 'none';
+          if (recMap[key]) {
+            rBtn.textContent = '● Recording'; rBtn.disabled = true; rBtn.style.display = '';
+          } else if (featPS.can_play) {
+            rBtn.textContent = '● Record remaining'; rBtn.disabled = false; rBtn.style.display = '';
+            rBtn.onclick = () => recordAiring(featPS, p.title, rBtn, true);
+          } else {
+            rBtn.style.display = 'none';
+          }
         } else if (recMap[key]) {
           rBtn.textContent = '✅ Scheduled'; rBtn.disabled = true; rBtn.style.display = '';
         } else {
@@ -9156,7 +9178,7 @@ function closeProg() {
   btn.textContent = '▶ Play'; btn.disabled = false;
   btn.onclick = playStream;
 }
-async function recordAiring(airing, title, button) {
+async function recordAiring(airing, title, button, allowCommercialMovie=false) {
   const btn = button || event.target;
   btn.disabled = true; btn.textContent = '…';
   const r = await post('/epg-web/api/record', {
@@ -9168,6 +9190,7 @@ async function recordAiring(airing, title, button) {
     episode_title: airing.episode_title || '',
     season_num: airing.season_num,
     episode_num: airing.episode_num,
+    allow_commercial_movie: allowCommercialMovie,
   });
   if (r.ok) {
     btn.textContent = '✅ Scheduled';
@@ -9180,7 +9203,7 @@ async function recordAiring(airing, title, button) {
     startRecPoll();
     refreshGuideRecMap().then(() => renderGuide());
   } else {
-    btn.disabled = false; btn.textContent = '⏱ Record';
+    btn.disabled = false; btn.textContent = allowCommercialMovie ? '● Record remaining' : '⏱ Record';
     document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
     document.getElementById('pm-status').className = 'status-msg err';
   }
