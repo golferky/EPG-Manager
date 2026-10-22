@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261022b"
+VERSION = "v20261022c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -1138,18 +1138,33 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
             })
     filled_pt = 0; filled_ep = 0
     TOLERANCE = 900  # 15 minutes in seconds
+    # Each title's episode list was appended while iterating the guide in
+    # start-time order.  Keep a parallel timestamp list so matching an XMLTV
+    # row takes a tiny binary search, not a walk through every episode ever
+    # broadcast under that title.  The old nested scan could monopolize the
+    # server for minutes after startup and make Play/Record controls vanish.
+    title_ep_times = {
+        title: [ep['ts'] for ep in episodes]
+        for title, episodes in title_eps.items()
+    }
     for p in programmes:
         if not p['prog_type'] and p['title'] in title_pt:
             p['prog_type'] = title_pt[p['title']]
             filled_pt += 1
         if p.get('season_num') is None and not p.get('episode_title'):
-            for ep in title_eps.get(p['title'], []):
-                if abs(ep['ts'] - p['start_ts']) <= TOLERANCE:
-                    p['season_num']    = ep['sn']
-                    p['episode_num']   = ep['en']
-                    p['episode_title'] = ep['et']
-                    filled_ep += 1
-                    break
+            episodes = title_eps.get(p['title'], [])
+            if episodes:
+                times = title_ep_times[p['title']]
+                pos = bisect_left(times, p['start_ts'])
+                candidates = [i for i in (pos - 1, pos) if 0 <= i < len(episodes)]
+                if candidates:
+                    best_i = min(candidates, key=lambda i: abs(times[i] - p['start_ts']))
+                    ep = episodes[best_i]
+                    if abs(ep['ts'] - p['start_ts']) <= TOLERANCE:
+                        p['season_num']    = ep['sn']
+                        p['episode_num']   = ep['en']
+                        p['episode_title'] = ep['et']
+                        filled_ep += 1
     print(f'[startup] Propagated prog_type={filled_pt}, episode info={filled_ep} XMLTV programmes')
 
     _epg['channels']    = channels
@@ -4641,13 +4656,15 @@ def api_plex_titles():
     plex_dir = cfg.get('plex_path', '/Volumes/Plex-1/Movies')
     if not os.path.isdir(plex_dir):
         return jsonify({'titles': []})
-    titles = []
+    titles, movies = [], []
     for name in os.listdir(plex_dir):
         if os.path.isdir(os.path.join(plex_dir, name)):
-            clean = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
+            match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', name)
+            clean = (match.group(1) if match else name).strip()
             if clean:
                 titles.append(clean)
-    return jsonify({'titles': titles})
+                movies.append({'title': clean, 'year': match.group(2) if match else ''})
+    return jsonify({'titles': titles, 'movies': movies})
 
 def _plex_tv_path(cfg):
     return cfg.get('plex_tv_path') or os.path.join(
@@ -5286,9 +5303,15 @@ def api_prog_info():
             def _omdb_result(od):
                 poster = od.get('Poster','')
                 if poster == 'N/A': poster = ''
+                # A Plex title match alone is not enough for remakes.  Do not
+                # label the 1981 *Arthur* as available merely because the
+                # library contains the 2011 film of the same name.
+                matching_library_copy = (in_library and lib_row and
+                                         (not lib_row.get('year') or not od.get('Year')
+                                          or str(lib_row.get('year')) == str(od.get('Year'))))
                 return {
                     'source':      'omdb',
-                    'in_library':  in_library,
+                    'in_library':  matching_library_copy,
                     'title':       od.get('Title',''),
                     'year':        od.get('Year',''),
                     'genre':       od.get('Genre',''),
@@ -5296,7 +5319,7 @@ def api_prog_info():
                     'plot':        od.get('Plot',''),
                     'actors':      od.get('Actors',''),
                     'director':    od.get('Director',''),
-                    'poster':      poster or local_poster,
+                    'poster':      poster or (local_poster if matching_library_copy else ''),
                     'imdb_rating': od.get('imdbRating',''),
                     'imdb_votes':  od.get('imdbVotes',''),
                     'imdb_id':     od.get('imdbID',''),
