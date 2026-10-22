@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261022d"
+VERSION = "v20261022e"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -5527,6 +5527,11 @@ def api_airings():
     """Return all future airings of a title from guide.db."""
     from zoneinfo import ZoneInfo
     title   = request.args.get('title','').strip()
+    selected_channel_id = request.args.get('channel_id', '').strip()
+    try:
+        selected_start_ts = float(request.args.get('start_ts', 0) or 0)
+    except (TypeError, ValueError):
+        selected_start_ts = 0
     if not title:
         return jsonify({'airings': []})
     cfg     = load_config()
@@ -5550,16 +5555,29 @@ def api_airings():
         conn = sqlite3.connect(db_path, timeout=3)
         conn.execute('PRAGMA busy_timeout=3000')
         conn.row_factory = sqlite3.Row
-        # Search both full title and cleaned title
+        # Prefer the title exactly as it appeared in the guide.  Falling back
+        # to a version without a year is useful for ordinary listings, but it
+        # must not merge *Arthur (1981)* with the unrelated children's series
+        # named *Arthur*.
         rows = conn.execute('''
             SELECT channel_id, channel_name, start_utc, end_utc, prog_type,
                    category, episode_title, season_num, episode_num
             FROM guide
-            WHERE (lower(title) = lower(?) OR lower(title) = lower(?))
+            WHERE lower(title) = lower(?)
             AND end_utc > ?
             ORDER BY start_utc
             LIMIT 30
-        ''', (title, clean_title, now_utc)).fetchall()
+        ''', (title, now_utc)).fetchall()
+        if not rows and clean_title.lower() != title.lower():
+            rows = conn.execute('''
+                SELECT channel_id, channel_name, start_utc, end_utc, prog_type,
+                       category, episode_title, season_num, episode_num
+                FROM guide
+                WHERE lower(title) = lower(?)
+                AND end_utc > ?
+                ORDER BY start_utc
+                LIMIT 30
+            ''', (clean_title, now_utc)).fetchall()
         # A PrimeStreams/XMLTV listing can omit episode data while its matching
         # Schedules Direct row has it.  Carry that detail across by title and
         # nearby start time so the visible, recordable airing is correctly
@@ -5595,6 +5613,25 @@ def api_airings():
                     item['prog_type'] = item['prog_type'] or detail['prog_type'] or ''
             enriched_rows.append(item)
         rows = enriched_rows
+        # A generic title can still represent both a film and a TV series.
+        # The clicked guide row is authoritative: do not let another channel's
+        # same-named show change its artwork, episode controls, or airings.
+        def _is_series_row(item):
+            return (item['prog_type'] in ('EP', 'SH') or
+                    item['season_num'] is not None or bool(item['episode_title']))
+        if selected_channel_id and selected_start_ts:
+            selected = min(
+                (item for item in rows if item['channel_id'] == selected_channel_id),
+                key=lambda item: abs(datetime.strptime(
+                    item['start_utc'], '%Y%m%d%H%M%S'
+                ).replace(tzinfo=timezone.utc).timestamp() - selected_start_ts),
+                default=None,
+            )
+            if selected and abs(datetime.strptime(
+                    selected['start_utc'], '%Y%m%d%H%M%S'
+                ).replace(tzinfo=timezone.utc).timestamp() - selected_start_ts) <= 300:
+                wanted_series = _is_series_row(selected)
+                rows = [item for item in rows if _is_series_row(item) == wanted_series]
         conn.close()
     except Exception:
         return jsonify({'airings': []})
@@ -8638,7 +8675,10 @@ async function openProg(p) {
     // Future-airing discovery can involve a guide database that is actively
     // refreshing.  It is secondary to opening/playing this programme, so
     // time out rather than leaving the detail panel in an indeterminate state.
-    const ar = await fetchJsonWithin(`/epg-web/api/airings?title=${encodeURIComponent(p.title)}`, 5000);
+    const airingParams = new URLSearchParams({title: p.title});
+    if (p.channel_id) airingParams.set('channel_id', p.channel_id);
+    if (p.start_ts)   airingParams.set('start_ts', p.start_ts);
+    const ar = await fetchJsonWithin(`/epg-web/api/airings?${airingParams}`, 5000);
     if (!ar) throw new Error('Airings lookup timed out');
     if (ar.airings && ar.airings.length > 0) {
       const isSeries = !!ar.is_series;
