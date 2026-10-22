@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261022a"
+VERSION = "v20261022b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -5338,10 +5338,17 @@ def api_prog_info():
                 else:
                     # Fetch only exact-title candidates.  Runtime comes first
                     # when the guide supplied a duration; descriptions break
-                    desc_words = set(_re.findall(r'[A-Z][a-z]+', desc)) if desc else set()
+                    # Compare the supplier synopsis as well as the duration.
+                    # This disambiguates same-name remakes such as the two
+                    # films called *Arthur*, whose runtimes are very close.
+                    ignored_words = {'about', 'after', 'against', 'being', 'from', 'have',
+                                     'into', 'only', 'that', 'their', 'there', 'these',
+                                     'they', 'this', 'when', 'with', 'will', 'would'}
+                    desc_words = ({word for word in _re.findall(r'[a-z]{4,}', desc.lower())
+                                   if word not in ignored_words} if desc else set())
                     best_od, best_score = None, (-float('inf'), -1)
                     exact_hits = [hit for hit in hits
-                                  if _metadata_title_matches(title, hit.get('Title'))][:5]
+                                  if _metadata_title_matches(title, hit.get('Title'))]
                     for hit in exact_hits:
                         iid = hit.get('imdbID','')
                         if not iid: continue
@@ -5351,17 +5358,20 @@ def api_prog_info():
                                 not _metadata_title_matches(title, od2.get('Title'))):
                             continue
                         # Score: exact title match wins, then actor name words from desc
-                        actor_words = set(_re.findall(r'[A-Z][a-z]+', od2.get('Actors','')))
+                        actor_words = set(_re.findall(r'[a-z]{4,}', od2.get('Actors','').lower()))
                         actor_score = len(desc_words & actor_words)
+                        plot_words = {word for word in _re.findall(r'[a-z]{4,}', od2.get('Plot','').lower())
+                                      if word not in ignored_words}
+                        plot_score = len(desc_words & plot_words)
                         runtime = _metadata_runtime_minutes(od2.get('Runtime'))
                         if expected_minutes:
                             # Prefer the closest plausible running time.  A
                             # missing runtime stays eligible but never wins
                             # over a known close match.
                             runtime_score = -abs(runtime - expected_minutes) if runtime else -10000
-                            score = (runtime_score, actor_score)
+                            score = (plot_score, runtime_score, actor_score)
                         else:
-                            score = (0, actor_score)
+                            score = (plot_score, 0, actor_score)
                         if score > best_score:
                             best_score, best_od = score, od2
                     if (best_od and _metadata_runtime_is_plausible(
