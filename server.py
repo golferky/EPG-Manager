@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261021i"
+VERSION = "v20261022a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -5208,6 +5208,11 @@ def api_prog_info():
             content_type = 'movie'
         elif 'series' in category or 'tv' in category:
             content_type = 'series'
+        # Some provider movie channels omit the category entirely.  A long
+        # one-off airing is a much safer movie signal than accepting a
+        # same-title children's/TV series result (for example *Arthur*).
+        elif expected_minutes >= 70:
+            content_type = 'movie'
     if not title:
         return jsonify({'error': 'No title'}), 400
 
@@ -5268,7 +5273,7 @@ def api_prog_info():
     # "Gravity" into "Gravity Falls" (or other longer, unrelated titles).
     # External providers below can still supply metadata when there is no
     # exact local-library title.
-    if rows:
+    if rows and (not year or str(rows[0].get('year') or '') == year):
         lib_row = rows[0]
 
     in_library  = lib_row is not None
