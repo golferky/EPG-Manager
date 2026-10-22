@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261022e"
+VERSION = "v20261022f"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -8439,6 +8439,7 @@ function hideTip() { document.getElementById('tooltip').style.display='none'; }
 
 // ── Programme modal + recording ───────────────────────────────────────────────
 let _currentProg = null;
+let _modalGeneration = 0;
 async function fetchJsonWithin(url, milliseconds=6000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), milliseconds);
@@ -8449,6 +8450,7 @@ async function fetchJsonWithin(url, milliseconds=6000) {
 }
 async function openProg(p) {
   hideTip();
+  _modalGeneration += 1;
   _currentProg = p;
   _nextAiring = null;
   // Show overlay in loading state
@@ -8457,6 +8459,7 @@ async function openProg(p) {
   document.getElementById('pm-loading').style.display = 'block';
   document.getElementById('pm-content').style.display = 'none';
   document.getElementById('pm-status').textContent = '';
+  document.getElementById('pm-status').className = 'status-msg';
   document.getElementById('pm-wanted-wrap').style.display = 'none';
 
   // Opening a guide tile must be immediate.  Render what the guide already
@@ -9219,6 +9222,7 @@ function closeProg() {
   btn.onclick = playStream;
 }
 async function recordAiring(airing, title, button, allowCommercialMovie=false) {
+  const modalGeneration = _modalGeneration;
   const btn = button || event.target;
   btn.disabled = true; btn.textContent = '…';
   const r = await post('/epg-web/api/record', {
@@ -9238,14 +9242,18 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
     const sourceText = r.source === 'eaglecast' ? 'on Eaglecast'
       : r.fallback_reason ? `on PrimeStreams — ${r.fallback_reason}`
       : 'on PrimeStreams';
-    document.getElementById('pm-status').textContent = `✅ "${title}" queued ${sourceText}`;
-    document.getElementById('pm-status').className = 'status-msg ok';
+    if (modalGeneration === _modalGeneration) {
+      document.getElementById('pm-status').textContent = `✅ "${title}" queued ${sourceText}`;
+      document.getElementById('pm-status').className = 'status-msg ok';
+    }
     startRecPoll();
     refreshGuideRecMap().then(() => renderGuide());
   } else {
     btn.disabled = false; btn.textContent = allowCommercialMovie ? '● Record remaining' : '⏱ Record';
-    document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
-    document.getElementById('pm-status').className = 'status-msg err';
+    if (modalGeneration === _modalGeneration) {
+      document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
+      document.getElementById('pm-status').className = 'status-msg err';
+    }
   }
 }
 
