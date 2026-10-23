@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261023a"
+VERSION = "v20261023b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -8772,7 +8772,13 @@ async function openProg(p) {
       // Do not preserve a clicked guide-only row simply because it was
       // clicked: it may not have a verified stream.  A Play button must never
       // promise a channel that the server will later reject.
-      const featPS = (selectedAiring && (selectedAiring.can_play || selectedAiring.can_record))
+      // A future airing needs recording permission, not merely a live stream.
+      // Otherwise a commercial movie feed such as Flix gets a Record button
+      // even though the server must reject it.  Keep a clicked stream only
+      // when it is recordable, or when it is on now and can be played.
+      const selectedUsable = selectedAiring && (selectedAiring.can_record ||
+        (selectedAiring.on_now && selectedAiring.can_play));
+      const featPS = selectedUsable
         ? selectedAiring : livePS || futurePS;
       if (featPS) {
         _nextAiring = featPS;
@@ -8811,8 +8817,10 @@ async function openProg(p) {
           }
         } else if (recMap[key]) {
           rBtn.textContent = '✅ Scheduled'; rBtn.disabled = true; rBtn.style.display = '';
-        } else {
+        } else if (featPS.can_record) {
           rBtn.textContent = '⏱ Record'; rBtn.disabled = false; rBtn.style.display = '';
+        } else {
+          rBtn.style.display = 'none';
         }
         document.getElementById('pm-next-wrap').style.display = 'block';
       }
