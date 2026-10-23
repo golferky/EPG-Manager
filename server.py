@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261022f"
+VERSION = "v20261023a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -456,9 +456,25 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
         import re as _re
         # All Movies.db guide_channels with a stream
         mconn = sqlite3.connect(movies_db_path)
-        mrows = mconn.execute(
-            'SELECT guide_channel, stream_id FROM channels WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL AND guide_channel != ""'
-        ).fetchall()
+        try:
+            bad_guide_channels = {row[0] for row in mconn.execute(
+                'SELECT guide_channel FROM channels WHERE is_bad=1 AND guide_channel IS NOT NULL'
+            ).fetchall()}
+        except sqlite3.OperationalError:
+            bad_guide_channels = set()
+        try:
+            mrows = mconn.execute(
+                '''SELECT guide_channel, stream_id FROM channels
+                   WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL
+                     AND guide_channel != "" AND (is_bad=0 OR is_bad IS NULL)'''
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Older installations predate the local ``is_bad`` safety flag.
+            mrows = mconn.execute(
+                '''SELECT guide_channel, stream_id FROM channels
+                   WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL
+                     AND guide_channel != ""'''
+            ).fetchall()
         mconn.close()
 
         gconn = sqlite3.connect(guide_db_path)
@@ -479,7 +495,8 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
             ).fetchall()}
             discovered_ids = {r[0] for r in gconn.execute(
                 'SELECT channel_id, stream_id FROM discovered_streams'
-            ).fetchall() if not authority.get(r[1]) or _authority_id_matches(r[0], *authority[r[1]])}
+            ).fetchall() if r[0] not in bad_guide_channels and
+                            (not authority.get(r[1]) or _authority_id_matches(r[0], *authority[r[1]]))}
         except sqlite3.OperationalError:
             authority = {}
             discovered_ids = set()
@@ -1780,6 +1797,23 @@ def _load_pending_recs():
     except Exception as e:
         print(f'[recdb] load error: {e}')
 
+def _is_bad_primestream_channel(channel_id):
+    """Whether the owner has disabled this PrimeStreams guide channel.
+
+    ``is_bad`` is set after a real-world check finds that a provider feed does
+    not carry the advertised linear channel.  Provider auto-discovery may
+    later rediscover the same feed, but must never silently overrule that
+    explicit safety decision.
+    """
+    try:
+        rows = db_rows(
+            'SELECT 1 FROM channels WHERE guide_channel=? AND is_bad=1 LIMIT 1',
+            (channel_id,)
+        )
+        return bool(rows)
+    except Exception:
+        return False
+
 def _stream_url(channel_id, preferred_provider=None):
     """Look up stream_id from Movies.db and build the stream URL.
     Returns (url, error, debug_info) where debug_info is a dict."""
@@ -1808,6 +1842,9 @@ def _stream_url(channel_id, preferred_provider=None):
                           'stream_extension': str(extension or 'ts')})
             url = _eaglecast_stream_url(sid, extension)
             return url, None if url else 'Eaglecast settings are incomplete', debug
+    if _is_bad_primestream_channel(channel_id):
+        return None, ('This PrimeStreams channel is disabled because it was '
+                      'verified as the wrong feed.'), debug
     # A provider-discovered mapping is tied to this exact XMLTV channel ID and
     # avoids relying on the older NAS-side channel table.
     try:
