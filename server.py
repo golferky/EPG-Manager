@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261023b"
+VERSION = "v20261023c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -1132,6 +1132,12 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
         })
         if progress and len(programmes) % 25000 == 0:
             progress('Reading guide listings', len(programmes), total)
+        # The complete guide can contain several million rows.  Briefly yield
+        # while it is being assembled so interactive requests (especially the
+        # airings lookup behind a programme modal) are not starved after a
+        # restart.
+        if len(programmes) % 5000 == 0:
+            time.sleep(0.002)
 
     conn.close()
 
@@ -4013,8 +4019,7 @@ def _best_incomplete_rerecord(title, expected_seconds):
         if (stop - start) < expected_seconds * 0.90:
             continue
         if (_is_foreign_recording_feed(channel)
-                or _is_automatic_recording_quarantined_channel(channel)
-                or not _is_commercial_free_channel(channel)):
+                or _is_automatic_recording_quarantined_channel(channel)):
             continue
         _url, stream_error, stream_debug = _resolve_recording_source(channel_id, start, stop)
         if stream_error or _recent_same_source_failure(title, channel_id):
@@ -4036,7 +4041,7 @@ def _best_incomplete_rerecord(title, expected_seconds):
                       -start),
         })
     if not candidates:
-        return None, {'error': 'No clean, recordable future airing was found yet'}
+        return None, {'error': 'No verified, recordable future airing was found yet'}
     return max(candidates, key=lambda item: item['score']), {}
 
 
@@ -4332,7 +4337,7 @@ def _auto_schedule_movie_upgrades():
         candidates_by_title = {}
         for row in rows:
             title_key = _norm_plex_show(row['title'])
-            if (title_key in plex_movies and _is_commercial_free_channel(row['channel_name'])
+            if (title_key in plex_movies
                     and not _is_foreign_recording_feed(row['channel_name'])
                     and not _is_automatic_recording_quarantined_channel(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
@@ -4434,8 +4439,9 @@ def api_recommendations():
     wanted = db_rows('SELECT * FROM wanted_titles ORDER BY status, title')
     now_ts = datetime.now(timezone.utc).timestamp()
 
-    # Build all future airings by title. Movies only surface a known
-    # commercial-free channel; series keep every option for the user to choose.
+    # Build all future airings by title.  A commercial-supported channel is
+    # still a valid source; only source-resolution decides whether it can be
+    # recorded.
     future_airings = {}
     if _epg['programmes']:
         for p in _epg['programmes']:
@@ -4455,8 +4461,7 @@ def api_recommendations():
         candidates = (future_airings.get(w['title'].lower()) or
                       future_airings.get(w['normalized_title'].lower() if w['normalized_title'] else '') or [])
         is_series_wanted = w['type'] == 'series'
-        airing = next((p for p in candidates if is_series_wanted or
-                       _is_commercial_free_channel(p.get('channel', ''))), None)
+        airing = next(iter(candidates), None)
         title_key = _norm_plex_show(w['title'])
         wanted_year = str(w['year'] or '').strip()
         in_movies = (title_key in plex_titles['movies'] if not wanted_year else
@@ -4468,7 +4473,7 @@ def api_recommendations():
             'title':      w['title'],
             'year':       w['year'],
             'type':       w['type'],
-            'commercial_free_only': not is_series_wanted,
+            'commercial_free_only': False,
             'status':     w['status'],
             'notes':      w['notes'],
             'source':     w['source'],
@@ -4512,17 +4517,16 @@ def api_recommendation_movie_upgrade():
                 title, clean_title, datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
             )).fetchall()
         conn.close()
-        candidate = next((row for row in rows if _is_commercial_free_channel(
-            row['channel_name'])), None)
+        candidate = next(iter(rows), None)
         if not candidate:
-            return jsonify({'better': False, 'decision': 'No future commercial-free airing found'})
+            return jsonify({'better': False, 'decision': 'No future airing found'})
         start = datetime.strptime(candidate['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
         stop = datetime.strptime(candidate['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
         url, stream_error, _debug = _resolve_recording_source(
             candidate['channel_id'], start.timestamp(), stop.timestamp()
         )
         if stream_error:
-            return jsonify({'better': False, 'decision': 'The next clean airing is not recordable'})
+            return jsonify({'better': False, 'decision': 'The next airing is not recordable'})
         incoming = probe_media(url, ffprobe=cfg.get('ffprobe', 'ffprobe'), timeout=45)
         better, decision = quality_decision(existing, incoming)
         return jsonify({
@@ -5740,15 +5744,9 @@ def api_airings():
         if current is None or score > current_score:
             deduped[key] = airing
     airings = sorted(deduped.values(), key=lambda item: item['start_ts'])
-    # Movies on commercial feeds are intentionally not offered for scheduled
-    # recording, but a currently live, usable stream must still be playable.
-    if not is_series:
-        for airing in airings:
-            if not airing['commercial_free']:
-                airing['can_record'] = False
     return jsonify({
         'airings': airings, 'prog_type': prog_type, 'is_series': is_series,
-        'commercial_free_only': not is_series,
+        'commercial_free_only': False,
     })
 
 # ── VLC Play ──────────────────────────────────────────────────────────────────
@@ -6326,10 +6324,9 @@ def api_record():
         return jsonify({'ok': False,
                         'error': f'{channel_name} is excluded because it is a non-English feed.'}), 400
 
-    # Movies are normally recorded only from commercial-free channels.  The
-    # one exception is an explicit, currently-live "Record remaining" action:
-    # the user may choose to keep what is left of a film they are watching,
-    # but the scheduler must not automatically queue a future commercial feed.
+    # Determine whether this will be filed as a movie or series.  Commercial
+    # status is metadata, not a reason to deny a recording from a mapped,
+    # verified channel: Flix and The Movie Channel remain legitimate sources.
     is_series_request = bool(data.get('is_series', False) or season_num is not None
                              or episode_num is not None)
     if not is_series_request:
@@ -6349,15 +6346,7 @@ def api_record():
                 guide_row[0] in ('EP', 'SH') or guide_row[1] is not None or guide_row[2] is not None
             ))
         except Exception:
-            # If the guide is temporarily unavailable, retain the conservative
-            # movie rule rather than recording a commercial-supported feed.
             is_series_request = False
-    live_manual_movie = (bool(data.get('allow_commercial_movie')) and
-                         start_ts <= time.time() < stop_ts)
-    if (not is_series_request and not _is_commercial_free_channel(channel_name)
-            and not live_manual_movie):
-        return jsonify({'ok': False,
-                        'error': f'{channel_name} carries commercials, so movies are not recorded there.'}), 400
 
     # Dedup: reject if same channel+start_ts already queued/scheduled/recording
     with _rec_lock:
@@ -8544,6 +8533,27 @@ async function openProg(p) {
     quickRecord.disabled = false;
     quickRecord.style.display = '';
     quickRecord.onclick = () => recordAiring(_nextAiring, p.title, quickRecord, true);
+    document.getElementById('pm-next-wrap').style.display = 'block';
+  } else if (p.can_record && p.channel_id) {
+    // A verified future grid row is already enough to schedule.  Keep this
+    // control available even if the optional all-airings lookup is busy while
+    // the full guide continues loading in the background.
+    _nextAiring = {
+      channel_id: p.channel_id,
+      channel_name: p.channel || p.channel_name || p.channel_id,
+      start_ts: p.start_ts, stop_ts: p.stop_ts, stop_fmt: p.stop_fmt || '',
+      on_now: false, _title: p.title
+    };
+    document.getElementById('pm-next-heading').textContent = p.stream_provider === 'eaglecast'
+      ? '🦅 Next on Eaglecast' : '📡 Next on PrimeStreams';
+    document.getElementById('pm-next-info').textContent =
+      `${p.start_fmt || ''} – ${p.stop_fmt || ''}  ·  ${_nextAiring.channel_name}`;
+    document.getElementById('pm-play-btn').style.display = 'none';
+    const quickRecord = document.getElementById('pm-rec-next-btn');
+    quickRecord.textContent = '⏱ Record';
+    quickRecord.disabled = false;
+    quickRecord.style.display = '';
+    quickRecord.onclick = () => recordAiring(_nextAiring, p.title, quickRecord);
     document.getElementById('pm-next-wrap').style.display = 'block';
   }
 
