@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261024b"
+VERSION = "v20261024c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -2962,8 +2962,11 @@ def api_search():
                 # A team in an episode title is a real matchup; a team only in
                 # the long description can be incidental pre-game context.
                 matchup = query_folded in (str(r['title'] or '') + ' ' + episode_text).casefold()
+                sports_event = 'sport' in str(r['category'] or '').casefold()
+                matchup_title = episode_text if _TEAM_MATCHUP_RE.match(episode_text) else ''
                 programs.append({
                     'title':          r['title'],
+                    'display_title':  matchup_title or r['title'],
                     'channel_id':     r['channel_id'],
                     'channel':        r['channel_name'],
                     'channel_name':   r['channel_name'],
@@ -2972,13 +2975,17 @@ def api_search():
                     'start_ts':     su.timestamp(),
                     'stop_ts':      eu.timestamp(),
                     'category':     r['category'] or '',
+                    'desc':         r['desc'] or '',
                     'on_now':       on_now,
                     'episode_title': r['episode_title'] or '',
                     'match_detail': (r['episode_title'] or r['desc'] or '')[:140],
                     'matchup':       matchup,
+                    'sports_event':  sports_event,
                     'season_num':   r['season_num'],
                     'episode_num':  r['episode_num'],
                     'has_stream':   r['channel_id'] in playable_ids,
+                    'can_play':     r['channel_id'] in playable_ids,
+                    'can_record':   r['channel_id'] in playable_ids,
                 })
             except Exception:
                 continue
@@ -5298,6 +5305,16 @@ def api_prog_info():
                   'talk', 'talk show', 'game show', 'reality', 'live', 'music',
                   'weather', 'shopping', 'infomercial', 'documentary news'}
     _skip_enrichment = any(s in category for s in _SKIP_CATS)
+    # Sports listings commonly reuse generic titles such as "NFL Football".
+    # Local Plex/metadata rows for that generic title can describe an entirely
+    # different game, so never substitute them for the guide's matchup.
+    if _skip_enrichment:
+        return jsonify({
+            'source': 'guide', 'in_library': False, 'title': title,
+            'year': '', 'genre': '', 'rated': '', 'plot': desc,
+            'actors': '', 'director': '', 'poster': '', 'imdb_rating': '',
+            'imdb_votes': '', 'imdb_id': '', 'media_type': '',
+        })
 
     # Strip trailing (YYYY) from titles like "Batman Returns (1992)"
     import re as _re
@@ -7844,7 +7861,7 @@ function onSearchInput(val) {
       html += d.programs.map((p, index) =>
         `<div class="sr" onclick="openProg(window._searchProgramRows[${index}])" style="padding:8px 14px;cursor:pointer;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:10px;">
           <span style="font-size:12px;min-width:70px;color:${p.on_now?'#22c55e':'#94a3b8'};font-weight:${p.on_now?'600':'400'};">${esc(p.start_fmt)}</span>
-          <span style="flex:1;min-width:0;font-size:13px;color:#e2e8f0;"><span>${p.matchup ? '<b style="color:#fbbf24;font-size:10px;margin-right:5px;">MATCHUP</b>' : ''}${esc(p.title)}</span>${p.match_detail ? `<small style="display:block;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(p.match_detail)}</small>` : ''}</span>
+          <span style="flex:1;min-width:0;font-size:13px;color:#e2e8f0;"><span>${p.matchup ? '<b style="color:#fbbf24;font-size:10px;margin-right:5px;">MATCHUP</b>' : ''}${esc(p.display_title || p.title)}</span>${p.match_detail && p.match_detail !== p.display_title ? `<small style="display:block;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">${esc(p.match_detail)}</small>` : ''}</span>
           <span style="font-size:11px;color:#64748b;text-align:right;">${p.has_stream ? '📡 ' : ''}${esc(p.channel_name)}</span>
         </div>`
       ).join('');
@@ -8512,7 +8529,9 @@ async function openProg(p) {
   // optional extras.  This also leaves a working Play control available while
   // the guide database is being refreshed.
   const now = Date.now() / 1000;
-  document.getElementById('pm-title').textContent = p.title || '';
+  const sportsEvent = !!p.sports_event;
+  const displayTitle = p.display_title || p.title || '';
+  document.getElementById('pm-title').textContent = displayTitle;
   document.getElementById('pm-air').textContent =
     (p.channel || p.channel_name || p.channel_id || '') + '  ·  ' +
     (p.start_fmt || '') + ' – ' + (p.stop_fmt || '');
@@ -8588,7 +8607,7 @@ async function openProg(p) {
     if (p.stop_ts && p.start_ts) params.set('duration', Math.max(0, p.stop_ts - p.start_ts));
     if (p.start_ts) params.set('start_ts', p.start_ts);
     if (p.channel_id) params.set('channel_id', p.channel_id);
-    infoPromise = fetchJsonWithin(`/epg-web/api/prog-info?${params}`);
+    if (!sportsEvent) infoPromise = fetchJsonWithin(`/epg-web/api/prog-info?${params}`);
   } catch(e) {}
   // The panel itself is useful even if an optional background lookup is
   // briefly blocked by a guide refresh.  Never leave the user at “Loading…”.
@@ -8607,7 +8626,7 @@ async function openProg(p) {
   let info = infoData || {};
 
   // Populate modal
-  document.getElementById('pm-title').textContent = info.title || p.title;
+  document.getElementById('pm-title').textContent = sportsEvent ? displayTitle : (info.title || p.title);
   document.getElementById('pm-air').textContent   = (p.channel || p.channel_id) + '  ·  ' + p.start_fmt + ' – ' + p.stop_fmt;
   const epEl = document.getElementById('pm-ep');
   const epParts = [];
@@ -8740,6 +8759,20 @@ async function openProg(p) {
     wantedBtn.disabled = false;
     document.getElementById('pm-wanted-wrap').style.display = 'block';
   };
+  // Do not turn a generic listing such as "NFL Football" into a different
+  // game by searching every future NFL Football programme.  The clicked guide
+  // row is the only trustworthy matchup; its direct Play/Record control above
+  // remains available when that particular channel has a verified stream.
+  if (sportsEvent) {
+    document.getElementById('pm-airings-wrap').style.display = 'none';
+    document.getElementById('pm-wanted-wrap').style.display = 'none';
+    if (!p.can_play && !p.can_record) {
+      const status = document.getElementById('pm-status');
+      status.textContent = 'This guide listing has no verified playback source yet.';
+      status.className = 'status-msg';
+    }
+    return;
+  }
   try {
     // Future-airing discovery can involve a guide database that is actively
     // refreshing.  It is secondary to opening/playing this programme, so
