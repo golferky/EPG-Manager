@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261023c"
+VERSION = "v20261024a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -464,14 +464,14 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
             bad_guide_channels = set()
         try:
             mrows = mconn.execute(
-                '''SELECT guide_channel, stream_id FROM channels
+                '''SELECT guide_channel, stream_id, sd_station_id FROM channels
                    WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL
                      AND guide_channel != "" AND (is_bad=0 OR is_bad IS NULL)'''
             ).fetchall()
         except sqlite3.OperationalError:
             # Older installations predate the local ``is_bad`` safety flag.
             mrows = mconn.execute(
-                '''SELECT guide_channel, stream_id FROM channels
+                '''SELECT guide_channel, stream_id, NULL AS sd_station_id FROM channels
                    WHERE stream_id IS NOT NULL AND guide_channel IS NOT NULL
                      AND guide_channel != ""'''
             ).fetchall()
@@ -502,10 +502,11 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
             discovered_ids = set()
         gconn.close()
 
-        ps_guide_channels = {
-            row[0] for row in mrows
+        ps_rows = [
+            row for row in mrows
             if not authority.get(str(row[1])) or _authority_id_matches(row[0], *authority[str(row[1])])
-        }
+        ]
+        ps_guide_channels = {row[0] for row in ps_rows}
 
         result = set(discovered_ids)
         # Build lookup dicts
@@ -522,8 +523,16 @@ def get_ps_channel_ids(guide_db_path, movies_db_path):
             """When multiple guide channels match one PS stream, pick the closest by name length."""
             return min(cids, key=lambda cid: abs(len(id_to_norm.get(cid, '')) - len(target_norm)))
 
-        # Fallback: normalise Movies.db guide_channel and look up in name_map
-        for gc in ps_guide_channels:
+        # Fallback: normalise Movies.db guide_channel and look up in name_map.
+        # A saved SD station identity is stronger than the display name.  Some
+        # source lineups have unrelated stations all called "HBO Hits"; merging
+        # those schedules by label draws overlapping programmes on one row.
+        for row in ps_rows:
+            gc = row[0]
+            station_id = re.sub(r'^sd\.', '', str(row[2] or ''), flags=re.I)
+            if station_id and station_id in id_to_norm:
+                result.add(station_id)
+                continue
             base = _channel_match_base(gc)
             # Exact match on base — pick single best to avoid East/West duplicates
             if base in name_map:
@@ -2561,7 +2570,7 @@ def api_guide():
             if movie_only: where_parts.append('is_movie_channel = 1')
             where = (' AND '.join(where_parts) + ' AND ' if where_parts else '') + \
                     'guide_channel IS NOT NULL AND guide_channel != ""'
-            rows = db_rows(f'SELECT guide_channel, nickname FROM channels WHERE {where}')
+            rows = db_rows(f'SELECT guide_channel, nickname, sd_station_id FROM channels WHERE {where}')
             direct_ids = {r['guide_channel'] for r in rows}
             if fav_only:
                 # Schedule Direct uses numeric station IDs while the older
@@ -2573,8 +2582,18 @@ def api_guide():
                 ids_by_name = {}
                 for channel in _epg.get('channels', []):
                     ids_by_name.setdefault(_channel_match_base(channel.get('name', '')), []).append(channel['id'])
+                known_guide_ids = {str(c['id']) for c in _epg.get('channels', [])}
                 resolved_favorites = set()
                 for row in rows:
+                    # Prefer the concrete Schedules Direct station identity
+                    # saved for this stream over a broad display-name match.
+                    # Several unrelated sources can be labelled identically
+                    # (notably HBO Hits), and treating every matching number
+                    # as one favorite row overlays their different schedules.
+                    station_id = re.sub(r'^sd\.', '', str(row.get('sd_station_id') or ''), flags=re.I)
+                    if station_id and station_id in known_guide_ids:
+                        resolved_favorites.add(station_id)
+                        continue
                     key = _channel_match_base(row.get('nickname') or row['guide_channel'])
                     candidates = ids_by_name.get(key, [])
                     numeric = [channel_id for channel_id in candidates if str(channel_id).isdigit()]

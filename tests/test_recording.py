@@ -143,6 +143,35 @@ class RecordingTests(unittest.TestCase):
             self.assertIn("mgmhits.us", mapped)
             self.assertIn("67929", mapped)
 
+    def test_sd_station_identity_beats_ambiguous_display_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            movies_db = os.path.join(temp, "movies.db")
+            server.ensure_guide_db(guide_db)
+            guide = sqlite3.connect(guide_db)
+            guide.executemany(
+                "INSERT INTO guide_channels(channel_id,channel_name) VALUES (?,?)",
+                [("10241", "HBO Hits"), ("10242", "HBO Hits")],
+            )
+            guide.commit()
+            guide.close()
+            movies = sqlite3.connect(movies_db)
+            movies.execute("""CREATE TABLE channels (
+                guide_channel TEXT, stream_id TEXT, is_bad INTEGER,
+                sd_station_id TEXT
+            )""")
+            movies.execute(
+                "INSERT INTO channels VALUES (?,?,?,?)",
+                ("hbo2.us", "95926", 0, "sd.10241"),
+            )
+            movies.commit()
+            movies.close()
+
+            server._ps_channel_cache.update({"paths": (), "loaded_at": 0, "ids": set()})
+            mapped = server.get_ps_channel_ids(guide_db, movies_db)
+            self.assertIn("10241", mapped)
+            self.assertNotIn("10242", mapped)
+
     def test_plex_episode_index_uses_show_season_episode_filename(self):
         with tempfile.TemporaryDirectory() as temp:
             episode = os.path.join(
