@@ -217,6 +217,29 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
 
     # 7. Insert into guide.db
     log('Writing to guide.db…')
+    # A station's schedule can be revised between daily pulls.  The former
+    # INSERT/UPDATE-only import left an old programme behind whenever its
+    # title or start time changed, so one guide row could eventually show two
+    # (or more) conflicting schedules.  Replace only this SD fetch window for
+    # the station IDs just retrieved; provider/XMLTV domain-style channels are
+    # untouched.
+    window_start = dates[0].replace('-', '') + '000000'
+    window_end = (datetime.fromisoformat(dates[-1]).date() + timedelta(days=1)).strftime('%Y%m%d') + '000000'
+    removed_stale = 0
+    for offset in range(0, len(station_ids), 500):
+        batch_ids = station_ids[offset:offset + 500]
+        if not batch_ids:
+            continue
+        placeholders = ','.join('?' for _ in batch_ids)
+        cur = conn.execute(
+            f'''DELETE FROM guide WHERE channel_id IN ({placeholders})
+                AND start_utc >= ? AND start_utc < ?''',
+            [*batch_ids, window_start, window_end],
+        )
+        removed_stale += max(0, cur.rowcount)
+    if removed_stale:
+        log(f'Removed {removed_stale} superseded Schedule Direct listings.')
+
     inserted = 0
     for pid, airings in schedule_data.items():
         detail = prog_details.get(pid, {'title': pid, 'category': '', 'desc': ''})
@@ -251,12 +274,13 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
 
     conn.commit()
     conn.close()
-    log(f'Done — {inserted} new rows inserted.')
+    log(f'Done — {inserted} new rows inserted ({removed_stale} superseded rows replaced).')
 
     return {
         'stations':  len(station_map),
         'programs':  len(all_program_ids),
         'inserted':  inserted,
+        'removed_stale': removed_stale,
     }
 
 
