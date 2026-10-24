@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261024c"
+VERSION = "v20261024d"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -965,6 +965,18 @@ def ensure_guide_db(db_path):
     conn.close()
 
 _TEAM_MATCHUP_RE = re.compile(r'^\s*(.+?)\s+(?:at|vs\.?|v\.)\s+(.+?)\s*$', re.I)
+_SPORT_CATEGORY_WORDS = (
+    'sport', 'football', 'basketball', 'baseball', 'hockey', 'soccer',
+    'golf', 'tennis', 'cricket', 'racing', 'wrestling', 'boxing', 'mma',
+    'lacrosse', 'volleyball', 'rugby', 'cycling',
+)
+
+def _is_sports_listing(category='', episode_title=''):
+    """Whether a guide row is a sporting event, including provider sport labels."""
+    category = str(category or '').casefold()
+    return bool(_TEAM_MATCHUP_RE.match(str(episode_title or ''))) or any(
+        word in category for word in _SPORT_CATEGORY_WORDS
+    )
 _TEAM_CATALOG_CATEGORIES = (
     'football', 'basketball', 'baseball', 'hockey', 'soccer', 'golf',
     'tennis', 'boxing', 'mixed martial arts', 'racing', 'sports',
@@ -2962,7 +2974,7 @@ def api_search():
                 # A team in an episode title is a real matchup; a team only in
                 # the long description can be incidental pre-game context.
                 matchup = query_folded in (str(r['title'] or '') + ' ' + episode_text).casefold()
-                sports_event = 'sport' in str(r['category'] or '').casefold()
+                sports_event = _is_sports_listing(r['category'], episode_text)
                 matchup_title = episode_text if _TEAM_MATCHUP_RE.match(episode_text) else ''
                 programs.append({
                     'title':          r['title'],
@@ -5304,7 +5316,7 @@ def api_prog_info():
     _SKIP_CATS = {'news', 'sports', 'sport', 'sports event', 'sports talk',
                   'talk', 'talk show', 'game show', 'reality', 'live', 'music',
                   'weather', 'shopping', 'infomercial', 'documentary news'}
-    _skip_enrichment = any(s in category for s in _SKIP_CATS)
+    _skip_enrichment = any(s in category for s in _SKIP_CATS) or _is_sports_listing(category)
     # Sports listings commonly reuse generic titles such as "NFL Football".
     # Local Plex/metadata rows for that generic title can describe an entirely
     # different game, so never substitute them for the guide's matchup.
