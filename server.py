@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261024d"
+VERSION = "v20261025a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -8757,10 +8757,11 @@ async function openProg(p) {
     } catch (e) { /* Quality information is optional; recording still works. */ }
   }
 
-  // Fetch future airings.  Keep a verified live button on screen while this
-  // optional lookup runs (or if a guide refresh temporarily locks the DB).
-  const keepImmediateLivePlay = !!(_nextAiring && _nextAiring.on_now);
-  if (!keepImmediateLivePlay) document.getElementById('pm-next-wrap').style.display = 'none';
+  // Fetch future airings. Keep a verified live action (and a selected sports
+  // event's direct record action) on screen while this optional lookup runs.
+  const keepImmediateAction = !!(_nextAiring && (_nextAiring.on_now ||
+    (sportsEvent && p.can_record)));
+  if (!keepImmediateAction) document.getElementById('pm-next-wrap').style.display = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
   // Wanted must not depend on the optional airing lookup succeeding.  It is
   // especially useful for an on-now programme with no later guide listing.
