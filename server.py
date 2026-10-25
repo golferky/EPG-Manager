@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261025b"
+VERSION = "v20261025c"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -1792,9 +1792,53 @@ def _reconcile_stale_recordings():
     except Exception as e:
         print(f'[recdb] stale reconciliation error: {e}')
 
+def _protect_pending_sports_recordings():
+    """Add overtime protection to sports bookings queued before this version."""
+    try:
+        db_path = _guide_db_path()
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT * FROM recordings
+                               WHERE status IN ('queued','scheduled')
+                                 AND stop_ts>? AND COALESCE(overtime_cushion_seconds,0)=0''',
+                            (time.time(),)).fetchall()
+        protected = 0
+        for row in rows:
+            guide_stop_ts = float(row['guide_stop_ts'] or row['stop_ts'] or 0)
+            if not _is_sports_guide_airing(row['channel_id'], row['start_ts'], row['title'], db_path):
+                continue
+            padded_stop_ts = guide_stop_ts + SPORTS_OVERTIME_CUSHION_SECONDS
+            _url, stream_error, debug = _resolve_recording_source(
+                row['channel_id'], row['start_ts'], padded_stop_ts, row['rec_id']
+            )
+            # Keep a working previously-selected source when the source lookup
+            # is temporarily unavailable; the padded window still protects the
+            # capture itself and will be checked again by the recording agent.
+            provider = row['stream_provider'] or 'primestreams'
+            stream_id = row['stream_id'] or ''
+            extension = row['stream_extension'] or 'ts'
+            if not stream_error:
+                provider = str(debug.get('provider') or provider)
+                stream_id = str(debug.get('stream_id') or stream_id)
+                extension = str(debug.get('stream_extension') or extension)
+            conn.execute('''UPDATE recordings
+                            SET stop_ts=?, guide_stop_ts=?, overtime_cushion_seconds=?,
+                                stream_provider=?, stream_id=?, stream_extension=?
+                            WHERE rec_id=?''',
+                         (padded_stop_ts, guide_stop_ts, SPORTS_OVERTIME_CUSHION_SECONDS,
+                          provider, stream_id, extension, row['rec_id']))
+            protected += 1
+        conn.commit()
+        conn.close()
+        if protected:
+            print(f'[recdb] added overtime protection to {protected} pending sports recording(s)')
+    except Exception as e:
+        print(f'[recdb] overtime protection update error: {e}')
+
 def _load_pending_recs():
     """On startup, reload queued/scheduled recs from guide.db that haven't aired yet."""
     _init_recordings_table()
+    _protect_pending_sports_recordings()
     _reconcile_stale_recordings()
     try:
         conn = sqlite3.connect(_guide_db_path())
@@ -1821,6 +1865,8 @@ def _load_pending_recs():
                 'channel':    r['channel'],
                 'start_ts':   r['start_ts'],
                 'stop_ts':    r['stop_ts'],
+                'guide_stop_ts': r['guide_stop_ts'] or r['stop_ts'],
+                'overtime_cushion_seconds': r['overtime_cushion_seconds'] or 0,
                 'status':     'queued',
                 'progress':   0,
                 'log':        [],
@@ -1847,6 +1893,8 @@ def _load_pending_recs():
                     'title': r['title'], 'channel_id': r['channel_id'],
                     'channel': r['channel'], 'start_ts': r['start_ts'],
                     'stop_ts': r['stop_ts'], 'status': r['status'],
+                    'guide_stop_ts': r['guide_stop_ts'] or r['stop_ts'],
+                    'overtime_cushion_seconds': r['overtime_cushion_seconds'] or 0,
                     'progress': 0, 'log': [], 'pid': None,
                     'file': r['file'] or None, 'backend': 'agent',
                     'stream_id': r['stream_id'] or '',
