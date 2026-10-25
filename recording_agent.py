@@ -45,6 +45,9 @@ def load_config(path):
     cfg.setdefault('local_recordings', os.path.expanduser('~/Movies/Recordings'))
     cfg.setdefault('plex_path', '/Volumes/Plex/Movies')
     cfg.setdefault('plex_tv_path', '/Volumes/Plex/TV Shows')
+    # Keep partial captures on the QNAP, but outside Plex's movie/TV folders
+    # so an incomplete game cannot be scanned as a finished title.
+    cfg.setdefault('incomplete_recordings_path', '')
     cfg.setdefault('ffmpeg', 'ffmpeg')
     cfg.setdefault('ffprobe', 'ffprobe')
     cfg.setdefault('transfer_retry_seconds', 30)
@@ -381,6 +384,26 @@ def discard_failed_media(*paths):
             print(f'[cleanup] kept failed fragment {path}: {exc}', file=sys.stderr, flush=True)
 
 
+def incomplete_recordings_root(cfg):
+    """Dedicated QNAP folder for watchable-but-incomplete recordings."""
+    configured = str(cfg.get('incomplete_recordings_path', '') or '').strip()
+    if configured:
+        return Path(os.path.expanduser(configured))
+    return Path(cfg['plex_path']).parent / 'Incomplete Recordings'
+
+
+def preserve_incomplete_recording(source, cfg, title, start_ts, progress_callback=None):
+    """Copy a partial MP4 to the QNAP, keeping it out of Plex libraries."""
+    destination_root = incomplete_recordings_root(cfg)
+    # Verify the actual QNAP share, not the destination folder (which may not
+    # exist until the first partial recording is saved there).
+    if not plex_mount_available(destination_root.parent, cfg.get('plex_mount_marker', '')):
+        raise RuntimeError('QNAP recording share is not available')
+    stamp = time.strftime('%Y-%m-%d_%H%M', time.localtime(start_ts))
+    filename = f'{safe_filename(title)} - INCOMPLETE - {stamp}.mp4'
+    return _verified_copy(source, destination_root / filename, progress_callback)
+
+
 def plex_mount_available(plex_root, marker=''):
     root = Path(plex_root)
     if not root.is_dir():
@@ -576,10 +599,27 @@ def process_job(api, job, cfg):
         message = (f'Recording ended early: {actual_minutes:.0f} min captured '
                    f'of {expected_minutes:.0f} min scheduled')
         quality.update({'decision': 'incomplete recording', 'recorded': recorded_probe})
+        incomplete_path = None
+        try:
+            def incomplete_progress(copied, total):
+                api.heartbeat(job['id'], 'transferring', file=str(mp4_path),
+                              progress=round(copied / total * 100, 1) if total else 0,
+                              quality_decision='saving incomplete recording to QNAP')
+            incomplete_path = preserve_incomplete_recording(
+                mp4_path, cfg, job['title'], job['start_ts'], incomplete_progress
+            )
+            quality['incomplete_path'] = str(incomplete_path)
+            message += f'; saved to QNAP: {incomplete_path.name}'
+        except Exception as exc:
+            # A failed QNAP transfer must never turn a partial recording into
+            # a deletion.  Leave the local MP4 in place for manual recovery.
+            quality['incomplete_save_error'] = str(exc)
+            message += '; kept on Mac because QNAP save failed'
         archive_terminal_result(api, job, 'failed', log_path, message=message,
-                                file=str(mp4_path),
+                                file=str(incomplete_path or mp4_path),
                                 quality_decision='incomplete recording', result=quality)
-        discard_failed_media(ts_path, mp4_path)
+        if incomplete_path:
+            discard_failed_media(ts_path, mp4_path)
         print(f'[incomplete] {job["title"]}: {message}', flush=True)
         return
     final_incomplete_copy = bool(final_existing_probe and incomplete_for_scheduled_window(

@@ -68,6 +68,19 @@ class QualityDecisionTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"recording-data")
             self.assertFalse(destination.with_name(destination.name + ".partial").exists())
 
+    def test_incomplete_recordings_use_a_separate_qnap_folder(self):
+        self.assertEqual(
+            recording_agent.incomplete_recordings_root({"plex_path": "/Volumes/Plex/Movies"}),
+            Path("/Volumes/Plex/Incomplete Recordings"),
+        )
+        self.assertEqual(
+            recording_agent.incomplete_recordings_root({
+                "plex_path": "/Volumes/Plex/Movies",
+                "incomplete_recordings_path": "/Volumes/QNAP/Partial TV",
+            }),
+            Path("/Volumes/QNAP/Partial TV"),
+        )
+
     def test_transfer_uses_resolved_year_when_title_has_none(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

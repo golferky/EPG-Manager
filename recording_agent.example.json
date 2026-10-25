@@ -8,6 +8,7 @@
   "local_recordings": "/Users/yourname/Movies/Recordings",
   "plex_path": "/Volumes/Plex/Movies",
   "plex_tv_path": "/Volumes/Plex/TV Shows",
+  "incomplete_recordings_path": "/Volumes/Plex/Incomplete Recordings",
   "plex_mount_marker": "",
   "ffmpeg": "/opt/homebrew/bin/ffmpeg",
   "ffprobe": "/opt/homebrew/bin/ffprobe",
