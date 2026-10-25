@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261025a"
+VERSION = "v20261025b"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -9,7 +9,12 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
+# Every recording gets a short cushion for slightly late programme changes.
+# Sports get a much larger, planned cushion because a game can go to overtime.
+# The sports cushion is stored in the booking's stop time, rather than added
+# only when FFmpeg starts, so source-conflict checks can see it in advance.
 RECORDING_TAIL_SECONDS = 45
+SPORTS_OVERTIME_CUSHION_SECONDS = 90 * 60
 
 BASE_DIR = os.path.abspath(
     os.environ.get('EPG_BASE_DIR', os.path.expanduser('~/epg'))
@@ -42,7 +47,9 @@ def _bootstrap():
                 ('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'),
                 ('is_series', 'INTEGER DEFAULT 0'), ('auto_upgrade', 'INTEGER DEFAULT 0'),
                 ('stream_provider', "TEXT DEFAULT 'primestreams'"),
-                ('stream_extension', "TEXT DEFAULT 'ts'")]:
+                ('stream_extension', "TEXT DEFAULT 'ts'"),
+                ('guide_stop_ts', 'REAL'),
+                ('overtime_cushion_seconds', 'INTEGER DEFAULT 0')]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -977,6 +984,30 @@ def _is_sports_listing(category='', episode_title=''):
     return bool(_TEAM_MATCHUP_RE.match(str(episode_title or ''))) or any(
         word in category for word in _SPORT_CATEGORY_WORDS
     )
+
+def _is_sports_guide_airing(channel_id, start_ts, title, db_path=None):
+    """Classify the exact clicked guide airing without guessing by its title.
+
+    Many games use generic titles such as ``NFL Football``.  The guide row's
+    category and matchup are the reliable source for deciding whether a booking
+    deserves overtime protection.
+    """
+    if not channel_id or not start_ts:
+        return False
+    try:
+        start = datetime.fromtimestamp(float(start_ts), timezone.utc)
+        lower = (start - timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+        upper = (start + timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+        conn = sqlite3.connect(db_path or _guide_db_path(), timeout=3)
+        row = conn.execute('''SELECT category, episode_title FROM guide
+                              WHERE channel_id=? AND lower(title)=lower(?)
+                                AND start_utc BETWEEN ? AND ?
+                              ORDER BY start_utc LIMIT 1''',
+                           (channel_id, str(title or ''), lower, upper)).fetchone()
+        conn.close()
+        return bool(row and _is_sports_listing(row[0], row[1]))
+    except Exception:
+        return False
 _TEAM_CATALOG_CATEGORIES = (
     'football', 'basketball', 'baseball', 'hockey', 'soccer', 'golf',
     'tennis', 'boxing', 'mixed martial arts', 'racing', 'sports',
@@ -1594,6 +1625,8 @@ def _init_recordings_table():
             ('auto_upgrade', 'INTEGER DEFAULT 0'),
             ('stream_provider', "TEXT DEFAULT 'primestreams'"),
             ('stream_extension', "TEXT DEFAULT 'ts'"),
+            ('guide_stop_ts', 'REAL'),
+            ('overtime_cushion_seconds', 'INTEGER DEFAULT 0'),
         ]
         for column, typedef in migrations:
             try:
@@ -1614,8 +1647,9 @@ def _db_upsert_rec(rec_id, rec):
         conn.execute('''INSERT INTO recordings
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
              status, failure_reason, file, created_at, backend, stream_id, updated_at,
-             episode_title, season_num, episode_num, is_series, auto_upgrade, stream_provider, stream_extension)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             episode_title, season_num, episode_num, is_series, auto_upgrade, stream_provider, stream_extension,
+             guide_stop_ts, overtime_cushion_seconds)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
@@ -1629,7 +1663,9 @@ def _db_upsert_rec(rec_id, rec):
               is_series=excluded.is_series,
               auto_upgrade=excluded.auto_upgrade,
               stream_provider=excluded.stream_provider,
-              stream_extension=excluded.stream_extension
+              stream_extension=excluded.stream_extension,
+              guide_stop_ts=excluded.guide_stop_ts,
+              overtime_cushion_seconds=excluded.overtime_cushion_seconds
         ''', (
             rec_id,
             rec.get('title',''),
@@ -1652,6 +1688,8 @@ def _db_upsert_rec(rec_id, rec):
             1 if rec.get('auto_upgrade') else 0,
             rec.get('stream_provider', 'primestreams'),
             rec.get('stream_extension', 'ts'),
+            rec.get('guide_stop_ts', rec.get('stop_ts', 0)),
+            rec.get('overtime_cushion_seconds', 0),
         ))
         conn.commit()
         conn.close()
@@ -3352,6 +3390,72 @@ def api_get_schedule():
     merged = local + [r for r in legacy if r.get('title','') + str(r.get('start_ts','')) not in seen]
     json_sched = load_schedule()
     return jsonify({'schedule': merged, 'pending': json_sched})
+
+@app.route('/epg-web/api/schedule/programme')
+def api_scheduled_programme():
+    """Return the exact guide item behind a scheduled recording.
+
+    Looking it up by channel and start time prevents a generic title such as
+    ``NFL Football`` from opening details for a different game.
+    """
+    rec_id = request.args.get('rec_id', '').strip()
+    channel_id = request.args.get('channel_id', '').strip()
+    title = request.args.get('title', '').strip()
+    try:
+        start_ts = float(request.args.get('start_ts', 0) or 0)
+    except (TypeError, ValueError):
+        start_ts = 0
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=3)
+        conn.row_factory = sqlite3.Row
+        if rec_id:
+            booking = conn.execute('''SELECT title, channel_id, start_ts
+                                      FROM recordings WHERE rec_id=?''', (rec_id,)).fetchone()
+            if booking:
+                title, channel_id, start_ts = booking['title'], booking['channel_id'], booking['start_ts']
+        if not channel_id or not title or not start_ts:
+            conn.close()
+            return jsonify({'error': 'This booking no longer has enough guide information.'}), 404
+        start = datetime.fromtimestamp(start_ts, timezone.utc)
+        lower = (start - timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+        upper = (start + timedelta(minutes=5)).strftime('%Y%m%d%H%M%S')
+        row = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc,
+                                      category, episode_title, season_num, episode_num, desc
+                               FROM guide WHERE channel_id=? AND lower(title)=lower(?)
+                                 AND start_utc BETWEEN ? AND ?
+                               ORDER BY start_utc LIMIT 1''',
+                           (channel_id, title, lower, upper)).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({'error': 'The guide listing for this recording has expired.'}), 404
+        su = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        eu = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        from zoneinfo import ZoneInfo
+        local_tz = ZoneInfo(load_config().get('timezone', 'America/New_York'))
+        sports_event = _is_sports_listing(row['category'], row['episode_title'])
+        _url, stream_error, stream_debug = _resolve_recording_source(
+            row['channel_id'], su.timestamp(), eu.timestamp()
+        )
+        matchup = row['episode_title'] if _TEAM_MATCHUP_RE.match(row['episode_title'] or '') else ''
+        return jsonify({'programme': {
+            'title': row['title'],
+            'display_title': matchup or row['title'],
+            'channel_id': row['channel_id'],
+            'channel': row['channel_name'],
+            'channel_name': row['channel_name'],
+            'start_ts': su.timestamp(), 'stop_ts': eu.timestamp(),
+            'start_fmt': su.astimezone(local_tz).strftime('%a %b %-d, %-I:%M %p'),
+            'stop_fmt': eu.astimezone(local_tz).strftime('%-I:%M %p'),
+            'category': row['category'] or '', 'desc': row['desc'] or '',
+            'episode_title': row['episode_title'] or '',
+            'season_num': row['season_num'], 'episode_num': row['episode_num'],
+            'sports_event': sports_event,
+            'can_play': not stream_error and not _is_foreign_recording_feed(row['channel_name']),
+            'can_record': not stream_error and not _is_foreign_recording_feed(row['channel_name']),
+            'stream_provider': str(stream_debug.get('provider') or ''),
+        }})
+    except Exception as exc:
+        return jsonify({'error': f'Could not open scheduled recording: {exc}'}), 500
 
 @app.route('/epg-web/api/recording-health')
 def api_recording_health():
@@ -6300,6 +6404,9 @@ def api_record():
     cfg2        = load_config()
     guide_db    = cfg2.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
     movies_db   = cfg2.get('db_path', '/Volumes/EPG/Movies.db')
+    # Prefer the guide's classification below, but preserve the explicit flag
+    # from a sports tile when a provider is temporarily refreshing its guide.
+    is_sports_request = bool(data.get('sports_event', False))
 
     # The requested guide channel may be supplied by either provider.
     _requested_url, requested_error, _requested_debug = _stream_url(channel_id)
@@ -6396,6 +6503,18 @@ def api_record():
         except Exception:
             is_series_request = False
 
+    # Protect a live sporting event from being cut off at the guide's nominal
+    # finish.  Keep the cushion in ``stop_ts`` so an Eaglecast/PrimeStreams
+    # source conflict is detected while the programme is still being queued.
+    # (The usual 45-second end cushion is still added by the recorder itself.)
+    is_sports_request = is_sports_request or _is_sports_guide_airing(
+        channel_id, start_ts, title, guide_db
+    )
+    guide_stop_ts = stop_ts
+    overtime_cushion_seconds = SPORTS_OVERTIME_CUSHION_SECONDS if is_sports_request else 0
+    if overtime_cushion_seconds:
+        stop_ts += overtime_cushion_seconds
+
     # Dedup: reject if same channel+start_ts already queued/scheduled/recording
     with _rec_lock:
         for existing in _recs.values():
@@ -6410,6 +6529,8 @@ def api_record():
         'channel':    channel_name,
         'start_ts':   start_ts,
         'stop_ts':    stop_ts,
+        'guide_stop_ts': guide_stop_ts,
+        'overtime_cushion_seconds': overtime_cushion_seconds,
         'status':     'queued',
         'progress':   0,
         'log':        [],
@@ -6441,6 +6562,7 @@ def api_record():
         t.start()
     return jsonify({'ok': True, 'id': rec_id, 'channel': channel_name, 'start_ts': start_ts,
                     'source': rec['stream_provider'],
+                    'overtime_cushion_minutes': overtime_cushion_seconds // 60,
                     'fallback_reason': stream_debug.get('fallback_reason', '')})
 
 @app.route('/epg-web/api/record/status')
@@ -9354,6 +9476,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
     episode_title: airing.episode_title || '',
     season_num: airing.season_num,
     episode_num: airing.episode_num,
+    sports_event: !!(airing.sports_event || (_currentProg && _currentProg.sports_event)),
     allow_commercial_movie: allowCommercialMovie,
   });
   if (r.ok) {
@@ -9363,7 +9486,9 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
       : r.fallback_reason ? `on PrimeStreams — ${r.fallback_reason}`
       : 'on PrimeStreams';
     if (modalGeneration === _modalGeneration) {
-      document.getElementById('pm-status').textContent = `✅ "${title}" queued ${sourceText}`;
+      const overtime = Number(r.overtime_cushion_minutes || 0);
+      document.getElementById('pm-status').textContent = `✅ "${title}" queued ${sourceText}` +
+        (overtime ? ` — includes ${overtime} minutes for overtime` : '');
       document.getElementById('pm-status').className = 'status-msg ok';
     }
     startRecPoll();
@@ -9770,6 +9895,22 @@ async function addToSchedule(prog) {
   const msg = `"${prog.title}" added to schedule.`;
   setGS(msg,'ok');
 }
+async function openScheduledRecording(rec) {
+  const params = new URLSearchParams({
+    rec_id: rec.rec_id || rec._id || '',
+    channel_id: rec.channel_id || '',
+    title: rec.title || '',
+    start_ts: rec.start_ts || '',
+  });
+  try {
+    const response = await fetch(`/epg-web/api/schedule/programme?${params}`);
+    const data = await response.json();
+    if (!response.ok || !data.programme) throw new Error(data.error || 'Programme details are no longer available.');
+    openProg(data.programme);
+  } catch (error) {
+    setGS(`Could not open this scheduled recording: ${error.message}`, 'err');
+  }
+}
 async function loadSchedule() {
   const [d, recD] = await Promise.all([
     (await fetch('/epg-web/api/schedule')).json(),
@@ -9779,6 +9920,10 @@ async function loadSchedule() {
   const memRecs = Object.entries(recD.recordings || {}).map(([id, r]) => ({
     title:      r.title || '',
     channel:    r.channel || r.channel_id || '',
+    channel_id: r.channel_id || '',
+    start_ts:   r.start_ts || 0,
+    stop_ts:    r.stop_ts || 0,
+    overtime_cushion_seconds: r.overtime_cushion_seconds || 0,
     start_time: r.start_ts ? new Date(r.start_ts * 1000).toLocaleString() : '',
     status:     (r.status||'queued').split('(')[0].trim(),  // strip "(Xm away)" verbose part
     _mem:       true,
@@ -9821,6 +9966,7 @@ async function loadSchedule() {
   }
   tbl.style.display='table'; emp.style.display='none';
 
+  window._scheduleRows = sched;
   document.getElementById('sched-body').innerHTML = sched.map((r,i) => {
     const s = (r.status||'').toLowerCase();
     const isFailed  = s === 'failed' || s === 'timeout' || s === 'error';
@@ -9834,12 +9980,13 @@ async function loadSchedule() {
     const badge     = (isMissed || isStale || isSkipped) ? 'badge-skipped' : (SB[s] || SB[r.status] || '');
     const rawLabel  = (r.status||'').replace(/_/g,' ').toUpperCase();
     const label     = isMissed ? 'MISSED' : isStale ? 'STALE' : isSkipped ? rawLabel : rawLabel;
+    const overtime  = Number(r.overtime_cushion_seconds || 0);
     return `<tr>
-      <td class="title-cell">${esc(r.title)}
+      <td class="title-cell"><button type="button" onclick="openScheduledRecording(window._scheduleRows[${i}])" title="Open programme details" style="padding:0;border:0;background:none;color:#e2e8f0;font:inherit;font-weight:inherit;cursor:pointer;text-align:left;text-decoration:underline;text-decoration-color:#334155;text-underline-offset:3px;">${esc(r.title)}</button>
         ${r.episode_title?`<br><span style="font-size:11px;color:#555;">S${r.season_number||'?'}E${r.episode_number||'?'} ${esc(r.episode_title)}</span>`:''}
       </td>
       <td class="ch-cell">${esc(r.channel)}</td>
-      <td class="time-cell">${esc(r.start_time||r.start_fmt||'')}</td>
+      <td class="time-cell">${esc(r.start_time||r.start_fmt||'')}${overtime ? `<br><span style="font-size:10px;color:#fbbf24;">+${Math.round(overtime/60)} min overtime protection</span>` : ''}</td>
       <td><span class="badge ${badge}">${esc(label)}</span></td>
       <td style="font-size:11px;color:#64748b;max-width:200px;">${esc(r.failure_reason||'')}
         ${(isFailed || isMissed || isStale || isSkipped) ? `<button class="btn btn-ghost btn-sm" style="margin-left:6px;font-size:11px;" onclick='searchOpenProg(${JSON.stringify(r.title)},${JSON.stringify(r.episode_title||"")},${JSON.stringify(r.season_number||"")},${JSON.stringify(r.episode_number||"")})'>🔄 Re-record</button>` : ''}

@@ -400,6 +400,18 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("(sportsEvent && p.can_record)", server.HTML)
         self.assertIn("if (!keepImmediateAction) document.getElementById('pm-next-wrap').style.display = 'none';", server.HTML)
 
+    def test_sports_recordings_have_planned_overtime_protection(self):
+        self.assertEqual(server.SPORTS_OVERTIME_CUSHION_SECONDS, 90 * 60)
+        self.assertTrue(server._is_sports_listing('Football', ''))
+        self.assertTrue(server._is_sports_listing('', 'Cincinnati Bengals at Baltimore Ravens'))
+        self.assertFalse(server._is_sports_listing('Movie', ''))
+
+    def test_schedule_titles_open_the_exact_programme_details(self):
+        self.assertIn("/epg-web/api/schedule/programme", server.HTML)
+        self.assertIn("openScheduledRecording(window._scheduleRows", server.HTML)
+        with open(server.__file__, encoding="utf-8") as source:
+            self.assertIn("def api_scheduled_programme():", source.read())
+
     def test_airings_ui_lists_playable_rows_and_uses_series_flag(self):
         self.assertIn("const isSeries = !!ar.is_series;", server.HTML)
         # A live usable stream remains playable even when it is not eligible
