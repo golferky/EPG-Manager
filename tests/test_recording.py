@@ -75,6 +75,13 @@ class RecordingTests(unittest.TestCase):
         self.assertIn('pm-plex-play-btn', server.HTML)
         self.assertIn("document.getElementById('pm-plex-info').textContent = 'Plex copy found'", server.HTML)
 
+    def test_weekly_recording_rule_uses_channel_and_weekly_time(self):
+        with open(server.__file__) as handle:
+            source = handle.read()
+        self.assertIn('CREATE TABLE IF NOT EXISTS weekly_recordings', source)
+        self.assertIn('recordWeekly()', server.HTML)
+        self.assertIn('/epg-web/api/record/weekly', server.HTML)
+
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
         self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))

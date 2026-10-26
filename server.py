@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261025c"
+VERSION = "v20261026a"
 
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
@@ -943,6 +944,21 @@ def ensure_guide_db(db_path):
             title TEXT UNIQUE,
             created_at TEXT,
             active INTEGER DEFAULT 1
+        )
+    ''')
+    # A weekly rule is deliberately separate from an episode/series rule.
+    # Sports and news shows often have no episode numbers, yet the user may
+    # want exactly one showing at the same weekly slot.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS weekly_recordings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            weekday INTEGER NOT NULL,
+            minute_of_day INTEGER NOT NULL,
+            created_at TEXT,
+            active INTEGER DEFAULT 1,
+            UNIQUE(title, channel_id, weekday, minute_of_day)
         )
     ''')
     conn.execute('''
@@ -6350,7 +6366,72 @@ def _schedule_active_series(guide_db_path=None):
     ) for title in titles)
     if total:
         print(f'[series] queued {total} new airing(s) from active rules')
+    total += _schedule_active_weekly_recordings(db_path)
     return total
+
+
+def _schedule_active_weekly_recordings(guide_db_path=None):
+    """Queue one matching guide airing per week for each weekly rule.
+
+    Unlike a series rule, this is for a programme such as *NFL GameDay Final*
+    which may not have episode numbers and may be replayed more than once.
+    The selected channel, weekday and approximate time are all part of the
+    rule, so it cannot quietly turn into a recording of every repeat.
+    """
+    cfg = load_config()
+    db_path = guide_db_path or cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    try:
+        tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+        now = time.time()
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rules = conn.execute('''SELECT title, channel_id, weekday, minute_of_day
+                                FROM weekly_recordings WHERE active=1''').fetchall()
+        queued = 0
+        for rule in rules:
+            rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc,
+                                          episode_title, season_num, episode_num
+                                   FROM guide
+                                   WHERE lower(title)=lower(?) AND channel_id=?
+                                     AND end_utc > ?
+                                   ORDER BY start_utc''',
+                                (rule['title'], rule['channel_id'],
+                                 datetime.fromtimestamp(now, timezone.utc).strftime('%Y%m%d%H%M%S'))).fetchall()
+            # Keep the closest listing to the original weekly clock time for
+            # each calendar week.  A 90-minute guard accommodates normal
+            # schedule shifts but rejects unrelated repeats on the same day.
+            by_week = {}
+            for row in rows:
+                start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                local = start.astimezone(tz)
+                if local.weekday() != int(rule['weekday']):
+                    continue
+                diff = abs((local.hour * 60 + local.minute) - int(rule['minute_of_day']))
+                if diff > 90:
+                    continue
+                key = local.isocalendar()[:2]
+                if key not in by_week or diff < by_week[key][0]:
+                    by_week[key] = (diff, row, start)
+            for _diff, row, start in by_week.values():
+                end = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                # Reuse the normal recording path: it resolves the verified
+                # source, deduplicates, and applies sports overtime protection.
+                with app.test_request_context('/epg-web/api/record', method='POST', json={
+                    'title': row['title'], 'channel_id': row['channel_id'],
+                    'channel_name': row['channel_name'], 'start_ts': start.timestamp(),
+                    'stop_ts': end.timestamp(), 'episode_title': row['episode_title'] or '',
+                    'season_num': row['season_num'], 'episode_num': row['episode_num'],
+                }):
+                    response = api_record()
+                if getattr(response, 'status_code', 500) < 300:
+                    queued += 1
+        conn.close()
+        if queued:
+            print(f'[weekly] queued {queued} weekly airing(s)')
+        return queued
+    except Exception as exc:
+        print(f'[weekly] scheduling error: {exc}')
+        return 0
 
 @app.route('/epg-web/api/record/series', methods=['GET'])
 def api_series_list():
@@ -6432,6 +6513,54 @@ def api_series_cancel():
     for rec_id in cancelled_ids:
         _db_update_rec_status(rec_id, 'cancelled', 'Series recording cancelled by user')
     return jsonify({'ok': True, 'cancelled': cancelled})
+
+@app.route('/epg-web/api/record/weekly', methods=['POST'])
+def api_weekly_recording_add():
+    """Remember this exact channel/time as a once-per-week recording."""
+    data = request.json or {}
+    title = str(data.get('title') or '').strip()
+    channel_id = str(data.get('channel_id') or '').strip()
+    try:
+        start_ts = float(data.get('start_ts'))
+        stop_ts = float(data.get('stop_ts'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'This airing has no usable time'}), 400
+    if not title or not channel_id or stop_ts <= start_ts:
+        return jsonify({'error': 'This airing cannot be made weekly'}), 400
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    ensure_guide_db(db_path)
+    local = datetime.fromtimestamp(start_ts, ZoneInfo(cfg.get('timezone', 'America/New_York')))
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute('''INSERT OR REPLACE INTO weekly_recordings
+                        (title, channel_id, weekday, minute_of_day, created_at, active)
+                        VALUES(?,?,?,?,?,1)''',
+                     (title, channel_id, local.weekday(), local.hour * 60 + local.minute,
+                      datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+    # When the button is used during a live showing, start saving the rest of
+    # today’s programme too.  Future weeks are then discovered automatically
+    # each time the guide refreshes.
+    current_queued = False
+    if start_ts <= time.time() < stop_ts:
+        with app.test_request_context('/epg-web/api/record', method='POST', json={
+            'title': title, 'channel_id': channel_id,
+            'channel_name': data.get('channel_name') or channel_id,
+            'start_ts': start_ts, 'stop_ts': stop_ts,
+            'sports_event': bool(data.get('sports_event', False)),
+        }):
+            response = api_record()
+        current_queued = getattr(response, 'status_code', 500) < 300
+    future_queued = _schedule_active_weekly_recordings(db_path)
+    return jsonify({
+        'ok': True, 'current_queued': current_queued, 'scheduled': future_queued,
+        'weekday': local.strftime('%A'), 'time': local.strftime('%-I:%M %p'),
+    })
 
 @app.route('/epg-web/api/record', methods=['POST'])
 def api_record():
@@ -7272,6 +7401,7 @@ tr:hover td{background:#141414;}
           <div id="pm-next-info" style="flex:1;font-size:13px;color:#e2e8f0;"></div>
           <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
           <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
+          <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="border-color:#f59e0b;color:#fbbf24;">📅 Record weekly</button>
         </div>
       </div>
       <!-- All future airings -->
@@ -9257,6 +9387,33 @@ async function stopStream(channelId) {
 async function recordNext() {
   if (!_nextAiring) return;
   await recordAiring(_nextAiring, _nextAiring._title);
+}
+
+async function recordWeekly() {
+  if (!_nextAiring || !_currentProg) return;
+  const btn = document.getElementById('pm-weekly-btn');
+  btn.disabled = true; btn.textContent = '⏳ Saving…';
+  try {
+    const r = await post('/epg-web/api/record/weekly', {
+      title: _currentProg.title,
+      channel_id: _nextAiring.channel_id,
+      channel_name: _nextAiring.channel_name || _nextAiring.channel || _nextAiring.channel_id,
+      start_ts: _nextAiring.start_ts,
+      stop_ts: _nextAiring.stop_ts,
+      sports_event: !!_currentProg.sports_event,
+    });
+    if (!r.ok) throw Error(r.error || 'Could not save weekly recording');
+    btn.textContent = '✅ Recording weekly';
+    document.getElementById('pm-status').textContent =
+      `✅ "${_currentProg.title}" will record every ${r.weekday} around ${r.time} on ${_nextAiring.channel_name || _nextAiring.channel_id}` +
+      (r.current_queued ? ' — today’s remaining time is recording too' : '');
+    document.getElementById('pm-status').className = 'status-msg ok';
+    startRecPoll();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = '📅 Record weekly';
+    document.getElementById('pm-status').textContent = '❌ ' + e.message;
+    document.getElementById('pm-status').className = 'status-msg err';
+  }
 }
 
 async function recordSeries() {
