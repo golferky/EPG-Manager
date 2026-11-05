@@ -82,6 +82,13 @@ class RecordingTests(unittest.TestCase):
         self.assertIn('recordWeekly()', server.HTML)
         self.assertIn('/epg-web/api/record/weekly', server.HTML)
 
+    def test_provider_refresh_recognizes_xmltv_programme_tags(self):
+        with open(server.__file__) as handle:
+            source = handle.read()
+        self.assertIn("br'<programme\\b[^>]*\\bstart=\"(\\d{14})'", source)
+        self.assertNotIn("br'<programme\\\\b[^>]*\\\\bstart=\"(\\\\d{14})'", source)
+        self.assertIn('attempt {attempt}/3', source)
+
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
         self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))

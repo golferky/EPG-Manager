@@ -2551,16 +2551,32 @@ def api_fetch_guide():
     local_xml = os.path.join(BASE_DIR, 'guide_fetched.xml')
     xmltv_url = f'{epg_url}/xmltv.php?username={epg_user}&password={epg_pass}'
     try:
-        print(f'[fetch-guide] Fetching {xmltv_url}')
-        req = urlreq.Request(xmltv_url, headers={'User-Agent': 'TiViMate/4.7.0 (Amazon AFTS; Android 9)'})
-        with urlreq.urlopen(req, timeout=60) as resp:
-            data = resp.read()
+        # PrimeStreams occasionally answers a valid request with an empty
+        # XMLTV shell.  Retry that transient provider hiccup before showing an
+        # error or touching the last good local guide.
+        data = b''
+        starts = []
+        last_fetch_error = None
+        for attempt in range(1, 4):
+            try:
+                print(f'[fetch-guide] Downloading provider guide (attempt {attempt}/3)')
+                req = urlreq.Request(xmltv_url, headers={'User-Agent': 'TiViMate/4.7.0 (Amazon AFTS; Android 9)'})
+                with urlreq.urlopen(req, timeout=60) as resp:
+                    candidate = resp.read()
+                candidate_starts = re.findall(br'<programme\b[^>]*\bstart="(\d{14})', candidate)
+                if candidate_starts:
+                    data, starts = candidate, candidate_starts
+                    break
+                last_fetch_error = 'Provider guide contains no programme listings'
+            except Exception as exc:
+                last_fetch_error = str(exc)
+            if attempt < 3:
+                time.sleep(attempt * 2)
+        if not starts:
+            raise RuntimeError(last_fetch_error or 'Provider guide contains no programme listings')
         # A provider can return a syntactically valid XML file that is already
         # a day old.  Do not replace the last usable local copy with it; use
         # the provider's live per-channel EPG below instead.
-        starts = re.findall(br'<programme\\b[^>]*\\bstart="(\\d{14})', data)
-        if not starts:
-            raise RuntimeError('Provider guide contains no programme listings')
         newest_stamp = max(starts).decode('ascii')
         from zoneinfo import ZoneInfo
         newest_local = datetime.strptime(newest_stamp, '%Y%m%d%H%M%S').replace(
@@ -7914,7 +7930,11 @@ async function fetchGuide() {
   try {
     const r = await fetch('/epg-web/api/fetch-guide', {method:'POST'});
     const d = await r.json();
-    if (d.error) { setGS('Fetch error: '+d.error, 'err'); return; }
+    if (d.error) {
+      setGS('Refresh could not get a new provider guide — the current guide is still available. '+d.error, 'err');
+      setGuideProgress(0, '', false);
+      return;
+    }
     const newInfo = d.new_rows > 0 ? ` (+${d.new_rows.toLocaleString()} new)` : ' (no new rows)';
     const live = d.live_epg || {};
     const liveInfo = live.channels ? ` · ${live.channels} favourite channels refreshed live` : '';
