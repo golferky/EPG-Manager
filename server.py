@@ -7464,7 +7464,7 @@ tr:hover td{background:#141414;}
           <div id="pm-next-info" style="flex:1;font-size:13px;color:#e2e8f0;"></div>
           <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
           <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
-          <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="border-color:#f59e0b;color:#fbbf24;">📅 Record weekly</button>
+          <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="display:none;border-color:#f59e0b;color:#fbbf24;">📅 Record weekly</button>
         </div>
       </div>
       <!-- All future airings -->
@@ -8912,6 +8912,12 @@ async function openProg(p) {
   // the guide database is being refreshed.
   const now = Date.now() / 1000;
   const sportsEvent = !!p.sports_event;
+  const weeklyBtn = document.getElementById('pm-weekly-btn');
+  // A weekly rule is meaningful for sports and recurring shows, never for a
+  // feature film.  Unknown programme types stay hidden until the airings
+  // lookup confirms that this is a series.
+  weeklyBtn.style.display = (sportsEvent || p.prog_type === 'EP' ||
+    p.prog_type === 'SH' || p.season_num != null || p.episode_num != null) ? '' : 'none';
   const displayTitle = p.display_title || p.title || '';
   document.getElementById('pm-title').textContent = displayTitle;
   document.getElementById('pm-air').textContent =
@@ -9224,6 +9230,7 @@ async function openProg(p) {
       batchBtn.style.display = isSeries ? '' : 'none';
       batchBtn.disabled = false;
       batchBtn.textContent = '📺 Record Identified Episodes';
+      weeklyBtn.style.display = (sportsEvent || isSeries) ? '' : 'none';
       const recMap = {};
       Object.values(recStatus.recordings || {}).forEach(r => {
         if (['queued','scheduled','recording'].includes(r.status))

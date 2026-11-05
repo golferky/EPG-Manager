@@ -628,6 +628,14 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(saved["epg_pass"], "provider-secret")
         self.assertEqual(saved["recording_agent_token"], "agent-secret")
 
+    def test_weekly_recording_control_is_not_offered_for_movies(self):
+        """Movies must never expose a weekly recording action in the modal."""
+        self.assertIn('id="pm-weekly-btn"', server.HTML)
+        self.assertIn('style="display:none;border-color:#f59e0b', server.HTML)
+        self.assertIn("p.prog_type === 'EP'", server.HTML)
+        self.assertIn("p.prog_type === 'SH'", server.HTML)
+        self.assertIn("weeklyBtn.style.display = (sportsEvent || isSeries) ? '' : 'none';", server.HTML)
+
 
 if __name__ == "__main__":
     unittest.main()
