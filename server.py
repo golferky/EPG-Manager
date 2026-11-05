@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-VERSION = "v20261026a"
-
 import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string, request
+
+def _build_version():
+    """Show the deployed revision so the web header cannot go stale."""
+    try:
+        revision = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=os.path.dirname(os.path.abspath(__file__)), text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        revision = ''
+    return f"v20261105a{('-' + revision) if revision else ''}"
+
+VERSION = _build_version()
 
 app = Flask(__name__)
 
@@ -9151,7 +9163,10 @@ async function openProg(p) {
     const airingParams = new URLSearchParams({title: p.title});
     if (p.channel_id) airingParams.set('channel_id', p.channel_id);
     if (p.start_ts)   airingParams.set('start_ts', p.start_ts);
-    const ar = await fetchJsonWithin(`/epg-web/api/airings?${airingParams}`, 5000);
+    // A full guide refresh can briefly contend for the database.  Give the
+    // recording-source lookup enough time to return rather than falling back
+    // to a misleading "no future airings" panel with no Record button.
+    const ar = await fetchJsonWithin(`/epg-web/api/airings?${airingParams}`, 12000);
     if (!ar) throw new Error('Airings lookup timed out');
     if (ar.airings && ar.airings.length > 0) {
       const isSeries = !!ar.is_series;
