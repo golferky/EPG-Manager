@@ -2593,7 +2593,38 @@ def api_fetch_guide():
             xml_path = local_xml  # import from local copy
             new_rows = import_xml_to_guide_db(xml_path, db_path)
         live_epg = refresh_provider_live_epg(db_path)
-        count    = load_epg_from_db(db_path, tz_str)
+        # A full guide contains millions of listings.  Do not make the
+        # Refresh Guide button wait for all of them to be re-read before the
+        # on-screen grid can return.  Load the current 12-hour window now,
+        # then finish the catalog in the same background manner as startup.
+        initial_start = datetime.now(timezone.utc).replace(
+            minute=0, second=0, microsecond=0)
+        count = load_epg_from_db(
+            db_path, tz_str, window_start=initial_start, window_hours=12
+        )
+        _startup_status.update({
+            'loading': False, 'background_loading': True,
+            'phase': 'Starting complete guide load', 'completed': 0, 'total': 0,
+        })
+
+        def _load_complete_guide_after_refresh():
+            def progress(phase, completed, total):
+                _startup_status.update({
+                    'phase': phase, 'completed': completed, 'total': total,
+                })
+            try:
+                total = load_epg_from_db(db_path, tz_str, progress=progress)
+                _schedule_active_series(db_path)
+                print(f'[fetch-guide] Complete guide ready — {total} programmes loaded')
+            except Exception as exc:
+                print(f'[fetch-guide] complete guide load failed: {exc}')
+            finally:
+                _startup_status.update({
+                    'background_loading': False, 'phase': '',
+                    'completed': 0, 'total': 0,
+                })
+        threading.Thread(target=_load_complete_guide_after_refresh,
+                         name='epg-complete-guide-refresh', daemon=True).start()
         _ps_channel_cache['loaded_at'] = 0
         _schedule_active_series(db_path)
         # Auto-upgrades use the already-saved stream-quality samples, so this
@@ -2604,7 +2635,7 @@ def api_fetch_guide():
                          name='epg-abandoned-transfer-retries', daemon=True).start()
         threading.Thread(target=_refresh_stream_quality_cache,
                          name='epg-stream-quality', daemon=True).start()
-        print(f'[fetch-guide] Done: {count} programmes, {new_rows} XML rows, '
+        print(f'[fetch-guide] Visible guide ready: {count} programmes, {new_rows} XML rows, '
               f"{live_epg.get('updated', 0)} live rows")
         return jsonify({'ok': True, 'bytes': len(data), 'count': count, 'new_rows': new_rows,
                         'provider_xml_stale': xml_stale,
@@ -7944,6 +7975,9 @@ async function fetchGuide() {
       ? 'Bulk guide was stale; current favourite-channel listings came from the live provider API.'
       : 'Fresh provider guide downloaded and imported.');
     await fetchAndRenderGuide();
+    // The current on-screen window is ready now; the rest of the large guide
+    // continues without pinning this Refresh button or looking like a loop.
+    pollCompleteGuide();
   } catch(e) { setGS('Fetch failed: '+e.message,'err'); setGuideProgress(0, '', false); }
   finally { btn.disabled=false; btn.textContent='↻ Refresh Guide'; }
 }
