@@ -94,6 +94,10 @@ class RecordingTests(unittest.TestCase):
             source = handle.read()
         self.assertIn('score = (actor_score > 0, actor_score, plot_score, runtime_score)', source)
 
+    def test_detail_panel_keeps_record_action_when_source_lookup_is_slow(self):
+        self.assertIn('directFallback: true', server.HTML)
+        self.assertIn('_nextAiring.directFallback', server.HTML)
+
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
         self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))

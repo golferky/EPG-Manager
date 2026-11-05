@@ -8975,6 +8975,29 @@ async function openProg(p) {
     quickRecord.style.display = '';
     quickRecord.onclick = () => recordAiring(_nextAiring, p.title, quickRecord);
     document.getElementById('pm-next-wrap').style.display = 'block';
+  } else if (p.channel_id) {
+    // The grid knows this exact guide channel and time even when a large
+    // background guide load temporarily delays its stream check.  Keep a
+    // deliberate Record action available; the server still performs the
+    // authoritative source validation (and can remap to a verified feed).
+    const isLive = Number(p.start_ts || 0) <= now && Number(p.stop_ts || 0) > now;
+    _nextAiring = {
+      channel_id: p.channel_id,
+      channel_name: p.channel || p.channel_name || p.channel_id,
+      start_ts: p.start_ts, stop_ts: p.stop_ts, stop_fmt: p.stop_fmt || '',
+      on_now: isLive, _title: p.title, directFallback: true,
+    };
+    document.getElementById('pm-next-heading').textContent = isLive ? '📡 Live now' : '📡 Guide airing';
+    document.getElementById('pm-next-info').textContent = isLive
+      ? `ON NOW  ·  ${_nextAiring.channel_name}${p.stop_fmt ? `  (until ${p.stop_fmt})` : ''}`
+      : `${p.start_fmt || ''} – ${p.stop_fmt || ''}  ·  ${_nextAiring.channel_name}`;
+    document.getElementById('pm-play-btn').style.display = 'none';
+    const quickRecord = document.getElementById('pm-rec-next-btn');
+    quickRecord.textContent = isLive ? '● Record remaining' : '⏱ Record';
+    quickRecord.disabled = false;
+    quickRecord.style.display = '';
+    quickRecord.onclick = () => recordAiring(_nextAiring, p.title, quickRecord, isLive);
+    document.getElementById('pm-next-wrap').style.display = 'block';
   }
 
   // Fetch these independent pieces together.  Waiting for metadata before the
@@ -9130,7 +9153,7 @@ async function openProg(p) {
   // Fetch future airings. Keep a verified live action (and a selected sports
   // event's direct record action) on screen while this optional lookup runs.
   const keepImmediateAction = !!(_nextAiring && (_nextAiring.on_now ||
-    (sportsEvent && p.can_record)));
+    _nextAiring.directFallback || (sportsEvent && p.can_record)));
   if (!keepImmediateAction) document.getElementById('pm-next-wrap').style.display = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
   // Wanted must not depend on the optional airing lookup succeeding.  It is
