@@ -89,6 +89,11 @@ class RecordingTests(unittest.TestCase):
         self.assertNotIn("br'<programme\\\\b[^>]*\\\\bstart=\"(\\\\d{14})'", source)
         self.assertIn('attempt {attempt}/3', source)
 
+    def test_same_title_metadata_prefers_named_people_over_generic_plot_words(self):
+        with open(server.__file__) as handle:
+            source = handle.read()
+        self.assertIn('score = (actor_score > 0, actor_score, plot_score, runtime_score)', source)
+
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
         self.assertTrue(server._is_quality_variant_channel_name("A&E HD"))

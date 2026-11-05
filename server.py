@@ -5684,7 +5684,11 @@ def api_prog_info():
                         if (od2.get('Response') != 'True' or
                                 not _metadata_title_matches(title, od2.get('Title'))):
                             continue
-                        # Score: exact title match wins, then actor name words from desc
+                        # Same-name films are best distinguished by named
+                        # people in the provider synopsis.  Generic plot words
+                        # such as "life" must not outweigh Ben Affleck /
+                        # Charlize Theron and select a different Reindeer
+                        # Games with a nearly identical runtime.
                         actor_words = set(_re.findall(r'[a-z]{4,}', od2.get('Actors','').lower()))
                         actor_score = len(desc_words & actor_words)
                         plot_words = {word for word in _re.findall(r'[a-z]{4,}', od2.get('Plot','').lower())
@@ -5696,9 +5700,9 @@ def api_prog_info():
                             # missing runtime stays eligible but never wins
                             # over a known close match.
                             runtime_score = -abs(runtime - expected_minutes) if runtime else -10000
-                            score = (plot_score, runtime_score, actor_score)
+                            score = (actor_score > 0, actor_score, plot_score, runtime_score)
                         else:
-                            score = (plot_score, 0, actor_score)
+                            score = (actor_score > 0, actor_score, plot_score, 0)
                         if score > best_score:
                             best_score, best_od = score, od2
                     if (best_od and _metadata_runtime_is_plausible(
