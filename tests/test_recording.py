@@ -96,7 +96,7 @@ class RecordingTests(unittest.TestCase):
 
     def test_detail_panel_keeps_record_action_when_source_lookup_is_slow(self):
         self.assertIn('directFallback: true', server.HTML)
-        self.assertIn('_nextAiring.directFallback', server.HTML)
+        self.assertIn('const keepImmediateAction = !!_nextAiring;', server.HTML)
 
     def test_quality_duplicate_channel_helpers(self):
         self.assertTrue(server._is_quality_variant_channel_name("A&E (SD)"))
@@ -419,8 +419,7 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(server._channel_match_base("HBO Movies"), "hbozone")
 
     def test_live_play_button_survives_optional_airings_lookup(self):
-        self.assertIn("const keepImmediateAction", server.HTML)
-        self.assertIn("(sportsEvent && p.can_record)", server.HTML)
+        self.assertIn("const keepImmediateAction = !!_nextAiring;", server.HTML)
         self.assertIn("if (!keepImmediateAction) document.getElementById('pm-next-wrap').style.display = 'none';", server.HTML)
 
     def test_sports_recordings_have_planned_overtime_protection(self):
@@ -635,6 +634,10 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("p.prog_type === 'EP'", server.HTML)
         self.assertIn("p.prog_type === 'SH'", server.HTML)
         self.assertIn("weeklyBtn.style.display = (sportsEvent || isSeries) ? '' : 'none';", server.HTML)
+
+    def test_airings_lookup_cannot_hide_existing_record_action(self):
+        """A valid clicked guide row remains recordable if lookup is slow."""
+        self.assertIn('const keepImmediateAction = !!_nextAiring;', server.HTML)
 
 
 if __name__ == "__main__":

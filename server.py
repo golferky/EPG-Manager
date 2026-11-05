@@ -9156,10 +9156,11 @@ async function openProg(p) {
     } catch (e) { /* Quality information is optional; recording still works. */ }
   }
 
-  // Fetch future airings. Keep a verified live action (and a selected sports
-  // event's direct record action) on screen while this optional lookup runs.
-  const keepImmediateAction = !!(_nextAiring && (_nextAiring.on_now ||
-    _nextAiring.directFallback || (sportsEvent && p.can_record)));
+  // Fetch future airings.  This lookup only adds alternatives; it must never
+  // take away the valid action that was already established from the exact
+  // guide row the user clicked.  Otherwise a slow/failed lookup makes a
+  // Record button disappear after the modal has already shown it.
+  const keepImmediateAction = !!_nextAiring;
   if (!keepImmediateAction) document.getElementById('pm-next-wrap').style.display = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
   // Wanted must not depend on the optional airing lookup succeeding.  It is
