@@ -3,7 +3,7 @@
 import json, os, subprocess, threading, time
 from flask import Flask, jsonify, request
 
-VERSION = 'v20261106a'
+VERSION = 'v20261106b'
 
 app = Flask(__name__)
 
@@ -75,6 +75,30 @@ def api_play():
     if err:
         return jsonify({'error': err}), 500
     return jsonify(_streams_payload(snapshot))
+
+@app.route('/play-file', methods=['POST'])
+def api_play_file():
+    data  = request.json or {}
+    fpath = data.get('file', '')
+    title = data.get('title', '')
+    if not fpath:
+        return jsonify({'error': 'file required'}), 400
+    if not os.path.exists(fpath):
+        return jsonify({'error': f'file not found: {fpath}'}), 404
+    try:
+        vlc_paths = [
+            '/Applications/VLC.app/Contents/MacOS/VLC',
+            '/usr/bin/vlc',
+            'vlc',
+        ]
+        vlc_exe = next((p for p in vlc_paths if os.path.exists(p)), 'vlc')
+        cmd = [vlc_exe, fpath]
+        if title:
+            cmd += ['--meta-title', title, '--video-title', title, '--video-title-timeout', '5000']
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return jsonify({'ok': True, 'file': fpath})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 @app.route('/stop', methods=['POST'])
 def api_stop():

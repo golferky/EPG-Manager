@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = _build_version()
+VERSION = "v20261106c"
 
 app = Flask(__name__)
 
@@ -5454,6 +5454,10 @@ def api_plex_play():
             break
     if not mp4_file:
         return jsonify({'error': 'file not found in Plex'}), 404
+    agent_result = _forward_to_play_agent('/play-file', {'file': mp4_file, 'title': title})
+    if agent_result is not None:
+        return jsonify(agent_result), (500 if 'error' in agent_result else 200)
+    # fallback: local open (Mac only)
     try:
         subprocess.Popen(['open', '-a', 'VLC', mp4_file])
         return jsonify({'ok': True, 'file': mp4_file})
