@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261106c"
+VERSION = "v20261106d"
 
 app = Flask(__name__)
 
@@ -5454,7 +5454,13 @@ def api_plex_play():
             break
     if not mp4_file:
         return jsonify({'error': 'file not found in Plex'}), 404
-    agent_result = _forward_to_play_agent('/play-file', {'file': mp4_file, 'title': title})
+    # translate QNAP plex path to Mac path for the play agent
+    agent_plex = cfg.get('play_agent_plex_path', '').rstrip('/')
+    qnap_plex  = cfg.get('plex_path', '').rstrip('/')
+    agent_file = mp4_file
+    if agent_plex and qnap_plex and mp4_file.startswith(qnap_plex):
+        agent_file = agent_plex + mp4_file[len(qnap_plex):]
+    agent_result = _forward_to_play_agent('/play-file', {'file': agent_file, 'title': title})
     if agent_result is not None:
         return jsonify(agent_result), (500 if 'error' in agent_result else 200)
     # fallback: local open (Mac only)
