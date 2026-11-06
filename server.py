@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261106f"
+VERSION = "v20261106g"
 
 app = Flask(__name__)
 
@@ -5655,7 +5655,7 @@ def api_prog_info():
                     'plot':        od.get('Plot',''),
                     'actors':      od.get('Actors',''),
                     'director':    od.get('Director',''),
-                    'poster':      poster if matching_library_copy else (local_poster or poster),
+                    'poster':      poster or (local_poster if matching_library_copy else ''),
                     'imdb_rating': od.get('imdbRating',''),
                     'imdb_votes':  od.get('imdbVotes',''),
                     'imdb_id':     od.get('imdbID',''),
@@ -9111,7 +9111,7 @@ async function openProg(p) {
   } else { imdbLink.style.display = 'none'; }
 
   const libBadge = document.getElementById('pm-library-badge');
-  if (_plexTitles.has(_plexNorm(p.title))) {
+  if (_plexTitles.has(_plexNorm(p.title)) && info.in_library !== false) {
     libBadge.textContent = '▶ IN PLEX';
     libBadge.style.background = '#2d1f5e'; libBadge.style.color = '#a78bfa';
     libBadge.style.display = '';
@@ -9164,7 +9164,7 @@ async function openProg(p) {
   // Plex file info
   const plexWrap = document.getElementById('pm-plex-wrap');
   plexWrap.style.display = 'none';
-  if (_plexTitles.has(_plexNorm(p.title))) {
+  if (_plexTitles.has(_plexNorm(p.title)) && info.in_library !== false) {
     plexWrap.style.display = 'block';
     document.getElementById('pm-plex-info').textContent = 'Plex copy found';
     // File probing can take several seconds on the NAS.  It is display-only,
