@@ -16,7 +16,7 @@ def _build_version():
         ).strip()
     except Exception:
         revision = ''
-    return f"v20261106a{('-' + revision) if revision else ''}"
+    return f"v20261106b{('-' + revision) if revision else ''}"
 
 VERSION = _build_version()
 
@@ -6107,6 +6107,21 @@ def _streams_payload(streams_snapshot):
         for cid, v in streams_snapshot.items()
     ]}
 
+def _forward_to_play_agent(endpoint, payload):
+    """Forward a play/stop request to the play agent running on the Mac."""
+    import urllib.request as _ureq
+    agent_url = load_config().get('play_agent_url', '').rstrip('/')
+    if not agent_url:
+        return None
+    body = json.dumps(payload).encode()
+    req = _ureq.Request(f"{agent_url}{endpoint}", data=body,
+                        headers={'Content-Type': 'application/json'}, method='POST')
+    try:
+        with _ureq.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        return {'error': str(exc)}
+
 @app.route('/epg-web/api/play', methods=['POST'])
 def api_play():
     data       = request.json or {}
@@ -6117,6 +6132,12 @@ def api_play():
     url, err, dbg = _stream_url(channel_id)
     if err:
         return jsonify({'error': err, 'debug': dbg}), 400
+    agent_result = _forward_to_play_agent('/play', {
+        'channel_id': channel_id, 'url': url,
+        'title': title, 'ch_label': ch_label, 'ch_name': ch_name,
+    })
+    if agent_result is not None:
+        return jsonify(agent_result), (500 if 'error' in agent_result else 200)
     streams_snapshot, start_error = _start_vlc_stream(channel_id, url, title, ch_label, ch_name)
     if start_error:
         return jsonify({'error': start_error}), 500
@@ -6220,6 +6241,9 @@ def api_play_stop():
     import signal as _sig
     data       = request.json or {}
     channel_id = data.get('channel_id', '')
+    agent_result = _forward_to_play_agent('/stop', {'channel_id': channel_id})
+    if agent_result is not None:
+        return jsonify(agent_result), (500 if 'error' in agent_result else 200)
     with _vlc_lock:
         if channel_id and channel_id in _vlc_streams:
             try: os.kill(_vlc_streams[channel_id]['pid'], _sig.SIGTERM)
