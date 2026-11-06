@@ -16,7 +16,7 @@ def _build_version():
         ).strip()
     except Exception:
         revision = ''
-    return f"v20261105a{('-' + revision) if revision else ''}"
+    return f"v20261106a{('-' + revision) if revision else ''}"
 
 VERSION = _build_version()
 
@@ -651,6 +651,16 @@ def get_eaglecast_channel_ids(guide_db_path=None):
 def get_recordable_channel_ids(guide_db_path, movies_db_path):
     """All guide channels that have either PrimeStreams or Eaglecast."""
     return get_ps_channel_ids(guide_db_path, movies_db_path) | get_eaglecast_channel_ids(guide_db_path)
+
+def _query_in_chunks(conn, select_prefix, ids, extra_params=(), chunk_size=999):
+    """Run SELECT...WHERE channel_id IN(...) in chunks to avoid SQLite 999-variable limit."""
+    ids = list(ids)
+    rows = []
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i:i + chunk_size]
+        ph = ','.join('?' * len(chunk))
+        rows.extend(conn.execute(f"{select_prefix} ({ph})", list(extra_params) + chunk).fetchall())
+    return rows
 
 def _eaglecast_stream_for_channel(channel_id):
     try:
@@ -6256,16 +6266,16 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     try:
         conn = sqlite3.connect(guide_db_path)
         conn.row_factory = sqlite3.Row
-        rows = conn.execute('''
-            SELECT channel_id, channel_name, start_utc, end_utc,
+        rows = _query_in_chunks(
+            conn,
+            '''SELECT channel_id, channel_name, start_utc, end_utc,
                    episode_title, season_num, episode_num
             FROM guide
             WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
-            AND start_utc > ? AND channel_id IN ({})
-            ORDER BY start_utc LIMIT 500
-        '''.format(','.join('?' * len(recordable))),
-            [title, clean_title, now_str] + list(recordable)
-        ).fetchall()
+            AND start_utc > ? AND channel_id IN''',
+            recordable,
+            extra_params=[title, clean_title, now_str]
+        )
         # Some provider rows omit episode details while a duplicate guide row
         # for the same airing contains them.  Match the closest such row so a
         # series recording gets a Plex-ready season/episode filename.
@@ -6665,13 +6675,15 @@ def api_record():
                 now_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
                 gconn = sqlite3.connect(guide_db)
                 gconn.row_factory = sqlite3.Row
-                airing = gconn.execute(
+                rows = _query_in_chunks(
+                    gconn,
                     '''SELECT channel_id, channel_name, start_utc, end_utc FROM guide
                        WHERE lower(title)=lower(?) AND start_utc > ?
-                       AND channel_id IN ({})
-                       ORDER BY start_utc LIMIT 1'''.format(','.join('?'*len(recordable_ids))),
-                    [title, now_str] + list(recordable_ids)
-                ).fetchone()
+                       AND channel_id IN''',
+                    recordable_ids,
+                    extra_params=[title, now_str]
+                )
+                airing = rows[0] if rows else None
                 gconn.close()
                 if airing:
                     su = datetime.strptime(airing['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
