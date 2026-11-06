@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261106e"
+VERSION = "v20261106f"
 
 app = Flask(__name__)
 
@@ -5655,7 +5655,7 @@ def api_prog_info():
                     'plot':        od.get('Plot',''),
                     'actors':      od.get('Actors',''),
                     'director':    od.get('Director',''),
-                    'poster':      poster or (local_poster if matching_library_copy else ''),
+                    'poster':      poster if matching_library_copy else (local_poster or poster),
                     'imdb_rating': od.get('imdbRating',''),
                     'imdb_votes':  od.get('imdbVotes',''),
                     'imdb_id':     od.get('imdbID',''),
