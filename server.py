@@ -652,7 +652,7 @@ def get_recordable_channel_ids(guide_db_path, movies_db_path):
     """All guide channels that have either PrimeStreams or Eaglecast."""
     return get_ps_channel_ids(guide_db_path, movies_db_path) | get_eaglecast_channel_ids(guide_db_path)
 
-def _query_in_chunks(conn, select_prefix, ids, extra_params=(), chunk_size=999):
+def _query_in_chunks(conn, select_prefix, ids, extra_params=(), chunk_size=500):
     """Run SELECT...WHERE channel_id IN(...) in chunks to avoid SQLite 999-variable limit."""
     ids = list(ids)
     rows = []
@@ -6312,7 +6312,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         rows = enriched
         conn.close()
     except Exception as e:
-        print(f'[series] query error: {e}')
+        import traceback; traceback.print_exc(); print(f'[series] query error: {e}')
         return 0
 
     # Deduplicate: one best airing per unique episode.
@@ -6521,11 +6521,13 @@ def api_series_list():
             recordable = get_recordable_channel_ids(db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'))
             cnt = 0
             if recordable:
-                cnt = conn.execute(
-                    'SELECT COUNT(*) FROM guide WHERE lower(title)=lower(?) AND start_utc>? AND channel_id IN ({})'.format(
-                        ','.join('?'*len(recordable))),
-                    [s['title'], now_str] + list(recordable)
-                ).fetchone()[0]
+                rows = _query_in_chunks(
+                    conn,
+                    'SELECT COUNT(*) FROM guide WHERE lower(title)=lower(?) AND start_utc>? AND channel_id IN',
+                    recordable,
+                    extra_params=[s['title'], now_str]
+                )
+                cnt = sum(r[0] for r in rows)
             result.append({'id': s['id'], 'title': s['title'], 'created_at': s['created_at'],
                            'active': s['active'], 'upcoming': cnt})
         conn.close()
