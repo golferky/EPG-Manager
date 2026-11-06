@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261106d"
+VERSION = "v20261106e"
 
 app = Flask(__name__)
 
@@ -6422,7 +6422,11 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 r['channel_id'], su.timestamp(), eu.timestamp()
             )
             if stream_error:
-                print(f'[series] stream lookup failed for {r["channel_id"]}: {stream_error}')
+                if not hasattr(_resolve_recording_source, '_no_stream_warned'):
+                    _resolve_recording_source._no_stream_warned = set()
+                if r['channel_id'] not in _resolve_recording_source._no_stream_warned:
+                    print(f'[series] stream lookup failed for {r["channel_id"]}: {stream_error} (will not repeat)')
+                    _resolve_recording_source._no_stream_warned.add(r['channel_id'])
                 continue
             backend = _recording_backend()
             rec = {
