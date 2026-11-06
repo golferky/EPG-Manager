@@ -6312,7 +6312,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         rows = enriched
         conn.close()
     except Exception as e:
-        import traceback; traceback.print_exc(); print(f'[series] query error: {e}')
+        print(f'[series] query error: {e}')
         return 0
 
     # Deduplicate: one best airing per unique episode.
