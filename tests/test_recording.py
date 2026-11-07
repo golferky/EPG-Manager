@@ -647,6 +647,12 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("preferred_provider=requested_provider", text)
         self.assertIn("if preferred_provider == 'primestreams':", text)
 
+    def test_plot_setting_year_is_not_used_as_a_movie_release_year(self):
+        with open(server.__file__, encoding='utf-8') as source:
+            text = source.read()
+        self.assertIn("A bare year in a\n    # plot is often part of the story", text)
+        self.assertIn("(?:this|from|released", text)
+
 
 if __name__ == "__main__":
     unittest.main()

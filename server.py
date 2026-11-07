@@ -5614,9 +5614,14 @@ def api_prog_info():
         if not year:
             year = m.group(2)
 
-    # Try to extract year from description (e.g. "Steve McQueen stars in this 1968 thriller")
+    # Extract a release year only when the wording actually identifies one
+    # (e.g. "Steve McQueen stars in this 1968 thriller").  A bare year in a
+    # plot is often part of the story—RoboCop takes place in 2028—and must not
+    # be treated as the film's release year.
     if not year and desc and content_type != 'series':
-        ym = _re.search(r'\b(19[3-9]\d|20[0-2]\d)\b', desc)
+        ym = _re.search(
+            r'\b(?:this|from|released(?:\s+in)?|made(?:\s+in)?|film\s+from)\s+'
+            r'(19[3-9]\d|20[0-2]\d)\b', desc, _re.I)
         if ym:
             year = ym.group(1)
 
