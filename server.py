@@ -5499,6 +5499,32 @@ def api_plex_stream():
             break
     if not mp4_file:
         return jsonify({'error': 'file not found in Plex'}), 404
+    if request.args.get('transcode'):
+        # Fallback for files the browser cannot decode: re-encode on the fly to
+        # a fragmented MP4 (no seeking, but plays immediately).
+        from flask import Response, stream_with_context
+        ffmpeg = cfg.get('ffmpeg') or shutil.which('ffmpeg') or '/opt/homebrew/bin/ffmpeg'
+        proc = subprocess.Popen(
+            [ffmpeg, '-v', 'error', '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt+genpts',
+             '-i', mp4_file, '-map', '0:v:0', '-map', '0:a:0?',
+             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+             '-c:a', 'aac', '-b:a', '160k', '-ac', '2',
+             '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        def _relay():
+            try:
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                proc.kill()
+                proc.wait()
+
+        return Response(stream_with_context(_relay()), mimetype='video/mp4',
+                        headers={'Cache-Control': 'no-store'})
     return send_file(mp4_file, conditional=True, mimetype='video/mp4')
 
 # ── Conversion routes ─────────────────────────────────────────────────────────
@@ -8686,7 +8712,20 @@ async function openBrowserPlayer({title, src, live}) {
   document.body.appendChild(o);
   const v = o.querySelector('video');
   const msg = o.querySelector('.bp-msg');
-  v.onerror = () => { msg.textContent = 'This browser cannot play this video format.'; };
+  let retried = false;
+  v.onerror = () => {
+    if (!live && !retried && src.indexOf('/plex/stream') >= 0) {
+      // The file will not decode as-is; ask the server to re-encode it.
+      retried = true;
+      msg.style.color = '#fcd34d';
+      msg.textContent = 'Converting for this browser… playback starts in a few seconds.';
+      v.src = src + '&transcode=1';
+      v.play().catch(() => {});
+      return;
+    }
+    msg.style.color = '#fca5a5';
+    msg.textContent = 'This browser cannot play this video format.';
+  };
   if (!live) { v.src = src; return; }
   try {
     await _loadMpegts();
