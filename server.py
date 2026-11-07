@@ -7817,7 +7817,7 @@ tr:hover td{background:#141414;}
         <span style="font-size:13px;color:#fdba74;font-weight:600;">⏰ Recordings older than <select id="rec-expired-days" onchange="loadExpiredRecordings()" style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:4px;padding:2px 6px;font-size:12px;"><option value="14" selected>14 days</option><option value="7">7 days</option><option value="30">30 days</option></select></span>
         <span id="rec-expired-total" style="font-size:12px;color:#64748b;"></span>
         <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadExpiredRecordings()">↻ Refresh</button>
-        <button id="rec-expired-panel" onclick="document.getElementById('rec-expired-panel').style.display='none'" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:16px;">✕</button>
+        <button onclick="closeExpiredPanel()" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:16px;">✕</button>
       </div>
       <div id="rec-expired-list" style="max-height:260px;overflow-y:auto;margin-bottom:10px;"></div>
       <button class="btn btn-sm" id="rec-expired-delete-btn" style="background:#7c2d12;color:#fdba74;display:none;" onclick="deleteExpiredRecordings()">🗑 Delete All Expired</button>
@@ -9778,6 +9778,11 @@ async function deleteSelectedRecordings() {
   if (r.errors && r.errors.length) alert('Errors:\\n' + r.errors.join('\\n'));
   await loadRecFiles();
   loadDiskUsage();
+}
+
+function closeExpiredPanel() {
+  const p = document.getElementById('rec-expired-panel');
+  if (p) p.style.display = 'none';
 }
 
 async function showExpiredRecordings() {
