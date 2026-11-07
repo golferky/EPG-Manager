@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261106h"
+VERSION = "v20261107a"
 
 app = Flask(__name__)
 
@@ -5470,6 +5470,34 @@ def api_plex_play():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/epg-web/api/plex/stream')
+def api_plex_stream():
+    from flask import send_file
+    title = request.args.get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'no title'}), 400
+    cfg = load_config()
+    plex_dir = cfg.get('plex_path', '/share/Plex/Movies')
+    def _norm(t):
+        import re as _re
+        return _re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
+    norm_title = _norm(title)
+    mp4_file = None
+    for name in os.listdir(plex_dir):
+        fp = os.path.join(plex_dir, name)
+        if not os.path.isdir(fp):
+            continue
+        folder_title = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
+        if _norm(folder_title) == norm_title:
+            for f in os.listdir(fp):
+                if f.lower().endswith(('.mp4', '.m4v', '.mkv')):
+                    mp4_file = os.path.join(fp, f)
+                    break
+            break
+    if not mp4_file:
+        return jsonify({'error': 'file not found in Plex'}), 404
+    return send_file(mp4_file, conditional=True, mimetype='video/mp4')
+
 # ── Conversion routes ─────────────────────────────────────────────────────────
 
 @app.route('/epg-web/api/convert/list')
@@ -8512,7 +8540,8 @@ async function quickRecord(key, btnEl) {
 async function playPlex(title) {
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
   if (isIOS) {
-    alert('Plex play opens on the Mac Mini. Use the Plex app on your iPhone/iPad to watch Plex titles.');
+    const streamUrl = location.origin + '/epg-web/api/plex/stream?title=' + encodeURIComponent(title);
+    window.location.href = 'vlc://' + streamUrl.replace(/^https?:\/\//, '');
     return;
   }
   const r = await fetch('/epg-web/api/plex/play', {
