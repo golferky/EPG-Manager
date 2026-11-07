@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107g"
+VERSION = "v20261107h"
 
 app = Flask(__name__)
 
@@ -2393,7 +2393,7 @@ def api_disk():
     cfg = load_config()
     # Built-in paths from config
     checks = [
-        ('Mac (recordings)', cfg.get('rec_path',  os.path.expanduser('~/Movies/Recordings'))),
+        *([('Mac (recordings)', cfg['rec_path'])] if 'rec_path' in cfg else []),
         ('NAS – Plex',       cfg.get('plex_path', '/Volumes/Plex/Movies')),
         ('NAS – EPG',        cfg.get('guide_path','/Volumes/EPG/guide/guide.xml')),
     ]
