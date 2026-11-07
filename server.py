@@ -7407,7 +7407,7 @@ tr:hover td{background:#141414;}
   <span class="badge-live" id="live-badge">● Server live</span>
   <span id="clock">--:-- --</span>
   <div class="spacer"></div>
-  <button class="btn btn-ghost btn-sm" id="btn-refresh" onclick="loadGuide()">↻ Refresh</button>
+  <button class="btn btn-ghost btn-sm" id="btn-refresh" onclick="loadGuide()">Refresh</button>
   <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">↻ Refresh Guide</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
@@ -7618,7 +7618,7 @@ tr:hover td{background:#141414;}
   <div class="card" style="margin-bottom:12px;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
       <h2 style="margin:0;">↑ Upgrade Opportunities</h2>
-      <button class="btn btn-ghost btn-sm" onclick="loadUpgradeOpportunities()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" onclick="loadUpgradeOpportunities()">Refresh</button>
     </div>
     <div id="upgrade-status" class="status-msg"></div>
     <div id="upgrade-list" style="font-size:13px;"></div>
@@ -7632,7 +7632,7 @@ tr:hover td{background:#141414;}
       <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap;">
         <button class="btn btn-primary" onclick="addWanted('movie')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Movie</button>
         <button class="btn btn-primary" onclick="addWanted('series')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Series</button>
-        <button class="btn btn-ghost btn-sm" onclick="loadRecs()">↻ Refresh</button>
+        <button class="btn btn-ghost btn-sm" onclick="loadRecs()">Refresh</button>
       </div>
     </div>
     <div id="rec-status" class="status-msg"></div>
@@ -7726,7 +7726,7 @@ tr:hover td{background:#141414;}
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Completed, failed, and skipped recordings are in Recording Health.</div>
       </div>
       <input id="sched-search" type="search" placeholder="Search scheduled recordings…" oninput="filterSchedule()" style="width:230px;max-width:100%;background:#111827;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:7px 10px;font-size:12px;" aria-label="Search scheduled recordings">
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadSchedule()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadSchedule()">Refresh</button>
     </div>
     <div id="sched-empty" class="empty" style="display:none;">
       Nothing waiting to record<br><span style="font-size:12px;color:#333;margin-top:6px;display:block;">
@@ -7752,7 +7752,7 @@ tr:hover td{background:#141414;}
       <select id="health-filter" onchange="loadRecordingHealth()" style="margin-left:auto;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#cbd5e1;padding:5px 8px;font-size:12px;">
         <option value="attention">Needs attention</option><option value="complete">Completed</option><option value="all">All results</option>
       </select>
-      <button class="btn btn-ghost btn-sm" onclick="loadRecordingHealth()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" onclick="loadRecordingHealth()">Refresh</button>
       <button class="btn btn-ghost btn-sm" onclick="importPriorRecordingLogs(this)">⇩ Import old FFmpeg logs</button>
     </div>
     <div id="recording-health-empty" style="display:none;color:#64748b;font-size:13px;">No completed recording reports yet. New recordings will appear here.</div>
@@ -7764,7 +7764,7 @@ tr:hover td{background:#141414;}
         <h2 style="margin:0;">✂️ Commercial Review</h2>
         <div style="font-size:12px;color:#64748b;margin-top:3px;">TV episodes only: analyze a completed Plex episode and inspect possible breaks first. This does not edit or replace the Plex file.</div>
       </div>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadCommercialReview()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadCommercialReview()">Refresh</button>
     </div>
     <div id="commercial-review-note" style="font-size:12px;color:#94a3b8;margin-bottom:8px;"></div>
     <div id="commercial-review-empty" style="display:none;color:#64748b;font-size:13px;">No completed Plex TV episodes are available to review yet.</div>
@@ -7776,7 +7776,7 @@ tr:hover td{background:#141414;}
         <h2 style="margin:0;">⚠ Incomplete Plex Copies</h2>
         <div style="font-size:12px;color:#64748b;margin-top:3px;">Files that are still more than 5% shorter than the airing they were meant to capture.</div>
       </div>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadIncompletePlexCopies()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadIncompletePlexCopies()">Refresh</button>
     </div>
     <div id="incomplete-plex-empty" style="display:none;color:#64748b;font-size:13px;">No incomplete Plex copies are currently flagged.</div>
     <div id="incomplete-plex-list" style="max-height:260px;overflow-y:auto;"></div>
@@ -7790,7 +7790,7 @@ tr:hover td{background:#141414;}
       <label style="font-size:12px;color:#94a3b8;cursor:pointer;white-space:nowrap;"><input type="checkbox" id="plex-debris-select-all" onchange="toggleAllPlexDebris(this.checked)"> Select all</label>
       <button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;" onclick="rerecordAllPlexTransferDebris(this)">↻ Re-record all</button>
       <button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="trashSelectedPlexTransferDebris()">🗑 Clean selected</button>
-      <button class="btn btn-ghost btn-sm" onclick="loadPlexTransferDebris()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" onclick="loadPlexTransferDebris()">Refresh</button>
     </div>
     <div id="plex-debris-empty" style="display:none;color:#64748b;font-size:13px;">No abandoned Plex transfer files found.</div>
     <div id="plex-debris-list" style="max-height:260px;overflow-y:auto;"></div>
@@ -7798,7 +7798,7 @@ tr:hover td{background:#141414;}
   <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <div><h2 style="margin:0;">🧾 Raw FFmpeg Log Cleanup</h2><div style="font-size:12px;color:#64748b;margin-top:3px;">These are old raw logs still using space. Import archives matched logs into the database, then removes them.</div></div>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRawLogFiles()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRawLogFiles()">Refresh</button>
     </div>
     <div id="raw-log-empty" style="display:none;color:#64748b;font-size:13px;">No raw FFmpeg logs are waiting to be imported.</div>
     <div id="raw-log-list" style="max-height:260px;overflow-y:auto;"></div>
@@ -7807,16 +7807,16 @@ tr:hover td{background:#141414;}
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <h2 style="margin:0;">🗑 Recordings Cleanup</h2>
       <span id="rec-files-total" style="font-size:12px;color:#64748b;"></span>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecFiles()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecFiles()">Refresh</button>
       <button class="btn btn-sm" id="rec-delete-btn" style="background:#7f1d1d;color:#fca5a5;display:none;" onclick="deleteSelectedRecordings()">🗑 Delete Selected</button>
       <button class="btn btn-sm" id="rec-expired-btn" style="background:#7c2d12;color:#fdba74;margin-left:6px;" onclick="showExpiredRecordings()">Delete All Expired</button>
     </div>
     <!-- Expired recordings panel -->
     <div id="rec-expired-panel" style="display:none;margin-top:12px;padding:12px;background:#0f1a2e;border-radius:8px;border:1px solid #7c2d12;">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
-        <span style="font-size:13px;color:#fdba74;font-weight:600;">⏰ Recordings older than <select id="rec-expired-days" onchange="loadExpiredRecordings()" style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:4px;padding:2px 6px;font-size:12px;"><option value="14" selected>14 days</option><option value="7">7 days</option><option value="30">30 days</option></select></span>
+        <span style="font-size:13px;color:#fdba74;font-weight:600;">Recordings older than <select id="rec-expired-days" onchange="loadExpiredRecordings()" style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:4px;padding:2px 6px;font-size:12px;"><option value="14" selected>14 days</option><option value="7">7 days</option><option value="30">30 days</option></select></span>
         <span id="rec-expired-total" style="font-size:12px;color:#64748b;"></span>
-        <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadExpiredRecordings()">↻ Refresh</button>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadExpiredRecordings()">Refresh</button>
         <button onclick="closeExpiredPanel()" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:16px;">✕</button>
       </div>
       <div id="rec-expired-list" style="max-height:260px;overflow-y:auto;margin-bottom:10px;"></div>
@@ -7832,7 +7832,7 @@ tr:hover td{background:#141414;}
   <div class="card">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
       <h2 style="margin:0;">TS → MP4 Converter</h2>
-      <button class="btn btn-ghost btn-sm" onclick="loadTsFiles()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" onclick="loadTsFiles()">Refresh</button>
     </div>
     <div id="conv-dir" style="font-size:12px;color:#333;margin-bottom:12px;"></div>
     <div id="ts-list" class="conv-list"></div>
@@ -7857,7 +7857,7 @@ tr:hover td{background:#141414;}
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <h2 style="margin:0;">💾 Storage</h2>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadStorageTab()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadStorageTab()">Refresh</button>
     </div>
     <div id="storage-tab-list"></div>
   </div>
