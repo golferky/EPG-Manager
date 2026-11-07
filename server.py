@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107d"
+VERSION = "v20261107f"
 
 app = Flask(__name__)
 
@@ -9747,7 +9747,7 @@ async function loadRecFiles() {
       return;
     }
     empty.style.display = 'none';
-    total.textContent = `${d.files.length} files · ${fmtSize(d.total)}`;
+    total.textContent = `${d.files.length} files - ${fmtSize(d.total)}`;
     list.innerHTML = d.files.map(f => `
       <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #1e293b;">
         <input type="checkbox" class="rec-file-chk" data-name="${esc(f.name)}"
@@ -9807,7 +9807,7 @@ async function loadExpiredRecordings() {
       delbtn.style.display = 'none';
       return;
     }
-    total.textContent = `${d.files.length} files · ${fmtSize(d.total)}`;
+    total.textContent = `${d.files.length} files - ${fmtSize(d.total)}`;
     list.innerHTML = d.files.map(f => `
       <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e293b;">
         <span style="flex:1;font-size:12px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(f.name)}">${esc(f.name)}</span>
