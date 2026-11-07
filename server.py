@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107b"
+VERSION = "v20261107c"
 
 app = Flask(__name__)
 
@@ -9610,7 +9610,7 @@ async function recordWeekly() {
       sports_event: !!_currentProg.sports_event,
     });
     if (!r.ok) throw Error(r.error || 'Could not save weekly recording');
-    btn.textContent = '✅ Recording weekly';
+    btn.textContent = '✅ Recording series';
     document.getElementById('pm-status').textContent =
       `✅ "${_currentProg.title}" will record every ${r.weekday} around ${r.time} on ${_nextAiring.channel_name || _nextAiring.channel_id}` +
       (r.current_queued ? ' — today’s remaining time is recording too' : '');
