@@ -6254,14 +6254,6 @@ def api_play_eaglecast_live():
         return jsonify({'error': start_error}), 500
     return jsonify(_streams_payload(streams_snapshot))
 
-@app.route("/epg-web/api/play/stream-url")
-def api_play_stream_url():
-    channel_id = request.args.get("channel_id", "")
-    url, err, dbg = _stream_url(channel_id)
-    if err:
-        return jsonify({"error": err, "debug": dbg}), 400
-    return jsonify({"ok": True, "url": url})
-
 @app.route('/epg-web/api/play/stop', methods=['POST'])
 def api_play_stop():
     import signal as _sig
