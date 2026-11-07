@@ -2104,8 +2104,11 @@ def _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id=''):
     except Exception:
         return None
 
-def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id=''):
-    """Prefer Eaglecast, but never knowingly schedule two overlapping EC streams."""
+def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
+                              preferred_provider=None):
+    """Resolve a recording source, honoring a source explicitly chosen in the UI."""
+    if preferred_provider == 'primestreams':
+        return _stream_url(channel_id, 'primestreams')
     eaglecast_stream = _eaglecast_stream_for_channel(channel_id)
     eaglecast_exists = bool(eaglecast_stream)
     if eaglecast_exists:
@@ -6733,9 +6736,13 @@ def api_record():
     # Prefer the guide's classification below, but preserve the explicit flag
     # from a sports tile when a provider is temporarily refreshing its guide.
     is_sports_request = bool(data.get('sports_event', False))
+    requested_provider = str(data.get('stream_provider', '') or '').strip().lower()
+    if requested_provider not in ('primestreams', 'eaglecast'):
+        requested_provider = None
 
     # The requested guide channel may be supplied by either provider.
-    _requested_url, requested_error, _requested_debug = _stream_url(channel_id)
+    _requested_url, requested_error, _requested_debug = _resolve_recording_source(
+        channel_id, start_ts, stop_ts, preferred_provider=requested_provider)
     has_stream = not requested_error
 
     # If no stream on this guide row, find the nearest upcoming airing supplied
@@ -6874,7 +6881,8 @@ def api_record():
         'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
     }
-    _url, stream_error, stream_debug = _resolve_recording_source(channel_id, start_ts, stop_ts)
+    _url, stream_error, stream_debug = _resolve_recording_source(
+        channel_id, start_ts, stop_ts, preferred_provider=requested_provider)
     if stream_error:
         return jsonify({'ok': False, 'error': stream_error}), 400
     rec['stream_id'] = str(stream_debug.get('stream_id') or '')
@@ -9998,6 +10006,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
     title:      title,
     channel_id: airing.channel_id,
     channel_name: airing.channel_name || airing.channel || airing.channel_id,
+    stream_provider: airing.stream_provider || '',
     start_ts:   airing.start_ts,
     stop_ts:    airing.stop_ts,
     episode_title: airing.episode_title || '',

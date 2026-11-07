@@ -639,6 +639,14 @@ class RecordingTests(unittest.TestCase):
         """A valid clicked guide row remains recordable if lookup is slow."""
         self.assertIn('const keepImmediateAction = !!_nextAiring;', server.HTML)
 
+    def test_recording_honors_the_source_selected_for_an_airing(self):
+        """A PrimeStreams airing must not be silently changed to Eaglecast."""
+        self.assertIn("stream_provider: airing.stream_provider || ''", server.HTML)
+        with open(server.__file__, encoding='utf-8') as source:
+            text = source.read()
+        self.assertIn("preferred_provider=requested_provider", text)
+        self.assertIn("if preferred_provider == 'primestreams':", text)
+
 
 if __name__ == "__main__":
     unittest.main()
