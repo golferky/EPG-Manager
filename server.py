@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261106g"
+VERSION = "v20261106h"
 
 app = Flask(__name__)
 
@@ -6153,6 +6153,14 @@ def api_play():
         return jsonify({'error': start_error}), 500
     return jsonify(_streams_payload(streams_snapshot))
 
+@app.route("/epg-web/api/play/stream-url")
+def api_play_stream_url():
+    channel_id = request.args.get("channel_id", "")
+    url, err, dbg = _stream_url(channel_id)
+    if err:
+        return jsonify({"error": err, "debug": dbg}), 400
+    return jsonify({"ok": True, "url": url})
+
 def _eaglecast_sports_terms(value):
     return bool(re.search(
         r'\b(?:sport|nfl|nba|nhl|mlb|ncaa|espn|fox\s*soccer|golf|tennis|cricket|rugby|soccer|football|baseball|basketball|hockey|mma|ufc|boxing|wwe|wrestling|racing|motorsport|nascar|formula\s*1|fubo)\b',
@@ -6245,6 +6253,14 @@ def api_play_eaglecast_live():
     if start_error:
         return jsonify({'error': start_error}), 500
     return jsonify(_streams_payload(streams_snapshot))
+
+@app.route("/epg-web/api/play/stream-url")
+def api_play_stream_url():
+    channel_id = request.args.get("channel_id", "")
+    url, err, dbg = _stream_url(channel_id)
+    if err:
+        return jsonify({"error": err, "debug": dbg}), 400
+    return jsonify({"ok": True, "url": url})
 
 @app.route('/epg-web/api/play/stop', methods=['POST'])
 def api_play_stop():
@@ -8502,6 +8518,11 @@ async function quickRecord(key, btnEl) {
 }
 
 async function playPlex(title) {
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  if (isIOS) {
+    alert('Plex play opens on the Mac Mini. Use the Plex app on your iPhone/iPad to watch Plex titles.');
+    return;
+  }
   const r = await fetch('/epg-web/api/plex/play', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({title})
@@ -9495,6 +9516,15 @@ function _updateNowPlaying(streams) {
 }
 
 async function playStream() {
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  if (isIOS && _nextAiring) {
+    const r = await fetch(`/epg-web/api/play/stream-url?channel_id=${encodeURIComponent(_nextAiring.channel_id)}`);
+    const d = await r.json();
+    if (d.ok) { window.location.href = 'vlc://' + d.url; return; }
+    document.getElementById('pm-status').textContent = '❌ ' + (d.error || 'Could not get stream');
+    document.getElementById('pm-status').className = 'status-msg err';
+    return;
+  }
   if (!_nextAiring) return;
   const btn = document.getElementById('pm-play-btn');
   if (Object.keys(_activeStreams).length >= 6) {
