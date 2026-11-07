@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107c"
+VERSION = "v20261107d"
 
 app = Flask(__name__)
 
@@ -6925,6 +6925,7 @@ def api_recordings_delete():
     names = (request.json or {}).get('files', [])
     deleted = []
     errors  = []
+    db_path = cfg.get('db_path', os.path.expanduser('~/Movies/guide.db'))
     for fn in names:
         # Safety: no path traversal
         fn = os.path.basename(fn)
@@ -6933,11 +6934,43 @@ def api_recordings_delete():
             try:
                 os.remove(fp)
                 deleted.append(fn)
+                # Also remove DB record matching this file path
+                try:
+                    import sqlite3 as _sq3
+                    with _sq3.connect(db_path) as _db:
+                        _db.execute("DELETE FROM recordings WHERE file LIKE ?", (f'%{fn}',))
+                        _db.commit()
+                except Exception:
+                    pass  # DB cleanup is best-effort
             except Exception as e:
                 errors.append(f'{fn}: {e}')
         else:
             errors.append(f'{fn}: not found')
     return jsonify({'ok': not errors, 'deleted': deleted, 'errors': errors})
+
+@app.route('/epg-web/api/recordings/expired')
+def api_recordings_expired():
+    import time
+    cfg = load_config()
+    rec_dir = cfg.get('rec_path', os.path.expanduser('~/Movies/Recordings'))
+    days = int(request.args.get('days', 14))
+    cutoff = time.time() - days * 86400
+    files = []
+    if os.path.isdir(rec_dir):
+        for fn in sorted(os.listdir(rec_dir)):
+            fp = os.path.join(rec_dir, fn)
+            if os.path.isfile(fp):
+                stat = os.stat(fp)
+                if stat.st_mtime < cutoff:
+                    files.append({
+                        'name':      fn,
+                        'size':      stat.st_size,
+                        'mtime':     stat.st_mtime,
+                        'mtime_fmt': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                    })
+    files.sort(key=lambda x: x['mtime'])
+    total = sum(f['size'] for f in files)
+    return jsonify({'ok': True, 'dir': rec_dir, 'days': days, 'files': files, 'total': total})
 
 @app.route('/epg-web/api/record/cancel', methods=['POST'])
 def api_rec_cancel():
@@ -7776,6 +7809,18 @@ tr:hover td{background:#141414;}
       <span id="rec-files-total" style="font-size:12px;color:#64748b;"></span>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecFiles()">↻ Refresh</button>
       <button class="btn btn-sm" id="rec-delete-btn" style="background:#7f1d1d;color:#fca5a5;display:none;" onclick="deleteSelectedRecordings()">🗑 Delete Selected</button>
+      <button class="btn btn-sm" id="rec-expired-btn" style="background:#7c2d12;color:#fdba74;margin-left:6px;" onclick="showExpiredRecordings()">🗑 Delete All Expired</button>
+    </div>
+    <!-- Expired recordings panel -->
+    <div id="rec-expired-panel" style="display:none;margin-top:12px;padding:12px;background:#0f1a2e;border-radius:8px;border:1px solid #7c2d12;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+        <span style="font-size:13px;color:#fdba74;font-weight:600;">⏰ Recordings older than <select id="rec-expired-days" onchange="loadExpiredRecordings()" style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:4px;padding:2px 6px;font-size:12px;"><option value="14" selected>14 days</option><option value="7">7 days</option><option value="30">30 days</option></select></span>
+        <span id="rec-expired-total" style="font-size:12px;color:#64748b;"></span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadExpiredRecordings()">↻ Refresh</button>
+        <button id="rec-expired-panel" onclick="document.getElementById('rec-expired-panel').style.display='none'" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:16px;">✕</button>
+      </div>
+      <div id="rec-expired-list" style="max-height:260px;overflow-y:auto;margin-bottom:10px;"></div>
+      <button class="btn btn-sm" id="rec-expired-delete-btn" style="background:#7c2d12;color:#fdba74;display:none;" onclick="deleteExpiredRecordings()">🗑 Delete All Expired</button>
     </div>
     <div id="rec-files-empty" style="display:none;color:#64748b;font-size:13px;">No recording files found.</div>
     <div id="rec-files-list" style="max-height:320px;overflow-y:auto;"></div>
@@ -9731,6 +9776,54 @@ async function deleteSelectedRecordings() {
   btn.disabled = true; btn.textContent = 'Deleting...';
   const r = await post('/epg-web/api/recordings/delete', {files: checked});
   if (r.errors && r.errors.length) alert('Errors:\\n' + r.errors.join('\\n'));
+  await loadRecFiles();
+  loadDiskUsage();
+}
+
+async function showExpiredRecordings() {
+  const panel = document.getElementById('rec-expired-panel');
+  if (!panel) return;
+  panel.style.display = '';
+  await loadExpiredRecordings();
+}
+
+async function loadExpiredRecordings() {
+  const list  = document.getElementById('rec-expired-list');
+  const total = document.getElementById('rec-expired-total');
+  const delbtn = document.getElementById('rec-expired-delete-btn');
+  const days  = document.getElementById('rec-expired-days')?.value || 14;
+  if (!list) return;
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;">Loading…</div>';
+  try {
+    const d = await (await fetch(`/epg-web/api/recordings/expired?days=${days}`)).json();
+    if (!d.ok || !d.files.length) {
+      list.innerHTML = '<div style="color:#64748b;font-size:13px;">No expired recordings found.</div>';
+      total.textContent = '';
+      delbtn.style.display = 'none';
+      return;
+    }
+    total.textContent = `${d.files.length} files · ${fmtSize(d.total)}`;
+    list.innerHTML = d.files.map(f => `
+      <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e293b;">
+        <span style="flex:1;font-size:12px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(f.name)}">${esc(f.name)}</span>
+        <span style="font-size:11px;color:#64748b;white-space:nowrap;">${fmtSize(f.size)}</span>
+        <span style="font-size:11px;color:#475569;white-space:nowrap;">${esc(f.mtime_fmt)}</span>
+      </div>`).join('');
+    delbtn.style.display = '';
+    delbtn.textContent = `🗑 Delete All Expired (${d.files.length})`;
+    delbtn.dataset.files = JSON.stringify(d.files.map(f => f.name));
+  } catch(e) { list.innerHTML = '<div style="color:#ef4444;">Error loading expired files.</div>'; }
+}
+
+async function deleteExpiredRecordings() {
+  const delbtn = document.getElementById('rec-expired-delete-btn');
+  const files = JSON.parse(delbtn.dataset.files || '[]');
+  if (!files.length) return;
+  if (!confirm(`Permanently delete ${files.length} expired recording(s) and their DB records?`)) return;
+  delbtn.disabled = true; delbtn.textContent = 'Deleting…';
+  const r = await post('/epg-web/api/recordings/delete', {files});
+  if (r.errors && r.errors.length) alert('Errors:\n' + r.errors.join('\n'));
+  await loadExpiredRecordings();
   await loadRecFiles();
   loadDiskUsage();
 }
