@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107i"
+VERSION = "v20261107j"
 
 app = Flask(__name__)
 
@@ -9597,6 +9597,8 @@ function _updateNowPlaying(streams) {
 }
 
 async function playStream() {
+  document.getElementById('pm-status').textContent = '';
+  document.getElementById('pm-status').className = 'status-msg';
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
   if (isIOS && _nextAiring) {
     const r = await fetch(`/epg-web/api/play/stream-url?channel_id=${encodeURIComponent(_nextAiring.channel_id)}`);
