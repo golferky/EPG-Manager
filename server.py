@@ -6224,20 +6224,10 @@ def api_play():
         return jsonify({'error': start_error}), 500
     return jsonify(_streams_payload(streams_snapshot))
 
-@app.route("/epg-web/api/play/proxy")
-def api_play_proxy():
-    """Relay a live stream to the requesting browser so it plays on that device.
-
-    Browsers cannot open the provider's MPEG-TS URL directly (CORS, and the
-    signed URL embeds credentials), so the stream is relayed same-origin and
-    the credentials never reach the page.
-    """
+def _relay_live_stream(url):
+    """Relay a provider live stream to the requesting browser (same-origin)."""
     import urllib.request as _ureq
     from flask import Response, stream_with_context
-    channel_id = request.args.get("channel_id", "")
-    url, err, dbg = _stream_url(channel_id)
-    if err:
-        return jsonify({"error": err}), 400
     try:
         upstream = _ureq.urlopen(_ureq.Request(url, headers={"User-Agent": "VLC/3.0"}), timeout=15)
     except Exception:
@@ -6255,6 +6245,31 @@ def api_play_proxy():
 
     return Response(stream_with_context(_relay()), mimetype="video/mp2t",
                     headers={"Cache-Control": "no-store"})
+
+@app.route("/epg-web/api/play/proxy")
+def api_play_proxy():
+    """Play a live channel on the requesting device.
+
+    Browsers cannot open the provider's MPEG-TS URL directly (CORS, and the
+    signed URL embeds credentials), so the stream is relayed same-origin and
+    the credentials never reach the page.
+    """
+    url, err, dbg = _stream_url(request.args.get("channel_id", ""))
+    if err:
+        return jsonify({"error": err}), 400
+    return _relay_live_stream(url)
+
+@app.route("/epg-web/api/play/eaglecast-proxy")
+def api_play_eaglecast_proxy():
+    stream_id = str(request.args.get("stream_id") or "")
+    # Only feeds from the live-sports catalogue may be relayed.
+    item = next((e for e in _eaglecast_live_sports() if e["stream_id"] == stream_id), None)
+    if not item:
+        return jsonify({"error": "That Eaglecast sports feed is no longer available."}), 404
+    url = _eaglecast_stream_url(item["stream_id"], item["extension"])
+    if not url:
+        return jsonify({"error": "Eaglecast playback is not configured on this Mac."}), 503
+    return _relay_live_stream(url)
 
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
@@ -8865,14 +8880,12 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
   }
 }
 
-async function playEaglecastLiveSport(streamId) {
-  const channelId = 'eaglecast-live:' + streamId;
-  try {
-    const r = await post('/epg-web/api/play/eaglecast-live', {stream_id: streamId});
-    if (!r.ok) { alert('Could not start VLC: ' + (r.error || 'unknown error')); return; }
-    _updateNowPlaying(r.streams);
-    fetchAndRenderGuide();
-  } catch (e) { alert('Could not start VLC: ' + e.message); }
+function playEaglecastLiveSport(streamId, name) {
+  openBrowserPlayer({
+    title: name || 'Eaglecast live',
+    src: '/epg-web/api/play/eaglecast-proxy?stream_id=' + encodeURIComponent(streamId),
+    live: true
+  });
 }
 function chPagePrev() { _chOffset = Math.max(0, _chOffset - 200); fetchAndRenderGuide(); }
 function chPageNext() { _chOffset += 200; fetchAndRenderGuide(); }
@@ -10539,12 +10552,12 @@ async function load247() {
       </div>`).join('');
   } catch(e) { setEl('c247-status', 'Failed', 'err'); }
 }
-async function play247(channelId, name) {
-  const r = await fetch('/epg-web/api/play', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({channel_id: channelId, title: name, ch_name: name})});
-  const d = await r.json();
-  if (d.error) setEl('c247-status', '❌ ' + d.error, 'err');
-  else setEl('c247-status', `▶ Playing: ${name}`, 'ok');
+function play247(channelId, name) {
+  openBrowserPlayer({
+    title: name || 'Live',
+    src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId),
+    live: true
+  });
 }
 async function hide247(channelId, hide, el) {
   const r = await fetch('/epg-web/api/channel/hide', {method:'POST',
