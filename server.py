@@ -7809,7 +7809,7 @@ tr:hover td{background:#141414;}
       <span id="rec-files-total" style="font-size:12px;color:#64748b;"></span>
       <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadRecFiles()">↻ Refresh</button>
       <button class="btn btn-sm" id="rec-delete-btn" style="background:#7f1d1d;color:#fca5a5;display:none;" onclick="deleteSelectedRecordings()">🗑 Delete Selected</button>
-      <button class="btn btn-sm" id="rec-expired-btn" style="background:#7c2d12;color:#fdba74;margin-left:6px;" onclick="showExpiredRecordings()">🗑 Delete All Expired</button>
+      <button class="btn btn-sm" id="rec-expired-btn" style="background:#7c2d12;color:#fdba74;margin-left:6px;" onclick="showExpiredRecordings()">Delete All Expired</button>
     </div>
     <!-- Expired recordings panel -->
     <div id="rec-expired-panel" style="display:none;margin-top:12px;padding:12px;background:#0f1a2e;border-radius:8px;border:1px solid #7c2d12;">
@@ -7820,7 +7820,7 @@ tr:hover td{background:#141414;}
         <button onclick="closeExpiredPanel()" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:16px;">✕</button>
       </div>
       <div id="rec-expired-list" style="max-height:260px;overflow-y:auto;margin-bottom:10px;"></div>
-      <button class="btn btn-sm" id="rec-expired-delete-btn" style="background:#7c2d12;color:#fdba74;display:none;" onclick="deleteExpiredRecordings()">🗑 Delete All Expired</button>
+      <button class="btn btn-sm" id="rec-expired-delete-btn" style="background:#7c2d12;color:#fdba74;display:none;" onclick="deleteExpiredRecordings()">Delete All Expired</button>
     </div>
     <div id="rec-files-empty" style="display:none;color:#64748b;font-size:13px;">No recording files found.</div>
     <div id="rec-files-list" style="max-height:320px;overflow-y:auto;"></div>
@@ -9738,7 +9738,7 @@ async function loadRecFiles() {
   const total = document.getElementById('rec-files-total');
   const delbtn = document.getElementById('rec-delete-btn');
   if (!list) return;
-  list.innerHTML = '<div style="color:#64748b;font-size:13px;">Loading…</div>';
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;">Loading...</div>';
   try {
     const d = await (await fetch('/epg-web/api/recordings/files')).json();
     if (!d.ok || !d.files.length) {
@@ -9798,7 +9798,7 @@ async function loadExpiredRecordings() {
   const delbtn = document.getElementById('rec-expired-delete-btn');
   const days  = document.getElementById('rec-expired-days')?.value || 14;
   if (!list) return;
-  list.innerHTML = '<div style="color:#64748b;font-size:13px;">Loading…</div>';
+  list.innerHTML = '<div style="color:#64748b;font-size:13px;">Loading...</div>';
   try {
     const d = await (await fetch(`/epg-web/api/recordings/expired?days=${days}`)).json();
     if (!d.ok || !d.files.length) {
@@ -9815,7 +9815,7 @@ async function loadExpiredRecordings() {
         <span style="font-size:11px;color:#475569;white-space:nowrap;">${esc(f.mtime_fmt)}</span>
       </div>`).join('');
     delbtn.style.display = '';
-    delbtn.textContent = `🗑 Delete All Expired (${d.files.length})`;
+    delbtn.textContent = `Delete All Expired (${d.files.length})`;
     delbtn.dataset.files = JSON.stringify(d.files.map(f => f.name));
   } catch(e) { list.innerHTML = '<div style="color:#ef4444;">Error loading expired files.</div>'; }
 }
@@ -9825,7 +9825,7 @@ async function deleteExpiredRecordings() {
   const files = JSON.parse(delbtn.dataset.files || '[]');
   if (!files.length) return;
   if (!confirm(`Permanently delete ${files.length} expired recording(s) and their DB records?`)) return;
-  delbtn.disabled = true; delbtn.textContent = 'Deleting…';
+  delbtn.disabled = true; delbtn.textContent = 'Deleting...';
   const r = await post('/epg-web/api/recordings/delete', {files});
   if (r.errors && r.errors.length) alert('Errors:\n' + r.errors.join('\n'));
   await loadExpiredRecordings();
