@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107f"
+VERSION = "v20261107g"
 
 app = Flask(__name__)
 
@@ -8111,7 +8111,7 @@ async function fetchGuide() {
     const r = await fetch('/epg-web/api/fetch-guide', {method:'POST'});
     const d = await r.json();
     if (d.error) {
-      setGS('Refresh could not get a new provider guide — the current guide is still available. '+d.error, 'err');
+      if (d.error === 'epg_user / epg_pass not configured') { setGS('Provider guide credentials not configured on this instance.', 'info'); } else { setGS('Refresh could not get a new provider guide — the current guide is still available. '+d.error, 'err'); }
       setGuideProgress(0, '', false);
       return;
     }
