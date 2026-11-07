@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107a"
+VERSION = "v20261107b"
 
 app = Flask(__name__)
 
@@ -7552,7 +7552,7 @@ tr:hover td{background:#141414;}
           <div id="pm-next-info" style="flex:1;font-size:13px;color:#e2e8f0;"></div>
           <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
           <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
-          <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="display:none;border-color:#f59e0b;color:#fbbf24;">📅 Record weekly</button>
+          <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="display:none;border-color:#f59e0b;color:#fbbf24;">📅 Record series</button>
         </div>
       </div>
       <!-- All future airings -->
@@ -9617,7 +9617,7 @@ async function recordWeekly() {
     document.getElementById('pm-status').className = 'status-msg ok';
     startRecPoll();
   } catch (e) {
-    btn.disabled = false; btn.textContent = '📅 Record weekly';
+    btn.disabled = false; btn.textContent = '📅 Record series';
     document.getElementById('pm-status').textContent = '❌ ' + e.message;
     document.getElementById('pm-status').className = 'status-msg err';
   }
