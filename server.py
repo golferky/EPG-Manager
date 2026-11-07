@@ -5504,10 +5504,19 @@ def api_plex_stream():
         # a fragmented MP4 (no seeking, but plays immediately).
         from flask import Response, stream_with_context
         ffmpeg = cfg.get('ffmpeg') or shutil.which('ffmpeg') or '/opt/homebrew/bin/ffmpeg'
+        try:
+            _enc = subprocess.run([ffmpeg, '-hide_banner', '-encoders'], capture_output=True,
+                                  text=True, timeout=10).stdout
+        except Exception:
+            _enc = ''
+        if 'h264_videotoolbox' in _enc:
+            # Mac hardware encoder: far lighter than software x264.
+            vcodec = ['-c:v', 'h264_videotoolbox', '-b:v', '5M', '-pix_fmt', 'yuv420p']
+        else:
+            vcodec = ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p']
         proc = subprocess.Popen(
             [ffmpeg, '-v', 'error', '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt+genpts',
-             '-i', mp4_file, '-map', '0:v:0', '-map', '0:a:0?',
-             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+             '-i', mp4_file, '-map', '0:v:0', '-map', '0:a:0?'] + vcodec + [
              '-c:a', 'aac', '-b:a', '160k', '-ac', '2',
              '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
