@@ -18,7 +18,7 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107h"
+VERSION = "v20261107i"
 
 app = Flask(__name__)
 
@@ -7163,6 +7163,21 @@ def api_agent_heartbeat(rec_id):
                   failure_reason, quality_decision, json.dumps(result), rec_id))
     conn.commit()
     conn.close()
+    # Auto-retry: if a recording ended early due to stream drop, queue the best future airing
+    if terminal and status == 'failed' and 'ended early' in failure_reason.lower():
+        try:
+            expected = (row['stop_ts'] - row['start_ts']) if row.get('stop_ts') and row.get('start_ts') else 0
+            candidate, detail = _best_incomplete_rerecord(row['title'], expected)
+            if candidate:
+                _queue_best_retry(row['title'], candidate, 'auto-retry after stream drop')
+                print(f'[auto-retry] Queued re-record of {row["title"]!r} after stream drop')
+            elif detail.get('already_queued'):
+                print(f'[auto-retry] {row["title"]!r} already has a retry queued, skipping')
+            else:
+                _watch_abandoned_transfer(row['title'], source='stream_drop_auto_retry')
+                print(f'[auto-retry] No future airing found for {row["title"]!r}, added to Wanted')
+        except Exception as _e:
+            print(f'[auto-retry] Error during auto-retry for {row["title"]!r}: {_e}')
     with _rec_lock:
         rec = _recs.setdefault(rec_id, {})
         rec.update({'status': status, 'file': file_path or None,
