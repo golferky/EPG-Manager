@@ -9827,7 +9827,7 @@ async function deleteExpiredRecordings() {
   if (!confirm(`Permanently delete ${files.length} expired recording(s) and their DB records?`)) return;
   delbtn.disabled = true; delbtn.textContent = 'Deleting...';
   const r = await post('/epg-web/api/recordings/delete', {files});
-  if (r.errors && r.errors.length) alert('Errors:\n' + r.errors.join('\n'));
+  if (r.errors && r.errors.length) alert('Errors:\\n' + r.errors.join('\\n'));
   await loadExpiredRecordings();
   await loadRecFiles();
   loadDiskUsage();
