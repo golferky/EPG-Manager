@@ -6189,6 +6189,38 @@ def api_play():
         return jsonify({'error': start_error}), 500
     return jsonify(_streams_payload(streams_snapshot))
 
+@app.route("/epg-web/api/play/proxy")
+def api_play_proxy():
+    """Relay a live stream to the requesting browser so it plays on that device.
+
+    Browsers cannot open the provider's MPEG-TS URL directly (CORS, and the
+    signed URL embeds credentials), so the stream is relayed same-origin and
+    the credentials never reach the page.
+    """
+    import urllib.request as _ureq
+    from flask import Response, stream_with_context
+    channel_id = request.args.get("channel_id", "")
+    url, err, dbg = _stream_url(channel_id)
+    if err:
+        return jsonify({"error": err}), 400
+    try:
+        upstream = _ureq.urlopen(_ureq.Request(url, headers={"User-Agent": "VLC/3.0"}), timeout=15)
+    except Exception:
+        return jsonify({"error": "Could not open the live stream"}), 502
+
+    def _relay():
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    return Response(stream_with_context(_relay()), mimetype="video/mp2t",
+                    headers={"Cache-Control": "no-store"})
+
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
@@ -8617,12 +8649,55 @@ async function playPlex(title) {
     window.location.href = 'vlc://' + streamUrl.replace(/^https?:\/\//, '');
     return;
   }
-  const r = await fetch('/epg-web/api/plex/play', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({title})
+  // Play on this device, in the browser, not on the Mac mini.
+  openBrowserPlayer({title, src: '/epg-web/api/plex/stream?title=' + encodeURIComponent(title), live: false});
+}
+
+// In-browser player overlay: plays on whichever device the browser is on.
+function closeBrowserPlayer() {
+  const o = document.getElementById('browser-player');
+  if (!o) return;
+  const v = o.querySelector('video');
+  if (o._mpegts) { try { o._mpegts.destroy(); } catch (e) {} }
+  if (v) { v.pause(); v.removeAttribute('src'); v.load(); }
+  o.remove();
+}
+function _loadMpegts() {
+  if (window.mpegts) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js';
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Could not load the player library'));
+    document.head.appendChild(s);
   });
-  const d = await r.json();
-  if (!d.ok) alert('Could not open in VLC: ' + (d.error||'unknown error'));
+}
+async function openBrowserPlayer({title, src, live}) {
+  closeBrowserPlayer();
+  const o = document.createElement('div');
+  o.id = 'browser-player';
+  o.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px;';
+  o.innerHTML = '<div style="width:100%;max-width:1100px;display:flex;justify-content:space-between;align-items:center;color:#e2e8f0;margin-bottom:8px;">'
+    + '<strong></strong><button class="btn btn-ghost btn-sm" style="margin:0;">✕ Close</button></div>'
+    + '<video controls autoplay playsinline style="width:100%;max-width:1100px;max-height:80vh;background:#000;"></video>'
+    + '<div class="bp-msg" style="color:#fca5a5;margin-top:8px;"></div>';
+  o.querySelector('strong').textContent = title || '';
+  o.querySelector('button').onclick = closeBrowserPlayer;
+  document.body.appendChild(o);
+  const v = o.querySelector('video');
+  const msg = o.querySelector('.bp-msg');
+  v.onerror = () => { msg.textContent = 'This browser cannot play this video format.'; };
+  if (!live) { v.src = src; return; }
+  try {
+    await _loadMpegts();
+    if (!mpegts.getFeatureList().mseLivePlayback) throw new Error('This browser cannot play live streams');
+    const player = mpegts.createPlayer({type: 'mpegts', isLive: true, url: src});
+    o._mpegts = player;
+    player.attachMediaElement(v);
+    player.load();
+    player.on(mpegts.Events.ERROR, () => { msg.textContent = 'Live stream failed to play in this browser.'; });
+    v.play().catch(() => {});
+  } catch (e) { msg.textContent = e.message; }
 }
 
 let _chIdFilter = '';
@@ -9622,6 +9697,15 @@ async function playStream() {
     return;
   }
   if (!_nextAiring) return;
+  if (!isIOS) {
+    // Play on this device, in the browser, not on the Mac mini.
+    openBrowserPlayer({
+      title: ((_currentProg && _currentProg.title) || '') + ' — ' + (_nextAiring.channel_name || _nextAiring.channel_id),
+      src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(_nextAiring.channel_id),
+      live: true
+    });
+    return;
+  }
   const btn = document.getElementById('pm-play-btn');
   if (Object.keys(_activeStreams).length >= 6) {
     document.getElementById('pm-status').textContent = '❌ Max 6 streams already playing';
