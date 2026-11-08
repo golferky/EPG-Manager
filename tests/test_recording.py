@@ -699,3 +699,35 @@ class PlexStreamTitleTests(unittest.TestCase):
                     resp = client.get("/epg-web/api/plex/stream", query_string={"title": title})
                     self.assertEqual(resp.status_code, 200, title)
                     resp.close()
+
+
+class DuplicateRecordingTests(unittest.TestCase):
+    @staticmethod
+    def _rec(title, start, channel_id, stream_id="1402", status="queued", provider="primestreams"):
+        return {"title": title, "start_ts": start, "stop_ts": start + 3600, "status": status,
+                "channel_id": channel_id, "stream_id": stream_id, "stream_provider": provider}
+
+    def test_same_title_and_start_on_another_guide_channel_is_a_duplicate(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710")}
+        self.assertEqual(server._find_duplicate_recording(
+            recs.items(), "NFL GameDay Final", 1000, "45399"), "a")
+
+    def test_same_provider_stream_and_start_is_a_duplicate(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710")}
+        self.assertEqual(server._find_duplicate_recording(
+            recs.items(), "Another Title", 1002, "45399", "primestreams", "1402"), "a")
+
+    def test_same_stream_id_on_a_different_provider_is_not_a_duplicate(self):
+        recs = {"a": self._rec("Show One", 1000, "1", provider="eaglecast")}
+        self.assertIsNone(server._find_duplicate_recording(
+            recs.items(), "Show Two", 1000, "2", "primestreams", "1402"))
+
+    def test_different_start_time_is_not_a_duplicate(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710")}
+        self.assertIsNone(server._find_duplicate_recording(
+            recs.items(), "NFL GameDay Final", 5000, "34710", "primestreams", "1402"))
+
+    def test_finished_or_cancelled_jobs_are_ignored(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710", status="cancelled")}
+        self.assertIsNone(server._find_duplicate_recording(
+            recs.items(), "NFL GameDay Final", 1000, "34710", "primestreams", "1402"))

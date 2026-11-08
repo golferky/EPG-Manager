@@ -6803,6 +6803,27 @@ def api_weekly_recording_add():
         'weekday': local.strftime('%A'), 'time': local.strftime('%-I:%M %p'),
     })
 
+def _find_duplicate_recording(recs, title, start_ts, channel_id='', stream_provider='', stream_id=''):
+    """Return the id of an active job that already covers this airing, else None.
+
+    Two guide listings can point at one provider stream (for example "NFL Network"
+    and "NFL Network HD").  A job is a duplicate if it starts within 5 seconds and
+    is on the same guide channel, the same provider stream, or has the same title
+    (the output file is named from title and start time, so those would collide).
+    ``recs`` is an iterable of (rec_id, rec) pairs.
+    """
+    wanted_title = _safe_filename(title).lower()
+    for rec_id, rec in recs:
+        if not _rec_is_active(rec) or abs(float(rec.get('start_ts') or 0) - start_ts) >= 5:
+            continue
+        same_channel = bool(channel_id) and rec.get('channel_id', '') == channel_id
+        same_stream = (bool(stream_id) and str(rec.get('stream_id') or '') == str(stream_id)
+                       and (rec.get('stream_provider') or 'primestreams') == (stream_provider or 'primestreams'))
+        same_title = _safe_filename(rec.get('title', '')).lower() == wanted_title
+        if same_channel or same_stream or same_title:
+            return rec_id
+    return None
+
 DEFAULT_MAX_CONCURRENT_RECORDINGS = 6
 
 def _recording_slot_conflicts(recs, start_ts, stop_ts, limit):
@@ -6965,11 +6986,8 @@ def api_record():
 
     # Dedup: reject if same channel+start_ts already queued/scheduled/recording
     with _rec_lock:
-        for existing in _recs.values():
-            if (abs(existing.get('start_ts', 0) - start_ts) < 5 and
-                    existing.get('channel_id','') == channel_id and
-                    _rec_is_active(existing)):
-                return jsonify({'ok': True, 'id': 'dup', 'dup': True})
+        if _find_duplicate_recording(_recs.items(), title, start_ts, channel_id):
+            return jsonify({'ok': True, 'id': 'dup', 'dup': True})
 
     # Refuse a recording when every recorder slot is already taken for that time.
     try:
@@ -7015,6 +7033,11 @@ def api_record():
     rec['stream_id'] = str(stream_debug.get('stream_id') or '')
     rec['stream_provider'] = str(stream_debug.get('provider') or 'primestreams')
     rec['stream_extension'] = str(stream_debug.get('stream_extension') or 'ts')
+    # A different guide channel can resolve to a stream that is already scheduled.
+    with _rec_lock:
+        if _find_duplicate_recording(_recs.items(), title, start_ts, channel_id,
+                                     rec['stream_provider'], rec['stream_id']):
+            return jsonify({'ok': True, 'id': 'dup', 'dup': True})
     if not _db_upsert_rec(rec_id, rec):
         return jsonify({'ok': False, 'error': 'Could not save recording to guide database'}), 500
     with _rec_lock:
