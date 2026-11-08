@@ -542,8 +542,13 @@ def process_job(api, job, cfg):
                       message='Recording window has already passed', result=quality)
         return
 
+    # IPTV providers close long-lived connections; reconnect so a dropped
+    # stream resumes instead of ending the recording early.
     record_cmd = [
-        cfg['ffmpeg'], '-y', '-i', url, '-t', str(remaining), '-c', 'copy', str(ts_path)
+        cfg['ffmpeg'], '-y',
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_at_eof', '1',
+        '-reconnect_delay_max', '30', '-rw_timeout', '15000000',
+        '-i', url, '-t', str(remaining), '-c', 'copy', str(ts_path)
     ]
     rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path))
     if rc is None:
