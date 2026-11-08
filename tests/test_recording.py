@@ -656,3 +656,29 @@ class RecordingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlotLimitTests(unittest.TestCase):
+    @staticmethod
+    def _rec(title, start, stop, status="queued"):
+        return {"title": title, "start_ts": start, "stop_ts": stop, "status": status}
+
+    def test_room_available_returns_no_conflicts(self):
+        recs = [self._rec(f"r{i}", 0, 100) for i in range(5)]
+        self.assertEqual(server._recording_slot_conflicts(recs, 10, 50, 6), [])
+
+    def test_full_slots_return_the_overlapping_jobs(self):
+        recs = [self._rec(f"r{i}", 0, 100) for i in range(6)]
+        self.assertEqual(len(server._recording_slot_conflicts(recs, 10, 50, 6)), 6)
+
+    def test_jobs_that_do_not_overlap_are_ignored(self):
+        recs = [self._rec(f"r{i}", 0, 100) for i in range(6)]
+        self.assertEqual(server._recording_slot_conflicts(recs, 100, 200, 6), [])
+
+    def test_peak_inside_window_counts_even_if_start_is_free(self):
+        recs = [self._rec(f"r{i}", 50, 150) for i in range(6)]
+        self.assertEqual(len(server._recording_slot_conflicts(recs, 0, 100, 6)), 6)
+
+    def test_finished_jobs_do_not_count(self):
+        recs = [self._rec(f"r{i}", 0, 100, status="done") for i in range(6)]
+        self.assertEqual(server._recording_slot_conflicts(recs, 10, 50, 6), [])

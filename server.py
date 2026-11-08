@@ -6801,6 +6801,30 @@ def api_weekly_recording_add():
         'weekday': local.strftime('%A'), 'time': local.strftime('%-I:%M %p'),
     })
 
+DEFAULT_MAX_CONCURRENT_RECORDINGS = 6
+
+def _recording_slot_conflicts(recs, start_ts, stop_ts, limit):
+    """Return the overlapping jobs if a new recording would exceed ``limit``.
+
+    ``recs`` is an iterable of recording dicts.  Only jobs whose window overlaps
+    [start_ts, stop_ts) matter, and the peak number running at the same instant
+    inside that window is what is compared with the limit.  Returns an empty
+    list when there is room.
+    """
+    overlapping = [r for r in recs
+                   if _rec_is_active(r)
+                   and float(r.get('start_ts') or 0) < stop_ts
+                   and float(r.get('stop_ts') or 0) > start_ts]
+    points = {start_ts}
+    points.update(max(float(r['start_ts']), start_ts) for r in overlapping)
+    peak, busiest = 0, []
+    for t in points:
+        running = [r for r in overlapping
+                   if float(r['start_ts']) <= t < float(r['stop_ts'])]
+        if len(running) > peak:
+            peak, busiest = len(running), running
+    return busiest if peak >= limit else []
+
 @app.route('/epg-web/api/record', methods=['POST'])
 def api_record():
     data       = request.json or {}
@@ -6944,6 +6968,20 @@ def api_record():
                     existing.get('channel_id','') == channel_id and
                     _rec_is_active(existing)):
                 return jsonify({'ok': True, 'id': 'dup', 'dup': True})
+
+    # Refuse a recording when every recorder slot is already taken for that time.
+    try:
+        slot_limit = int(cfg2.get('max_concurrent_recordings') or DEFAULT_MAX_CONCURRENT_RECORDINGS)
+    except (TypeError, ValueError):
+        slot_limit = DEFAULT_MAX_CONCURRENT_RECORDINGS
+    with _rec_lock:
+        full_with = _recording_slot_conflicts(list(_recs.values()), start_ts, stop_ts, slot_limit)
+    if full_with:
+        return jsonify({
+            'ok': False, 'slot_full': True, 'max': slot_limit,
+            'error': f'All {slot_limit} recording slots are already in use at that time.',
+            'conflicts': sorted({str(r.get('title', '')) for r in full_with}),
+        }), 409
 
     rec = {
         'title':      title,
@@ -8661,6 +8699,23 @@ async function refreshGuideRecMap() {
 
 let _progMap = {};
 
+function showSlotFullModal(d) {
+  const old = document.getElementById('slot-full-modal');
+  if (old) old.remove();
+  const o = document.createElement('div');
+  o.id = 'slot-full-modal';
+  o.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;padding:16px;';
+  const list = (d.conflicts || []).map(t => '<li>' + esc(t) + '</li>').join('');
+  o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:440px;width:100%;padding:22px;color:#e2e8f0;">'
+    + '<h3 style="margin:0 0 10px;color:#fca5a5;">Can\'t schedule this recording</h3>'
+    + '<p style="margin:0 0 10px;">All ' + esc(d.max) + ' recording slots are already in use at that time.</p>'
+    + (list ? '<p style="margin:0 0 4px;color:#94a3b8;">Already recording or scheduled:</p><ul style="margin:0 0 14px;padding-left:20px;">' + list + '</ul>' : '')
+    + '<button class="btn btn-primary" style="margin:0;">OK</button></div>';
+  o.querySelector('button').onclick = () => o.remove();
+  o.onclick = e => { if (e.target === o) o.remove(); };
+  document.body.appendChild(o);
+}
+
 async function quickRecord(key, btnEl) {
   const p = _progMap[key];
   if (!p) return;
@@ -8683,7 +8738,8 @@ async function quickRecord(key, btnEl) {
       btnEl.textContent = '⏺';
       btnEl.className = 'rec-btn';
       btnEl.onclick = e => { e.stopPropagation(); quickRecord(key, btnEl); };
-      if (d.error) alert(d.error);
+      if (d.slot_full) showSlotFullModal(d);
+      else if (d.error) alert(d.error);
     }
   } catch(e) {
     btnEl.textContent = '⏺';
@@ -10181,6 +10237,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
     refreshGuideRecMap().then(() => renderGuide());
   } else {
     btn.disabled = false; btn.textContent = allowCommercialMovie ? '● Record remaining' : '⏱ Record';
+    if (r.slot_full) showSlotFullModal(r);
     if (modalGeneration === _modalGeneration) {
       document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
       document.getElementById('pm-status').className = 'status-msg err';
