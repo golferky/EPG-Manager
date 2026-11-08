@@ -8707,7 +8707,7 @@ function showSlotFullModal(d) {
   o.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;padding:16px;';
   const list = (d.conflicts || []).map(t => '<li>' + esc(t) + '</li>').join('');
   o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:440px;width:100%;padding:22px;color:#e2e8f0;">'
-    + '<h3 style="margin:0 0 10px;color:#fca5a5;">Can\'t schedule this recording</h3>'
+    + '<h3 style="margin:0 0 10px;color:#fca5a5;">Cannot schedule this recording</h3>'
     + '<p style="margin:0 0 10px;">All ' + esc(d.max) + ' recording slots are already in use at that time.</p>'
     + (list ? '<p style="margin:0 0 4px;color:#94a3b8;">Already recording or scheduled:</p><ul style="margin:0 0 14px;padding-left:20px;">' + list + '</ul>' : '')
     + '<button class="btn btn-primary" style="margin:0;">OK</button></div>';
