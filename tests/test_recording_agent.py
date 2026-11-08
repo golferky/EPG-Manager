@@ -1,3 +1,4 @@
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -225,7 +226,7 @@ class ResumeRecordingTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.ts.read_bytes(), b"AAAABBBB")
         self.assertEqual(len(calls), 2)
-        self.assertFalse(Path(f"{self.ts}.part1").exists())
+        self.assertEqual(sorted(p.name for p in self.ts.parent.glob("show*.ts")), ["show.ts"])
 
     def test_a_recording_that_reaches_its_end_is_not_restarted(self):
         rc, calls = self._run([(b"AAAA", 600, 0)])
@@ -244,3 +245,31 @@ class ResumeRecordingTests(unittest.TestCase):
         rc, calls = self._run(plan)
         self.assertEqual(rc, 0)
         self.assertEqual(self.ts.read_bytes(), b"AAAA")
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is not installed")
+class RealFfmpegSegmentTests(unittest.TestCase):
+    """Run the real command for a later segment, the case a fake FFmpeg hid."""
+
+    def test_later_segment_name_is_accepted_by_ffmpeg(self):
+        import functools
+        import http.server
+        import subprocess
+        import threading
+
+        with tempfile.TemporaryDirectory() as temp:
+            sample = Path(temp) / "sample.ts"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=2:s=160x120:r=10",
+                 "-c:v", "libx264", "-t", "2", "-f", "mpegts", str(sample)], check=True)
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=temp)
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            segment = recording_agent.segment_path(Path(temp) / "show.ts", 4)
+            self.assertEqual(segment.name, "show.part4.ts")
+            cmd = recording_agent.build_record_command(
+                {"ffmpeg": "ffmpeg"}, f"http://127.0.0.1:{server.server_port}/sample.ts", 2, segment)
+            done = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            self.assertTrue(segment.exists() and segment.stat().st_size > 0, done.stderr[-400:])

@@ -491,6 +491,27 @@ RESUME_MAX_ATTEMPTS = 20
 RESUME_MAX_EMPTY_SEGMENTS = 5
 
 
+def segment_path(ts_path, attempt):
+    """Path of the n-th recording segment; the first is the final file itself.
+
+    The name keeps a .ts extension: FFmpeg refuses an output whose format it
+    cannot work out from the name (e.g. "show.ts.part1").
+    """
+    ts_path = Path(ts_path)
+    if attempt == 0:
+        return ts_path
+    return ts_path.with_name(f'{ts_path.stem}.part{attempt}{ts_path.suffix or ".ts"}')
+
+
+def build_record_command(cfg, url, remaining, segment):
+    return [
+        cfg['ffmpeg'], '-y',
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_at_eof', '1',
+        '-reconnect_delay_max', '30', '-rw_timeout', '15000000',
+        '-i', url, '-t', str(remaining), '-c', 'copy', '-f', 'mpegts', str(segment)
+    ]
+
+
 def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
     """Record a live stream to ``ts_path``, resuming if the provider cuts it early.
 
@@ -506,14 +527,9 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
     attempt = 0
     rc = 0
     while True:
-        segment = ts_path if attempt == 0 else Path(f'{ts_path}.part{attempt}')
+        segment = segment_path(ts_path, attempt)
         remaining = int(end_time - time.time())
-        record_cmd = [
-            cfg['ffmpeg'], '-y',
-            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_at_eof', '1',
-            '-reconnect_delay_max', '30', '-rw_timeout', '15000000',
-            '-i', url, '-t', str(remaining), '-c', 'copy', str(segment)
-        ]
+        record_cmd = build_record_command(cfg, url, remaining, segment)
         rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path))
         if rc is None:
             for extra in segments[1:] + [segment]:
