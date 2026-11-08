@@ -5442,7 +5442,8 @@ def api_plex_play():
     plex_dir = cfg.get('plex_path', '/Volumes/Plex/Movies')
     def _norm(t):
         return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
-    norm_title = _norm(title)
+    # The guide title may carry a year, "Title (1984)"; folders are matched without it.
+    norm_title = _norm(re.sub(r'\s*\(\d{4}\)\s*$', '', title))
     mp4_file = None
     for name in os.listdir(plex_dir):
         fp = os.path.join(plex_dir, name)
@@ -5484,7 +5485,8 @@ def api_plex_stream():
     def _norm(t):
         import re as _re
         return _re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
-    norm_title = _norm(title)
+    # The guide title may carry a year, "Title (1984)"; folders are matched without it.
+    norm_title = _norm(re.sub(r'\s*\(\d{4}\)\s*$', '', title))
     mp4_file = None
     for name in os.listdir(plex_dir):
         fp = os.path.join(plex_dir, name)

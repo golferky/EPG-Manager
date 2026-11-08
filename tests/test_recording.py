@@ -682,3 +682,20 @@ class SlotLimitTests(unittest.TestCase):
     def test_finished_jobs_do_not_count(self):
         recs = [self._rec(f"r{i}", 0, 100, status="done") for i in range(6)]
         self.assertEqual(server._recording_slot_conflicts(recs, 10, 50, 6), [])
+
+
+class PlexStreamTitleTests(unittest.TestCase):
+    def test_stream_finds_movie_when_title_includes_year(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "Indiana Jones and the Temple of Doom (1984)")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "movie.mp4"), "wb") as fh:
+                fh.write(b"0" * 64)
+            cfg = {"plex_path": root}
+            with mock.patch.object(server, "load_config", return_value=cfg):
+                client = server.app.test_client()
+                for title in ("Indiana Jones and the Temple of Doom (1984)",
+                              "Indiana Jones and the Temple of Doom"):
+                    resp = client.get("/epg-web/api/plex/stream", query_string={"title": title})
+                    self.assertEqual(resp.status_code, 200, title)
+                    resp.close()
