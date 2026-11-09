@@ -8820,6 +8820,7 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
     // VLC on this device reconnects through provider hiccups that stop the in-page player.
     const vlcBtn = o.querySelector('.bp-vlc');
     vlcBtn.style.display = '';
+    vlcBtn.textContent = 'Copy address for VLC';
     vlcBtn.onclick = async () => {
       try {
         const r = await fetch('/epg-web/api/play/stream-url?channel_id=' + encodeURIComponent(vlcChannelId));
@@ -8827,8 +8828,22 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
         if (!d.ok) { msg.textContent = d.error || 'Could not get the stream address'; return; }
         const v2 = o.querySelector('video');
         if (v2) v2.pause();
-        window.location.href = 'vlc://' + d.url;
-      } catch (e) { msg.textContent = 'Could not open VLC: ' + e.message; }
+        let box = o.querySelector('.bp-addr');
+        if (!box) {
+          box = document.createElement('input');
+          box.className = 'bp-addr';
+          box.readOnly = true;
+          box.style.cssText = 'width:100%;max-width:1100px;margin-top:8px;padding:6px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;';
+          o.appendChild(box);
+        }
+        box.value = d.url;
+        box.select();
+        let copied = false;
+        try { copied = document.execCommand('copy'); } catch (e) {}
+        msg.style.color = '#86efac';
+        msg.textContent = (copied ? 'Address copied. ' : 'Copy the address above. ')
+          + 'In VLC press Cmd+N (File, Open Network), paste it, then click Open.';
+      } catch (e) { msg.textContent = 'Could not get the stream address: ' + e.message; }
     };
   }
   document.body.appendChild(o);
