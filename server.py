@@ -8738,6 +8738,17 @@ function _normTitle(t) {
 }
 // Strip trailing (YYYY) before normalizing — Plex folders have year stripped already
 function _plexNorm(t) { return _normTitle((t||'').replace(/\s*\(\d{4}\)\s*$/,'')); }
+let _plexYears = {};   // normalized title -> Set of the years of its Plex folders
+// True when a Plex folder matches the title and, if the year is known, one folder has that year.
+// The folder list is what is really on disk; this does not need the master_titles table.
+function _plexHasMovie(title, year) {
+  const k = _plexNorm(title);
+  if (!_plexTitles.has(k)) return false;
+  const years = _plexYears[k];
+  const y = String(year || '').slice(0, 4);
+  if (!y || !years || years.size === 0 || years.has('')) return true;
+  return years.has(y);
+}
 let _plexTitlesReady = false;
 let _plexTitlesPromise = null;
 async function loadPlexTitles() {
@@ -8745,6 +8756,11 @@ async function loadPlexTitles() {
     const r = await fetch('/epg-web/api/plex/titles');
     const d = await r.json();
     _plexTitles = new Set((d.titles||[]).map(_normTitle));
+    _plexYears = {};
+    (d.movies || []).forEach(m => {
+      const k = _normTitle(m.title);
+      (_plexYears[k] = _plexYears[k] || new Set()).add(String(m.year || ''));
+    });
     _plexTitlesReady = true;
   } catch(e) { _plexTitlesReady = true; }
 }
@@ -9567,7 +9583,7 @@ async function openProg(p) {
   } else { imdbLink.style.display = 'none'; }
 
   const libBadge = document.getElementById('pm-library-badge');
-  if (_plexTitles.has(_plexNorm(p.title)) && info.in_library !== false) {
+  if (_plexHasMovie(p.title, info.year || p.year)) {
     libBadge.textContent = '▶ IN PLEX';
     libBadge.style.background = '#2d1f5e'; libBadge.style.color = '#a78bfa';
     libBadge.style.display = '';
@@ -9621,7 +9637,7 @@ async function openProg(p) {
   // Plex file info
   const plexWrap = document.getElementById('pm-plex-wrap');
   plexWrap.style.display = 'none';
-  if (_plexTitles.has(_plexNorm(p.title)) && info.in_library !== false) {
+  if (_plexHasMovie(p.title, info.year || p.year)) {
     plexWrap.style.display = 'block';
     document.getElementById('pm-plex-info').textContent = 'Plex copy found';
     // File probing can take several seconds on the NAS.  It is display-only,
