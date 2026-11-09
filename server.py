@@ -8803,20 +8803,36 @@ function _loadMpegts() {
     document.head.appendChild(s);
   });
 }
-async function openBrowserPlayer({title, src, live}) {
+async function openBrowserPlayer({title, src, live, vlcChannelId}) {
   closeBrowserPlayer();
   const o = document.createElement('div');
   o.id = 'browser-player';
   o.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px;';
   o.innerHTML = '<div style="width:100%;max-width:1100px;display:flex;justify-content:space-between;align-items:center;color:#e2e8f0;margin-bottom:8px;">'
-    + '<strong></strong><button class="btn btn-ghost btn-sm" style="margin:0;">✕ Close</button></div>'
+    + '<strong></strong><span><button class="btn btn-ghost btn-sm bp-vlc" style="margin:0 8px 0 0;display:none;">Open in VLC</button>'
+    + '<button class="btn btn-ghost btn-sm bp-close" style="margin:0;">✕ Close</button></span></div>'
     + '<video controls autoplay playsinline style="width:100%;max-width:1100px;max-height:80vh;background:#000;"></video>'
     + '<div class="bp-msg" style="color:#fca5a5;margin-top:8px;"></div>';
   o.querySelector('strong').textContent = title || '';
-  o.querySelector('button').onclick = closeBrowserPlayer;
+  o.querySelector('.bp-close').onclick = closeBrowserPlayer;
+  const msg = o.querySelector('.bp-msg');
+  if (vlcChannelId) {
+    // VLC on this device reconnects through provider hiccups that stop the in-page player.
+    const vlcBtn = o.querySelector('.bp-vlc');
+    vlcBtn.style.display = '';
+    vlcBtn.onclick = async () => {
+      try {
+        const r = await fetch('/epg-web/api/play/stream-url?channel_id=' + encodeURIComponent(vlcChannelId));
+        const d = await r.json();
+        if (!d.ok) { msg.textContent = d.error || 'Could not get the stream address'; return; }
+        const v2 = o.querySelector('video');
+        if (v2) v2.pause();
+        window.location.href = 'vlc://' + d.url;
+      } catch (e) { msg.textContent = 'Could not open VLC: ' + e.message; }
+    };
+  }
   document.body.appendChild(o);
   const v = o.querySelector('video');
-  const msg = o.querySelector('.bp-msg');
   let retried = false;
   v.onerror = () => {
     if (!live && !retried && src.indexOf('/plex/stream') >= 0) {
@@ -9844,7 +9860,8 @@ async function playStream() {
     openBrowserPlayer({
       title: ((_currentProg && _currentProg.title) || '') + ' — ' + (_nextAiring.channel_name || _nextAiring.channel_id),
       src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(_nextAiring.channel_id),
-      live: true
+      live: true,
+      vlcChannelId: _nextAiring.channel_id
     });
     return;
   }
@@ -10638,7 +10655,8 @@ function play247(channelId, name) {
   openBrowserPlayer({
     title: name || 'Live',
     src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId),
-    live: true
+    live: true,
+    vlcChannelId: channelId
   });
 }
 async function hide247(channelId, hide, el) {
