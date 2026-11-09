@@ -6292,6 +6292,27 @@ def api_play_playlist():
                     headers={"Content-Disposition": 'attachment; filename="epg-live.m3u"',
                              "Cache-Control": "no-store"})
 
+# Eaglecast allows one connection at a time.  A job in these states holds it.
+_PROVIDER_CONNECTION_STATES = {'recording', 'preflight'}
+
+def _busy_eaglecast_titles(recs):
+    """Titles of recordings that currently hold the single Eaglecast connection."""
+    return sorted({str(r.get('title', '')) for r in recs
+                   if (r.get('stream_provider') or 'primestreams') == 'eaglecast'
+                   and _rec_status_base(r.get('status')) in _PROVIDER_CONNECTION_STATES})
+
+@app.route("/epg-web/api/play/provider")
+def api_play_provider():
+    """Which provider a live channel uses, and whether playing it would collide
+    with a recording that already holds that provider's single connection."""
+    _url, _err, dbg = _stream_url(request.args.get("channel_id", ""))
+    provider = (dbg or {}).get('provider') or 'primestreams'
+    busy = []
+    if provider == 'eaglecast':
+        with _rec_lock:
+            busy = _busy_eaglecast_titles(list(_recs.values()))
+    return jsonify({'provider': provider, 'busy': bool(busy), 'busy_with': busy})
+
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
@@ -6367,7 +6388,9 @@ def _eaglecast_stream_is_playable(stream_url):
 def api_eaglecast_live_sports():
     try:
         items = _eaglecast_live_sports()
-        return jsonify({'items': items, 'total': len(items)})
+        with _rec_lock:
+            busy = _busy_eaglecast_titles(list(_recs.values()))
+        return jsonify({'items': items, 'total': len(items), 'busy_with': busy})
     except Exception as exc:
         return jsonify({'error': f'Could not load Eaglecast live sports: {exc}'}), 502
 
@@ -7776,6 +7799,7 @@ tr:hover td{background:#141414;}
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
           <div id="pm-next-info" style="flex:1;font-size:13px;color:#e2e8f0;"></div>
           <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
+          <span id="pm-play-busy" style="display:none;color:#fbbf24;font-size:13px;margin-left:8px;"></span>
           <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
           <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="display:none;border-color:#f59e0b;color:#fbbf24;">📅 Record series</button>
         </div>
@@ -9002,9 +9026,12 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
     const rows = items.map(item => {
       const channelId = 'eaglecast-live:' + item.stream_id;
       const playing = !!_activeStreams[channelId];
+      const eagleBusy = (d.busy_with || []).length > 0;
       const action = playing
         ? `<button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();stopStream('${channelId}')">■ Stop</button>`
-        : `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();playEaglecastLiveSport('${item.stream_id}')">▶ Play</button>`;
+        : eagleBusy
+          ? `<span style="color:#fbbf24;font-size:12px;" title="${esc((d.busy_with || []).join(', '))}">🦅 Eaglecast — in use by a recording</span>`
+          : `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();playEaglecastLiveSport('${item.stream_id}')">▶ Play</button>`;
       return `<div class="guide-row">
         <div class="ch-name" title="${esc(item.name)} — Eaglecast live-only" style="display:flex;align-items:center;">🦅&nbsp;<span class="ch-name-label">${esc(item.name)}</span></div>
         <div class="prog-row" style="width:${totalPx}px;">
@@ -9343,6 +9370,7 @@ async function openProg(p) {
   _modalGeneration += 1;
   _currentProg = p;
   _nextAiring = null;
+  { const busyLbl = document.getElementById('pm-play-busy'); if (busyLbl) busyLbl.style.display = 'none'; }
   // Show overlay in loading state
   const overlay = document.getElementById('prog-modal-overlay');
   overlay.style.display = 'flex';
@@ -9400,6 +9428,7 @@ async function openProg(p) {
     quickPlay.style.display = '';
     quickPlay.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
     quickPlay.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
+    refreshPlayBusy(p.channel_id);
     const quickRecord = document.getElementById('pm-rec-next-btn');
     quickRecord.textContent = '● Record remaining';
     quickRecord.disabled = false;
@@ -9547,6 +9576,7 @@ async function openProg(p) {
     pBtn.style.display = '';
     pBtn.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
     pBtn.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
+    refreshPlayBusy(p.channel_id);
     const immediateRecord = document.getElementById('pm-rec-next-btn');
     immediateRecord.textContent = '● Record remaining';
     immediateRecord.disabled = false;
@@ -9723,6 +9753,7 @@ async function openProg(p) {
           const alreadyPlaying = !!_activeStreams[featPS.channel_id];
           pBtn.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
           pBtn.onclick     = alreadyPlaying ? () => stopStream(featPS.channel_id) : playStream;
+          refreshPlayBusy(featPS.channel_id);
         }
 
         // A live programme can be captured from this point forward.  Keep
@@ -9886,6 +9917,23 @@ function _updateNowPlaying(streams) {
     pBtn.textContent = playing ? '■ Stop' : '▶ Play';
     pBtn.onclick     = playing ? () => stopStream(_nextAiring.channel_id) : playStream;
   }
+}
+
+// Swap the Play button for an Eaglecast label while a recording holds its one connection.
+async function refreshPlayBusy(channelId) {
+  const pBtn = document.getElementById('pm-play-btn');
+  const lbl = document.getElementById('pm-play-busy');
+  if (!pBtn || !lbl || !channelId) return;
+  lbl.style.display = 'none';
+  try {
+    const d = await (await fetch('/epg-web/api/play/provider?channel_id=' + encodeURIComponent(channelId))).json();
+    if (!_nextAiring || _nextAiring.channel_id !== channelId) return;   // the modal moved on
+    if (d.busy && pBtn.style.display !== 'none' && pBtn.textContent.indexOf('Stop') < 0) {
+      pBtn.style.display = 'none';
+      lbl.textContent = '🦅 Eaglecast — in use by a recording' + (d.busy_with && d.busy_with.length ? ' (' + d.busy_with.join(', ') + ')' : '');
+      lbl.style.display = '';
+    }
+  } catch (e) { /* if the check fails, leave the Play button as it is */ }
 }
 
 async function playStream() {
@@ -10697,7 +10745,11 @@ async function load247() {
       </div>`).join('');
   } catch(e) { setEl('c247-status', 'Failed', 'err'); }
 }
-function play247(channelId, name) {
+async function play247(channelId, name) {
+  try {
+    const pv = await (await fetch('/epg-web/api/play/provider?channel_id=' + encodeURIComponent(channelId))).json();
+    if (pv.busy) { setEl('c247-status', '🦅 Eaglecast — in use by a recording', 'err'); return; }
+  } catch (e) { /* if the check fails, just play */ }
   openBrowserPlayer({
     title: name || 'Live',
     src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId),

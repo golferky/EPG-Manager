@@ -750,3 +750,43 @@ class PlaylistRouteTests(unittest.TestCase):
             resp = server.app.test_client().get(
                 "/epg-web/api/play/playlist.m3u", query_string={"channel_id": "x"})
         self.assertEqual(resp.status_code, 400)
+
+
+class ProviderBusyTests(unittest.TestCase):
+    @staticmethod
+    def _rec(title, provider, status):
+        return {"title": title, "stream_provider": provider, "status": status}
+
+    def test_only_eaglecast_jobs_holding_a_connection_count_as_busy(self):
+        recs = [
+            self._rec("A", "eaglecast", "recording"),
+            self._rec("B", "eaglecast", "preflight"),
+            self._rec("C", "eaglecast", "queued"),
+            self._rec("D", "eaglecast", "done"),
+            self._rec("E", "primestreams", "recording"),
+        ]
+        self.assertEqual(server._busy_eaglecast_titles(recs), ["A", "B"])
+
+    def test_endpoint_reports_busy_for_an_eaglecast_channel(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._recs["r1"] = self._rec("The Amateur", "eaglecast", "recording")
+        with mock.patch.object(server, "_stream_url",
+                               return_value=("http://x/1.ts", None, {"provider": "eaglecast"})):
+            data = server.app.test_client().get(
+                "/epg-web/api/play/provider", query_string={"channel_id": "18086"}).get_json()
+        self.assertEqual(data, {"provider": "eaglecast", "busy": True, "busy_with": ["The Amateur"]})
+        with server._rec_lock:
+            server._recs.clear()
+
+    def test_endpoint_is_never_busy_for_primestreams(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._recs["r1"] = self._rec("The Amateur", "eaglecast", "recording")
+        with mock.patch.object(server, "_stream_url",
+                               return_value=("http://x/1.ts", None, {"provider": "primestreams"})):
+            data = server.app.test_client().get(
+                "/epg-web/api/play/provider", query_string={"channel_id": "1"}).get_json()
+        self.assertFalse(data["busy"])
+        with server._rec_lock:
+            server._recs.clear()
