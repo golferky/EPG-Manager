@@ -656,3 +656,78 @@ class RecordingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlotLimitTests(unittest.TestCase):
+    @staticmethod
+    def _rec(title, start, stop, status="queued"):
+        return {"title": title, "start_ts": start, "stop_ts": stop, "status": status}
+
+    def test_room_available_returns_no_conflicts(self):
+        recs = [self._rec(f"r{i}", 0, 100) for i in range(5)]
+        self.assertEqual(server._recording_slot_conflicts(recs, 10, 50, 6), [])
+
+    def test_full_slots_return_the_overlapping_jobs(self):
+        recs = [self._rec(f"r{i}", 0, 100) for i in range(6)]
+        self.assertEqual(len(server._recording_slot_conflicts(recs, 10, 50, 6)), 6)
+
+    def test_jobs_that_do_not_overlap_are_ignored(self):
+        recs = [self._rec(f"r{i}", 0, 100) for i in range(6)]
+        self.assertEqual(server._recording_slot_conflicts(recs, 100, 200, 6), [])
+
+    def test_peak_inside_window_counts_even_if_start_is_free(self):
+        recs = [self._rec(f"r{i}", 50, 150) for i in range(6)]
+        self.assertEqual(len(server._recording_slot_conflicts(recs, 0, 100, 6)), 6)
+
+    def test_finished_jobs_do_not_count(self):
+        recs = [self._rec(f"r{i}", 0, 100, status="done") for i in range(6)]
+        self.assertEqual(server._recording_slot_conflicts(recs, 10, 50, 6), [])
+
+
+class PlexStreamTitleTests(unittest.TestCase):
+    def test_stream_finds_movie_when_title_includes_year(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "Indiana Jones and the Temple of Doom (1984)")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "movie.mp4"), "wb") as fh:
+                fh.write(b"0" * 64)
+            cfg = {"plex_path": root}
+            with mock.patch.object(server, "load_config", return_value=cfg):
+                client = server.app.test_client()
+                for title in ("Indiana Jones and the Temple of Doom (1984)",
+                              "Indiana Jones and the Temple of Doom"):
+                    resp = client.get("/epg-web/api/plex/stream", query_string={"title": title})
+                    self.assertEqual(resp.status_code, 200, title)
+                    resp.close()
+
+
+class DuplicateRecordingTests(unittest.TestCase):
+    @staticmethod
+    def _rec(title, start, channel_id, stream_id="1402", status="queued", provider="primestreams"):
+        return {"title": title, "start_ts": start, "stop_ts": start + 3600, "status": status,
+                "channel_id": channel_id, "stream_id": stream_id, "stream_provider": provider}
+
+    def test_same_title_and_start_on_another_guide_channel_is_a_duplicate(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710")}
+        self.assertEqual(server._find_duplicate_recording(
+            recs.items(), "NFL GameDay Final", 1000, "45399"), "a")
+
+    def test_same_provider_stream_and_start_is_a_duplicate(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710")}
+        self.assertEqual(server._find_duplicate_recording(
+            recs.items(), "Another Title", 1002, "45399", "primestreams", "1402"), "a")
+
+    def test_same_stream_id_on_a_different_provider_is_not_a_duplicate(self):
+        recs = {"a": self._rec("Show One", 1000, "1", provider="eaglecast")}
+        self.assertIsNone(server._find_duplicate_recording(
+            recs.items(), "Show Two", 1000, "2", "primestreams", "1402"))
+
+    def test_different_start_time_is_not_a_duplicate(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710")}
+        self.assertIsNone(server._find_duplicate_recording(
+            recs.items(), "NFL GameDay Final", 5000, "34710", "primestreams", "1402"))
+
+    def test_finished_or_cancelled_jobs_are_ignored(self):
+        recs = {"a": self._rec("NFL GameDay Final", 1000, "34710", status="cancelled")}
+        self.assertIsNone(server._find_duplicate_recording(
+            recs.items(), "NFL GameDay Final", 1000, "34710", "primestreams", "1402"))

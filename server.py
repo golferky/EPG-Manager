@@ -5442,7 +5442,8 @@ def api_plex_play():
     plex_dir = cfg.get('plex_path', '/Volumes/Plex/Movies')
     def _norm(t):
         return re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
-    norm_title = _norm(title)
+    # The guide title may carry a year, "Title (1984)"; folders are matched without it.
+    norm_title = _norm(re.sub(r'\s*\(\d{4}\)\s*$', '', title))
     mp4_file = None
     for name in os.listdir(plex_dir):
         fp = os.path.join(plex_dir, name)
@@ -5484,7 +5485,8 @@ def api_plex_stream():
     def _norm(t):
         import re as _re
         return _re.sub(r'[^a-z0-9 ]', '', t.lower()).strip()
-    norm_title = _norm(title)
+    # The guide title may carry a year, "Title (1984)"; folders are matched without it.
+    norm_title = _norm(re.sub(r'\s*\(\d{4}\)\s*$', '', title))
     mp4_file = None
     for name in os.listdir(plex_dir):
         fp = os.path.join(plex_dir, name)
@@ -5499,6 +5501,41 @@ def api_plex_stream():
             break
     if not mp4_file:
         return jsonify({'error': 'file not found in Plex'}), 404
+    if request.args.get('transcode'):
+        # Fallback for files the browser cannot decode: re-encode on the fly to
+        # a fragmented MP4 (no seeking, but plays immediately).
+        from flask import Response, stream_with_context
+        ffmpeg = cfg.get('ffmpeg') or shutil.which('ffmpeg') or '/opt/homebrew/bin/ffmpeg'
+        try:
+            _enc = subprocess.run([ffmpeg, '-hide_banner', '-encoders'], capture_output=True,
+                                  text=True, timeout=10).stdout
+        except Exception:
+            _enc = ''
+        if 'h264_videotoolbox' in _enc:
+            # Mac hardware encoder: far lighter than software x264.
+            vcodec = ['-c:v', 'h264_videotoolbox', '-b:v', '5M', '-pix_fmt', 'yuv420p']
+        else:
+            vcodec = ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p']
+        proc = subprocess.Popen(
+            [ffmpeg, '-v', 'error', '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt+genpts',
+             '-i', mp4_file, '-map', '0:v:0', '-map', '0:a:0?'] + vcodec + [
+             '-c:a', 'aac', '-b:a', '160k', '-ac', '2',
+             '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        def _relay():
+            try:
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                proc.kill()
+                proc.wait()
+
+        return Response(stream_with_context(_relay()), mimetype='video/mp4',
+                        headers={'Cache-Control': 'no-store'})
     return send_file(mp4_file, conditional=True, mimetype='video/mp4')
 
 # ── Conversion routes ─────────────────────────────────────────────────────────
@@ -6189,6 +6226,53 @@ def api_play():
         return jsonify({'error': start_error}), 500
     return jsonify(_streams_payload(streams_snapshot))
 
+def _relay_live_stream(url):
+    """Relay a provider live stream to the requesting browser (same-origin)."""
+    import urllib.request as _ureq
+    from flask import Response, stream_with_context
+    try:
+        upstream = _ureq.urlopen(_ureq.Request(url, headers={"User-Agent": "VLC/3.0"}), timeout=15)
+    except Exception:
+        return jsonify({"error": "Could not open the live stream"}), 502
+
+    def _relay():
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    return Response(stream_with_context(_relay()), mimetype="video/mp2t",
+                    headers={"Cache-Control": "no-store"})
+
+@app.route("/epg-web/api/play/proxy")
+def api_play_proxy():
+    """Play a live channel on the requesting device.
+
+    Browsers cannot open the provider's MPEG-TS URL directly (CORS, and the
+    signed URL embeds credentials), so the stream is relayed same-origin and
+    the credentials never reach the page.
+    """
+    url, err, dbg = _stream_url(request.args.get("channel_id", ""))
+    if err:
+        return jsonify({"error": err}), 400
+    return _relay_live_stream(url)
+
+@app.route("/epg-web/api/play/eaglecast-proxy")
+def api_play_eaglecast_proxy():
+    stream_id = str(request.args.get("stream_id") or "")
+    # Only feeds from the live-sports catalogue may be relayed.
+    item = next((e for e in _eaglecast_live_sports() if e["stream_id"] == stream_id), None)
+    if not item:
+        return jsonify({"error": "That Eaglecast sports feed is no longer available."}), 404
+    url = _eaglecast_stream_url(item["stream_id"], item["extension"])
+    if not url:
+        return jsonify({"error": "Eaglecast playback is not configured on this Mac."}), 503
+    return _relay_live_stream(url)
+
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
@@ -6719,6 +6803,51 @@ def api_weekly_recording_add():
         'weekday': local.strftime('%A'), 'time': local.strftime('%-I:%M %p'),
     })
 
+def _find_duplicate_recording(recs, title, start_ts, channel_id='', stream_provider='', stream_id=''):
+    """Return the id of an active job that already covers this airing, else None.
+
+    Two guide listings can point at one provider stream (for example "NFL Network"
+    and "NFL Network HD").  A job is a duplicate if it starts within 5 seconds and
+    is on the same guide channel, the same provider stream, or has the same title
+    (the output file is named from title and start time, so those would collide).
+    ``recs`` is an iterable of (rec_id, rec) pairs.
+    """
+    wanted_title = _safe_filename(title).lower()
+    for rec_id, rec in recs:
+        if not _rec_is_active(rec) or abs(float(rec.get('start_ts') or 0) - start_ts) >= 5:
+            continue
+        same_channel = bool(channel_id) and rec.get('channel_id', '') == channel_id
+        same_stream = (bool(stream_id) and str(rec.get('stream_id') or '') == str(stream_id)
+                       and (rec.get('stream_provider') or 'primestreams') == (stream_provider or 'primestreams'))
+        same_title = _safe_filename(rec.get('title', '')).lower() == wanted_title
+        if same_channel or same_stream or same_title:
+            return rec_id
+    return None
+
+DEFAULT_MAX_CONCURRENT_RECORDINGS = 6
+
+def _recording_slot_conflicts(recs, start_ts, stop_ts, limit):
+    """Return the overlapping jobs if a new recording would exceed ``limit``.
+
+    ``recs`` is an iterable of recording dicts.  Only jobs whose window overlaps
+    [start_ts, stop_ts) matter, and the peak number running at the same instant
+    inside that window is what is compared with the limit.  Returns an empty
+    list when there is room.
+    """
+    overlapping = [r for r in recs
+                   if _rec_is_active(r)
+                   and float(r.get('start_ts') or 0) < stop_ts
+                   and float(r.get('stop_ts') or 0) > start_ts]
+    points = {start_ts}
+    points.update(max(float(r['start_ts']), start_ts) for r in overlapping)
+    peak, busiest = 0, []
+    for t in points:
+        running = [r for r in overlapping
+                   if float(r['start_ts']) <= t < float(r['stop_ts'])]
+        if len(running) > peak:
+            peak, busiest = len(running), running
+    return busiest if peak >= limit else []
+
 @app.route('/epg-web/api/record', methods=['POST'])
 def api_record():
     data       = request.json or {}
@@ -6857,11 +6986,22 @@ def api_record():
 
     # Dedup: reject if same channel+start_ts already queued/scheduled/recording
     with _rec_lock:
-        for existing in _recs.values():
-            if (abs(existing.get('start_ts', 0) - start_ts) < 5 and
-                    existing.get('channel_id','') == channel_id and
-                    _rec_is_active(existing)):
-                return jsonify({'ok': True, 'id': 'dup', 'dup': True})
+        if _find_duplicate_recording(_recs.items(), title, start_ts, channel_id):
+            return jsonify({'ok': True, 'id': 'dup', 'dup': True})
+
+    # Refuse a recording when every recorder slot is already taken for that time.
+    try:
+        slot_limit = int(cfg2.get('max_concurrent_recordings') or DEFAULT_MAX_CONCURRENT_RECORDINGS)
+    except (TypeError, ValueError):
+        slot_limit = DEFAULT_MAX_CONCURRENT_RECORDINGS
+    with _rec_lock:
+        full_with = _recording_slot_conflicts(list(_recs.values()), start_ts, stop_ts, slot_limit)
+    if full_with:
+        return jsonify({
+            'ok': False, 'slot_full': True, 'max': slot_limit,
+            'error': f'All {slot_limit} recording slots are already in use at that time.',
+            'conflicts': sorted({str(r.get('title', '')) for r in full_with}),
+        }), 409
 
     rec = {
         'title':      title,
@@ -6893,6 +7033,11 @@ def api_record():
     rec['stream_id'] = str(stream_debug.get('stream_id') or '')
     rec['stream_provider'] = str(stream_debug.get('provider') or 'primestreams')
     rec['stream_extension'] = str(stream_debug.get('stream_extension') or 'ts')
+    # A different guide channel can resolve to a stream that is already scheduled.
+    with _rec_lock:
+        if _find_duplicate_recording(_recs.items(), title, start_ts, channel_id,
+                                     rec['stream_provider'], rec['stream_id']):
+            return jsonify({'ok': True, 'id': 'dup', 'dup': True})
     if not _db_upsert_rec(rec_id, rec):
         return jsonify({'ok': False, 'error': 'Could not save recording to guide database'}), 500
     with _rec_lock:
@@ -8579,6 +8724,23 @@ async function refreshGuideRecMap() {
 
 let _progMap = {};
 
+function showSlotFullModal(d) {
+  const old = document.getElementById('slot-full-modal');
+  if (old) old.remove();
+  const o = document.createElement('div');
+  o.id = 'slot-full-modal';
+  o.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;padding:16px;';
+  const list = (d.conflicts || []).map(t => '<li>' + esc(t) + '</li>').join('');
+  o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:440px;width:100%;padding:22px;color:#e2e8f0;">'
+    + '<h3 style="margin:0 0 10px;color:#fca5a5;">Cannot schedule this recording</h3>'
+    + '<p style="margin:0 0 10px;">All ' + esc(d.max) + ' recording slots are already in use at that time.</p>'
+    + (list ? '<p style="margin:0 0 4px;color:#94a3b8;">Already recording or scheduled:</p><ul style="margin:0 0 14px;padding-left:20px;">' + list + '</ul>' : '')
+    + '<button class="btn btn-primary" style="margin:0;">OK</button></div>';
+  o.querySelector('button').onclick = () => o.remove();
+  o.onclick = e => { if (e.target === o) o.remove(); };
+  document.body.appendChild(o);
+}
+
 async function quickRecord(key, btnEl) {
   const p = _progMap[key];
   if (!p) return;
@@ -8601,7 +8763,8 @@ async function quickRecord(key, btnEl) {
       btnEl.textContent = '⏺';
       btnEl.className = 'rec-btn';
       btnEl.onclick = e => { e.stopPropagation(); quickRecord(key, btnEl); };
-      if (d.error) alert(d.error);
+      if (d.slot_full) showSlotFullModal(d);
+      else if (d.error) alert(d.error);
     }
   } catch(e) {
     btnEl.textContent = '⏺';
@@ -8617,12 +8780,68 @@ async function playPlex(title) {
     window.location.href = 'vlc://' + streamUrl.replace(/^https?:\/\//, '');
     return;
   }
-  const r = await fetch('/epg-web/api/plex/play', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({title})
+  // Play on this device, in the browser, not on the Mac mini.
+  openBrowserPlayer({title, src: '/epg-web/api/plex/stream?title=' + encodeURIComponent(title), live: false});
+}
+
+// In-browser player overlay: plays on whichever device the browser is on.
+function closeBrowserPlayer() {
+  const o = document.getElementById('browser-player');
+  if (!o) return;
+  const v = o.querySelector('video');
+  if (o._mpegts) { try { o._mpegts.destroy(); } catch (e) {} }
+  if (v) { v.pause(); v.removeAttribute('src'); v.load(); }
+  o.remove();
+}
+function _loadMpegts() {
+  if (window.mpegts) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js';
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Could not load the player library'));
+    document.head.appendChild(s);
   });
-  const d = await r.json();
-  if (!d.ok) alert('Could not open in VLC: ' + (d.error||'unknown error'));
+}
+async function openBrowserPlayer({title, src, live}) {
+  closeBrowserPlayer();
+  const o = document.createElement('div');
+  o.id = 'browser-player';
+  o.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px;';
+  o.innerHTML = '<div style="width:100%;max-width:1100px;display:flex;justify-content:space-between;align-items:center;color:#e2e8f0;margin-bottom:8px;">'
+    + '<strong></strong><button class="btn btn-ghost btn-sm" style="margin:0;">✕ Close</button></div>'
+    + '<video controls autoplay playsinline style="width:100%;max-width:1100px;max-height:80vh;background:#000;"></video>'
+    + '<div class="bp-msg" style="color:#fca5a5;margin-top:8px;"></div>';
+  o.querySelector('strong').textContent = title || '';
+  o.querySelector('button').onclick = closeBrowserPlayer;
+  document.body.appendChild(o);
+  const v = o.querySelector('video');
+  const msg = o.querySelector('.bp-msg');
+  let retried = false;
+  v.onerror = () => {
+    if (!live && !retried && src.indexOf('/plex/stream') >= 0) {
+      // The file will not decode as-is; ask the server to re-encode it.
+      retried = true;
+      msg.style.color = '#fcd34d';
+      msg.textContent = 'Converting for this browser… playback starts in a few seconds.';
+      v.src = src + '&transcode=1';
+      v.play().catch(() => {});
+      return;
+    }
+    msg.style.color = '#fca5a5';
+    msg.textContent = 'This browser cannot play this video format.';
+  };
+  if (!live) { v.src = src; return; }
+  try {
+    await _loadMpegts();
+    if (!mpegts.getFeatureList().mseLivePlayback) throw new Error('This browser cannot play live streams');
+    const player = mpegts.createPlayer({type: 'mpegts', isLive: true, url: src});
+    o._mpegts = player;
+    player.attachMediaElement(v);
+    player.load();
+    player.on(mpegts.Events.ERROR, () => { msg.textContent = 'Live stream failed to play in this browser.'; });
+    v.play().catch(() => {});
+  } catch (e) { msg.textContent = e.message; }
 }
 
 let _chIdFilter = '';
@@ -8742,14 +8961,12 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
   }
 }
 
-async function playEaglecastLiveSport(streamId) {
-  const channelId = 'eaglecast-live:' + streamId;
-  try {
-    const r = await post('/epg-web/api/play/eaglecast-live', {stream_id: streamId});
-    if (!r.ok) { alert('Could not start VLC: ' + (r.error || 'unknown error')); return; }
-    _updateNowPlaying(r.streams);
-    fetchAndRenderGuide();
-  } catch (e) { alert('Could not start VLC: ' + e.message); }
+function playEaglecastLiveSport(streamId, name) {
+  openBrowserPlayer({
+    title: name || 'Eaglecast live',
+    src: '/epg-web/api/play/eaglecast-proxy?stream_id=' + encodeURIComponent(streamId),
+    live: true
+  });
 }
 function chPagePrev() { _chOffset = Math.max(0, _chOffset - 200); fetchAndRenderGuide(); }
 function chPageNext() { _chOffset += 200; fetchAndRenderGuide(); }
@@ -9622,6 +9839,15 @@ async function playStream() {
     return;
   }
   if (!_nextAiring) return;
+  if (!isIOS) {
+    // Play on this device, in the browser, not on the Mac mini.
+    openBrowserPlayer({
+      title: ((_currentProg && _currentProg.title) || '') + ' — ' + (_nextAiring.channel_name || _nextAiring.channel_id),
+      src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(_nextAiring.channel_id),
+      live: true
+    });
+    return;
+  }
   const btn = document.getElementById('pm-play-btn');
   if (Object.keys(_activeStreams).length >= 6) {
     document.getElementById('pm-status').textContent = '❌ Max 6 streams already playing';
@@ -10036,6 +10262,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
     refreshGuideRecMap().then(() => renderGuide());
   } else {
     btn.disabled = false; btn.textContent = allowCommercialMovie ? '● Record remaining' : '⏱ Record';
+    if (r.slot_full) showSlotFullModal(r);
     if (modalGeneration === _modalGeneration) {
       document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
       document.getElementById('pm-status').className = 'status-msg err';
@@ -10407,12 +10634,12 @@ async function load247() {
       </div>`).join('');
   } catch(e) { setEl('c247-status', 'Failed', 'err'); }
 }
-async function play247(channelId, name) {
-  const r = await fetch('/epg-web/api/play', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({channel_id: channelId, title: name, ch_name: name})});
-  const d = await r.json();
-  if (d.error) setEl('c247-status', '❌ ' + d.error, 'err');
-  else setEl('c247-status', `▶ Playing: ${name}`, 'ok');
+function play247(channelId, name) {
+  openBrowserPlayer({
+    title: name || 'Live',
+    src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId),
+    live: true
+  });
 }
 async function hide247(channelId, hide, el) {
   const r = await fetch('/epg-web/api/channel/hide', {method:'POST',

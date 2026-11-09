@@ -486,6 +486,86 @@ def verified_unidentified_episode_transfer(source, tv_root, show_title, start_ts
     return _verified_copy(source, destination, progress_callback)
 
 
+RESUME_PAUSE_SECONDS = 20
+RESUME_MAX_ATTEMPTS = 20
+RESUME_MAX_EMPTY_SEGMENTS = 5
+
+
+def segment_path(ts_path, attempt):
+    """Path of the n-th recording segment; the first is the final file itself.
+
+    The name keeps a .ts extension: FFmpeg refuses an output whose format it
+    cannot work out from the name (e.g. "show.ts.part1").
+    """
+    ts_path = Path(ts_path)
+    if attempt == 0:
+        return ts_path
+    return ts_path.with_name(f'{ts_path.stem}.part{attempt}{ts_path.suffix or ".ts"}')
+
+
+def build_record_command(cfg, url, remaining, segment):
+    return [
+        cfg['ffmpeg'], '-y',
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_at_eof', '1',
+        '-reconnect_delay_max', '30', '-rw_timeout', '15000000',
+        '-i', url, '-t', str(remaining), '-c', 'copy', '-f', 'mpegts', str(segment)
+    ]
+
+
+def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
+    """Record a live stream to ``ts_path``, resuming if the provider cuts it early.
+
+    FFmpeg's own reconnect gives up after about half a minute, and providers
+    often refuse a new connection (HTTP 403) while the old one is still counted.
+    When FFmpeg stops before ``end_time``, wait, start it again on a new segment
+    and, at the end, append the segments to ``ts_path`` (MPEG-TS joins by
+    concatenation).  Returns FFmpeg's last exit code, or None if cancelled.
+    """
+    ts_path = Path(ts_path)
+    segments = []
+    empty_in_a_row = 0
+    attempt = 0
+    rc = 0
+    while True:
+        segment = segment_path(ts_path, attempt)
+        remaining = int(end_time - time.time())
+        record_cmd = build_record_command(cfg, url, remaining, segment)
+        rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path))
+        if rc is None:
+            for extra in segments[1:] + [segment]:
+                if extra != ts_path:
+                    discard_failed_media(extra)
+            return None
+        segments.append(segment)
+        size = segment.stat().st_size if segment.exists() else 0
+        empty_in_a_row = empty_in_a_row + 1 if size == 0 else 0
+        if end_time - time.time() < 90:
+            break
+        attempt += 1
+        if attempt > RESUME_MAX_ATTEMPTS or empty_in_a_row >= RESUME_MAX_EMPTY_SEGMENTS:
+            break
+        print(f'[resume] {job["title"]}: stream stopped early; retrying in '
+              f'{RESUME_PAUSE_SECONDS}s (attempt {attempt})', flush=True)
+        if not heartbeat_sleep(api, job, 'recording', RESUME_PAUSE_SECONDS, cfg,
+                               file=str(ts_path)):
+            for extra in segments[1:]:
+                discard_failed_media(extra)
+            return None
+    # Join the extra segments onto the first one.
+    for extra in segments[1:]:
+        if extra.exists() and extra.stat().st_size:
+            with open(ts_path, 'ab') as out, open(extra, 'rb') as src:
+                shutil.copyfileobj(src, out)
+        try:
+            extra.unlink()
+        except FileNotFoundError:
+            pass
+    if rc != 0 and ts_path.exists() and ts_path.stat().st_size:
+        # We kept what was captured; the incomplete-recording check decides next.
+        rc = 0
+    return rc
+
+
 def process_job(api, job, cfg):
     local_dir = Path(os.path.expanduser(cfg['local_recordings']))
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -542,10 +622,11 @@ def process_job(api, job, cfg):
                       message='Recording window has already passed', result=quality)
         return
 
-    record_cmd = [
-        cfg['ffmpeg'], '-y', '-i', url, '-t', str(remaining), '-c', 'copy', str(ts_path)
-    ]
-    rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path))
+    # IPTV providers close long-lived connections; resume so a dropped stream
+    # continues instead of ending the recording early.
+    rc = record_with_resume(api, job, cfg, url, ts_path, log_path,
+                            time.time() + remaining)
+    quality['record_log_tail'] = _log_excerpt(log_path, 3000)
     if rc is None:
         return
     if rc != 0:
