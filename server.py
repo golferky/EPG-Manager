@@ -6277,16 +6277,29 @@ def api_play_eaglecast_proxy():
 def api_play_playlist():
     """A one-entry playlist that opens in VLC (or any player set for .m3u files).
 
-    The provider cuts live connections into short pieces that a browser cannot
-    stitch together; VLC reconnects.  Downloading this file is how a click on
-    the player hands the channel to VLC without copying an address by hand.
+    Takes ``channel_id`` (a live channel), ``plex_title`` (a movie in the Plex
+    folder, streamed from this server) or ``eaglecast_id`` (a live-sports feed).
+    VLC reconnects through provider cuts that a browser player cannot, and plays
+    any video format, so this is how a click hands the video to VLC.
     """
+    from urllib.parse import quote
     from flask import Response
     channel_id = request.args.get("channel_id", "")
-    title = re.sub(r'[\r\n]+', ' ', request.args.get("title", "") or channel_id).strip()[:100]
-    url, err, dbg = _stream_url(channel_id)
-    if err:
-        return jsonify({"error": err}), 400
+    plex_title = request.args.get("plex_title", "")
+    eaglecast_id = request.args.get("eaglecast_id", "")
+    title = re.sub(r'[\r\n]+', ' ', request.args.get("title", "") or channel_id or plex_title).strip()[:100]
+    if plex_title:
+        url = request.host_url.rstrip('/') + '/epg-web/api/plex/stream?title=' + quote(plex_title)
+    elif eaglecast_id:
+        # Only feeds in the live-sports catalogue may be handed out.
+        item = next((e for e in _eaglecast_live_sports() if e["stream_id"] == str(eaglecast_id)), None)
+        url = _eaglecast_stream_url(item["stream_id"], item["extension"]) if item else None
+        if not url:
+            return jsonify({"error": "That Eaglecast sports feed is not available."}), 404
+    else:
+        url, err, dbg = _stream_url(channel_id)
+        if err:
+            return jsonify({"error": err}), 400
     body = f"#EXTM3U\n#EXTINF:-1,{title}\n{url}\n"
     return Response(body, mimetype="audio/x-mpegurl",
                     headers={"Content-Disposition": 'attachment; filename="epg-live.m3u"',
@@ -7624,6 +7637,7 @@ tr:hover td{background:#141414;}
   <div class="spacer"></div>
   <button class="btn btn-ghost btn-sm" id="btn-refresh" onclick="loadGuide()">Refresh</button>
   <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">↻ Refresh Guide</button>
+  <button class="btn btn-ghost btn-sm" id="player-pref-btn" onclick="togglePlayerPref()" title="Where Play opens videos on this device">Player: VLC</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
 
@@ -8823,9 +8837,27 @@ async function playPlex(title) {
     window.location.href = 'vlc://' + streamUrl.replace(/^https?:\/\//, '');
     return;
   }
+  if (playerPref() === 'vlc') { openInVlc({plex_title: title, title}); return; }
   // Play on this device, in the browser, not on the Mac mini.
   openBrowserPlayer({title, src: '/epg-web/api/plex/stream?title=' + encodeURIComponent(title), live: false});
 }
+
+// Which player the Play buttons use on this device: VLC (default) or the in-page player.
+function playerPref() { return localStorage.getItem('epg_player_pref') || 'vlc'; }
+function updatePlayerPrefBtn() {
+  const b = document.getElementById('player-pref-btn');
+  if (b) b.textContent = 'Player: ' + (playerPref() === 'vlc' ? 'VLC' : 'Browser');
+}
+function togglePlayerPref() {
+  localStorage.setItem('epg_player_pref', playerPref() === 'vlc' ? 'browser' : 'vlc');
+  updatePlayerPrefBtn();
+}
+// Hand a video to VLC by downloading a one-entry playlist (set VLC as the default for .m3u files).
+function openInVlc(params) {
+  window.location.href = '/epg-web/api/play/playlist.m3u?' + new URLSearchParams(params).toString();
+}
+document.addEventListener('DOMContentLoaded', updatePlayerPrefBtn);
+updatePlayerPrefBtn();
 
 // In-browser player overlay: plays on whichever device the browser is on.
 function closeBrowserPlayer() {
@@ -9051,6 +9083,7 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
 }
 
 function playEaglecastLiveSport(streamId, name) {
+  if (playerPref() === 'vlc') { openInVlc({eaglecast_id: streamId, title: name || 'Eaglecast live'}); return; }
   openBrowserPlayer({
     title: name || 'Eaglecast live',
     src: '/epg-web/api/play/eaglecast-proxy?stream_id=' + encodeURIComponent(streamId),
@@ -9949,6 +9982,11 @@ async function playStream() {
     return;
   }
   if (!_nextAiring) return;
+  if (!isIOS && playerPref() === 'vlc') {
+    openInVlc({channel_id: _nextAiring.channel_id,
+               title: ((_currentProg && _currentProg.title) || '') + ' — ' + (_nextAiring.channel_name || _nextAiring.channel_id)});
+    return;
+  }
   if (!isIOS) {
     // Play on this device, in the browser, not on the Mac mini.
     openBrowserPlayer({
@@ -10750,6 +10788,7 @@ async function play247(channelId, name) {
     const pv = await (await fetch('/epg-web/api/play/provider?channel_id=' + encodeURIComponent(channelId))).json();
     if (pv.busy) { setEl('c247-status', '🦅 Eaglecast — in use by a recording', 'err'); return; }
   } catch (e) { /* if the check fails, just play */ }
+  if (playerPref() === 'vlc') { openInVlc({channel_id: channelId, title: name || 'Live'}); return; }
   openBrowserPlayer({
     title: name || 'Live',
     src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId),

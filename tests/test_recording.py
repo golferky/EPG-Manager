@@ -790,3 +790,25 @@ class ProviderBusyTests(unittest.TestCase):
         self.assertFalse(data["busy"])
         with server._rec_lock:
             server._recs.clear()
+
+
+class PlaylistKindsTests(unittest.TestCase):
+    def test_plex_playlist_points_at_this_servers_stream_route(self):
+        resp = server.app.test_client().get(
+            "/epg-web/api/play/playlist.m3u",
+            query_string={"plex_title": "Indiana Jones (1984)", "title": "Indiana Jones"},
+            base_url="http://nas.test:5001")
+        lines = resp.get_data(as_text=True).splitlines()
+        self.assertEqual(lines[0], "#EXTM3U")
+        self.assertEqual(lines[2],
+                         "http://nas.test:5001/epg-web/api/plex/stream?title=Indiana%20Jones%20%281984%29")
+
+    def test_eaglecast_playlist_only_serves_catalogue_feeds(self):
+        catalogue = [{"stream_id": "7", "name": "ESPN", "extension": "ts"}]
+        with mock.patch.object(server, "_eaglecast_live_sports", return_value=catalogue), \
+             mock.patch.object(server, "_eaglecast_stream_url", return_value="http://eagle.test/7.ts"):
+            client = server.app.test_client()
+            ok = client.get("/epg-web/api/play/playlist.m3u", query_string={"eaglecast_id": "7"})
+            bad = client.get("/epg-web/api/play/playlist.m3u", query_string={"eaglecast_id": "999"})
+        self.assertEqual(ok.get_data(as_text=True).splitlines()[2], "http://eagle.test/7.ts")
+        self.assertEqual(bad.status_code, 404)
