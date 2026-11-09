@@ -6273,6 +6273,25 @@ def api_play_eaglecast_proxy():
         return jsonify({"error": "Eaglecast playback is not configured on this Mac."}), 503
     return _relay_live_stream(url)
 
+@app.route("/epg-web/api/play/playlist.m3u")
+def api_play_playlist():
+    """A one-entry playlist that opens in VLC (or any player set for .m3u files).
+
+    The provider cuts live connections into short pieces that a browser cannot
+    stitch together; VLC reconnects.  Downloading this file is how a click on
+    the player hands the channel to VLC without copying an address by hand.
+    """
+    from flask import Response
+    channel_id = request.args.get("channel_id", "")
+    title = re.sub(r'[\r\n]+', ' ', request.args.get("title", "") or channel_id).strip()[:100]
+    url, err, dbg = _stream_url(channel_id)
+    if err:
+        return jsonify({"error": err}), 400
+    body = f"#EXTM3U\n#EXTINF:-1,{title}\n{url}\n"
+    return Response(body, mimetype="audio/x-mpegurl",
+                    headers={"Content-Disposition": 'attachment; filename="epg-live.m3u"',
+                             "Cache-Control": "no-store"})
+
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
@@ -8809,7 +8828,8 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
   o.id = 'browser-player';
   o.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px;';
   o.innerHTML = '<div style="width:100%;max-width:1100px;display:flex;justify-content:space-between;align-items:center;color:#e2e8f0;margin-bottom:8px;">'
-    + '<strong></strong><span><button class="btn btn-ghost btn-sm bp-vlc" style="margin:0 8px 0 0;display:none;">Open in VLC</button>'
+    + '<strong></strong><span><button class="btn btn-ghost btn-sm bp-m3u" style="margin:0 8px 0 0;display:none;">Open in VLC</button>'
+    + '<button class="btn btn-ghost btn-sm bp-vlc" style="margin:0 8px 0 0;display:none;">Copy address</button>'
     + '<button class="btn btn-ghost btn-sm bp-close" style="margin:0;">✕ Close</button></span></div>'
     + '<video controls autoplay playsinline style="width:100%;max-width:1100px;max-height:80vh;background:#000;"></video>'
     + '<div class="bp-msg" style="color:#fca5a5;margin-top:8px;"></div>';
@@ -8820,7 +8840,18 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
     // VLC on this device reconnects through provider hiccups that stop the in-page player.
     const vlcBtn = o.querySelector('.bp-vlc');
     vlcBtn.style.display = '';
-    vlcBtn.textContent = 'Copy address for VLC';
+    vlcBtn.textContent = 'Copy address';
+    const m3uBtn = o.querySelector('.bp-m3u');
+    m3uBtn.style.display = '';
+    m3uBtn.onclick = () => {
+      const v3 = o.querySelector('video');
+      if (v3) v3.pause();
+      // Downloads a tiny playlist; with VLC as the default for .m3u files it opens at once.
+      window.location.href = '/epg-web/api/play/playlist.m3u?channel_id=' + encodeURIComponent(vlcChannelId)
+        + '&title=' + encodeURIComponent(title || '');
+      msg.style.color = '#86efac';
+      msg.textContent = 'Opening in VLC… if nothing happens, open the downloaded epg-live.m3u file.';
+    };
     vlcBtn.onclick = async () => {
       try {
         const r = await fetch('/epg-web/api/play/stream-url?channel_id=' + encodeURIComponent(vlcChannelId));

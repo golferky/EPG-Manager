@@ -731,3 +731,22 @@ class DuplicateRecordingTests(unittest.TestCase):
         recs = {"a": self._rec("NFL GameDay Final", 1000, "34710", status="cancelled")}
         self.assertIsNone(server._find_duplicate_recording(
             recs.items(), "NFL GameDay Final", 1000, "34710", "primestreams", "1402"))
+
+
+class PlaylistRouteTests(unittest.TestCase):
+    def test_playlist_is_a_downloadable_m3u_with_the_stream_address(self):
+        url = "http://provider.test/live/u/p/1.ts"
+        with mock.patch.object(server, "_stream_url", return_value=(url, None, {})):
+            resp = server.app.test_client().get(
+                "/epg-web/api/play/playlist.m3u",
+                query_string={"channel_id": "18086", "title": "Paycheck\nextra"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        body = resp.get_data(as_text=True)
+        self.assertEqual(body.splitlines(), ["#EXTM3U", "#EXTINF:-1,Paycheck extra", url])
+
+    def test_playlist_reports_a_stream_error(self):
+        with mock.patch.object(server, "_stream_url", return_value=(None, "no stream", {})):
+            resp = server.app.test_client().get(
+                "/epg-web/api/play/playlist.m3u", query_string={"channel_id": "x"})
+        self.assertEqual(resp.status_code, 400)
