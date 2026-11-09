@@ -8847,7 +8847,7 @@ async function quickRecord(key, btnEl) {
 }
 
 async function playPlex(title) {
-  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const isIOS = isAppleMobile();
   if (isIOS) {
     const streamUrl = location.origin + '/epg-web/api/plex/stream?title=' + encodeURIComponent(title);
     window.location.href = 'vlc://' + streamUrl.replace(/^https?:\/\//, '');
@@ -8868,9 +8868,32 @@ function togglePlayerPref() {
   localStorage.setItem('epg_player_pref', playerPref() === 'vlc' ? 'browser' : 'vlc');
   updatePlayerPrefBtn();
 }
-// Hand a video to VLC by downloading a one-entry playlist (set VLC as the default for .m3u files).
-function openInVlc(params) {
-  window.location.href = '/epg-web/api/play/playlist.m3u?' + new URLSearchParams(params).toString();
+// Hand a video to VLC through the EPG VLC helper app on the viewing Mac, which registers the
+// epgvlc:// link type.  The server builds the address (credentials stay server-side until now).
+// iPhone/iPad (including iPads whose Safari reports itself as a Mac) open VLC through vlc://;
+// a Mac uses the EPG VLC helper app's epgvlc:// link.
+function isAppleMobile() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (/Mac/.test(navigator.platform || navigator.userAgent) && navigator.maxTouchPoints > 1);
+}
+function vlcLaunchUrl(mediaUrl) {
+  return isAppleMobile() ? 'vlc://' + mediaUrl : 'epgvlc://play/' + encodeURIComponent(mediaUrl);
+}
+let _vlcNavigate = u => { window.location.href = u; };
+async function openInVlc(params) {
+  try {
+    const r = await fetch('/epg-web/api/play/playlist.m3u?' + new URLSearchParams(params).toString());
+    const text = await r.text();
+    if (!r.ok) {
+      let msg = 'Could not get the video address';
+      try { msg = JSON.parse(text).error || msg; } catch (e) {}
+      alert(msg);
+      return;
+    }
+    const mediaUrl = text.split('\\n').map(l => l.trim()).find(l => l && l[0] !== '#');
+    if (!mediaUrl) { alert('Could not get the video address'); return; }
+    _vlcNavigate(vlcLaunchUrl(mediaUrl));
+  } catch (e) { alert('Could not open VLC: ' + e.message); }
 }
 document.addEventListener('DOMContentLoaded', updatePlayerPrefBtn);
 updatePlayerPrefBtn();
@@ -8918,11 +8941,9 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
     m3uBtn.onclick = () => {
       const v3 = o.querySelector('video');
       if (v3) v3.pause();
-      // Downloads a tiny playlist; with VLC as the default for .m3u files it opens at once.
-      window.location.href = '/epg-web/api/play/playlist.m3u?channel_id=' + encodeURIComponent(vlcChannelId)
-        + '&title=' + encodeURIComponent(title || '');
+      openInVlc({channel_id: vlcChannelId, title: title || ''});
       msg.style.color = '#86efac';
-      msg.textContent = 'Opening in VLC… if nothing happens, open the downloaded epg-live.m3u file.';
+      msg.textContent = 'Opening in VLC… (needs the EPG VLC helper app installed on this Mac)';
     };
     vlcBtn.onclick = async () => {
       try {
@@ -9988,7 +10009,7 @@ async function refreshPlayBusy(channelId) {
 async function playStream() {
   document.getElementById('pm-status').textContent = '';
   document.getElementById('pm-status').className = 'status-msg';
-  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const isIOS = isAppleMobile();
   if (isIOS && _nextAiring) {
     const r = await fetch(`/epg-web/api/play/stream-url?channel_id=${encodeURIComponent(_nextAiring.channel_id)}`);
     const d = await r.json();
