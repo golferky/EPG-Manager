@@ -29,7 +29,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261110b"
+AGENT_VERSION = "v20261110c"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -100,6 +100,7 @@ class AgentAPI:
     def claim(self, claim_ahead_seconds):
         return self._request('POST', '/epg-web/api/agent/jobs/claim', {
             'agent_id': self.agent_id,
+            'agent_version': AGENT_VERSION,
             'lease_seconds': self.lease_seconds,
             'claim_ahead_seconds': int(claim_ahead_seconds),
         }).get('job')
@@ -107,6 +108,7 @@ class AgentAPI:
     def heartbeat(self, job_id, status, **fields):
         payload = {
             'agent_id': self.agent_id,
+            'agent_version': AGENT_VERSION,
             'lease_seconds': self.lease_seconds,
             'status': status,
             **fields,

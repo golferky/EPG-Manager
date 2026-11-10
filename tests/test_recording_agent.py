@@ -486,3 +486,15 @@ class PatientHeartbeatTests(unittest.TestCase):
             with self.assertRaises(urllib.error.URLError):
                 api.patient_heartbeat("j1", "done", wait_seconds=100, pause=20)
         self.assertLessEqual(len(calls), 7)
+
+
+class AgentVersionPayloadTests(unittest.TestCase):
+    def test_claim_and_heartbeat_send_the_recorders_version(self):
+        api = recording_agent.AgentAPI({"server_url": "http://x.test", "agent_token": "t", "agent_id": "a",
+                                        "epg_url": "", "epg_user": "", "epg_pass": "", "lease_seconds": 90})
+        sent = []
+        api._request = lambda method, path, payload=None, timeout=30: sent.append(payload) or {}
+        api.claim(300)
+        api.heartbeat("j1", "recording")
+        self.assertEqual([p["agent_version"] for p in sent],
+                         [recording_agent.AGENT_VERSION] * 2)

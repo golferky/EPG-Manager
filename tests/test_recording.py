@@ -1120,3 +1120,39 @@ class VersionLabelTests(unittest.TestCase):
     def test_the_header_shows_the_version(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn(server.VERSION, html)
+
+
+class AgentSeenTests(unittest.TestCase):
+    def setUp(self):
+        server._init_recordings_table()
+        server._agent_seen.update({'id': '', 'version': '', 'at': 0.0})
+
+    def _post(self, path, body):
+        with mock.patch.object(server, "_agent_authorized", return_value=True):
+            return server.app.test_client().post(path, json=body)
+
+    def test_a_claim_records_the_recorders_version_and_time(self):
+        resp = self._post("/epg-web/api/agent/jobs/claim",
+                          {"agent_id": "mac-mini", "agent_version": "v20261110c"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(server._agent_seen["id"], "mac-mini")
+        self.assertEqual(server._agent_seen["version"], "v20261110c")
+        self.assertAlmostEqual(server._agent_seen["at"], time.time(), delta=5)
+
+    def test_a_heartbeat_records_it_too_even_for_an_unknown_job(self):
+        self._post("/epg-web/api/agent/jobs/nope/heartbeat",
+                   {"agent_id": "mac-mini", "agent_version": "v20261110c", "status": "recording"})
+        self.assertEqual(server._agent_seen["version"], "v20261110c")
+
+    def test_an_old_recorder_without_a_version_is_still_recorded(self):
+        self._post("/epg-web/api/agent/jobs/claim", {"agent_id": "mac-mini"})
+        self.assertEqual(server._agent_seen["version"], "")
+        self.assertGreater(server._agent_seen["at"], 0)
+
+    def test_overview_reports_the_recorder_or_none_if_it_has_not_checked_in(self):
+        data = server.app.test_client().get("/epg-web/api/recordings/overview").get_json()
+        self.assertIsNone(data["agent"])
+        server._agent_seen.update({'id': 'mac-mini', 'version': 'v20261110c', 'at': time.time() - 12})
+        data = server.app.test_client().get("/epg-web/api/recordings/overview").get_json()
+        self.assertEqual(data["agent"]["version"], "v20261110c")
+        self.assertAlmostEqual(data["agent"]["seconds_ago"], 12, delta=3)
