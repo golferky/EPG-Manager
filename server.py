@@ -11895,6 +11895,75 @@ def _startup_load():
     finally:
         _startup_status['loading'] = False
 
+# ── Daily guide refresh ───────────────────────────────────────────────────────
+# Replaces the 3:00 AM job that used to run on another computer and call this server.
+
+DAILY_REFRESH_MARKER = 'daily_guide_refresh.json'
+
+def _daily_refresh_due(now, last_run_date, hour=3, enabled=True, window_hours=3):
+    """True when the daily refresh should start now.
+
+    It runs once per local day, inside the window that opens at ``hour``, so a restart
+    during the window catches a missed run and a restart later in the day does not
+    trigger a surprise refresh.
+    """
+    if not enabled or last_run_date == now.date().isoformat():
+        return False
+    return hour <= now.hour < hour + window_hours
+
+def _read_daily_refresh_marker():
+    try:
+        with open(os.path.join(BASE_DIR, DAILY_REFRESH_MARKER), encoding='utf-8') as handle:
+            return str(json.load(handle).get('date', ''))
+    except (OSError, ValueError, AttributeError):
+        return ''
+
+def _write_daily_refresh_marker(day):
+    try:
+        with open(os.path.join(BASE_DIR, DAILY_REFRESH_MARKER), 'w', encoding='utf-8') as handle:
+            json.dump({'date': day}, handle)
+    except OSError as exc:
+        print(f'[daily-guide] could not save the run marker: {exc}')
+
+def _wait_for_guide_load(timeout=1800):
+    """Wait for any guide load already in progress, so two full loads never overlap."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and (_startup_status['loading'] or _startup_status['background_loading']):
+        time.sleep(15)
+
+def _run_daily_guide_refresh():
+    """The provider guide first, then 21 days from Schedules Direct, as the old job did."""
+    def status_of(resp):
+        return resp[1] if isinstance(resp, tuple) else getattr(resp, 'status_code', 200)
+    try:
+        with app.test_request_context('/epg-web/api/fetch-guide', method='POST'):
+            print(f'[daily-guide] provider guide: HTTP {status_of(api_fetch_guide())}')
+    except Exception as exc:
+        print(f'[daily-guide] provider guide failed: {exc}')
+    _wait_for_guide_load()
+    try:
+        with app.test_request_context('/epg-web/api/fetch-sd', method='POST', json={'days': 21}):
+            print(f'[daily-guide] Schedules Direct: HTTP {status_of(api_fetch_sd())}')
+    except Exception as exc:
+        print(f'[daily-guide] Schedules Direct failed: {exc}')
+
+def _daily_guide_loop():
+    while True:
+        try:
+            cfg = load_config()
+            now = datetime.now(ZoneInfo(cfg.get('timezone', 'America/New_York')))
+            busy = _startup_status['loading'] or _startup_status['background_loading']
+            if not busy and _daily_refresh_due(
+                    now, _read_daily_refresh_marker(),
+                    int(cfg.get('daily_guide_refresh_hour', 3)),
+                    bool(cfg.get('daily_guide_refresh', True))):
+                _write_daily_refresh_marker(now.date().isoformat())
+                print('[daily-guide] starting the daily guide refresh')
+                _run_daily_guide_refresh()
+        except Exception as exc:
+            print(f'[daily-guide] scheduler error: {exc}')
+        time.sleep(60)
+
 # Bind the web server immediately, then prepare the large guide in the
 # background.  The browser displays a clear preparation message meanwhile.
 _startup_status['loading'] = True
@@ -11905,6 +11974,7 @@ threading.Thread(target=_startup_load, daemon=True).start()
 if __name__ == '__main__':
     import webbrowser
     _load_pending_recs()
+    threading.Thread(target=_daily_guide_loop, name='epg-daily-guide', daemon=True).start()
     print(f'\n  EPG Manager Web {VERSION}')
     print(  '  ──────────────────────')
     print(  '  Open: http://localhost:5001/epg-web\n')

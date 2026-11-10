@@ -940,3 +940,74 @@ class ThreadDumpSignalTests(unittest.TestCase):
                                 timeout=60, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.assertIn("still running", result.stdout)
         self.assertIn("most recent call first", result.stderr)
+
+
+class DailyGuideRefreshTests(unittest.TestCase):
+    @staticmethod
+    def _at(hour, minute=0, day=10):
+        from datetime import datetime as _dt
+        return _dt(2026, 11, day, hour, minute)
+
+    def test_due_inside_the_window_on_a_day_it_has_not_run(self):
+        self.assertTrue(server._daily_refresh_due(self._at(3, 5), "2026-11-09"))
+        self.assertTrue(server._daily_refresh_due(self._at(5, 59), ""))
+
+    def test_not_due_outside_the_window(self):
+        for hour in (0, 2, 6, 14, 23):
+            self.assertFalse(server._daily_refresh_due(self._at(hour, 30), "2026-11-09"), hour)
+
+    def test_not_due_twice_in_one_day_or_when_switched_off(self):
+        self.assertFalse(server._daily_refresh_due(self._at(3, 30), "2026-11-10"))
+        self.assertFalse(server._daily_refresh_due(self._at(3, 30), "2026-11-09", enabled=False))
+
+    def test_the_hour_is_configurable(self):
+        self.assertTrue(server._daily_refresh_due(self._at(4, 0), "", hour=4))
+        self.assertFalse(server._daily_refresh_due(self._at(3, 0), "", hour=4))
+
+    def test_marker_round_trips_and_a_missing_file_means_never_run(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(server, "BASE_DIR", temp):
+            self.assertEqual(server._read_daily_refresh_marker(), "")
+            server._write_daily_refresh_marker("2026-11-10")
+            self.assertEqual(server._read_daily_refresh_marker(), "2026-11-10")
+
+    def test_runs_the_provider_guide_then_schedules_direct_even_if_the_first_fails(self):
+        order = []
+
+        def provider():
+            order.append("provider")
+            raise RuntimeError("provider down")
+
+        def sd():
+            order.append("sd")
+            return server.jsonify({"ok": True})
+
+        with mock.patch.object(server, "api_fetch_guide", provider), \
+             mock.patch.object(server, "api_fetch_sd", sd), \
+             mock.patch.object(server, "_wait_for_guide_load"):
+            server._run_daily_guide_refresh()
+        self.assertEqual(order, ["provider", "sd"])
+
+    def test_the_loop_marks_the_day_before_it_starts_the_refresh(self):
+        events = []
+        with mock.patch.object(server, "_daily_refresh_due", return_value=True), \
+             mock.patch.object(server, "_read_daily_refresh_marker", return_value=""), \
+             mock.patch.object(server, "_write_daily_refresh_marker",
+                               side_effect=lambda d: events.append(("mark", d))), \
+             mock.patch.object(server, "_run_daily_guide_refresh",
+                               side_effect=lambda: events.append(("run",))), \
+             mock.patch.object(server, "load_config", return_value={}), \
+             mock.patch.dict(server._startup_status, {"loading": False, "background_loading": False}), \
+             mock.patch.object(server.time, "sleep", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                server._daily_guide_loop()
+        self.assertEqual([e[0] for e in events], ["mark", "run"])
+
+    def test_the_loop_waits_while_the_guide_is_loading(self):
+        with mock.patch.object(server, "_daily_refresh_due", return_value=True) as due, \
+             mock.patch.object(server, "_run_daily_guide_refresh") as run, \
+             mock.patch.object(server, "load_config", return_value={}), \
+             mock.patch.dict(server._startup_status, {"loading": False, "background_loading": True}), \
+             mock.patch.object(server.time, "sleep", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                server._daily_guide_loop()
+        run.assert_not_called()
