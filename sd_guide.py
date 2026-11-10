@@ -94,6 +94,89 @@ def ensure_guide_db(db_path):
 
 # ── Main fetch ────────────────────────────────────────────────────────────────
 
+STATION_GROUP = 50   # stations written (and committed) together
+
+
+def _retry_locked(action, attempts=12, pause=10):
+    """Run ``action``; if the database is busy, wait and try again."""
+    for attempt in range(attempts):
+        try:
+            return action()
+        except sqlite3.OperationalError as exc:
+            if 'locked' not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+
+
+def write_listings(conn, station_ids, schedule_data, prog_details, station_map,
+                   window_start, window_end, log=print, pause=10):
+    """Replace this fetch window for the given stations, a small group per transaction.
+
+    One giant transaction held the database's write lock for minutes and made the
+    commit fail with "database is locked" while anything else was reading.  Each group
+    of stations is deleted and re-inserted together, so a group is never left half
+    written, and a short busy spell is retried instead of failing the whole fetch.
+    Returns (rows inserted, superseded rows removed).
+    """
+    rows_by_station = {}
+    for pid, airings in schedule_data.items():
+        detail = prog_details.get(pid, {'title': pid, 'category': '', 'desc': ''})
+        for airing in airings:
+            sid = airing['stationID']
+            ch_name = station_map.get(sid, {}).get('name', sid)
+            try:
+                dt = datetime.fromisoformat(airing['start'].replace('Z', '+00:00'))
+                start_utc = dt.astimezone(timezone.utc).strftime('%Y%m%d%H%M%S')
+                end_utc = (dt + timedelta(seconds=airing['duration'])).astimezone(
+                    timezone.utc).strftime('%Y%m%d%H%M%S')
+            except Exception:
+                continue
+            rows_by_station.setdefault(sid, []).append((
+                detail['title'], sid, ch_name, start_utc, end_utc,
+                detail['desc'], detail['category'],
+                detail.get('episode_title', ''), detail.get('season_num'),
+                detail.get('episode_num'), detail.get('prog_type', '')))
+
+    insert_sql = '''
+        INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category,
+                          episode_title, season_num, episode_num, prog_type)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(channel_id, start_utc, title) DO UPDATE SET
+            desc=excluded.desc, category=excluded.category,
+            episode_title=excluded.episode_title,
+            season_num=excluded.season_num, episode_num=excluded.episode_num,
+            prog_type=excluded.prog_type
+    '''
+    inserted = removed = 0
+    for offset in range(0, len(station_ids), STATION_GROUP):
+        group = station_ids[offset:offset + STATION_GROUP]
+        rows = [row for sid in group for row in rows_by_station.get(sid, [])]
+        placeholders = ','.join('?' for _ in group)
+
+        def replace_group():
+            try:
+                cur = conn.execute(
+                    f'DELETE FROM guide WHERE channel_id IN ({placeholders}) '
+                    'AND start_utc >= ? AND start_utc < ?', [*group, window_start, window_end])
+                gone = max(0, cur.rowcount)
+                added = conn.executemany(insert_sql, rows).rowcount if rows else 0
+                conn.commit()
+                return gone, max(0, added)
+            except Exception:
+                conn.rollback()
+                raise
+
+        def attempt():
+            return _retry_locked(replace_group, pause=pause)
+
+        gone, added = attempt()
+        removed += gone
+        inserted += added
+    if removed:
+        log(f'Removed {removed} superseded Schedule Direct listings.')
+    return inserted, removed
+
+
 def fetch_sd_guide(username, password, db_path, days=14, log=print):
     """
     Authenticate with Schedules Direct, pull <days> days of listings,
@@ -230,54 +313,9 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
     # untouched.
     window_start = dates[0].replace('-', '') + '000000'
     window_end = (datetime.fromisoformat(dates[-1]).date() + timedelta(days=1)).strftime('%Y%m%d') + '000000'
-    removed_stale = 0
-    for offset in range(0, len(station_ids), 500):
-        batch_ids = station_ids[offset:offset + 500]
-        if not batch_ids:
-            continue
-        placeholders = ','.join('?' for _ in batch_ids)
-        cur = conn.execute(
-            f'''DELETE FROM guide WHERE channel_id IN ({placeholders})
-                AND start_utc >= ? AND start_utc < ?''',
-            [*batch_ids, window_start, window_end],
-        )
-        removed_stale += max(0, cur.rowcount)
-    if removed_stale:
-        log(f'Removed {removed_stale} superseded Schedule Direct listings.')
-
-    inserted = 0
-    for pid, airings in schedule_data.items():
-        detail = prog_details.get(pid, {'title': pid, 'category': '', 'desc': ''})
-        for airing in airings:
-            sid = airing['stationID']
-            ch_name = station_map.get(sid, {}).get('name', sid)
-            # Parse start ISO → yyyyMMddHHmmss UTC
-            try:
-                dt = datetime.fromisoformat(airing['start'].replace('Z', '+00:00'))
-                start_utc = dt.astimezone(timezone.utc).strftime('%Y%m%d%H%M%S')
-                end_dt    = dt + timedelta(seconds=airing['duration'])
-                end_utc   = end_dt.astimezone(timezone.utc).strftime('%Y%m%d%H%M%S')
-            except Exception:
-                continue
-            cur = conn.execute('''
-                INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category,
-                                  episode_title, season_num, episode_num, prog_type)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(channel_id, start_utc, title) DO UPDATE SET
-                    desc=excluded.desc, category=excluded.category,
-                    episode_title=excluded.episode_title,
-                    season_num=excluded.season_num, episode_num=excluded.episode_num,
-                    prog_type=excluded.prog_type
-            ''', (
-                detail['title'], sid, ch_name,
-                start_utc, end_utc,
-                detail['desc'], detail['category'],
-                detail['episode_title'], detail['season_num'], detail['episode_num'],
-                detail.get('prog_type', '')
-            ))
-            inserted += cur.rowcount
-
-    conn.commit()
+    inserted, removed_stale = write_listings(
+        conn, station_ids, schedule_data, prog_details, station_map,
+        window_start, window_end, log=log)
     conn.close()
     log(f'Done — {inserted} new rows inserted ({removed_stale} superseded rows replaced).')
 
