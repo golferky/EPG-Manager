@@ -438,3 +438,51 @@ class AgentVersionTests(unittest.TestCase):
                                        "poll_seconds": 0}, once=True)
         self.assertIn(f"version {recording_agent.AGENT_VERSION}", out.getvalue())
         self.assertIn("[agent] connected;", out.getvalue())
+
+
+class PatientHeartbeatTests(unittest.TestCase):
+    def _api(self, outcomes):
+        """An AgentAPI whose heartbeat returns or raises each outcome in turn."""
+        cfg = {"server_url": "http://x.test", "agent_token": "t", "agent_id": "a",
+               "epg_url": "", "epg_user": "", "epg_pass": ""}
+        api = recording_agent.AgentAPI(dict(cfg, lease_seconds=90))
+        results = iter(outcomes)
+        calls = []
+
+        def heartbeat(job_id, status, **fields):
+            calls.append(status)
+            value = next(results)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        api.heartbeat = heartbeat
+        return api, calls
+
+    def test_rides_out_a_server_outage_then_succeeds(self):
+        import urllib.error
+        api, calls = self._api([urllib.error.URLError("Connection refused"),
+                                urllib.error.URLError("Connection refused"), {"ok": True}])
+        with mock.patch.object(recording_agent.time, "sleep"):
+            self.assertEqual(api.patient_heartbeat("j1", "done", pause=0), {"ok": True})
+        self.assertEqual(len(calls), 3)
+
+    def test_server_errors_are_retried_but_client_errors_are_not(self):
+        api, calls = self._api([RuntimeError("EPG API HTTP 500: busy"), {"ok": True}])
+        with mock.patch.object(recording_agent.time, "sleep"):
+            api.patient_heartbeat("j1", "done", pause=0)
+        self.assertEqual(len(calls), 2)
+        api, calls = self._api([RuntimeError("EPG API HTTP 404: Recording job not found"), {"ok": True}])
+        with mock.patch.object(recording_agent.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                api.patient_heartbeat("j1", "done", pause=0)
+        self.assertEqual(len(calls), 1)
+
+    def test_gives_up_after_the_wait_limit(self):
+        import urllib.error
+        api, calls = self._api([urllib.error.URLError("down")] * 50)
+        clock = [1000.0]
+        with mock.patch.object(recording_agent.time, "time", lambda: clock[0]), \
+             mock.patch.object(recording_agent.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s)):
+            with self.assertRaises(urllib.error.URLError):
+                api.patient_heartbeat("j1", "done", wait_seconds=100, pause=20)
+        self.assertLessEqual(len(calls), 7)
