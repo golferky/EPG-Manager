@@ -409,3 +409,32 @@ class RepeatClaimTests(unittest.TestCase):
         active = {"2ba0fd44": self.FakeThread(name="old", alive=False)}
         self.assertTrue(recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread))
         self.assertEqual(self.FakeThread.started, ["epg-record-2ba0fd44"])
+
+
+class AgentVersionTests(unittest.TestCase):
+    def test_version_is_v_date_letter(self):
+        import datetime as dt
+        import re as _re
+        self.assertRegex(recording_agent.AGENT_VERSION, r"^v\d{8}[a-z]$")
+        dt.datetime.strptime(recording_agent.AGENT_VERSION[1:9], "%Y%m%d")
+
+    def test_the_connect_line_shows_the_version(self):
+        import contextlib
+        import io
+
+        class FakeApi:
+            def __init__(self, cfg):
+                pass
+
+            def health(self):
+                return {"recording_backend": "agent"}
+
+            def claim(self, ahead):
+                return None
+
+        out = io.StringIO()
+        with mock.patch.object(recording_agent, "AgentAPI", FakeApi), contextlib.redirect_stdout(out):
+            recording_agent.run_agent({"max_concurrent_recordings": 2, "claim_ahead_seconds": 300,
+                                       "poll_seconds": 0}, once=True)
+        self.assertIn(f"version {recording_agent.AGENT_VERSION}", out.getvalue())
+        self.assertIn("[agent] connected;", out.getvalue())

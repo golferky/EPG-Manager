@@ -25,6 +25,11 @@ from pathlib import Path
 
 MEDIA_EXTENSIONS = {'.mp4', '.mkv', '.m4v', '.ts'}
 DEFAULT_RECORDING_TAIL_SECONDS = 45
+
+# Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
+# the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
+# letter starting again at "a" on a new day.
+AGENT_VERSION = "v20261110a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -994,7 +999,7 @@ def run_agent(cfg, once=False):
     api = AgentAPI(cfg)
     health = api.health()
     max_workers = cfg['max_concurrent_recordings']
-    print(f'[agent] connected; server backend={health.get("recording_backend")}; '
+    print(f'[agent] connected; version {AGENT_VERSION}; server backend={health.get("recording_backend")}; '
           f'max recordings={max_workers}', flush=True)
     active = {}
     while True:
