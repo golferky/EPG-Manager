@@ -812,3 +812,63 @@ class PlaylistKindsTests(unittest.TestCase):
             bad = client.get("/epg-web/api/play/playlist.m3u", query_string={"eaglecast_id": "999"})
         self.assertEqual(ok.get_data(as_text=True).splitlines()[2], "http://eagle.test/7.ts")
         self.assertEqual(bad.status_code, 404)
+
+
+class PlexReplaceTests(unittest.TestCase):
+    def _plex(self, root, names):
+        movies = os.path.join(root, "Movies")
+        for name in names:
+            os.makedirs(os.path.join(movies, name))
+            with open(os.path.join(movies, name, "movie.mp4"), "wb") as fh:
+                fh.write(b"0" * 16)
+        return movies
+
+    def _post(self, movies, body, candidate=None, detail=None):
+        queued = {"channel": "SHO 2 HD", "start_ts": 1.0}
+        with mock.patch.object(server, "load_config", return_value={"plex_path": movies}), \
+             mock.patch.object(server, "_best_incomplete_rerecord",
+                               return_value=(candidate, detail or {})) as best, \
+             mock.patch.object(server, "_queue_best_retry", return_value=queued) as queue, \
+             mock.patch.object(server, "_watch_abandoned_transfer") as wanted:
+            resp = server.app.test_client().post("/epg-web/api/plex/replace", json=body)
+        return resp, best, queue, wanted
+
+    def test_moves_the_folder_aside_and_queues_a_fresh_recording(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["Quantum of Solace (2008)", "Other (1999)"])
+            resp, best, queue, wanted = self._post(
+                movies, {"title": "Quantum of Solace", "year": "2008"},
+                candidate={"channel": "SHO 2 HD"})
+            data = resp.get_json()
+            self.assertTrue(data["ok"])
+            self.assertEqual(sorted(os.listdir(movies)), ["Other (1999)"])
+            held = os.path.join(root, "_wrong_movies")
+            self.assertEqual(len(os.listdir(held)), 1)
+            self.assertTrue(os.path.exists(os.path.join(held, os.listdir(held)[0], "movie.mp4")))
+            queue.assert_called_once()
+            self.assertEqual(data["queued"]["channel"], "SHO 2 HD")
+
+    def test_no_future_airing_adds_the_title_to_wanted(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["Quantum of Solace (2008)"])
+            resp, _best, queue, wanted = self._post(movies, {"title": "Quantum of Solace"})
+            self.assertTrue(resp.get_json()["added_to_wanted"])
+            wanted.assert_called_once()
+            queue.assert_not_called()
+
+    def test_same_title_in_two_years_needs_the_year(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["The Untouchables (1987)", "The Untouchables (1959)"])
+            resp, *_ = self._post(movies, {"title": "The Untouchables"})
+            self.assertEqual(resp.status_code, 409)
+            self.assertEqual(len(os.listdir(movies)), 2)
+            resp, *_ = self._post(movies, {"title": "The Untouchables", "year": "1987"})
+            self.assertTrue(resp.get_json()["ok"])
+            self.assertEqual(os.listdir(movies), ["The Untouchables (1959)"])
+
+    def test_unknown_title_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["Other (1999)"])
+            resp, *_ = self._post(movies, {"title": "Nope"})
+            self.assertEqual(resp.status_code, 404)
+            self.assertEqual(os.listdir(movies), ["Other (1999)"])

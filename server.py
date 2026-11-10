@@ -5474,6 +5474,75 @@ def api_plex_play():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def _find_plex_movie_folders(plex_dir, title, year=''):
+    """Folders under ``plex_dir`` whose name (year removed) matches ``title``.
+
+    When a year is given, a folder that names a different year is not a match.
+    """
+    clean, title_year = _plex_title_and_year(title)
+    year = str(year or title_year or '')[:4]
+    wanted = re.sub(r'[^a-z0-9]', '', clean.lower())
+    found = []
+    for name in sorted(os.listdir(plex_dir)):
+        path = os.path.join(plex_dir, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        folder_title, folder_year = _plex_title_and_year(name)
+        if re.sub(r'[^a-z0-9]', '', folder_title.lower()) != wanted:
+            continue
+        if year and folder_year and folder_year != year:
+            continue
+        found.append(path)
+    return found
+
+@app.route('/epg-web/api/plex/replace', methods=['POST'])
+def api_plex_replace():
+    """Take a wrong or damaged Plex copy out of the library and record a fresh one.
+
+    The movie's folder is moved to ``_wrong_movies`` beside the Movies folder, not
+    deleted, so it can be put back.  The recorder skips a title Plex already has,
+    so the bad copy has to go before a good one can be recorded.
+    """
+    data = request.json or {}
+    title = str(data.get('title', '')).strip()
+    if not title:
+        return jsonify({'ok': False, 'error': 'no title'}), 400
+    cfg = load_config()
+    plex_dir = cfg.get('plex_path', '/Volumes/Plex/Movies')
+    if not os.path.isdir(plex_dir):
+        return jsonify({'ok': False, 'error': 'Plex folder is not available'}), 503
+    folders = _find_plex_movie_folders(plex_dir, title, data.get('year', ''))
+    if not folders:
+        return jsonify({'ok': False, 'error': 'No matching movie folder in Plex'}), 404
+    if len(folders) > 1:
+        return jsonify({'ok': False,
+                        'error': 'More than one folder matches; the year is needed to choose',
+                        'folders': [os.path.basename(f) for f in folders]}), 409
+    folder = folders[0]
+    holding = os.path.join(os.path.dirname(os.path.abspath(plex_dir)), '_wrong_movies')
+    os.makedirs(holding, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    destination = os.path.join(holding, f'{os.path.basename(folder)}__{stamp}')
+    try:
+        shutil.move(folder, destination)
+    except OSError as exc:
+        return jsonify({'ok': False, 'error': f'Could not move the folder: {exc}'}), 500
+    _plex_info_cache.clear()
+    clean_title, _y = _plex_title_and_year(title)
+    queued, wanted, already = None, False, None
+    candidate, detail = _best_incomplete_rerecord(clean_title, 3600)
+    if candidate:
+        rec = _queue_best_retry(clean_title, candidate, 'replacing a wrong Plex copy')
+        if rec:
+            queued = {'channel': rec['channel'], 'start_ts': rec['start_ts']}
+    elif detail.get('already_queued'):
+        already = detail['already_queued']
+    else:
+        _watch_abandoned_transfer(clean_title, source='wrong_plex_copy')
+        wanted = True
+    return jsonify({'ok': True, 'moved_to': destination, 'queued': queued,
+                    'already_queued': already, 'added_to_wanted': wanted})
+
 @app.route('/epg-web/api/plex/stream')
 def api_plex_stream():
     from flask import send_file
@@ -7801,6 +7870,7 @@ tr:hover td{background:#141414;}
         <span style="font-size:10px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">▶ PLEX</span>
         <span id="pm-plex-info" style="font-size:12px;color:#a78bfa;font-family:monospace;"></span>
         <button id="pm-plex-play-btn" class="btn btn-ghost btn-sm" style="float:right;margin:0;border-color:#7c3aed;color:#c4b5fd;" onclick="playPlex(_currentProg.title)">▶ Play Plex copy</button>
+        <button id="pm-plex-replace-btn" class="btn btn-ghost btn-sm" style="float:right;margin:0 8px 0 0;color:#fbbf24;border-color:#78350f;" onclick="replacePlexCopy()" title="Take this copy out of Plex and record a fresh one">Wrong movie? Replace</button>
       </div>
       <!-- Actual incoming stream quality, sampled from the recordable channel -->
       <div id="pm-stream-wrap" style="display:none;border-top:1px solid #17365d;padding:9px 20px;background:#0b1726;">
@@ -8846,6 +8916,34 @@ async function quickRecord(key, btnEl) {
   }
 }
 
+// Take a wrong or damaged Plex copy out of the library and queue a fresh recording.
+async function replacePlexCopy() {
+  const p = _currentProg;
+  if (!p || !p.title) return;
+  const year = String((_currentInfoYear || p.year || '')).slice(0, 4);
+  const ok = confirm('Move the Plex copy of "' + p.title + '" aside and record a fresh one?\\n\\n'
+    + 'The files are moved to a _wrong_movies folder, not deleted.');
+  if (!ok) return;
+  const status = document.getElementById('pm-status');
+  status.className = 'status-msg';
+  status.textContent = 'Moving the Plex copy aside…';
+  try {
+    const r = await post('/epg-web/api/plex/replace', {title: p.title, year});
+    if (!r.ok) { status.className = 'status-msg err'; status.textContent = '❌ ' + (r.error || 'Failed'); return; }
+    let note = 'Plex copy moved aside. ';
+    if (r.queued) note += 'Recording queued on ' + r.queued.channel + ' at '
+      + new Date(r.queued.start_ts * 1000).toLocaleString([], {weekday:'short', hour:'numeric', minute:'2-digit'}) + '.';
+    else if (r.already_queued) note += 'A recording is already queued for it.';
+    else if (r.added_to_wanted) note += 'No airing yet; added to your Wanted list.';
+    status.className = 'status-msg ok';
+    status.textContent = '✅ ' + note;
+    document.getElementById('pm-plex-wrap').style.display = 'none';
+    document.getElementById('pm-library-badge').style.display = 'none';
+    await loadPlexTitles();
+  } catch (e) { status.className = 'status-msg err'; status.textContent = '❌ ' + e.message; }
+}
+let _currentInfoYear = '';
+
 async function playPlex(title) {
   const isIOS = isAppleMobile();
   if (isIOS) {
@@ -9658,6 +9756,7 @@ async function openProg(p) {
   // Plex file info
   const plexWrap = document.getElementById('pm-plex-wrap');
   plexWrap.style.display = 'none';
+  _currentInfoYear = info.year || p.year || '';
   if (_plexHasMovie(p.title, info.year || p.year)) {
     plexWrap.style.display = 'block';
     document.getElementById('pm-plex-info').textContent = 'Plex copy found';
