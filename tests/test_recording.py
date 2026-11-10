@@ -1108,3 +1108,15 @@ class RecordingsOverviewTests(unittest.TestCase):
         self.assertIn("Overview Test Movie", titles)
         item = next(r for r in data["upcoming"] if r["title"] == "Overview Test Movie")
         self.assertEqual(item["provider"], "eaglecast")
+
+
+class VersionLabelTests(unittest.TestCase):
+    def test_version_is_v_date_letter(self):
+        import re as _re
+        self.assertRegex(server.VERSION, r"^v\d{8}[a-z]$")
+        import datetime as dt
+        dt.datetime.strptime(server.VERSION[1:9], "%Y%m%d")      # the date part is a real date
+
+    def test_the_header_shows_the_version(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn(server.VERSION, html)

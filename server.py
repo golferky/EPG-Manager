@@ -25,7 +25,9 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107j"
+# Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
+# (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
+VERSION = "v20261110a"
 
 app = Flask(__name__)
 
