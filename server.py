@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
+import faulthandler, hmac, json, os, re, shutil, signal, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string, request
+
+# Diagnostic: `kill -USR1 <server pid>` writes every thread's stack to the log, which
+# shows which background job is holding a stuck database lock.
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except (AttributeError, ValueError, OSError):
+    pass
 
 def _build_version():
     """Show the deployed revision so the web header cannot go stale."""
@@ -1178,20 +1185,27 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
     query = ('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category, '
              'episode_title, season_num, episode_num, prog_type FROM guide')
     params = ()
+    where = ''
     if window_start is not None and window_hours:
         window_end = window_start + timedelta(hours=window_hours)
-        query += ' WHERE end_utc > ? AND start_utc < ?'
+        where = ' WHERE end_utc > ? AND start_utc < ?'
         params = (window_start.strftime('%Y%m%d%H%M%S'),
                   window_end.strftime('%Y%m%d%H%M%S'))
-    query += ' ORDER BY start_utc'
+    else:
+        # The full load keeps every future listing but only the last few days of the past.
+        # The database holds months of history; loading all of it needed more than 8 GB.
+        try:
+            keep_days = float(load_config().get('guide_keep_past_days', 3))
+        except (TypeError, ValueError):
+            keep_days = 3.0
+        if keep_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+            where = ' WHERE end_utc > ?'
+            params = (cutoff.strftime('%Y%m%d%H%M%S'),)
+    query += where + ' ORDER BY start_utc'
     total = 0
     if progress:
-        count_query = 'SELECT COUNT(*) FROM guide'
-        count_params = ()
-        if params:
-            count_query += ' WHERE end_utc > ? AND start_utc < ?'
-            count_params = params
-        total = conn.execute(count_query, count_params).fetchone()[0]
+        total = conn.execute('SELECT COUNT(*) FROM guide' + where, params).fetchone()[0]
         progress('Reading guide listings', 0, total)
 
     programmes = []
@@ -2488,6 +2502,9 @@ def api_fetch_sd():
     days    = int(request.json.get('days', 21) if request.json else 21)
     if not sd_user or not sd_pass:
         return jsonify({'error': 'SD credentials not configured'}), 400
+    if _sd_status['running']:
+        # A second fetch would fight the first for the database write lock.
+        return jsonify({'ok': True, 'message': 'A Schedules Direct fetch is already running'})
     _sd_status['running'] = True
     _sd_status['log']     = []
     _sd_status['result']  = None
@@ -11885,6 +11902,75 @@ def _startup_load():
     finally:
         _startup_status['loading'] = False
 
+# ── Daily guide refresh ───────────────────────────────────────────────────────
+# Replaces the 3:00 AM job that used to run on another computer and call this server.
+
+DAILY_REFRESH_MARKER = 'daily_guide_refresh.json'
+
+def _daily_refresh_due(now, last_run_date, hour=3, enabled=True, window_hours=3):
+    """True when the daily refresh should start now.
+
+    It runs once per local day, inside the window that opens at ``hour``, so a restart
+    during the window catches a missed run and a restart later in the day does not
+    trigger a surprise refresh.
+    """
+    if not enabled or last_run_date == now.date().isoformat():
+        return False
+    return hour <= now.hour < hour + window_hours
+
+def _read_daily_refresh_marker():
+    try:
+        with open(os.path.join(BASE_DIR, DAILY_REFRESH_MARKER), encoding='utf-8') as handle:
+            return str(json.load(handle).get('date', ''))
+    except (OSError, ValueError, AttributeError):
+        return ''
+
+def _write_daily_refresh_marker(day):
+    try:
+        with open(os.path.join(BASE_DIR, DAILY_REFRESH_MARKER), 'w', encoding='utf-8') as handle:
+            json.dump({'date': day}, handle)
+    except OSError as exc:
+        print(f'[daily-guide] could not save the run marker: {exc}')
+
+def _wait_for_guide_load(timeout=1800):
+    """Wait for any guide load already in progress, so two full loads never overlap."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and (_startup_status['loading'] or _startup_status['background_loading']):
+        time.sleep(15)
+
+def _run_daily_guide_refresh():
+    """The provider guide first, then 21 days from Schedules Direct, as the old job did."""
+    def status_of(resp):
+        return resp[1] if isinstance(resp, tuple) else getattr(resp, 'status_code', 200)
+    try:
+        with app.test_request_context('/epg-web/api/fetch-guide', method='POST'):
+            print(f'[daily-guide] provider guide: HTTP {status_of(api_fetch_guide())}')
+    except Exception as exc:
+        print(f'[daily-guide] provider guide failed: {exc}')
+    _wait_for_guide_load()
+    try:
+        with app.test_request_context('/epg-web/api/fetch-sd', method='POST', json={'days': 21}):
+            print(f'[daily-guide] Schedules Direct: HTTP {status_of(api_fetch_sd())}')
+    except Exception as exc:
+        print(f'[daily-guide] Schedules Direct failed: {exc}')
+
+def _daily_guide_loop():
+    while True:
+        try:
+            cfg = load_config()
+            now = datetime.now(ZoneInfo(cfg.get('timezone', 'America/New_York')))
+            busy = _startup_status['loading'] or _startup_status['background_loading']
+            if not busy and _daily_refresh_due(
+                    now, _read_daily_refresh_marker(),
+                    int(cfg.get('daily_guide_refresh_hour', 3)),
+                    bool(cfg.get('daily_guide_refresh', True))):
+                _write_daily_refresh_marker(now.date().isoformat())
+                print('[daily-guide] starting the daily guide refresh')
+                _run_daily_guide_refresh()
+        except Exception as exc:
+            print(f'[daily-guide] scheduler error: {exc}')
+        time.sleep(60)
+
 # Bind the web server immediately, then prepare the large guide in the
 # background.  The browser displays a clear preparation message meanwhile.
 _startup_status['loading'] = True
@@ -11895,6 +11981,7 @@ threading.Thread(target=_startup_load, daemon=True).start()
 if __name__ == '__main__':
     import webbrowser
     _load_pending_recs()
+    threading.Thread(target=_daily_guide_loop, name='epg-daily-guide', daemon=True).start()
     print(f'\n  EPG Manager Web {VERSION}')
     print(  '  ──────────────────────')
     print(  '  Open: http://localhost:5001/epg-web\n')

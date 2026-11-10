@@ -908,3 +908,143 @@ class AutoRetryTests(unittest.TestCase):
     def test_other_failures_do_not_retry(self):
         best, wanted = self._heartbeat("FFmpeg recording failed")
         best.assert_not_called()
+
+
+class SdFetchGuardTests(unittest.TestCase):
+    def test_a_second_fetch_is_not_started_while_one_is_running(self):
+        server._sd_status.update({'running': True, 'log': [], 'result': None, 'error': None})
+        try:
+            with mock.patch.object(server, "load_config",
+                                   return_value={"sd_user": "u", "sd_pass": "p"}), \
+                 mock.patch.object(server.threading, "Thread") as thread:
+                resp = server.app.test_client().post("/epg-web/api/fetch-sd", json={"days": 21})
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("already running", resp.get_json()["message"])
+            thread.assert_not_called()
+        finally:
+            server._sd_status.update({'running': False})
+
+
+class ThreadDumpSignalTests(unittest.TestCase):
+    def test_sigusr1_writes_every_threads_stack_and_the_server_keeps_running(self):
+        import signal
+        import subprocess
+        import sys
+        code = ("import os, signal, time, tempfile\n"
+                "os.environ['EPG_BASE_DIR'] = tempfile.mkdtemp()\n"
+                "import server\n"
+                "os.kill(os.getpid(), signal.SIGUSR1)\n"
+                "time.sleep(0.5)\n"
+                "print('still running')\n")
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                timeout=60, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertIn("still running", result.stdout)
+        self.assertIn("most recent call first", result.stderr)
+
+
+class DailyGuideRefreshTests(unittest.TestCase):
+    @staticmethod
+    def _at(hour, minute=0, day=10):
+        from datetime import datetime as _dt
+        return _dt(2026, 11, day, hour, minute)
+
+    def test_due_inside_the_window_on_a_day_it_has_not_run(self):
+        self.assertTrue(server._daily_refresh_due(self._at(3, 5), "2026-11-09"))
+        self.assertTrue(server._daily_refresh_due(self._at(5, 59), ""))
+
+    def test_not_due_outside_the_window(self):
+        for hour in (0, 2, 6, 14, 23):
+            self.assertFalse(server._daily_refresh_due(self._at(hour, 30), "2026-11-09"), hour)
+
+    def test_not_due_twice_in_one_day_or_when_switched_off(self):
+        self.assertFalse(server._daily_refresh_due(self._at(3, 30), "2026-11-10"))
+        self.assertFalse(server._daily_refresh_due(self._at(3, 30), "2026-11-09", enabled=False))
+
+    def test_the_hour_is_configurable(self):
+        self.assertTrue(server._daily_refresh_due(self._at(4, 0), "", hour=4))
+        self.assertFalse(server._daily_refresh_due(self._at(3, 0), "", hour=4))
+
+    def test_marker_round_trips_and_a_missing_file_means_never_run(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(server, "BASE_DIR", temp):
+            self.assertEqual(server._read_daily_refresh_marker(), "")
+            server._write_daily_refresh_marker("2026-11-10")
+            self.assertEqual(server._read_daily_refresh_marker(), "2026-11-10")
+
+    def test_runs_the_provider_guide_then_schedules_direct_even_if_the_first_fails(self):
+        order = []
+
+        def provider():
+            order.append("provider")
+            raise RuntimeError("provider down")
+
+        def sd():
+            order.append("sd")
+            return server.jsonify({"ok": True})
+
+        with mock.patch.object(server, "api_fetch_guide", provider), \
+             mock.patch.object(server, "api_fetch_sd", sd), \
+             mock.patch.object(server, "_wait_for_guide_load"):
+            server._run_daily_guide_refresh()
+        self.assertEqual(order, ["provider", "sd"])
+
+    def test_the_loop_marks_the_day_before_it_starts_the_refresh(self):
+        events = []
+        with mock.patch.object(server, "_daily_refresh_due", return_value=True), \
+             mock.patch.object(server, "_read_daily_refresh_marker", return_value=""), \
+             mock.patch.object(server, "_write_daily_refresh_marker",
+                               side_effect=lambda d: events.append(("mark", d))), \
+             mock.patch.object(server, "_run_daily_guide_refresh",
+                               side_effect=lambda: events.append(("run",))), \
+             mock.patch.object(server, "load_config", return_value={}), \
+             mock.patch.dict(server._startup_status, {"loading": False, "background_loading": False}), \
+             mock.patch.object(server.time, "sleep", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                server._daily_guide_loop()
+        self.assertEqual([e[0] for e in events], ["mark", "run"])
+
+    def test_the_loop_waits_while_the_guide_is_loading(self):
+        with mock.patch.object(server, "_daily_refresh_due", return_value=True) as due, \
+             mock.patch.object(server, "_run_daily_guide_refresh") as run, \
+             mock.patch.object(server, "load_config", return_value={}), \
+             mock.patch.dict(server._startup_status, {"loading": False, "background_loading": True}), \
+             mock.patch.object(server.time, "sleep", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                server._daily_guide_loop()
+        run.assert_not_called()
+
+
+class GuideKeepPastTests(unittest.TestCase):
+    def _db(self, temp):
+        import datetime as dt
+        import sd_guide
+        db = os.path.join(temp, "guide.db")
+        sd_guide.ensure_guide_db(db)
+        now = dt.datetime.now(dt.timezone.utc)
+        fmt = "%Y%m%d%H%M%S"
+        conn = sqlite3.connect(db)
+        for title, start in (("Old", now - dt.timedelta(days=60)), ("Recent", now - dt.timedelta(days=1)),
+                             ("Soon", now + dt.timedelta(hours=2)), ("Later", now + dt.timedelta(days=10))):
+            conn.execute("insert into guide(title,channel_id,channel_name,start_utc,end_utc,desc,category) "
+                         "values (?,?,?,?,?,?,?)",
+                         (title, "c1", "One", start.strftime(fmt),
+                          (start + dt.timedelta(hours=1)).strftime(fmt), "", ""))
+        conn.commit()
+        conn.close()
+        return db
+
+    def _titles(self, cfg):
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp)
+            with mock.patch.object(server, "load_config", return_value=cfg):
+                server.load_epg_from_db(db)
+            return sorted(p["title"] for p in server._epg["programmes"])
+
+    def test_the_full_load_skips_old_history_but_keeps_the_recent_past_and_the_future(self):
+        self.assertEqual(self._titles({}), ["Later", "Recent", "Soon"])
+
+    def test_a_custom_number_of_past_days(self):
+        self.assertEqual(self._titles({"guide_keep_past_days": 0.5}), ["Later", "Soon"])
+        self.assertEqual(self._titles({"guide_keep_past_days": 90}), ["Later", "Old", "Recent", "Soon"])
+
+    def test_zero_keeps_everything(self):
+        self.assertEqual(self._titles({"guide_keep_past_days": 0}), ["Later", "Old", "Recent", "Soon"])
