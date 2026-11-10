@@ -968,6 +968,28 @@ def _run_claimed_job(api, job, cfg):
         print(f'[error] {job["title"]}: {exc}', file=sys.stderr, flush=True)
 
 
+def start_job_once(api, job, cfg, active, thread_factory=threading.Thread):
+    """Start a worker for a claimed job unless this recorder is already running it.
+
+    The server can offer a job again when it could not record the recorder's heartbeats
+    (for example while its database was locked) and the lease ran out.  Starting a second
+    worker for the same job made two FFmpeg processes write the same file and fight over
+    the provider's connection.  Returns True if a worker was started.
+    """
+    job_id = job['id']
+    existing = active.get(job_id)
+    if existing is not None and existing.is_alive():
+        print(f'[claim] {job["title"]} ({job_id}) is already recording here; '
+              'ignoring the repeat claim', flush=True)
+        return False
+    print(f'[claim] {job["title"]} ({job_id})', flush=True)
+    worker = thread_factory(target=_run_claimed_job, args=(api, job, cfg), daemon=True,
+                            name=f'epg-record-{job_id}')
+    active[job_id] = worker
+    worker.start()
+    return True
+
+
 def run_agent(cfg, once=False):
     api = AgentAPI(cfg)
     health = api.health()
@@ -984,14 +1006,7 @@ def run_agent(cfg, once=False):
                 job = api.claim(cfg['claim_ahead_seconds'])
                 if not job:
                     break
-                job_id = job['id']
-                print(f'[claim] {job["title"]} ({job_id})', flush=True)
-                worker = threading.Thread(
-                    target=_run_claimed_job, args=(api, job, cfg), daemon=True,
-                    name=f'epg-record-{job_id}',
-                )
-                active[job_id] = worker
-                worker.start()
+                start_job_once(api, job, cfg, active)
             if once:
                 for worker in list(active.values()):
                     worker.join()

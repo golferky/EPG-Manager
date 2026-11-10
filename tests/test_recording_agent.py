@@ -372,3 +372,40 @@ class WrongProgrammeTests(unittest.TestCase):
                 Api(), {"id": "j"}, "recording", ["sleep", "30"], {"heartbeat_seconds": 0.05},
                 str(Path(temp) / "log"), watchdog=lambda: recording_agent.WrongProgramme("wrong"))
         self.assertIsInstance(result, recording_agent.WrongProgramme)
+
+
+class RepeatClaimTests(unittest.TestCase):
+    class FakeThread:
+        started = []
+
+        def __init__(self, target=None, args=(), daemon=None, name=None, alive=True):
+            self.name, self.alive = name, alive
+
+        def start(self):
+            RepeatClaimTests.FakeThread.started.append(self.name)
+
+        def is_alive(self):
+            return self.alive
+
+    def setUp(self):
+        RepeatClaimTests.FakeThread.started = []
+        self.job = {"id": "2ba0fd44", "title": "Star Trek: First Contact"}
+
+    def test_a_new_job_is_started(self):
+        active = {}
+        self.assertTrue(recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread))
+        self.assertEqual(self.FakeThread.started, ["epg-record-2ba0fd44"])
+        self.assertIn("2ba0fd44", active)
+
+    def test_a_repeat_claim_of_a_running_job_is_ignored(self):
+        active = {}
+        recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread)
+        original = active["2ba0fd44"]
+        self.assertFalse(recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread))
+        self.assertEqual(self.FakeThread.started, ["epg-record-2ba0fd44"])   # no second worker
+        self.assertIs(active["2ba0fd44"], original)
+
+    def test_a_job_whose_worker_has_finished_can_be_started_again(self):
+        active = {"2ba0fd44": self.FakeThread(name="old", alive=False)}
+        self.assertTrue(recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread))
+        self.assertEqual(self.FakeThread.started, ["epg-record-2ba0fd44"])
