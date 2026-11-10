@@ -923,3 +923,20 @@ class SdFetchGuardTests(unittest.TestCase):
             thread.assert_not_called()
         finally:
             server._sd_status.update({'running': False})
+
+
+class ThreadDumpSignalTests(unittest.TestCase):
+    def test_sigusr1_writes_every_threads_stack_and_the_server_keeps_running(self):
+        import signal
+        import subprocess
+        import sys
+        code = ("import os, signal, time, tempfile\n"
+                "os.environ['EPG_BASE_DIR'] = tempfile.mkdtemp()\n"
+                "import server\n"
+                "os.kill(os.getpid(), signal.SIGUSR1)\n"
+                "time.sleep(0.5)\n"
+                "print('still running')\n")
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                timeout=60, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertIn("still running", result.stdout)
+        self.assertIn("most recent call first", result.stderr)

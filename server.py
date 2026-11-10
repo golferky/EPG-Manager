@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
-import hmac, json, os, re, shutil, sqlite3, subprocess, threading, time, uuid
+import faulthandler, hmac, json, os, re, shutil, signal, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string, request
+
+# Diagnostic: `kill -USR1 <server pid>` writes every thread's stack to the log, which
+# shows which background job is holding a stuck database lock.
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except (AttributeError, ValueError, OSError):
+    pass
 
 def _build_version():
     """Show the deployed revision so the web header cannot go stale."""
