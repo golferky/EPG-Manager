@@ -27,7 +27,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261110b"
+VERSION = "v20261110c"
 
 app = Flask(__name__)
 
@@ -7252,6 +7252,36 @@ def api_recordings_overview():
                       'seconds_ago': max(0.0, now - seen['at'])} if seen['at'] else None)
     return jsonify(data)
 
+@app.route('/epg-web/api/recordings/mark-finished', methods=['POST'])
+def api_recordings_mark_finished():
+    """Mark a failed recording as done, for when the file turned out to be fine."""
+    rec_id = str((request.json or {}).get('id', '')).strip()
+    if not rec_id:
+        return jsonify({'ok': False, 'error': 'No recording id'}), 400
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
+        row = conn.execute('SELECT status FROM recordings WHERE rec_id=?', (rec_id,)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({'ok': False, 'error': 'Recording not found'}), 404
+        status = _rec_status_base(row[0])
+        if status not in ('failed', 'error'):
+            conn.close()
+            return jsonify({'ok': False, 'error': f'Only failed recordings can be marked finished (this one is {status})'}), 409
+        conn.execute("UPDATE recordings SET status='done', failure_reason='Marked finished by hand' WHERE rec_id=?",
+                     (rec_id,))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    with _rec_lock:
+        r = _recs.get(rec_id)
+        if r and _rec_status_base(r.get('status')) in ('failed', 'error'):
+            r['status'] = 'done'
+            r.setdefault('log', []).append('Marked finished by hand')
+    return jsonify({'ok': True})
+
 @app.route('/epg-web/api/record/status')
 def api_rec_status():
     with _rec_lock:
@@ -10708,7 +10738,9 @@ function renderRecWindow(d) {
     const good = r.status === 'done' || r.status === 'done_ts';
     html += row('<div style="display:flex;gap:8px;"><span style="width:130px;color:#94a3b8;">' + _recDay(r.stop_ts, now) + ' ' + _recClock(r.stop_ts) + '</span>'
       + '<strong style="flex:1;">' + esc(r.title) + '</strong><span style="color:' + (good ? '#86efac' : '#fca5a5') + ';font-size:12px;">'
-      + esc(r.status.replace(/_/g, ' ')) + '</span></div>'
+      + esc(r.status.replace(/_/g, ' ')) + '</span>'
+      + ((r.status === 'failed' || r.status === 'error') ? '<button class="btn btn-ghost btn-sm" style="margin:0;" title="The file is fine - show this as done" data-id="' + esc(r.id) + '" onclick="markRecFinished(this.dataset.id)">Mark finished</button>' : '')
+      + '</div>'
       + (!good && r.note ? '<div style="color:#94a3b8;font-size:12px;margin-left:138px;">' + esc(r.note.slice(0, 140)) + '</div>' : ''));
   });
   // The recorder's version and whether it is checking in.
@@ -10770,6 +10802,12 @@ async function cancelRecFromWindow(id) {
   await post('/epg-web/api/record/cancel', {id});
   await refreshRecWindow();
   refreshRecBadge();
+}
+async function markRecFinished(id) {
+  if (!confirm('Show this recording as finished? Only do this if you have checked the file is complete.')) return;
+  const r = await (await post('/epg-web/api/recordings/mark-finished', {id})).json();
+  if (!r.ok) alert(r.error || 'Could not mark it finished');
+  await refreshRecWindow();
 }
 setInterval(refreshRecBadge, 30000);
 refreshRecBadge();

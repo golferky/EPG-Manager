@@ -1156,3 +1156,44 @@ class AgentSeenTests(unittest.TestCase):
         data = server.app.test_client().get("/epg-web/api/recordings/overview").get_json()
         self.assertEqual(data["agent"]["version"], "v20261110c")
         self.assertAlmostEqual(data["agent"]["seconds_ago"], 12, delta=3)
+
+
+class MarkFinishedTests(unittest.TestCase):
+    def setUp(self):
+        server._init_recordings_table()
+
+    def _rec(self, rec_id, status):
+        now = time.time()
+        rec = {"title": "Mark Test", "channel_id": "5", "channel": "SHO", "start_ts": now - 3600,
+               "stop_ts": now - 1800, "status": status, "progress": 0, "log": [], "pid": None,
+               "file": "/x/mark_test.mp4", "backend": "agent", "stream_id": "1",
+               "stream_provider": "primestreams", "stream_extension": "ts", "episode_title": "",
+               "season_num": None, "episode_num": None, "is_series": False, "auto_upgrade": False,
+               "failure_reason": "Recording agent heartbeat expired"}
+        server._db_upsert_rec(rec_id, rec)
+
+    def _status(self, rec_id):
+        conn = sqlite3.connect(server._guide_db_path())
+        row = conn.execute("SELECT status, failure_reason, file FROM recordings WHERE rec_id=?", (rec_id,)).fetchone()
+        conn.close()
+        return row
+
+    def _mark(self, rec_id):
+        return server.app.test_client().post("/epg-web/api/recordings/mark-finished", json={"id": rec_id})
+
+    def test_a_failed_recording_becomes_done_and_keeps_its_file(self):
+        self._rec("mk_failed1", "failed")
+        self.assertEqual(self._mark("mk_failed1").status_code, 200)
+        status, reason, file = self._status("mk_failed1")
+        self.assertEqual(status, "done")
+        self.assertEqual(file, "/x/mark_test.mp4")
+        self.assertIn("by hand", reason)
+
+    def test_a_recording_in_progress_cannot_be_marked(self):
+        self._rec("mk_live1", "recording")
+        self.assertEqual(self._mark("mk_live1").status_code, 409)
+        self.assertEqual(self._status("mk_live1")[0], "recording")
+
+    def test_unknown_or_missing_id(self):
+        self.assertEqual(self._mark("nope_nope").status_code, 404)
+        self.assertEqual(self._mark("").status_code, 400)
