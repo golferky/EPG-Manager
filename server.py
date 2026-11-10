@@ -7446,9 +7446,10 @@ def api_agent_heartbeat(rec_id):
     conn.commit()
     conn.close()
     # Auto-retry: if a recording ended early due to stream drop, queue the best future airing
-    if terminal and status == 'failed' and 'ended early' in failure_reason.lower():
+    reason_text = failure_reason.lower()
+    if terminal and status == 'failed' and ('ended early' in reason_text or 'wrong programme' in reason_text):
         try:
-            expected = (row['stop_ts'] - row['start_ts']) if row.get('stop_ts') and row.get('start_ts') else 0
+            expected = (row['stop_ts'] - row['start_ts']) if row['stop_ts'] and row['start_ts'] else 0
             candidate, detail = _best_incomplete_rerecord(row['title'], expected)
             if candidate:
                 _queue_best_retry(row['title'], candidate, 'auto-retry after stream drop')

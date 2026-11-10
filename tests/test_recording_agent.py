@@ -202,7 +202,7 @@ class ResumeRecordingTests(unittest.TestCase):
         """plan: list of (bytes_written, seconds_elapsed, rc) per FFmpeg run."""
         calls = []
 
-        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path=""):
+        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None):
             data, elapsed, rc = plan[len(calls)]
             seg = Path(cmd[-1])
             seg.write_bytes(data)
@@ -226,6 +226,26 @@ class ResumeRecordingTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.ts.read_bytes(), b"AAAABBBB")
         self.assertEqual(len(calls), 2)
+        self.assertEqual(sorted(p.name for p in self.ts.parent.glob("show*.ts")), ["show.ts"])
+
+    def test_wrong_programme_result_is_returned_and_pieces_are_removed(self):
+        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None):
+            Path(cmd[-1]).write_bytes(b"XXXX")
+            self.now[0] += 100
+            if Path(cmd[-1]).name != "show.ts":
+                return recording_agent.WrongProgramme("provider shows another movie")
+            return 0
+
+        def fake_sleep(api, job, status, seconds, cfg, **fields):
+            self.now[0] += seconds
+            return True
+
+        with mock.patch.object(recording_agent, "run_process", fake_run_process), \
+             mock.patch.object(recording_agent, "heartbeat_sleep", fake_sleep), \
+             mock.patch.object(recording_agent.time, "time", lambda: self.now[0]):
+            rc = recording_agent.record_with_resume(
+                None, self.job, self.cfg, "http://x/y.ts", self.ts, self.log, 1000.0 + 600)
+        self.assertIsInstance(rc, recording_agent.WrongProgramme)
         self.assertEqual(sorted(p.name for p in self.ts.parent.glob("show*.ts")), ["show.ts"])
 
     def test_a_recording_that_reaches_its_end_is_not_restarted(self):
@@ -273,3 +293,82 @@ class RealFfmpegSegmentTests(unittest.TestCase):
                 {"ffmpeg": "ffmpeg"}, f"http://127.0.0.1:{server.server_port}/sample.ts", 2, segment)
             done = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             self.assertTrue(segment.exists() and segment.stat().st_size > 0, done.stderr[-400:])
+
+
+class WrongProgrammeTests(unittest.TestCase):
+    def test_plainly_different_titles_are_flagged(self):
+        self.assertTrue(recording_agent.titles_clearly_differ("Quantum of Solace", "The Terminator"))
+        self.assertTrue(recording_agent.titles_clearly_differ("MobLand", "V for Vendetta"))
+
+    def test_different_wordings_of_one_title_are_not_flagged(self):
+        same = [("Quantum of Solace", "007: Quantum of Solace"),
+                ("The Untouchables (1987)", "Untouchables, The"),
+                ("Quantum of Solace", "QUANTUM OF SOLACE (2008)"),
+                ("Indiana Jones and the Temple of Doom", "Indiana Jones: Temple of Doom")]
+        for a, b in same:
+            self.assertFalse(recording_agent.titles_clearly_differ(a, b), (a, b))
+
+    def test_blank_titles_are_never_flagged(self):
+        self.assertFalse(recording_agent.titles_clearly_differ("Quantum of Solace", ""))
+
+    def _dog(self, titles, now, enabled=True):
+        job = {"title": "Quantum of Solace", "start_ts": 1000.0, "stop_ts": 1000.0 + 7200,
+               "stream_id": "9", "stream_provider": "eaglecast"}
+        seq = iter(titles)
+        clock = [now]
+        dog = recording_agent.ProgrammeWatchdog(
+            {"verify_stream_programme": enabled}, job, now=lambda: clock[0],
+            fetch=lambda cfg, provider, stream_id, now: ({"title": next(seq)} if True else None))
+        return dog, clock
+
+    def test_stops_after_two_matching_wrong_readings(self):
+        dog, clock = self._dog(["The Terminator", "The Terminator"], now=1000.0 + 100)
+        self.assertIsNone(dog())                      # first disagreement: wait and look again
+        clock[0] += 31
+        problem = dog()
+        self.assertIsInstance(problem, recording_agent.WrongProgramme)
+        self.assertIn("The Terminator", problem)
+
+    def test_a_single_odd_reading_does_not_stop_the_recording(self):
+        dog, clock = self._dog(["The Terminator", "Quantum of Solace"], now=1000.0 + 100)
+        self.assertIsNone(dog())
+        clock[0] += 31
+        self.assertIsNone(dog())
+        clock[0] += 31
+        self.assertIsNone(dog())                      # confirmed once: nothing more to check
+
+    def test_too_early_or_too_late_or_disabled_does_nothing(self):
+        for now, enabled in ((1000.0 + 10, True), (1000.0 + 7100, True), (1000.0 + 100, False)):
+            dog, _ = self._dog(["The Terminator"] * 3, now=now, enabled=enabled)
+            self.assertIsNone(dog())
+
+    def test_unknown_provider_guide_never_stops_a_recording(self):
+        job = {"title": "Quantum of Solace", "start_ts": 1000.0, "stop_ts": 8200.0, "stream_id": "9"}
+        clock = [1100.0]
+        dog = recording_agent.ProgrammeWatchdog({}, job, now=lambda: clock[0],
+                                                fetch=lambda *a, **k: None)
+        for _ in range(8):
+            self.assertIsNone(dog())
+            clock[0] += 31
+
+    def test_now_playing_decodes_the_provider_listing(self):
+        import base64, io, json as _json
+        listing = {"epg_listings": [
+            {"title": base64.b64encode(b"Old Show").decode(), "start_timestamp": "100", "stop_timestamp": "500"},
+            {"title": base64.b64encode(b"The Terminator").decode(), "start_timestamp": "500", "stop_timestamp": "9000"}]}
+        cfg = {"epg_url": "http://p.test", "epg_user": "u", "epg_pass": "p"}
+        resp = mock.MagicMock()
+        resp.__enter__.return_value.read.return_value = _json.dumps(listing).encode()
+        with mock.patch.object(recording_agent.urllib.request, "urlopen", return_value=resp):
+            playing = recording_agent.fetch_now_playing(cfg, "primestreams", "9", now=700)
+        self.assertEqual(playing["title"], "The Terminator")
+
+    def test_run_process_stops_ffmpeg_when_the_watchdog_complains(self):
+        class Api:
+            def heartbeat(self, *a, **k):
+                return {}
+        with tempfile.TemporaryDirectory() as temp:
+            result = recording_agent.run_process(
+                Api(), {"id": "j"}, "recording", ["sleep", "30"], {"heartbeat_seconds": 0.05},
+                str(Path(temp) / "log"), watchdog=lambda: recording_agent.WrongProgramme("wrong"))
+        self.assertIsInstance(result, recording_agent.WrongProgramme)

@@ -872,3 +872,39 @@ class PlexReplaceTests(unittest.TestCase):
             resp, *_ = self._post(movies, {"title": "Nope"})
             self.assertEqual(resp.status_code, 404)
             self.assertEqual(os.listdir(movies), ["Other (1999)"])
+
+
+class AutoRetryTests(unittest.TestCase):
+    """A recording that failed because it was cut short or wrong looks for another airing."""
+
+    def _heartbeat(self, message):
+        server._init_recordings_table()
+        rec = {"title": "Quantum of Solace", "channel_id": "5", "channel": "SHO",
+               "start_ts": time.time() - 3600, "stop_ts": time.time() + 3600, "status": "recording",
+               "progress": 0, "log": [], "pid": None, "file": None, "backend": "agent",
+               "stream_id": "1", "stream_provider": "primestreams", "stream_extension": "ts",
+               "episode_title": "", "season_num": None, "episode_num": None,
+               "is_series": False, "auto_upgrade": False}
+        rec_id = "retry" + str(int(time.time() * 1000) % 100000)
+        server._db_upsert_rec(rec_id, rec)
+        with mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_best_incomplete_rerecord", return_value=(None, {})) as best, \
+             mock.patch.object(server, "_watch_abandoned_transfer") as wanted:
+            resp = server.app.test_client().post(
+                f"/epg-web/api/agent/jobs/{rec_id}/heartbeat",
+                json={"agent_id": "a", "status": "failed", "message": message})
+        self.assertEqual(resp.status_code, 200)
+        return best, wanted
+
+    def test_early_end_looks_for_another_airing(self):
+        best, wanted = self._heartbeat("Recording ended early: 22 min captured of 137 min scheduled")
+        best.assert_called_once()
+        wanted.assert_called_once()
+
+    def test_wrong_programme_looks_for_another_airing(self):
+        best, wanted = self._heartbeat('Wrong programme on stream: provider shows "The Terminator"')
+        best.assert_called_once()
+
+    def test_other_failures_do_not_retry(self):
+        best, wanted = self._heartbeat("FFmpeg recording failed")
+        best.assert_not_called()
