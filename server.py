@@ -27,7 +27,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261110a"
+VERSION = "v20261110c"
 
 app = Flask(__name__)
 
@@ -7247,7 +7247,40 @@ def api_recordings_overview():
         return jsonify({'ok': False, 'error': str(exc)}), 503
     data = _group_recordings(rows, now)
     data['ok'] = True
+    seen = dict(_agent_seen)
+    data['agent'] = ({'id': seen['id'], 'version': seen['version'],
+                      'seconds_ago': max(0.0, now - seen['at'])} if seen['at'] else None)
     return jsonify(data)
+
+@app.route('/epg-web/api/recordings/mark-finished', methods=['POST'])
+def api_recordings_mark_finished():
+    """Mark a failed recording as done, for when the file turned out to be fine."""
+    rec_id = str((request.json or {}).get('id', '')).strip()
+    if not rec_id:
+        return jsonify({'ok': False, 'error': 'No recording id'}), 400
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
+        row = conn.execute('SELECT status FROM recordings WHERE rec_id=?', (rec_id,)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({'ok': False, 'error': 'Recording not found'}), 404
+        status = _rec_status_base(row[0])
+        if status not in ('failed', 'error'):
+            conn.close()
+            return jsonify({'ok': False, 'error': f'Only failed recordings can be marked finished (this one is {status})'}), 409
+        conn.execute("UPDATE recordings SET status='done', failure_reason='Marked finished by hand' WHERE rec_id=?",
+                     (rec_id,))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    with _rec_lock:
+        r = _recs.get(rec_id)
+        if r and _rec_status_base(r.get('status')) in ('failed', 'error'):
+            r['status'] = 'done'
+            r.setdefault('log', []).append('Marked finished by hand')
+    return jsonify({'ok': True})
 
 @app.route('/epg-web/api/record/status')
 def api_rec_status():
@@ -7406,6 +7439,16 @@ def api_agent_health():
     return jsonify({'ok': True, 'server_time': time.time(),
                     'recording_backend': _recording_backend()})
 
+# The recorder's last check-in (claim or heartbeat), so the dashboard can show which recorder
+# version is running and whether it is connected.  Kept in memory: empty until the first
+# check-in after the server starts, which is within seconds.
+_agent_seen = {'id': '', 'version': '', 'at': 0.0}
+
+def _note_agent_seen(data):
+    _agent_seen.update({'id': str(data.get('agent_id', '')).strip()[:100],
+                        'version': str(data.get('agent_version', '')).strip()[:40],
+                        'at': time.time()})
+
 @app.route('/epg-web/api/agent/jobs/claim', methods=['POST'])
 def api_agent_claim():
     if not _agent_authorized():
@@ -7414,6 +7457,7 @@ def api_agent_claim():
     agent_id = str(data.get('agent_id', '')).strip()[:100]
     if not agent_id:
         return jsonify({'ok': False, 'error': 'agent_id is required'}), 400
+    _note_agent_seen(data)
     lease_seconds = max(30, min(int(data.get('lease_seconds', 90)), 300))
     claim_ahead = max(30, min(int(data.get('claim_ahead_seconds', 300)), 1800))
     now = time.time()
@@ -7488,6 +7532,7 @@ def api_agent_heartbeat(rec_id):
         return _agent_auth_failure()
     data = request.json or {}
     agent_id = str(data.get('agent_id', '')).strip()[:100]
+    _note_agent_seen(data)
     status = str(data.get('status', 'agent_claimed')).strip().lower()
     if status not in _AGENT_ACTIVE_STATES | _AGENT_TERMINAL_STATES:
         return jsonify({'ok': False, 'error': f'Invalid agent status: {status}'}), 400
@@ -10693,9 +10738,20 @@ function renderRecWindow(d) {
     const good = r.status === 'done' || r.status === 'done_ts';
     html += row('<div style="display:flex;gap:8px;"><span style="width:130px;color:#94a3b8;">' + _recDay(r.stop_ts, now) + ' ' + _recClock(r.stop_ts) + '</span>'
       + '<strong style="flex:1;">' + esc(r.title) + '</strong><span style="color:' + (good ? '#86efac' : '#fca5a5') + ';font-size:12px;">'
-      + esc(r.status.replace(/_/g, ' ')) + '</span></div>'
+      + esc(r.status.replace(/_/g, ' ')) + '</span>'
+      + ((r.status === 'failed' || r.status === 'error') ? '<button class="btn btn-ghost btn-sm" style="margin:0;" title="The file is fine - show this as done" data-id="' + esc(r.id) + '" onclick="markRecFinished(this.dataset.id)">Mark finished</button>' : '')
+      + '</div>'
       + (!good && r.note ? '<div style="color:#94a3b8;font-size:12px;margin-left:138px;">' + esc(r.note.slice(0, 140)) + '</div>' : ''));
   });
+  // The recorder's version and whether it is checking in.
+  let tone = '#94a3b8', text = 'Recorder: no check-in since the server started';
+  if (d.agent) {
+    const secs = Math.round(d.agent.seconds_ago);
+    tone = secs < 60 ? '#86efac' : (secs < 300 ? '#fbbf24' : '#fca5a5');
+    text = 'Recorder ' + esc(d.agent.version || 'version unknown') + ' · last check-in '
+      + (secs < 90 ? secs + ' s' : _recIn(secs)) + ' ago';
+  }
+  html += '<div style="margin-top:14px;padding-top:8px;border-top:1px solid #1e293b;font-size:12px;color:' + tone + ';">' + text + '</div>';
   return html;
 }
 async function _fetchRecOverview() {
@@ -10746,6 +10802,12 @@ async function cancelRecFromWindow(id) {
   await post('/epg-web/api/record/cancel', {id});
   await refreshRecWindow();
   refreshRecBadge();
+}
+async function markRecFinished(id) {
+  if (!confirm('Show this recording as finished? Only do this if you have checked the file is complete.')) return;
+  const r = await (await post('/epg-web/api/recordings/mark-finished', {id})).json();
+  if (!r.ok) alert(r.error || 'Could not mark it finished');
+  await refreshRecWindow();
 }
 setInterval(refreshRecBadge, 30000);
 refreshRecBadge();

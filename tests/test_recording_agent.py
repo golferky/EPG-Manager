@@ -1,3 +1,4 @@
+import time
 import shutil
 import tempfile
 import unittest
@@ -55,6 +56,30 @@ class QualityDecisionTests(unittest.TestCase):
         self.assertFalse(recording_agent.incomplete_for_scheduled_window(
             {"duration": 155 * 60}, 0, 160 * 60
         ))
+
+    def test_a_fresh_recording_missing_a_few_minutes_is_flagged(self):
+        missing = recording_agent.recording_missing_seconds
+        # Star Trek: 128 of about 137 minutes - passed the old 80% rule.
+        self.assertGreater(missing({"duration": 128 * 60 + 38}, 0, 137 * 60), 8 * 60)
+        # The Last Face: 103 of 132 minutes.
+        self.assertGreater(missing({"duration": 103 * 60 + 19}, 0, 132 * 60), 28 * 60)
+
+    def test_a_complete_recording_is_not_flagged(self):
+        missing = recording_agent.recording_missing_seconds
+        self.assertEqual(missing({"duration": 137 * 60 + 40}, 0, 137 * 60), 0)   # runs a little long
+        self.assertEqual(missing({"duration": 136 * 60}, 0, 137 * 60), 0)        # a minute short
+        self.assertEqual(missing({"duration": 133 * 60}, 0, 137 * 60), 0)        # 4 min < allowance
+
+    def test_short_programmes_and_unknown_lengths_are_not_judged(self):
+        missing = recording_agent.recording_missing_seconds
+        self.assertEqual(missing({"duration": 5 * 60}, 0, 10 * 60), 0)    # under 15 min slots
+        self.assertEqual(missing({"duration": 0}, 0, 120 * 60), 0)
+        self.assertEqual(missing({}, 0, 120 * 60), 0)
+
+    def test_library_copies_still_use_the_looser_rule(self):
+        # A 111-minute rip against a 137-minute slot must not look incomplete.
+        self.assertFalse(recording_agent.incomplete_for_scheduled_window(
+            {"duration": 111 * 60}, 0, 137 * 60))
 
     def test_atomic_transfer_verifies_and_renames(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -486,3 +511,57 @@ class PatientHeartbeatTests(unittest.TestCase):
             with self.assertRaises(urllib.error.URLError):
                 api.patient_heartbeat("j1", "done", wait_seconds=100, pause=20)
         self.assertLessEqual(len(calls), 7)
+
+
+class AgentVersionPayloadTests(unittest.TestCase):
+    def test_claim_and_heartbeat_send_the_recorders_version(self):
+        api = recording_agent.AgentAPI({"server_url": "http://x.test", "agent_token": "t", "agent_id": "a",
+                                        "epg_url": "", "epg_user": "", "epg_pass": "", "lease_seconds": 90})
+        sent = []
+        api._request = lambda method, path, payload=None, timeout=30: sent.append(payload) or {}
+        api.claim(300)
+        api.heartbeat("j1", "recording")
+        self.assertEqual([p["agent_version"] for p in sent],
+                         [recording_agent.AGENT_VERSION] * 2)
+
+
+class ShortRecordingFlowTests(unittest.TestCase):
+    """A recording a few minutes short goes to Incomplete Recordings, not Plex."""
+
+    def _run(self, recorded_minutes):
+        now = time.time()
+        job = {"id": "j1", "title": "Short Movie", "stream_id": "1", "start_ts": now - 3600,
+               "stop_ts": now - 3600 + 137 * 60, "stream_provider": "primestreams",
+               "stream_extension": "ts"}
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = {"local_recordings": temp, "plex_path": temp + "/Movies", "plex_tv_path": temp + "/TV",
+                   "ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "recording_tail_seconds": 45,
+                   "epg_url": "http://x.test", "epg_user": "u", "epg_pass": "p", "heartbeat_seconds": 1,
+                   "transfer_wait_timeout": 5, "transfer_retry_seconds": 1}
+            api = mock.Mock()
+            probe = {"duration": recorded_minutes * 60, "height": 480}
+            with mock.patch.object(recording_agent, "find_plex_candidates", return_value=[]), \
+                 mock.patch.object(recording_agent, "probe_media", return_value=probe), \
+                 mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
+                 mock.patch.object(recording_agent, "record_with_resume", return_value=0), \
+                 mock.patch.object(recording_agent, "run_process", return_value=0), \
+                 mock.patch.object(recording_agent, "plex_mount_available", return_value=True), \
+                 mock.patch.object(recording_agent, "archive_terminal_result") as archive, \
+                 mock.patch.object(recording_agent, "discard_failed_media"), \
+                 mock.patch.object(recording_agent, "preserve_incomplete_recording",
+                                   return_value=Path(temp) / "x - INCOMPLETE.mp4") as preserve, \
+                 mock.patch.object(recording_agent, "verified_transfer",
+                                   return_value=Path(temp) / "x.mp4"):
+                recording_agent.process_job(api, job, cfg)
+            return archive, preserve
+
+    def test_a_recording_nine_minutes_short_is_saved_as_incomplete(self):
+        archive, preserve = self._run(128)
+        preserve.assert_called_once()
+        kwargs = archive.call_args.kwargs
+        self.assertEqual(archive.call_args.args[2], "failed")
+        self.assertIn("min missing", kwargs["message"])
+
+    def test_a_complete_recording_is_not_saved_as_incomplete(self):
+        _archive, preserve = self._run(138)
+        preserve.assert_not_called()
