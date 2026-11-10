@@ -6,6 +6,8 @@ FFmpeg, and transfers verified MP4 files to a mounted Plex library.
 """
 
 import argparse
+import base64
+import difflib
 import json
 import os
 import re
@@ -315,7 +317,138 @@ def heartbeat_sleep(api, job, status, seconds, cfg, **fields):
     return True
 
 
-def run_process(api, job, status, cmd, cfg, log_path, file_path=''):
+class WrongProgramme(str):
+    """Returned by run_process when the stream is clearly showing a different programme."""
+
+
+def provider_api(cfg, provider):
+    """(base, username, password) for a provider's Xtream player API, or None."""
+    if provider == 'eaglecast':
+        path = os.path.expanduser(cfg.get(
+            'eaglecast_config_path', '~/epg/eaglecast_test_config.json'))
+        try:
+            with open(path, encoding='utf-8') as handle:
+                eagle = json.load(handle)
+            return (str(eagle['server_url']).rstrip('/'),
+                    str(eagle['username']), str(eagle['password']))
+        except (OSError, KeyError, TypeError, ValueError):
+            return None
+    try:
+        return cfg['epg_url'].rstrip('/'), cfg['epg_user'], cfg['epg_pass']
+    except (KeyError, AttributeError):
+        return None
+
+
+def _decode_title(value):
+    text = str(value or '')
+    try:
+        return base64.b64decode(text, validate=True).decode('utf-8', 'replace').strip()
+    except Exception:
+        return text.strip()
+
+
+def fetch_now_playing(cfg, provider, stream_id, now=None, timeout=10):
+    """The programme the provider says is on a stream right now, or None if unknown."""
+    api = provider_api(cfg, provider)
+    if not api or not stream_id:
+        return None
+    base, user, password = api
+    now = now if now is not None else time.time()
+    query = urllib.parse.urlencode({
+        'username': user, 'password': password,
+        'action': 'get_short_epg', 'stream_id': stream_id, 'limit': 4})
+    try:
+        with urllib.request.urlopen(f'{base}/player_api.php?{query}', timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+    except Exception:
+        return None
+    for item in (data.get('epg_listings') or []) if isinstance(data, dict) else []:
+        try:
+            start = float(item.get('start_timestamp'))
+            stop = float(item.get('stop_timestamp'))
+        except (TypeError, ValueError):
+            continue
+        if start - 60 <= now < stop:
+            title = _decode_title(item.get('title'))
+            if title:
+                return {'title': title, 'start': start, 'stop': stop}
+    return None
+
+
+def _title_key(value):
+    text = re.sub(r'\s*\(\d{4}\)\s*$', '', str(value or '')).lower()
+    text = re.sub(r'[^a-z0-9 ]', ' ', text)
+    words = [w for w in text.split() if w not in ('the', 'a', 'an')]
+    return ' '.join(words)
+
+
+def titles_clearly_differ(scheduled, shown):
+    """True only when two titles are plainly different programmes.
+
+    Provider guides word titles differently ("007: Quantum of Solace", "Untouchables,
+    The"), so this errs towards "same": a recording is only stopped when the match is poor.
+    """
+    a, b = _title_key(scheduled), _title_key(shown)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return False
+    wa, wb = set(a.split()), set(b.split())
+    if wa and wb and len(wa & wb) / min(len(wa), len(wb)) >= 0.5:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() < 0.45
+
+
+class ProgrammeWatchdog:
+    """Checks a minute or so into a recording that the stream carries the scheduled programme.
+
+    A wrong stream mapping can deliver another movie that gets saved under the
+    scheduled title.  The provider's own guide is asked what is on the stream; the
+    recording is stopped only after two lookups in a row clearly disagree.  A missing
+    or unreadable provider guide never stops a recording.
+    """
+    START_AFTER = 75        # seconds after the scheduled start
+    RECHECK_AFTER = 30
+    MAX_LOOKUPS = 6
+
+    def __init__(self, cfg, job, now=time.time, fetch=None):
+        self.cfg, self.job, self.now = cfg, job, now
+        self.fetch = fetch or fetch_now_playing
+        self.enabled = bool(cfg.get('verify_stream_programme', True))
+        self.lookups = 0
+        self.mismatches = []
+        self.next_check = 0.0
+        self.done = False
+
+    def __call__(self):
+        if not self.enabled or self.done:
+            return None
+        now = self.now()
+        job = self.job
+        if now < float(job['start_ts']) + self.START_AFTER or now >= float(job['stop_ts']) - 300:
+            return None
+        if now < self.next_check or not job.get('stream_id'):
+            return None
+        self.next_check = now + self.RECHECK_AFTER
+        self.lookups += 1
+        playing = self.fetch(self.cfg, job.get('stream_provider') or 'primestreams',
+                             job.get('stream_id'), now)
+        if playing and titles_clearly_differ(job['title'], playing['title']):
+            self.mismatches.append(playing['title'])
+            if len(self.mismatches) >= 2 and self.mismatches[-1] == self.mismatches[-2]:
+                self.done = True
+                return WrongProgramme(
+                    f'provider shows "{playing["title"]}" but "{job["title"]}" was scheduled')
+        else:
+            self.mismatches = []
+            if playing:            # confirmed: nothing more to check
+                self.done = True
+        if self.lookups >= self.MAX_LOOKUPS:
+            self.done = True
+        return None
+
+
+def run_process(api, job, status, cmd, cfg, log_path, file_path='', watchdog=None):
     with open(log_path, 'a', encoding='utf-8') as log:
         process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log, text=True)
         while process.poll() is None:
@@ -333,6 +466,15 @@ def run_process(api, job, status, cmd, cfg, log_path, file_path=''):
                 except subprocess.TimeoutExpired:
                     process.kill()
                 return None
+            if watchdog is not None:
+                problem = watchdog()
+                if problem:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return problem
             time.sleep(float(cfg['heartbeat_seconds']))
     return process.returncode
 
@@ -526,11 +668,18 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
     empty_in_a_row = 0
     attempt = 0
     rc = 0
+    watchdog = ProgrammeWatchdog(cfg, job)
     while True:
         segment = segment_path(ts_path, attempt)
         remaining = int(end_time - time.time())
         record_cmd = build_record_command(cfg, url, remaining, segment)
-        rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path))
+        rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path),
+                         watchdog=watchdog)
+        if isinstance(rc, WrongProgramme):
+            for extra in segments[1:] + [segment]:
+                if extra != ts_path:
+                    discard_failed_media(extra)
+            return rc
         if rc is None:
             for extra in segments[1:] + [segment]:
                 if extra != ts_path:
@@ -627,6 +776,14 @@ def process_job(api, job, cfg):
     rc = record_with_resume(api, job, cfg, url, ts_path, log_path,
                             time.time() + remaining)
     quality['record_log_tail'] = _log_excerpt(log_path, 3000)
+    if isinstance(rc, WrongProgramme):
+        message = f'Wrong programme on stream: {rc}'
+        quality['wrong_programme'] = str(rc)
+        archive_terminal_result(api, job, 'failed', log_path, message=message,
+                                file=str(ts_path), result=quality)
+        discard_failed_media(ts_path, mp4_path)
+        print(f'[wrong-programme] {job["title"]}: {message}', flush=True)
+        return
     if rc is None:
         return
     if rc != 0:

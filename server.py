@@ -5474,6 +5474,75 @@ def api_plex_play():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def _find_plex_movie_folders(plex_dir, title, year=''):
+    """Folders under ``plex_dir`` whose name (year removed) matches ``title``.
+
+    When a year is given, a folder that names a different year is not a match.
+    """
+    clean, title_year = _plex_title_and_year(title)
+    year = str(year or title_year or '')[:4]
+    wanted = re.sub(r'[^a-z0-9]', '', clean.lower())
+    found = []
+    for name in sorted(os.listdir(plex_dir)):
+        path = os.path.join(plex_dir, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        folder_title, folder_year = _plex_title_and_year(name)
+        if re.sub(r'[^a-z0-9]', '', folder_title.lower()) != wanted:
+            continue
+        if year and folder_year and folder_year != year:
+            continue
+        found.append(path)
+    return found
+
+@app.route('/epg-web/api/plex/replace', methods=['POST'])
+def api_plex_replace():
+    """Take a wrong or damaged Plex copy out of the library and record a fresh one.
+
+    The movie's folder is moved to ``_wrong_movies`` beside the Movies folder, not
+    deleted, so it can be put back.  The recorder skips a title Plex already has,
+    so the bad copy has to go before a good one can be recorded.
+    """
+    data = request.json or {}
+    title = str(data.get('title', '')).strip()
+    if not title:
+        return jsonify({'ok': False, 'error': 'no title'}), 400
+    cfg = load_config()
+    plex_dir = cfg.get('plex_path', '/Volumes/Plex/Movies')
+    if not os.path.isdir(plex_dir):
+        return jsonify({'ok': False, 'error': 'Plex folder is not available'}), 503
+    folders = _find_plex_movie_folders(plex_dir, title, data.get('year', ''))
+    if not folders:
+        return jsonify({'ok': False, 'error': 'No matching movie folder in Plex'}), 404
+    if len(folders) > 1:
+        return jsonify({'ok': False,
+                        'error': 'More than one folder matches; the year is needed to choose',
+                        'folders': [os.path.basename(f) for f in folders]}), 409
+    folder = folders[0]
+    holding = os.path.join(os.path.dirname(os.path.abspath(plex_dir)), '_wrong_movies')
+    os.makedirs(holding, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    destination = os.path.join(holding, f'{os.path.basename(folder)}__{stamp}')
+    try:
+        shutil.move(folder, destination)
+    except OSError as exc:
+        return jsonify({'ok': False, 'error': f'Could not move the folder: {exc}'}), 500
+    _plex_info_cache.clear()
+    clean_title, _y = _plex_title_and_year(title)
+    queued, wanted, already = None, False, None
+    candidate, detail = _best_incomplete_rerecord(clean_title, 3600)
+    if candidate:
+        rec = _queue_best_retry(clean_title, candidate, 'replacing a wrong Plex copy')
+        if rec:
+            queued = {'channel': rec['channel'], 'start_ts': rec['start_ts']}
+    elif detail.get('already_queued'):
+        already = detail['already_queued']
+    else:
+        _watch_abandoned_transfer(clean_title, source='wrong_plex_copy')
+        wanted = True
+    return jsonify({'ok': True, 'moved_to': destination, 'queued': queued,
+                    'already_queued': already, 'added_to_wanted': wanted})
+
 @app.route('/epg-web/api/plex/stream')
 def api_plex_stream():
     from flask import send_file
@@ -6273,6 +6342,59 @@ def api_play_eaglecast_proxy():
         return jsonify({"error": "Eaglecast playback is not configured on this Mac."}), 503
     return _relay_live_stream(url)
 
+@app.route("/epg-web/api/play/playlist.m3u")
+def api_play_playlist():
+    """A one-entry playlist that opens in VLC (or any player set for .m3u files).
+
+    Takes ``channel_id`` (a live channel), ``plex_title`` (a movie in the Plex
+    folder, streamed from this server) or ``eaglecast_id`` (a live-sports feed).
+    VLC reconnects through provider cuts that a browser player cannot, and plays
+    any video format, so this is how a click hands the video to VLC.
+    """
+    from urllib.parse import quote
+    from flask import Response
+    channel_id = request.args.get("channel_id", "")
+    plex_title = request.args.get("plex_title", "")
+    eaglecast_id = request.args.get("eaglecast_id", "")
+    title = re.sub(r'[\r\n]+', ' ', request.args.get("title", "") or channel_id or plex_title).strip()[:100]
+    if plex_title:
+        url = request.host_url.rstrip('/') + '/epg-web/api/plex/stream?title=' + quote(plex_title)
+    elif eaglecast_id:
+        # Only feeds in the live-sports catalogue may be handed out.
+        item = next((e for e in _eaglecast_live_sports() if e["stream_id"] == str(eaglecast_id)), None)
+        url = _eaglecast_stream_url(item["stream_id"], item["extension"]) if item else None
+        if not url:
+            return jsonify({"error": "That Eaglecast sports feed is not available."}), 404
+    else:
+        url, err, dbg = _stream_url(channel_id)
+        if err:
+            return jsonify({"error": err}), 400
+    body = f"#EXTM3U\n#EXTINF:-1,{title}\n{url}\n"
+    return Response(body, mimetype="audio/x-mpegurl",
+                    headers={"Content-Disposition": 'attachment; filename="epg-live.m3u"',
+                             "Cache-Control": "no-store"})
+
+# Eaglecast allows one connection at a time.  A job in these states holds it.
+_PROVIDER_CONNECTION_STATES = {'recording', 'preflight'}
+
+def _busy_eaglecast_titles(recs):
+    """Titles of recordings that currently hold the single Eaglecast connection."""
+    return sorted({str(r.get('title', '')) for r in recs
+                   if (r.get('stream_provider') or 'primestreams') == 'eaglecast'
+                   and _rec_status_base(r.get('status')) in _PROVIDER_CONNECTION_STATES})
+
+@app.route("/epg-web/api/play/provider")
+def api_play_provider():
+    """Which provider a live channel uses, and whether playing it would collide
+    with a recording that already holds that provider's single connection."""
+    _url, _err, dbg = _stream_url(request.args.get("channel_id", ""))
+    provider = (dbg or {}).get('provider') or 'primestreams'
+    busy = []
+    if provider == 'eaglecast':
+        with _rec_lock:
+            busy = _busy_eaglecast_titles(list(_recs.values()))
+    return jsonify({'provider': provider, 'busy': bool(busy), 'busy_with': busy})
+
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
@@ -6348,7 +6470,9 @@ def _eaglecast_stream_is_playable(stream_url):
 def api_eaglecast_live_sports():
     try:
         items = _eaglecast_live_sports()
-        return jsonify({'items': items, 'total': len(items)})
+        with _rec_lock:
+            busy = _busy_eaglecast_titles(list(_recs.values()))
+        return jsonify({'items': items, 'total': len(items), 'busy_with': busy})
     except Exception as exc:
         return jsonify({'error': f'Could not load Eaglecast live sports: {exc}'}), 502
 
@@ -7322,9 +7446,10 @@ def api_agent_heartbeat(rec_id):
     conn.commit()
     conn.close()
     # Auto-retry: if a recording ended early due to stream drop, queue the best future airing
-    if terminal and status == 'failed' and 'ended early' in failure_reason.lower():
+    reason_text = failure_reason.lower()
+    if terminal and status == 'failed' and ('ended early' in reason_text or 'wrong programme' in reason_text):
         try:
-            expected = (row['stop_ts'] - row['start_ts']) if row.get('stop_ts') and row.get('start_ts') else 0
+            expected = (row['stop_ts'] - row['start_ts']) if row['stop_ts'] and row['start_ts'] else 0
             candidate, detail = _best_incomplete_rerecord(row['title'], expected)
             if candidate:
                 _queue_best_retry(row['title'], candidate, 'auto-retry after stream drop')
@@ -7582,6 +7707,7 @@ tr:hover td{background:#141414;}
   <div class="spacer"></div>
   <button class="btn btn-ghost btn-sm" id="btn-refresh" onclick="loadGuide()">Refresh</button>
   <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">↻ Refresh Guide</button>
+  <button class="btn btn-ghost btn-sm" id="player-pref-btn" onclick="togglePlayerPref()" title="Where Play opens videos on this device">Player: VLC</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
 
@@ -7745,6 +7871,7 @@ tr:hover td{background:#141414;}
         <span style="font-size:10px;font-weight:700;color:#7c3aed;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">▶ PLEX</span>
         <span id="pm-plex-info" style="font-size:12px;color:#a78bfa;font-family:monospace;"></span>
         <button id="pm-plex-play-btn" class="btn btn-ghost btn-sm" style="float:right;margin:0;border-color:#7c3aed;color:#c4b5fd;" onclick="playPlex(_currentProg.title)">▶ Play Plex copy</button>
+        <button id="pm-plex-replace-btn" class="btn btn-ghost btn-sm" style="float:right;margin:0 8px 0 0;color:#fbbf24;border-color:#78350f;" onclick="replacePlexCopy()" title="Take this copy out of Plex and record a fresh one">Wrong movie? Replace</button>
       </div>
       <!-- Actual incoming stream quality, sampled from the recordable channel -->
       <div id="pm-stream-wrap" style="display:none;border-top:1px solid #17365d;padding:9px 20px;background:#0b1726;">
@@ -7757,6 +7884,7 @@ tr:hover td{background:#141414;}
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
           <div id="pm-next-info" style="flex:1;font-size:13px;color:#e2e8f0;"></div>
           <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
+          <span id="pm-play-busy" style="display:none;color:#fbbf24;font-size:13px;margin-left:8px;"></span>
           <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
           <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="display:none;border-color:#f59e0b;color:#fbbf24;">📅 Record series</button>
         </div>
@@ -8681,6 +8809,17 @@ function _normTitle(t) {
 }
 // Strip trailing (YYYY) before normalizing — Plex folders have year stripped already
 function _plexNorm(t) { return _normTitle((t||'').replace(/\s*\(\d{4}\)\s*$/,'')); }
+let _plexYears = {};   // normalized title -> Set of the years of its Plex folders
+// True when a Plex folder matches the title and, if the year is known, one folder has that year.
+// The folder list is what is really on disk; this does not need the master_titles table.
+function _plexHasMovie(title, year) {
+  const k = _plexNorm(title);
+  if (!_plexTitles.has(k)) return false;
+  const years = _plexYears[k];
+  const y = String(year || '').slice(0, 4);
+  if (!y || !years || years.size === 0 || years.has('')) return true;
+  return years.has(y);
+}
 let _plexTitlesReady = false;
 let _plexTitlesPromise = null;
 async function loadPlexTitles() {
@@ -8688,6 +8827,11 @@ async function loadPlexTitles() {
     const r = await fetch('/epg-web/api/plex/titles');
     const d = await r.json();
     _plexTitles = new Set((d.titles||[]).map(_normTitle));
+    _plexYears = {};
+    (d.movies || []).forEach(m => {
+      const k = _normTitle(m.title);
+      (_plexYears[k] = _plexYears[k] || new Set()).add(String(m.year || ''));
+    });
     _plexTitlesReady = true;
   } catch(e) { _plexTitlesReady = true; }
 }
@@ -8773,16 +8917,85 @@ async function quickRecord(key, btnEl) {
   }
 }
 
+// Take a wrong or damaged Plex copy out of the library and queue a fresh recording.
+async function replacePlexCopy() {
+  const p = _currentProg;
+  if (!p || !p.title) return;
+  const year = String((_currentInfoYear || p.year || '')).slice(0, 4);
+  const ok = confirm('Move the Plex copy of "' + p.title + '" aside and record a fresh one?\\n\\n'
+    + 'The files are moved to a _wrong_movies folder, not deleted.');
+  if (!ok) return;
+  const status = document.getElementById('pm-status');
+  status.className = 'status-msg';
+  status.textContent = 'Moving the Plex copy aside…';
+  try {
+    const r = await post('/epg-web/api/plex/replace', {title: p.title, year});
+    if (!r.ok) { status.className = 'status-msg err'; status.textContent = '❌ ' + (r.error || 'Failed'); return; }
+    let note = 'Plex copy moved aside. ';
+    if (r.queued) note += 'Recording queued on ' + r.queued.channel + ' at '
+      + new Date(r.queued.start_ts * 1000).toLocaleString([], {weekday:'short', hour:'numeric', minute:'2-digit'}) + '.';
+    else if (r.already_queued) note += 'A recording is already queued for it.';
+    else if (r.added_to_wanted) note += 'No airing yet; added to your Wanted list.';
+    status.className = 'status-msg ok';
+    status.textContent = '✅ ' + note;
+    document.getElementById('pm-plex-wrap').style.display = 'none';
+    document.getElementById('pm-library-badge').style.display = 'none';
+    await loadPlexTitles();
+  } catch (e) { status.className = 'status-msg err'; status.textContent = '❌ ' + e.message; }
+}
+let _currentInfoYear = '';
+
 async function playPlex(title) {
-  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const isIOS = isAppleMobile();
   if (isIOS) {
     const streamUrl = location.origin + '/epg-web/api/plex/stream?title=' + encodeURIComponent(title);
     window.location.href = 'vlc://' + streamUrl.replace(/^https?:\/\//, '');
     return;
   }
+  if (playerPref() === 'vlc') { openInVlc({plex_title: title, title}); return; }
   // Play on this device, in the browser, not on the Mac mini.
   openBrowserPlayer({title, src: '/epg-web/api/plex/stream?title=' + encodeURIComponent(title), live: false});
 }
+
+// Which player the Play buttons use on this device: VLC (default) or the in-page player.
+function playerPref() { return localStorage.getItem('epg_player_pref') || 'vlc'; }
+function updatePlayerPrefBtn() {
+  const b = document.getElementById('player-pref-btn');
+  if (b) b.textContent = 'Player: ' + (playerPref() === 'vlc' ? 'VLC' : 'Browser');
+}
+function togglePlayerPref() {
+  localStorage.setItem('epg_player_pref', playerPref() === 'vlc' ? 'browser' : 'vlc');
+  updatePlayerPrefBtn();
+}
+// Hand a video to VLC through the EPG VLC helper app on the viewing Mac, which registers the
+// epgvlc:// link type.  The server builds the address (credentials stay server-side until now).
+// iPhone/iPad (including iPads whose Safari reports itself as a Mac) open VLC through vlc://;
+// a Mac uses the EPG VLC helper app's epgvlc:// link.
+function isAppleMobile() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (/Mac/.test(navigator.platform || navigator.userAgent) && navigator.maxTouchPoints > 1);
+}
+function vlcLaunchUrl(mediaUrl) {
+  return isAppleMobile() ? 'vlc://' + mediaUrl : 'epgvlc://play/' + encodeURIComponent(mediaUrl);
+}
+let _vlcNavigate = u => { window.location.href = u; };
+async function openInVlc(params) {
+  try {
+    const r = await fetch('/epg-web/api/play/playlist.m3u?' + new URLSearchParams(params).toString());
+    const text = await r.text();
+    if (!r.ok) {
+      let msg = 'Could not get the video address';
+      try { msg = JSON.parse(text).error || msg; } catch (e) {}
+      alert(msg);
+      return;
+    }
+    const mediaUrl = text.split('\\n').map(l => l.trim()).find(l => l && l[0] !== '#');
+    if (!mediaUrl) { alert('Could not get the video address'); return; }
+    _vlcNavigate(vlcLaunchUrl(mediaUrl));
+  } catch (e) { alert('Could not open VLC: ' + e.message); }
+}
+document.addEventListener('DOMContentLoaded', updatePlayerPrefBtn);
+updatePlayerPrefBtn();
 
 // In-browser player overlay: plays on whichever device the browser is on.
 function closeBrowserPlayer() {
@@ -8809,7 +9022,8 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
   o.id = 'browser-player';
   o.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px;';
   o.innerHTML = '<div style="width:100%;max-width:1100px;display:flex;justify-content:space-between;align-items:center;color:#e2e8f0;margin-bottom:8px;">'
-    + '<strong></strong><span><button class="btn btn-ghost btn-sm bp-vlc" style="margin:0 8px 0 0;display:none;">Open in VLC</button>'
+    + '<strong></strong><span><button class="btn btn-ghost btn-sm bp-m3u" style="margin:0 8px 0 0;display:none;">Open in VLC</button>'
+    + '<button class="btn btn-ghost btn-sm bp-vlc" style="margin:0 8px 0 0;display:none;">Copy address</button>'
     + '<button class="btn btn-ghost btn-sm bp-close" style="margin:0;">✕ Close</button></span></div>'
     + '<video controls autoplay playsinline style="width:100%;max-width:1100px;max-height:80vh;background:#000;"></video>'
     + '<div class="bp-msg" style="color:#fca5a5;margin-top:8px;"></div>';
@@ -8820,6 +9034,16 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
     // VLC on this device reconnects through provider hiccups that stop the in-page player.
     const vlcBtn = o.querySelector('.bp-vlc');
     vlcBtn.style.display = '';
+    vlcBtn.textContent = 'Copy address';
+    const m3uBtn = o.querySelector('.bp-m3u');
+    m3uBtn.style.display = '';
+    m3uBtn.onclick = () => {
+      const v3 = o.querySelector('video');
+      if (v3) v3.pause();
+      openInVlc({channel_id: vlcChannelId, title: title || ''});
+      msg.style.color = '#86efac';
+      msg.textContent = 'Opening in VLC… (needs the EPG VLC helper app installed on this Mac)';
+    };
     vlcBtn.onclick = async () => {
       try {
         const r = await fetch('/epg-web/api/play/stream-url?channel_id=' + encodeURIComponent(vlcChannelId));
@@ -8827,8 +9051,22 @@ async function openBrowserPlayer({title, src, live, vlcChannelId}) {
         if (!d.ok) { msg.textContent = d.error || 'Could not get the stream address'; return; }
         const v2 = o.querySelector('video');
         if (v2) v2.pause();
-        window.location.href = 'vlc://' + d.url;
-      } catch (e) { msg.textContent = 'Could not open VLC: ' + e.message; }
+        let box = o.querySelector('.bp-addr');
+        if (!box) {
+          box = document.createElement('input');
+          box.className = 'bp-addr';
+          box.readOnly = true;
+          box.style.cssText = 'width:100%;max-width:1100px;margin-top:8px;padding:6px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;';
+          o.appendChild(box);
+        }
+        box.value = d.url;
+        box.select();
+        let copied = false;
+        try { copied = document.execCommand('copy'); } catch (e) {}
+        msg.style.color = '#86efac';
+        msg.textContent = (copied ? 'Address copied. ' : 'Copy the address above. ')
+          + 'In VLC press Cmd+N (File, Open Network), paste it, then click Open.';
+      } catch (e) { msg.textContent = 'Could not get the stream address: ' + e.message; }
     };
   }
   document.body.appendChild(o);
@@ -8956,9 +9194,12 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
     const rows = items.map(item => {
       const channelId = 'eaglecast-live:' + item.stream_id;
       const playing = !!_activeStreams[channelId];
+      const eagleBusy = (d.busy_with || []).length > 0;
       const action = playing
         ? `<button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();stopStream('${channelId}')">■ Stop</button>`
-        : `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();playEaglecastLiveSport('${item.stream_id}')">▶ Play</button>`;
+        : eagleBusy
+          ? `<span style="color:#fbbf24;font-size:12px;" title="${esc((d.busy_with || []).join(', '))}">🦅 Eaglecast — in use by a recording</span>`
+          : `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();playEaglecastLiveSport('${item.stream_id}')">▶ Play</button>`;
       return `<div class="guide-row">
         <div class="ch-name" title="${esc(item.name)} — Eaglecast live-only" style="display:flex;align-items:center;">🦅&nbsp;<span class="ch-name-label">${esc(item.name)}</span></div>
         <div class="prog-row" style="width:${totalPx}px;">
@@ -8978,6 +9219,7 @@ async function fetchAndRenderEaglecastLiveSports(requestId) {
 }
 
 function playEaglecastLiveSport(streamId, name) {
+  if (playerPref() === 'vlc') { openInVlc({eaglecast_id: streamId, title: name || 'Eaglecast live'}); return; }
   openBrowserPlayer({
     title: name || 'Eaglecast live',
     src: '/epg-web/api/play/eaglecast-proxy?stream_id=' + encodeURIComponent(streamId),
@@ -9297,6 +9539,7 @@ async function openProg(p) {
   _modalGeneration += 1;
   _currentProg = p;
   _nextAiring = null;
+  { const busyLbl = document.getElementById('pm-play-busy'); if (busyLbl) busyLbl.style.display = 'none'; }
   // Show overlay in loading state
   const overlay = document.getElementById('prog-modal-overlay');
   overlay.style.display = 'flex';
@@ -9354,6 +9597,7 @@ async function openProg(p) {
     quickPlay.style.display = '';
     quickPlay.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
     quickPlay.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
+    refreshPlayBusy(p.channel_id);
     const quickRecord = document.getElementById('pm-rec-next-btn');
     quickRecord.textContent = '● Record remaining';
     quickRecord.disabled = false;
@@ -9459,7 +9703,7 @@ async function openProg(p) {
   } else { imdbLink.style.display = 'none'; }
 
   const libBadge = document.getElementById('pm-library-badge');
-  if (_plexTitles.has(_plexNorm(p.title)) && info.in_library !== false) {
+  if (_plexHasMovie(p.title, info.year || p.year)) {
     libBadge.textContent = '▶ IN PLEX';
     libBadge.style.background = '#2d1f5e'; libBadge.style.color = '#a78bfa';
     libBadge.style.display = '';
@@ -9501,6 +9745,7 @@ async function openProg(p) {
     pBtn.style.display = '';
     pBtn.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
     pBtn.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
+    refreshPlayBusy(p.channel_id);
     const immediateRecord = document.getElementById('pm-rec-next-btn');
     immediateRecord.textContent = '● Record remaining';
     immediateRecord.disabled = false;
@@ -9512,7 +9757,8 @@ async function openProg(p) {
   // Plex file info
   const plexWrap = document.getElementById('pm-plex-wrap');
   plexWrap.style.display = 'none';
-  if (_plexTitles.has(_plexNorm(p.title)) && info.in_library !== false) {
+  _currentInfoYear = info.year || p.year || '';
+  if (_plexHasMovie(p.title, info.year || p.year)) {
     plexWrap.style.display = 'block';
     document.getElementById('pm-plex-info').textContent = 'Plex copy found';
     // File probing can take several seconds on the NAS.  It is display-only,
@@ -9677,6 +9923,7 @@ async function openProg(p) {
           const alreadyPlaying = !!_activeStreams[featPS.channel_id];
           pBtn.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
           pBtn.onclick     = alreadyPlaying ? () => stopStream(featPS.channel_id) : playStream;
+          refreshPlayBusy(featPS.channel_id);
         }
 
         // A live programme can be captured from this point forward.  Keep
@@ -9842,10 +10089,27 @@ function _updateNowPlaying(streams) {
   }
 }
 
+// Swap the Play button for an Eaglecast label while a recording holds its one connection.
+async function refreshPlayBusy(channelId) {
+  const pBtn = document.getElementById('pm-play-btn');
+  const lbl = document.getElementById('pm-play-busy');
+  if (!pBtn || !lbl || !channelId) return;
+  lbl.style.display = 'none';
+  try {
+    const d = await (await fetch('/epg-web/api/play/provider?channel_id=' + encodeURIComponent(channelId))).json();
+    if (!_nextAiring || _nextAiring.channel_id !== channelId) return;   // the modal moved on
+    if (d.busy && pBtn.style.display !== 'none' && pBtn.textContent.indexOf('Stop') < 0) {
+      pBtn.style.display = 'none';
+      lbl.textContent = '🦅 Eaglecast — in use by a recording' + (d.busy_with && d.busy_with.length ? ' (' + d.busy_with.join(', ') + ')' : '');
+      lbl.style.display = '';
+    }
+  } catch (e) { /* if the check fails, leave the Play button as it is */ }
+}
+
 async function playStream() {
   document.getElementById('pm-status').textContent = '';
   document.getElementById('pm-status').className = 'status-msg';
-  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const isIOS = isAppleMobile();
   if (isIOS && _nextAiring) {
     const r = await fetch(`/epg-web/api/play/stream-url?channel_id=${encodeURIComponent(_nextAiring.channel_id)}`);
     const d = await r.json();
@@ -9855,6 +10119,11 @@ async function playStream() {
     return;
   }
   if (!_nextAiring) return;
+  if (!isIOS && playerPref() === 'vlc') {
+    openInVlc({channel_id: _nextAiring.channel_id,
+               title: ((_currentProg && _currentProg.title) || '') + ' — ' + (_nextAiring.channel_name || _nextAiring.channel_id)});
+    return;
+  }
   if (!isIOS) {
     // Play on this device, in the browser, not on the Mac mini.
     openBrowserPlayer({
@@ -10651,7 +10920,12 @@ async function load247() {
       </div>`).join('');
   } catch(e) { setEl('c247-status', 'Failed', 'err'); }
 }
-function play247(channelId, name) {
+async function play247(channelId, name) {
+  try {
+    const pv = await (await fetch('/epg-web/api/play/provider?channel_id=' + encodeURIComponent(channelId))).json();
+    if (pv.busy) { setEl('c247-status', '🦅 Eaglecast — in use by a recording', 'err'); return; }
+  } catch (e) { /* if the check fails, just play */ }
+  if (playerPref() === 'vlc') { openInVlc({channel_id: channelId, title: name || 'Live'}); return; }
   openBrowserPlayer({
     title: name || 'Live',
     src: '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId),

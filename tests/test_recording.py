@@ -731,3 +731,180 @@ class DuplicateRecordingTests(unittest.TestCase):
         recs = {"a": self._rec("NFL GameDay Final", 1000, "34710", status="cancelled")}
         self.assertIsNone(server._find_duplicate_recording(
             recs.items(), "NFL GameDay Final", 1000, "34710", "primestreams", "1402"))
+
+
+class PlaylistRouteTests(unittest.TestCase):
+    def test_playlist_is_a_downloadable_m3u_with_the_stream_address(self):
+        url = "http://provider.test/live/u/p/1.ts"
+        with mock.patch.object(server, "_stream_url", return_value=(url, None, {})):
+            resp = server.app.test_client().get(
+                "/epg-web/api/play/playlist.m3u",
+                query_string={"channel_id": "18086", "title": "Paycheck\nextra"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        body = resp.get_data(as_text=True)
+        self.assertEqual(body.splitlines(), ["#EXTM3U", "#EXTINF:-1,Paycheck extra", url])
+
+    def test_playlist_reports_a_stream_error(self):
+        with mock.patch.object(server, "_stream_url", return_value=(None, "no stream", {})):
+            resp = server.app.test_client().get(
+                "/epg-web/api/play/playlist.m3u", query_string={"channel_id": "x"})
+        self.assertEqual(resp.status_code, 400)
+
+
+class ProviderBusyTests(unittest.TestCase):
+    @staticmethod
+    def _rec(title, provider, status):
+        return {"title": title, "stream_provider": provider, "status": status}
+
+    def test_only_eaglecast_jobs_holding_a_connection_count_as_busy(self):
+        recs = [
+            self._rec("A", "eaglecast", "recording"),
+            self._rec("B", "eaglecast", "preflight"),
+            self._rec("C", "eaglecast", "queued"),
+            self._rec("D", "eaglecast", "done"),
+            self._rec("E", "primestreams", "recording"),
+        ]
+        self.assertEqual(server._busy_eaglecast_titles(recs), ["A", "B"])
+
+    def test_endpoint_reports_busy_for_an_eaglecast_channel(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._recs["r1"] = self._rec("The Amateur", "eaglecast", "recording")
+        with mock.patch.object(server, "_stream_url",
+                               return_value=("http://x/1.ts", None, {"provider": "eaglecast"})):
+            data = server.app.test_client().get(
+                "/epg-web/api/play/provider", query_string={"channel_id": "18086"}).get_json()
+        self.assertEqual(data, {"provider": "eaglecast", "busy": True, "busy_with": ["The Amateur"]})
+        with server._rec_lock:
+            server._recs.clear()
+
+    def test_endpoint_is_never_busy_for_primestreams(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._recs["r1"] = self._rec("The Amateur", "eaglecast", "recording")
+        with mock.patch.object(server, "_stream_url",
+                               return_value=("http://x/1.ts", None, {"provider": "primestreams"})):
+            data = server.app.test_client().get(
+                "/epg-web/api/play/provider", query_string={"channel_id": "1"}).get_json()
+        self.assertFalse(data["busy"])
+        with server._rec_lock:
+            server._recs.clear()
+
+
+class PlaylistKindsTests(unittest.TestCase):
+    def test_plex_playlist_points_at_this_servers_stream_route(self):
+        resp = server.app.test_client().get(
+            "/epg-web/api/play/playlist.m3u",
+            query_string={"plex_title": "Indiana Jones (1984)", "title": "Indiana Jones"},
+            base_url="http://nas.test:5001")
+        lines = resp.get_data(as_text=True).splitlines()
+        self.assertEqual(lines[0], "#EXTM3U")
+        self.assertEqual(lines[2],
+                         "http://nas.test:5001/epg-web/api/plex/stream?title=Indiana%20Jones%20%281984%29")
+
+    def test_eaglecast_playlist_only_serves_catalogue_feeds(self):
+        catalogue = [{"stream_id": "7", "name": "ESPN", "extension": "ts"}]
+        with mock.patch.object(server, "_eaglecast_live_sports", return_value=catalogue), \
+             mock.patch.object(server, "_eaglecast_stream_url", return_value="http://eagle.test/7.ts"):
+            client = server.app.test_client()
+            ok = client.get("/epg-web/api/play/playlist.m3u", query_string={"eaglecast_id": "7"})
+            bad = client.get("/epg-web/api/play/playlist.m3u", query_string={"eaglecast_id": "999"})
+        self.assertEqual(ok.get_data(as_text=True).splitlines()[2], "http://eagle.test/7.ts")
+        self.assertEqual(bad.status_code, 404)
+
+
+class PlexReplaceTests(unittest.TestCase):
+    def _plex(self, root, names):
+        movies = os.path.join(root, "Movies")
+        for name in names:
+            os.makedirs(os.path.join(movies, name))
+            with open(os.path.join(movies, name, "movie.mp4"), "wb") as fh:
+                fh.write(b"0" * 16)
+        return movies
+
+    def _post(self, movies, body, candidate=None, detail=None):
+        queued = {"channel": "SHO 2 HD", "start_ts": 1.0}
+        with mock.patch.object(server, "load_config", return_value={"plex_path": movies}), \
+             mock.patch.object(server, "_best_incomplete_rerecord",
+                               return_value=(candidate, detail or {})) as best, \
+             mock.patch.object(server, "_queue_best_retry", return_value=queued) as queue, \
+             mock.patch.object(server, "_watch_abandoned_transfer") as wanted:
+            resp = server.app.test_client().post("/epg-web/api/plex/replace", json=body)
+        return resp, best, queue, wanted
+
+    def test_moves_the_folder_aside_and_queues_a_fresh_recording(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["Quantum of Solace (2008)", "Other (1999)"])
+            resp, best, queue, wanted = self._post(
+                movies, {"title": "Quantum of Solace", "year": "2008"},
+                candidate={"channel": "SHO 2 HD"})
+            data = resp.get_json()
+            self.assertTrue(data["ok"])
+            self.assertEqual(sorted(os.listdir(movies)), ["Other (1999)"])
+            held = os.path.join(root, "_wrong_movies")
+            self.assertEqual(len(os.listdir(held)), 1)
+            self.assertTrue(os.path.exists(os.path.join(held, os.listdir(held)[0], "movie.mp4")))
+            queue.assert_called_once()
+            self.assertEqual(data["queued"]["channel"], "SHO 2 HD")
+
+    def test_no_future_airing_adds_the_title_to_wanted(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["Quantum of Solace (2008)"])
+            resp, _best, queue, wanted = self._post(movies, {"title": "Quantum of Solace"})
+            self.assertTrue(resp.get_json()["added_to_wanted"])
+            wanted.assert_called_once()
+            queue.assert_not_called()
+
+    def test_same_title_in_two_years_needs_the_year(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["The Untouchables (1987)", "The Untouchables (1959)"])
+            resp, *_ = self._post(movies, {"title": "The Untouchables"})
+            self.assertEqual(resp.status_code, 409)
+            self.assertEqual(len(os.listdir(movies)), 2)
+            resp, *_ = self._post(movies, {"title": "The Untouchables", "year": "1987"})
+            self.assertTrue(resp.get_json()["ok"])
+            self.assertEqual(os.listdir(movies), ["The Untouchables (1959)"])
+
+    def test_unknown_title_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            movies = self._plex(root, ["Other (1999)"])
+            resp, *_ = self._post(movies, {"title": "Nope"})
+            self.assertEqual(resp.status_code, 404)
+            self.assertEqual(os.listdir(movies), ["Other (1999)"])
+
+
+class AutoRetryTests(unittest.TestCase):
+    """A recording that failed because it was cut short or wrong looks for another airing."""
+
+    def _heartbeat(self, message):
+        server._init_recordings_table()
+        rec = {"title": "Quantum of Solace", "channel_id": "5", "channel": "SHO",
+               "start_ts": time.time() - 3600, "stop_ts": time.time() + 3600, "status": "recording",
+               "progress": 0, "log": [], "pid": None, "file": None, "backend": "agent",
+               "stream_id": "1", "stream_provider": "primestreams", "stream_extension": "ts",
+               "episode_title": "", "season_num": None, "episode_num": None,
+               "is_series": False, "auto_upgrade": False}
+        rec_id = "retry" + str(int(time.time() * 1000) % 100000)
+        server._db_upsert_rec(rec_id, rec)
+        with mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_best_incomplete_rerecord", return_value=(None, {})) as best, \
+             mock.patch.object(server, "_watch_abandoned_transfer") as wanted:
+            resp = server.app.test_client().post(
+                f"/epg-web/api/agent/jobs/{rec_id}/heartbeat",
+                json={"agent_id": "a", "status": "failed", "message": message})
+        self.assertEqual(resp.status_code, 200)
+        return best, wanted
+
+    def test_early_end_looks_for_another_airing(self):
+        best, wanted = self._heartbeat("Recording ended early: 22 min captured of 137 min scheduled")
+        best.assert_called_once()
+        wanted.assert_called_once()
+
+    def test_wrong_programme_looks_for_another_airing(self):
+        best, wanted = self._heartbeat('Wrong programme on stream: provider shows "The Terminator"')
+        best.assert_called_once()
+
+    def test_other_failures_do_not_retry(self):
+        best, wanted = self._heartbeat("FFmpeg recording failed")
+        best.assert_not_called()
