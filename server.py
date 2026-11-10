@@ -1185,20 +1185,27 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
     query = ('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category, '
              'episode_title, season_num, episode_num, prog_type FROM guide')
     params = ()
+    where = ''
     if window_start is not None and window_hours:
         window_end = window_start + timedelta(hours=window_hours)
-        query += ' WHERE end_utc > ? AND start_utc < ?'
+        where = ' WHERE end_utc > ? AND start_utc < ?'
         params = (window_start.strftime('%Y%m%d%H%M%S'),
                   window_end.strftime('%Y%m%d%H%M%S'))
-    query += ' ORDER BY start_utc'
+    else:
+        # The full load keeps every future listing but only the last few days of the past.
+        # The database holds months of history; loading all of it needed more than 8 GB.
+        try:
+            keep_days = float(load_config().get('guide_keep_past_days', 3))
+        except (TypeError, ValueError):
+            keep_days = 3.0
+        if keep_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+            where = ' WHERE end_utc > ?'
+            params = (cutoff.strftime('%Y%m%d%H%M%S'),)
+    query += where + ' ORDER BY start_utc'
     total = 0
     if progress:
-        count_query = 'SELECT COUNT(*) FROM guide'
-        count_params = ()
-        if params:
-            count_query += ' WHERE end_utc > ? AND start_utc < ?'
-            count_params = params
-        total = conn.execute(count_query, count_params).fetchone()[0]
+        total = conn.execute('SELECT COUNT(*) FROM guide' + where, params).fetchone()[0]
         progress('Reading guide listings', 0, total)
 
     programmes = []

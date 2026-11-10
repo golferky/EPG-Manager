@@ -1011,3 +1011,40 @@ class DailyGuideRefreshTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 server._daily_guide_loop()
         run.assert_not_called()
+
+
+class GuideKeepPastTests(unittest.TestCase):
+    def _db(self, temp):
+        import datetime as dt
+        import sd_guide
+        db = os.path.join(temp, "guide.db")
+        sd_guide.ensure_guide_db(db)
+        now = dt.datetime.now(dt.timezone.utc)
+        fmt = "%Y%m%d%H%M%S"
+        conn = sqlite3.connect(db)
+        for title, start in (("Old", now - dt.timedelta(days=60)), ("Recent", now - dt.timedelta(days=1)),
+                             ("Soon", now + dt.timedelta(hours=2)), ("Later", now + dt.timedelta(days=10))):
+            conn.execute("insert into guide(title,channel_id,channel_name,start_utc,end_utc,desc,category) "
+                         "values (?,?,?,?,?,?,?)",
+                         (title, "c1", "One", start.strftime(fmt),
+                          (start + dt.timedelta(hours=1)).strftime(fmt), "", ""))
+        conn.commit()
+        conn.close()
+        return db
+
+    def _titles(self, cfg):
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp)
+            with mock.patch.object(server, "load_config", return_value=cfg):
+                server.load_epg_from_db(db)
+            return sorted(p["title"] for p in server._epg["programmes"])
+
+    def test_the_full_load_skips_old_history_but_keeps_the_recent_past_and_the_future(self):
+        self.assertEqual(self._titles({}), ["Later", "Recent", "Soon"])
+
+    def test_a_custom_number_of_past_days(self):
+        self.assertEqual(self._titles({"guide_keep_past_days": 0.5}), ["Later", "Soon"])
+        self.assertEqual(self._titles({"guide_keep_past_days": 90}), ["Later", "Old", "Recent", "Soon"])
+
+    def test_zero_keeps_everything(self):
+        self.assertEqual(self._titles({"guide_keep_past_days": 0}), ["Later", "Old", "Recent", "Soon"])
