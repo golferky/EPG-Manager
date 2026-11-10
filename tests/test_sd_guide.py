@@ -43,3 +43,21 @@ class TokenCacheTests(unittest.TestCase):
     def test_no_cache_file_logs_in(self):
         token, logged_in, _ = self._run(None)
         self.assertEqual((token, logged_in), ("fresh", True))
+
+
+class DatabaseLockTests(unittest.TestCase):
+    def test_waits_for_another_writer_instead_of_failing(self):
+        import sqlite3
+        import threading
+        with tempfile.TemporaryDirectory() as temp:
+            db = os.path.join(temp, "guide.db")
+            sd_guide.ensure_guide_db(db)
+            blocker = sqlite3.connect(db, isolation_level=None)
+            blocker.execute("BEGIN EXCLUSIVE")
+            release = threading.Timer(1.0, lambda: blocker.execute("COMMIT"))
+            release.start()
+            started = time.time()
+            sd_guide.ensure_guide_db(db)          # the default 5 s wait would also pass; this
+            self.assertGreaterEqual(time.time() - started, 0.5)   # proves it actually waited
+            release.join()
+            blocker.close()

@@ -55,7 +55,8 @@ def get_token(username, password):
 # ── Guide DB helpers ──────────────────────────────────────────────────────────
 
 def ensure_guide_db(db_path):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=120)  # wait for other writers instead of failing
+    conn.execute('PRAGMA busy_timeout=120000')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS guide (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +142,8 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
     log(f'Total stations: {len(station_map)}')
 
     # 3. Upsert channels into guide.db
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=120)  # wait for other writers instead of failing
+    conn.execute('PRAGMA busy_timeout=120000')
     for sid, info in station_map.items():
         conn.execute(
             'INSERT OR REPLACE INTO guide_channels(channel_id, channel_name, icon) VALUES (?,?,?)',

@@ -908,3 +908,18 @@ class AutoRetryTests(unittest.TestCase):
     def test_other_failures_do_not_retry(self):
         best, wanted = self._heartbeat("FFmpeg recording failed")
         best.assert_not_called()
+
+
+class SdFetchGuardTests(unittest.TestCase):
+    def test_a_second_fetch_is_not_started_while_one_is_running(self):
+        server._sd_status.update({'running': True, 'log': [], 'result': None, 'error': None})
+        try:
+            with mock.patch.object(server, "load_config",
+                                   return_value={"sd_user": "u", "sd_pass": "p"}), \
+                 mock.patch.object(server.threading, "Thread") as thread:
+                resp = server.app.test_client().post("/epg-web/api/fetch-sd", json={"days": 21})
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("already running", resp.get_json()["message"])
+            thread.assert_not_called()
+        finally:
+            server._sd_status.update({'running': False})

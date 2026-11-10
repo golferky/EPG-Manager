@@ -2488,6 +2488,9 @@ def api_fetch_sd():
     days    = int(request.json.get('days', 21) if request.json else 21)
     if not sd_user or not sd_pass:
         return jsonify({'error': 'SD credentials not configured'}), 400
+    if _sd_status['running']:
+        # A second fetch would fight the first for the database write lock.
+        return jsonify({'ok': True, 'message': 'A Schedules Direct fetch is already running'})
     _sd_status['running'] = True
     _sd_status['log']     = []
     _sd_status['result']  = None
