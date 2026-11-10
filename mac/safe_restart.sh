@@ -4,12 +4,14 @@
 #   ~/EPG-Manager/mac/safe_restart.sh --pull     (also git pull first)
 #   ~/EPG-Manager/mac/safe_restart.sh --check    (just say if it is idle)
 # "Idle" means the dashboard server reports nothing recording or finishing,
-# no recording starts in the next 3 minutes, and no ffmpeg is running here.
+# no recording starts in the next 3 minutes (EPG_SOON_SECONDS to change), and no
+# ffmpeg is running here.
 # If the server cannot be reached the state is unknown, so it keeps waiting.
 SERVER="${EPG_SERVER:-http://192.168.1.176:5001}"
 LABEL="com.epg.recording-agent"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$(command -v python3 || echo /usr/bin/python3)"
+export EPG_SOON_SECONDS="${EPG_SOON_SECONDS:-180}"
 
 busy_reason() {
   if pgrep -x ffmpeg >/dev/null 2>&1; then echo "ffmpeg is running here"; return 0; fi
@@ -17,7 +19,7 @@ busy_reason() {
   body="$(curl -fsS -m 15 "$SERVER/epg-web/api/recordings/overview" 2>/dev/null)" \
     || { echo "dashboard server not reachable (state unknown)"; return 0; }
   printf '%s' "$body" | "$PY" -c '
-import sys, json, time
+import sys, json, time, os
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -29,9 +31,10 @@ if d.get("recording"):
 if d.get("finishing"):
     print("still finishing: " + ", ".join(e["title"] for e in d["finishing"])); sys.exit(0)
 now = d.get("now", time.time())
-soon = [e for e in d.get("upcoming", []) if e["start_ts"] - now < 180]
+limit = int(os.environ.get("EPG_SOON_SECONDS", "180"))
+soon = [e for e in d.get("upcoming", []) if e["start_ts"] - now < limit]
 if soon:
-    print("starts within 3 min: " + ", ".join(e["title"] for e in soon)); sys.exit(0)
+    print("starts within %d min: " % (limit // 60) + "" + ", ".join(e["title"] for e in soon)); sys.exit(0)
 sys.exit(1)
 ' && return 0
   return 1
