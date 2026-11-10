@@ -372,3 +372,117 @@ class WrongProgrammeTests(unittest.TestCase):
                 Api(), {"id": "j"}, "recording", ["sleep", "30"], {"heartbeat_seconds": 0.05},
                 str(Path(temp) / "log"), watchdog=lambda: recording_agent.WrongProgramme("wrong"))
         self.assertIsInstance(result, recording_agent.WrongProgramme)
+
+
+class RepeatClaimTests(unittest.TestCase):
+    class FakeThread:
+        started = []
+
+        def __init__(self, target=None, args=(), daemon=None, name=None, alive=True):
+            self.name, self.alive = name, alive
+
+        def start(self):
+            RepeatClaimTests.FakeThread.started.append(self.name)
+
+        def is_alive(self):
+            return self.alive
+
+    def setUp(self):
+        RepeatClaimTests.FakeThread.started = []
+        self.job = {"id": "2ba0fd44", "title": "Star Trek: First Contact"}
+
+    def test_a_new_job_is_started(self):
+        active = {}
+        self.assertTrue(recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread))
+        self.assertEqual(self.FakeThread.started, ["epg-record-2ba0fd44"])
+        self.assertIn("2ba0fd44", active)
+
+    def test_a_repeat_claim_of_a_running_job_is_ignored(self):
+        active = {}
+        recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread)
+        original = active["2ba0fd44"]
+        self.assertFalse(recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread))
+        self.assertEqual(self.FakeThread.started, ["epg-record-2ba0fd44"])   # no second worker
+        self.assertIs(active["2ba0fd44"], original)
+
+    def test_a_job_whose_worker_has_finished_can_be_started_again(self):
+        active = {"2ba0fd44": self.FakeThread(name="old", alive=False)}
+        self.assertTrue(recording_agent.start_job_once(None, self.job, {}, active, self.FakeThread))
+        self.assertEqual(self.FakeThread.started, ["epg-record-2ba0fd44"])
+
+
+class AgentVersionTests(unittest.TestCase):
+    def test_version_is_v_date_letter(self):
+        import datetime as dt
+        import re as _re
+        self.assertRegex(recording_agent.AGENT_VERSION, r"^v\d{8}[a-z]$")
+        dt.datetime.strptime(recording_agent.AGENT_VERSION[1:9], "%Y%m%d")
+
+    def test_the_connect_line_shows_the_version(self):
+        import contextlib
+        import io
+
+        class FakeApi:
+            def __init__(self, cfg):
+                pass
+
+            def health(self):
+                return {"recording_backend": "agent"}
+
+            def claim(self, ahead):
+                return None
+
+        out = io.StringIO()
+        with mock.patch.object(recording_agent, "AgentAPI", FakeApi), contextlib.redirect_stdout(out):
+            recording_agent.run_agent({"max_concurrent_recordings": 2, "claim_ahead_seconds": 300,
+                                       "poll_seconds": 0}, once=True)
+        self.assertIn(f"version {recording_agent.AGENT_VERSION}", out.getvalue())
+        self.assertIn("[agent] connected;", out.getvalue())
+
+
+class PatientHeartbeatTests(unittest.TestCase):
+    def _api(self, outcomes):
+        """An AgentAPI whose heartbeat returns or raises each outcome in turn."""
+        cfg = {"server_url": "http://x.test", "agent_token": "t", "agent_id": "a",
+               "epg_url": "", "epg_user": "", "epg_pass": ""}
+        api = recording_agent.AgentAPI(dict(cfg, lease_seconds=90))
+        results = iter(outcomes)
+        calls = []
+
+        def heartbeat(job_id, status, **fields):
+            calls.append(status)
+            value = next(results)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        api.heartbeat = heartbeat
+        return api, calls
+
+    def test_rides_out_a_server_outage_then_succeeds(self):
+        import urllib.error
+        api, calls = self._api([urllib.error.URLError("Connection refused"),
+                                urllib.error.URLError("Connection refused"), {"ok": True}])
+        with mock.patch.object(recording_agent.time, "sleep"):
+            self.assertEqual(api.patient_heartbeat("j1", "done", pause=0), {"ok": True})
+        self.assertEqual(len(calls), 3)
+
+    def test_server_errors_are_retried_but_client_errors_are_not(self):
+        api, calls = self._api([RuntimeError("EPG API HTTP 500: busy"), {"ok": True}])
+        with mock.patch.object(recording_agent.time, "sleep"):
+            api.patient_heartbeat("j1", "done", pause=0)
+        self.assertEqual(len(calls), 2)
+        api, calls = self._api([RuntimeError("EPG API HTTP 404: Recording job not found"), {"ok": True}])
+        with mock.patch.object(recording_agent.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                api.patient_heartbeat("j1", "done", pause=0)
+        self.assertEqual(len(calls), 1)
+
+    def test_gives_up_after_the_wait_limit(self):
+        import urllib.error
+        api, calls = self._api([urllib.error.URLError("down")] * 50)
+        clock = [1000.0]
+        with mock.patch.object(recording_agent.time, "time", lambda: clock[0]), \
+             mock.patch.object(recording_agent.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s)):
+            with self.assertRaises(urllib.error.URLError):
+                api.patient_heartbeat("j1", "done", wait_seconds=100, pause=20)
+        self.assertLessEqual(len(calls), 7)

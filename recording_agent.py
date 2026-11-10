@@ -25,6 +25,11 @@ from pathlib import Path
 
 MEDIA_EXTENSIONS = {'.mp4', '.mkv', '.m4v', '.ts'}
 DEFAULT_RECORDING_TAIL_SECONDS = 45
+
+# Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
+# the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
+# letter starting again at "a" on a new day.
+AGENT_VERSION = "v20261110b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -109,6 +114,30 @@ class AgentAPI:
         return self._request(
             'POST', f'/epg-web/api/agent/jobs/{job_id}/heartbeat', payload
         )
+
+    def patient_heartbeat(self, job_id, status, wait_seconds=7200, pause=20, **fields):
+        """A heartbeat that rides out a server outage.
+
+        Used once a recording exists: an unreachable server must not make the recorder
+        abandon a finished file.  Network failures and server errors are retried every
+        ``pause`` seconds for up to ``wait_seconds``; an HTTP error that retrying cannot
+        fix (job not found, leased elsewhere) is raised at once.
+        """
+        deadline = time.time() + wait_seconds
+        while True:
+            try:
+                return self.heartbeat(job_id, status, **fields)
+            except RuntimeError as exc:
+                text = str(exc)
+                if text.startswith('EPG API HTTP') and not text.startswith('EPG API HTTP 5'):
+                    raise
+                error = exc
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                error = exc
+            if time.time() >= deadline:
+                raise error
+            print(f'[heartbeat] server unavailable ({error}); retrying in {pause}s', file=sys.stderr, flush=True)
+            time.sleep(pause)
 
     def movie_year(self, title):
         """Ask the EPG server's cached guide/OMDb lookup for a movie year."""
@@ -502,7 +531,7 @@ def archive_terminal_result(api, job, status, log_path, **fields):
     excerpt = _log_excerpt(log_path)
     if excerpt:
         result['log_excerpt'] = excerpt
-    response = api.heartbeat(job['id'], status, result=result, **fields)
+    response = api.patient_heartbeat(job['id'], status, result=result, **fields)
     # The heartbeat is the durable database write.  Only reclaim disk space
     # after it succeeds; an offline server leaves the original log intact.
     try:
@@ -728,7 +757,7 @@ def process_job(api, job, cfg):
     is_series = bool(job.get('is_series'))
     library_root = cfg['plex_tv_path'] if (episode or is_series) else cfg['plex_path']
 
-    api.heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
+    api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
     candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'])
         if episode else ([] if is_series else find_plex_candidates(library_root, job['title'])))
@@ -736,7 +765,7 @@ def process_job(api, job, cfg):
     try:
         incoming_probe = probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
     except Exception as exc:
-        api.heartbeat(job['id'], 'failed', message=f'Incoming stream probe failed: {exc}')
+        api.patient_heartbeat(job['id'], 'failed', message=f'Incoming stream probe failed: {exc}')
         return
 
     incomplete_copy = bool(existing_probe and incomplete_for_scheduled_window(
@@ -756,7 +785,7 @@ def process_job(api, job, cfg):
         'existing': existing_probe, 'existing_path': str(existing_path or ''),
     }
     if not should_record:
-        api.heartbeat(job['id'], 'skipped_existing_better',
+        api.patient_heartbeat(job['id'], 'skipped_existing_better',
                       quality_decision=decision, result=quality)
         print(f'[skip] {job["title"]}: {decision}', flush=True)
         return
@@ -767,7 +796,7 @@ def process_job(api, job, cfg):
         return
     remaining = int(job['stop_ts'] - time.time()) + cfg['recording_tail_seconds']
     if remaining < 60:
-        api.heartbeat(job['id'], 'skipped_too_short',
+        api.patient_heartbeat(job['id'], 'skipped_too_short',
                       message='Recording window has already passed', result=quality)
         return
 
@@ -840,9 +869,12 @@ def process_job(api, job, cfg):
         incomplete_path = None
         try:
             def incomplete_progress(copied, total):
-                api.heartbeat(job['id'], 'transferring', file=str(mp4_path),
-                              progress=round(copied / total * 100, 1) if total else 0,
-                              quality_decision='saving incomplete recording to QNAP')
+                try:
+                    api.heartbeat(job['id'], 'transferring', file=str(mp4_path),
+                                  progress=round(copied / total * 100, 1) if total else 0,
+                                  quality_decision='saving incomplete recording to QNAP')
+                except Exception as exc:    # a progress report must never abort the copy
+                    print(f'[heartbeat] server unavailable: {exc}', file=sys.stderr, flush=True)
             incomplete_path = preserve_incomplete_recording(
                 mp4_path, cfg, job['title'], job['start_ts'], incomplete_progress
             )
@@ -896,8 +928,8 @@ def process_job(api, job, cfg):
         decision = final_decision
         existing_path = final_existing_path
 
-    api.heartbeat(job['id'], 'transferring', file=str(mp4_path),
-                  quality_decision=decision)
+    api.patient_heartbeat(job['id'], 'transferring', file=str(mp4_path),
+                          quality_decision=decision)
     def transfer_progress(copied, total):
         try:
             response = api.heartbeat(
@@ -968,11 +1000,33 @@ def _run_claimed_job(api, job, cfg):
         print(f'[error] {job["title"]}: {exc}', file=sys.stderr, flush=True)
 
 
+def start_job_once(api, job, cfg, active, thread_factory=threading.Thread):
+    """Start a worker for a claimed job unless this recorder is already running it.
+
+    The server can offer a job again when it could not record the recorder's heartbeats
+    (for example while its database was locked) and the lease ran out.  Starting a second
+    worker for the same job made two FFmpeg processes write the same file and fight over
+    the provider's connection.  Returns True if a worker was started.
+    """
+    job_id = job['id']
+    existing = active.get(job_id)
+    if existing is not None and existing.is_alive():
+        print(f'[claim] {job["title"]} ({job_id}) is already recording here; '
+              'ignoring the repeat claim', flush=True)
+        return False
+    print(f'[claim] {job["title"]} ({job_id})', flush=True)
+    worker = thread_factory(target=_run_claimed_job, args=(api, job, cfg), daemon=True,
+                            name=f'epg-record-{job_id}')
+    active[job_id] = worker
+    worker.start()
+    return True
+
+
 def run_agent(cfg, once=False):
     api = AgentAPI(cfg)
     health = api.health()
     max_workers = cfg['max_concurrent_recordings']
-    print(f'[agent] connected; server backend={health.get("recording_backend")}; '
+    print(f'[agent] connected; version {AGENT_VERSION}; server backend={health.get("recording_backend")}; '
           f'max recordings={max_workers}', flush=True)
     active = {}
     while True:
@@ -984,14 +1038,7 @@ def run_agent(cfg, once=False):
                 job = api.claim(cfg['claim_ahead_seconds'])
                 if not job:
                     break
-                job_id = job['id']
-                print(f'[claim] {job["title"]} ({job_id})', flush=True)
-                worker = threading.Thread(
-                    target=_run_claimed_job, args=(api, job, cfg), daemon=True,
-                    name=f'epg-record-{job_id}',
-                )
-                active[job_id] = worker
-                worker.start()
+                start_job_once(api, job, cfg, active)
             if once:
                 for worker in list(active.values()):
                     worker.join()

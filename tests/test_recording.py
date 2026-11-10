@@ -1048,3 +1048,75 @@ class GuideKeepPastTests(unittest.TestCase):
 
     def test_zero_keeps_everything(self):
         self.assertEqual(self._titles({"guide_keep_past_days": 0}), ["Later", "Old", "Recent", "Soon"])
+
+
+class RecordingsOverviewTests(unittest.TestCase):
+    NOW = 1_800_000_000.0
+
+    @staticmethod
+    def _row(title, status, start, stop, provider="primestreams", note=""):
+        return {"rec_id": title[:4], "title": title, "channel": "Ch", "stream_provider": provider,
+                "start_ts": start, "stop_ts": stop, "status": status, "failure_reason": note}
+
+    def test_rows_are_sorted_into_the_four_groups(self):
+        n = self.NOW
+        rows = [
+            self._row("Now", "recording", n - 600, n + 1800),
+            self._row("Finishing", "transferring", n - 4000, n - 100),
+            self._row("Later", "queued", n + 7200, n + 14400),
+            self._row("Soon", "scheduled (5m away)", n + 300, n + 3900),
+            self._row("Claimed", "agent_claimed", n + 100, n + 3700),
+            self._row("Good", "done", n - 7200, n - 3600),
+            self._row("Bad", "failed", n - 5000, n - 4000, note="Recording ended early"),
+        ]
+        d = server._group_recordings(rows, n)
+        self.assertEqual([r["title"] for r in d["recording"]], ["Now"])
+        self.assertEqual([r["title"] for r in d["finishing"]], ["Finishing"])
+        self.assertEqual([r["title"] for r in d["upcoming"]], ["Claimed", "Soon", "Later"])
+        self.assertEqual([r["title"] for r in d["recent"]], ["Good", "Bad"])   # newest first
+        self.assertEqual(d["upcoming_total"], 3)
+
+    def test_stale_rows_are_not_shown_as_running_or_coming_up(self):
+        n = self.NOW
+        rows = [
+            self._row("Zombie", "recording", n - 90000, n - 86000),   # stuck "recording" a day ago
+            self._row("Missed", "queued", n - 90000, n - 86000),      # queued in the past
+            self._row("OldDone", "done", n - 200000, n - 190000),     # finished days ago
+        ]
+        d = server._group_recordings(rows, n)
+        self.assertEqual((d["recording"], d["upcoming"], d["recent"]), ([], [], []))
+
+    def test_upcoming_is_limited_and_counted(self):
+        n = self.NOW
+        rows = [self._row(f"S{i:02d}", "queued", n + 100 * (i + 1), n + 100 * (i + 1) + 50) for i in range(30)]
+        d = server._group_recordings(rows, n, upcoming_limit=20)
+        self.assertEqual(len(d["upcoming"]), 20)
+        self.assertEqual(d["upcoming_total"], 30)
+
+    def test_endpoint_reads_the_recordings_table(self):
+        server._init_recordings_table()
+        now = time.time()
+        rec = {"title": "Overview Test Movie", "channel_id": "5", "channel": "SHO", "start_ts": now + 600,
+               "stop_ts": now + 4200, "status": "queued", "progress": 0, "log": [], "pid": None, "file": None,
+               "backend": "agent", "stream_id": "1", "stream_provider": "eaglecast", "stream_extension": "ts",
+               "episode_title": "", "season_num": None, "episode_num": None, "is_series": False,
+               "auto_upgrade": False}
+        server._db_upsert_rec("ovw12345", rec)
+        data = server.app.test_client().get("/epg-web/api/recordings/overview").get_json()
+        self.assertTrue(data["ok"])
+        titles = [r["title"] for r in data["upcoming"]]
+        self.assertIn("Overview Test Movie", titles)
+        item = next(r for r in data["upcoming"] if r["title"] == "Overview Test Movie")
+        self.assertEqual(item["provider"], "eaglecast")
+
+
+class VersionLabelTests(unittest.TestCase):
+    def test_version_is_v_date_letter(self):
+        import re as _re
+        self.assertRegex(server.VERSION, r"^v\d{8}[a-z]$")
+        import datetime as dt
+        dt.datetime.strptime(server.VERSION[1:9], "%Y%m%d")      # the date part is a real date
+
+    def test_the_header_shows_the_version(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn(server.VERSION, html)

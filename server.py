@@ -25,7 +25,9 @@ def _build_version():
         revision = ''
     return f"v20261106b{('-' + revision) if revision else ''}"
 
-VERSION = "v20261107j"
+# Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
+# (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
+VERSION = "v20261110a"
 
 app = Flask(__name__)
 
@@ -7192,6 +7194,61 @@ def api_record():
                     'overtime_cushion_minutes': overtime_cushion_seconds // 60,
                     'fallback_reason': stream_debug.get('fallback_reason', '')})
 
+_RECORDING_NOW_STATES = {'recording', 'preflight'}
+_RECORDING_FINISHING_STATES = {'converting', 'awaiting_transfer', 'transferring', 'copying'}
+_RECORDING_UPCOMING_STATES = {'queued', 'scheduled', 'agent_claimed', 'waiting'}
+_RECORDING_FINISHED_STATES = {'done', 'done_ts', 'failed', 'error', 'skipped_existing_better',
+                              'skipped_too_short', 'cancelled'}
+
+def _group_recordings(rows, now, upcoming_limit=20, recent_limit=8):
+    """Sort recording rows into what is recording now, finishing, coming up and recent.
+
+    A row stuck in "recording" long after it should have ended is not shown as running.
+    """
+    def item(row):
+        return {'id': row['rec_id'], 'title': row['title'], 'channel': row['channel'] or '',
+                'provider': row['stream_provider'] or 'primestreams',
+                'start_ts': row['start_ts'], 'stop_ts': row['stop_ts'],
+                'status': _rec_status_base(row['status']),
+                'note': row['failure_reason'] or ''}
+    recording, finishing, upcoming, recent = [], [], [], []
+    for row in rows:
+        entry = item(row)
+        state = entry['status']
+        stop = float(row['stop_ts'] or 0)
+        if state in _RECORDING_NOW_STATES and stop > now - 3 * 3600:
+            recording.append(entry)
+        elif state in _RECORDING_FINISHING_STATES and stop > now - 6 * 3600:
+            finishing.append(entry)
+        elif state in _RECORDING_UPCOMING_STATES and stop > now:
+            upcoming.append(entry)
+        elif state in _RECORDING_FINISHED_STATES and now - 12 * 3600 <= stop <= now + 60:
+            recent.append(entry)
+    recording.sort(key=lambda e: e['start_ts'])
+    finishing.sort(key=lambda e: e['stop_ts'])
+    upcoming.sort(key=lambda e: e['start_ts'])
+    recent.sort(key=lambda e: e['stop_ts'], reverse=True)
+    return {'now': now, 'recording': recording, 'finishing': finishing,
+            'upcoming': upcoming[:upcoming_limit], 'upcoming_total': len(upcoming),
+            'recent': recent[:recent_limit]}
+
+@app.route('/epg-web/api/recordings/overview')
+def api_recordings_overview():
+    """Everything the Recordings window needs in one call."""
+    now = time.time()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT rec_id, title, channel, stream_provider, start_ts, stop_ts, status, failure_reason '
+            'FROM recordings WHERE stop_ts > ?', (now - 12 * 3600,)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    data = _group_recordings(rows, now)
+    data['ok'] = True
+    return jsonify(data)
+
 @app.route('/epg-web/api/record/status')
 def api_rec_status():
     with _rec_lock:
@@ -7724,6 +7781,7 @@ tr:hover td{background:#141414;}
   <div class="spacer"></div>
   <button class="btn btn-ghost btn-sm" id="btn-refresh" onclick="loadGuide()">Refresh</button>
   <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">↻ Refresh Guide</button>
+  <button class="btn btn-ghost btn-sm" id="rec-window-btn" onclick="openRecWindow()" title="What is recording and what is coming up">⏺ Recordings</button>
   <button class="btn btn-ghost btn-sm" id="player-pref-btn" onclick="togglePlayerPref()" title="Where Play opens videos on this device">Player: VLC</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
@@ -10580,6 +10638,118 @@ function startRecPoll() {
   _recPoll = setInterval(updateRecPanel, 3000);
   updateRecPanel();
 }
+// ── Recordings window: recording now, coming up, recently finished ──────────
+let _recWindowTimer = null;
+function _recClock(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+}
+function _recDay(ts, now) {
+  const d = new Date(ts * 1000), today = new Date(now * 1000);
+  const days = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate())
+    - new Date(today.getFullYear(), today.getMonth(), today.getDate())) / 86400000);
+  if (days === 0) return 'Today';
+  if (days === 1) return 'Tomorrow';
+  return d.toLocaleDateString([], {weekday: 'short', month: 'short', day: 'numeric'});
+}
+function _recIn(seconds) {
+  const m = Math.max(0, Math.round(seconds / 60));
+  if (m < 60) return m + ' min';
+  const h = Math.floor(m / 60);
+  return h + ' h' + (m % 60 ? ' ' + (m % 60) + ' min' : '');
+}
+function _recBadge(provider) {
+  return provider === 'eaglecast'
+    ? '<span style="color:#fbbf24;font-size:11px;">🦅 EC</span>'
+    : '<span style="color:#60a5fa;font-size:11px;">PS</span>';
+}
+function renderRecWindow(d) {
+  const now = d.now;
+  const row = (inner) => '<div style="padding:8px 0;border-bottom:1px solid #1e293b;">' + inner + '</div>';
+  let html = '';
+  html += '<h4 style="margin:0 0 6px;color:#fca5a5;">🔴 Recording now</h4>';
+  if (!d.recording.length && !d.finishing.length) html += '<div style="color:#64748b;padding:6px 0;">Nothing is recording.</div>';
+  d.recording.forEach(r => {
+    const total = Math.max(1, r.stop_ts - r.start_ts);
+    const pct = Math.max(0, Math.min(100, Math.round((now - r.start_ts) / total * 100)));
+    html += row('<div style="display:flex;gap:8px;align-items:center;"><strong style="flex:1;">' + esc(r.title) + '</strong>'
+      + _recBadge(r.provider) + '<button class="btn btn-danger btn-sm" style="margin:0;" data-id="' + esc(r.id) + '" onclick="cancelRecFromWindow(this.dataset.id)">■ Stop</button></div>'
+      + '<div style="color:#94a3b8;font-size:12px;margin:3px 0;">' + esc(r.channel) + ' · started ' + _recClock(r.start_ts)
+      + ' · ends ' + _recClock(r.stop_ts) + ' · ' + _recIn(Math.max(0, r.stop_ts - now)) + ' left</div>'
+      + '<div style="background:#1e293b;border-radius:4px;height:6px;"><div style="background:#ef4444;width:' + pct + '%;height:6px;border-radius:4px;"></div></div>');
+  });
+  d.finishing.forEach(r => {
+    html += row('<strong>' + esc(r.title) + '</strong> <span style="color:#94a3b8;font-size:12px;">· ' + esc(r.status.replace('_', ' ')) + '</span>');
+  });
+  html += '<h4 style="margin:14px 0 6px;color:#93c5fd;">⏱ Coming up' + (d.upcoming_total ? ' (' + d.upcoming_total + ')' : '') + '</h4>';
+  if (!d.upcoming.length) html += '<div style="color:#64748b;padding:6px 0;">Nothing scheduled.</div>';
+  d.upcoming.forEach(r => {
+    html += row('<div style="display:flex;gap:8px;align-items:center;"><span style="width:130px;color:#cbd5e1;">' + _recDay(r.start_ts, now) + ' ' + _recClock(r.start_ts) + '</span>'
+      + '<strong style="flex:1;">' + esc(r.title) + '</strong>' + _recBadge(r.provider) + '</div>'
+      + '<div style="color:#94a3b8;font-size:12px;margin-left:138px;">' + esc(r.channel) + ' · in ' + _recIn(Math.max(0, r.start_ts - now)) + '</div>');
+  });
+  html += '<h4 style="margin:14px 0 6px;color:#86efac;">✔ Recently finished</h4>';
+  if (!d.recent.length) html += '<div style="color:#64748b;padding:6px 0;">Nothing in the last 12 hours.</div>';
+  d.recent.forEach(r => {
+    const good = r.status === 'done' || r.status === 'done_ts';
+    html += row('<div style="display:flex;gap:8px;"><span style="width:130px;color:#94a3b8;">' + _recDay(r.stop_ts, now) + ' ' + _recClock(r.stop_ts) + '</span>'
+      + '<strong style="flex:1;">' + esc(r.title) + '</strong><span style="color:' + (good ? '#86efac' : '#fca5a5') + ';font-size:12px;">'
+      + esc(r.status.replace(/_/g, ' ')) + '</span></div>'
+      + (!good && r.note ? '<div style="color:#94a3b8;font-size:12px;margin-left:138px;">' + esc(r.note.slice(0, 140)) + '</div>' : ''));
+  });
+  return html;
+}
+async function _fetchRecOverview() {
+  const r = await fetch('/epg-web/api/recordings/overview');
+  return r.json();
+}
+async function refreshRecBadge() {
+  const btn = document.getElementById('rec-window-btn');
+  if (!btn) return;
+  try {
+    const d = await _fetchRecOverview();
+    if (!d.ok) return;
+    const n = d.recording.length;
+    const next = d.upcoming[0];
+    btn.textContent = '⏺ ' + (n ? n + ' recording' : 'Recordings') + (next ? ' · next ' + _recClock(next.start_ts) : '');
+    btn.style.color = n ? '#fca5a5' : '';
+  } catch (e) { /* leave the label as it is */ }
+}
+async function refreshRecWindow() {
+  const body = document.getElementById('rec-window-body');
+  if (!body) return;
+  try {
+    const d = await _fetchRecOverview();
+    body.innerHTML = d.ok ? renderRecWindow(d) : '<div style="color:#fca5a5;">Could not load recordings: ' + esc(d.error || '') + '</div>';
+  } catch (e) { body.innerHTML = '<div style="color:#fca5a5;">Could not load recordings: ' + esc(e.message) + '</div>'; }
+}
+function closeRecWindow() {
+  const o = document.getElementById('rec-window');
+  if (o) o.remove();
+  if (_recWindowTimer) { clearInterval(_recWindowTimer); _recWindowTimer = null; }
+}
+function openRecWindow() {
+  closeRecWindow();
+  const o = document.createElement('div');
+  o.id = 'rec-window';
+  o.style.cssText = 'position:fixed;inset:0;z-index:100002;background:rgba(0,0,0,.7);display:flex;align-items:flex-start;justify-content:center;padding:40px 12px;overflow:auto;';
+  o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:760px;width:100%;padding:18px 22px;color:#e2e8f0;">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><h3 style="margin:0;">Recordings</h3>'
+    + '<button class="btn btn-ghost btn-sm" style="margin:0;" onclick="closeRecWindow()">✕ Close</button></div>'
+    + '<div id="rec-window-body" style="font-size:13px;">Loading…</div></div>';
+  o.onclick = e => { if (e.target === o) closeRecWindow(); };
+  document.body.appendChild(o);
+  refreshRecWindow();
+  _recWindowTimer = setInterval(refreshRecWindow, 10000);
+}
+async function cancelRecFromWindow(id) {
+  if (!confirm('Stop this recording?')) return;
+  await post('/epg-web/api/record/cancel', {id});
+  await refreshRecWindow();
+  refreshRecBadge();
+}
+setInterval(refreshRecBadge, 30000);
+refreshRecBadge();
+
 async function updateRecPanel() {
   const d = await (await fetch('/epg-web/api/record/status')).json();
   const recs = Object.entries(d.recordings || {});
