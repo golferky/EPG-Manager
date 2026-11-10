@@ -29,7 +29,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261110c"
+AGENT_VERSION = "v20261110d"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -245,6 +245,30 @@ def incomplete_for_scheduled_window(existing, start_ts, stop_ts):
     duration = float(existing.get('duration') or 0)
     scheduled = float(stop_ts or 0) - float(start_ts or 0)
     return scheduled >= 900 and duration > 0 and duration < scheduled * 0.80
+
+
+# A complete recording runs a little LONGER than its slot (it starts a few seconds
+# early and keeps a tail), so anything well short of the slot lost real content.
+SHORT_RECORDING_MIN_SECONDS = 180
+SHORT_RECORDING_FRACTION = 0.04
+
+
+def recording_missing_seconds(recorded, start_ts, stop_ts):
+    """Seconds of the scheduled slot that a fresh recording did not capture.
+
+    Returns 0 when the recording is complete enough.  This is stricter than
+    ``incomplete_for_scheduled_window`` (which allows 20% short, because it also
+    judges library files that may be edited versions): a recording is of the
+    very stream and slot we scheduled, so a hole of a few minutes means missing
+    scenes - for example the opening, after the provider cut the stream.
+    """
+    duration = float(recorded.get('duration') or 0)
+    scheduled = float(stop_ts or 0) - float(start_ts or 0)
+    if scheduled < 900 or duration <= 0:
+        return 0
+    missing = scheduled - duration
+    allowed = max(SHORT_RECORDING_MIN_SECONDS, scheduled * SHORT_RECORDING_FRACTION)
+    return missing if missing > allowed else 0
 
 
 def find_plex_candidates(plex_root, title):
@@ -862,11 +886,15 @@ def process_job(api, job, cfg):
     recorded_probe = probe_media(mp4_path, ffprobe=cfg['ffprobe'])
     # FFmpeg can exit successfully when a live HTTP source simply stops
     # sending data. Do not let a short fragment replace the Plex copy.
-    if incomplete_for_scheduled_window(recorded_probe, job['start_ts'], job['stop_ts']):
+    missing_seconds = recording_missing_seconds(recorded_probe, job['start_ts'], job['stop_ts'])
+    if missing_seconds or incomplete_for_scheduled_window(
+            recorded_probe, job['start_ts'], job['stop_ts']):
         expected_minutes = (job['stop_ts'] - job['start_ts']) / 60
         actual_minutes = recorded_probe['duration'] / 60
         message = (f'Recording ended early: {actual_minutes:.0f} min captured '
                    f'of {expected_minutes:.0f} min scheduled')
+        if missing_seconds:
+            message += f' (about {missing_seconds / 60:.0f} min missing)'
         quality.update({'decision': 'incomplete recording', 'recorded': recorded_probe})
         incomplete_path = None
         try:
