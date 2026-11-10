@@ -60,6 +60,19 @@ else
   echo "FAIL  boot hook /etc/config/autorun.sh differs from the backup"
   echo "      restore it:  cp -p $QDIR/$B/autorun.sh /etc/config/autorun.sh"
 fi
+up="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; now="$(date +%s)"
+if [ -n "$up" ] && [ -f boot.log ]; then
+  m="$(stat -c %Y boot.log 2>/dev/null)"
+  if [ -n "$m" ] && [ "$m" -ge $((now - up - 60)) ]; then
+    echo "PASS  boot hook ran after the last reboot (boot.log was written)"
+  else
+    echo "FAIL  boot.log is older than the last reboot - the boot hook did not run"
+    echo "      check QTS Control Panel > System > Hardware: run user defined processes at startup"
+  fi
+else
+  echo "FAIL  no boot.log - the boot hook has not run since it was set up (or since the QNAP rebooted)"
+  echo "      check QTS Control Panel > System > Hardware: run user defined processes at startup"
+fi
 [ -e /share/EPG-Manager ] && echo "PASS  shortcut /share/EPG-Manager exists" \
   || echo "WARN  shortcut /share/EPG-Manager is missing (scripts use the real path, so this is harmless)"
 echo "--- last lines of epg_server.log ---"
