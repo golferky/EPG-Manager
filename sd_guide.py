@@ -34,10 +34,13 @@ def get_token(username, password):
     """Return cached token or fetch a new one."""
     # Cache token for up to 23 hours
     if os.path.exists(SD_TOKEN_FILE):
-        with open(SD_TOKEN_FILE) as f:
-            cached = json.load(f)
-        if cached.get('expires', 0) > time.time():
-            return cached['token']
+        try:
+            with open(SD_TOKEN_FILE) as f:
+                cached = json.load(f)
+            if cached.get('expires', 0) > time.time():
+                return cached['token']
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass  # an unreadable or damaged cache is ignored; log in again below
 
     pw_hash = hashlib.sha1(password.encode()).hexdigest()
     resp    = _req('POST', '/token', {'username': username, 'password': pw_hash})
