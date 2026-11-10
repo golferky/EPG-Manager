@@ -52,12 +52,31 @@ class DatabaseLockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             db = os.path.join(temp, "guide.db")
             sd_guide.ensure_guide_db(db)
-            blocker = sqlite3.connect(db, isolation_level=None)
-            blocker.execute("BEGIN EXCLUSIVE")
-            release = threading.Timer(1.0, lambda: blocker.execute("COMMIT"))
-            release.start()
+            locked = threading.Event()
+
+            def hold_the_lock():
+                # SQLite connections belong to one thread: take and release the lock here.
+                conn = sqlite3.connect(db, isolation_level=None)
+                conn.execute("BEGIN EXCLUSIVE")
+                locked.set()
+                time.sleep(1.0)
+                conn.execute("COMMIT")
+                conn.close()
+
+            holder = threading.Thread(target=hold_the_lock)
+            holder.start()
+            self.assertTrue(locked.wait(5))
             started = time.time()
-            sd_guide.ensure_guide_db(db)          # the default 5 s wait would also pass; this
-            self.assertGreaterEqual(time.time() - started, 0.5)   # proves it actually waited
-            release.join()
-            blocker.close()
+            sd_guide.ensure_guide_db(db)            # must wait for the lock, not raise
+            self.assertGreaterEqual(time.time() - started, 0.5)
+            holder.join()
+
+    def test_every_database_connection_asks_for_a_long_wait(self):
+        import inspect
+        import re as _re
+        source = inspect.getsource(sd_guide)
+        calls = _re.findall(r"sqlite3\.connect\([^)]*\)", source)
+        self.assertGreaterEqual(len(calls), 2)
+        for call in calls:
+            match = _re.search(r"timeout\s*=\s*(\d+)", call)
+            self.assertTrue(match and int(match.group(1)) >= 60, call)
