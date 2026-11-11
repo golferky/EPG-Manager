@@ -1287,3 +1287,79 @@ class CleanedTitleTests(unittest.TestCase):
             root = self._library(temp)
             _rc, out = self._run(root, ["fix 2", "q"])
             self.assertIn("use set 2 YEAR", out)
+
+
+class RenameOnlyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_only", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    JUNK = "Bottle Shock 20260205 181000-Copy(1)"
+    JUNK2 = "Alien 20260101 090000 - Copy"
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in (self.JUNK, self.JUNK2, "Heat"):
+            (root / name).mkdir(parents=True)
+        return root
+
+    def _run(self, root, answers):
+        out = []
+        years = {"Bottle Shock": "2008", "Alien": "1979", "Heat": "1995"}
+        with mock.patch.object(self.tool, "suggest_year", side_effect=lambda s, n, k="": years.get(n, "")), \
+             mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            self.tool.main(["--movies", str(root), "--server", "http://x"])
+        return "\n".join(out)
+
+    def _names(self, root):
+        return sorted(p.name for p in root.iterdir())
+
+    def test_rename_only_leaves_every_junk_folder_alone_and_still_renames_the_rest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            out = self._run(root, ["rename only", "y"])
+            self.assertEqual(self._names(root), sorted([self.JUNK, self.JUNK2, "Heat (1995)"]))
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+            self.assertIn("2 junk-named folder(s) will be left alone", out)
+
+    def test_it_also_undoes_a_fix_chosen_earlier(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["fix all", "rename only", "y"])
+            self.assertIn(self.JUNK, self._names(root))
+            self.assertNotIn("Bottle Shock (2008)", self._names(root))
+
+    def test_the_one_word_spellings_work_too(self):
+        plan = self.tool.build_plan(["A 20260101 090000-Copy(1)"], {}, junk=["A 20260101 090000-Copy(1)"])
+        for text in ("renameonly", "rename-only", "Rename Only"):
+            for row in plan:
+                row["skip"] = False
+            self.tool.parse_command(text, plan)
+            self.assertTrue(plan[0]["skip"], text)
+
+    def test_with_no_junk_folders_it_says_so(self):
+        plan = self.tool.build_plan(["Heat"], {"Heat": "1995"})
+        action, message = self.tool.parse_command("rename only", plan)
+        self.assertEqual(action, "continue")
+        self.assertIn("no junk-named folders", message)
+
+    def test_plain_rename_with_something_else_is_not_mistaken_for_it(self):
+        plan = self.tool.build_plan(["A 20260101 090000-Copy(1)"], {}, junk=["A 20260101 090000-Copy(1)"])
+        action, message = self.tool.parse_command("rename", plan)
+        self.assertIn("Unknown command", message)
+        self.assertFalse(plan[0]["skip"])
+
+    def test_the_menu_mentions_it_only_when_there_are_junk_folders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self.assertIn("rename only", self._run(root, ["q"]))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "Movies"
+            (root / "Heat").mkdir(parents=True)
+            self.assertNotIn("rename only", self._run(root, ["q"]))
