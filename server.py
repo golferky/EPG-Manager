@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111i"
+VERSION = "v20261111j"
 
 app = Flask(__name__)
 
@@ -297,6 +297,15 @@ def _is_premium_channel(name):
 def _is_commercial_free_channel(name):
     """Channels we can reliably treat as commercial-free for movie recording."""
     return _is_premium_channel(name)
+
+
+def _is_rerecord_channel(name):
+    """May a film we already have be recorded again from this channel?
+
+    Only from a commercial-free channel that is not an explicitly non-English feed: a
+    second copy from an ad-supported or foreign channel is not wanted.
+    """
+    return _is_commercial_free_channel(name) and not _is_foreign_recording_feed(name)
 
 
 def _is_premium_movie_channel(name):
@@ -4710,7 +4719,7 @@ def _auto_schedule_movie_upgrades():
             # more than once (a remake, say), so such a title is left alone.
             row_year = _clean_year(row['year'])
             if (_upgrade_matches_plex(plex_index, title_key, row_year)
-                    and not _is_foreign_recording_feed(row['channel_name'])
+                    and _is_rerecord_channel(row['channel_name'])
                     and not _is_automatic_recording_quarantined_channel(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
                     and not _recent_same_source_failure(row['title'], row['channel_id'])):
@@ -4854,6 +4863,10 @@ def api_recommendations():
             # library is being renamed, a folder with no year still counts.
             in_shows = ((title_key, wanted_year) in plex_titles.get('show_versions', set()) or
                         title_key in plex_titles.get('unyearred_shows', set()))
+        if in_movies and not is_series_wanted:
+            # A film we already have is offered for recording again only from a
+            # commercial-free English channel.
+            airing = next((a for a in candidates if _is_rerecord_channel(a.get('channel'))), None)
         result.append({
             'id':         w['id'],
             'title':      w['title'],
@@ -4905,6 +4918,8 @@ def api_recommendation_movie_upgrade():
                 title, clean_title, datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
             )).fetchall()
         conn.close()
+        # Recording a film we already have again: only from a commercial-free English channel.
+        rows = [row for row in rows if _is_rerecord_channel(row['channel_name'])]
         candidate = next(iter(rows), None)
         if not candidate:
             return jsonify({'better': False, 'decision': 'No future airing found'})
@@ -11281,7 +11296,7 @@ async function loadRecs() {
         : r.in_plex
           ? (r.upgrade_scheduled
               ? `<span class="badge badge-record" title="A better commercial-free airing was found and scheduled automatically">✓ Upgrade scheduled</span>`
-              : `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>`)
+              : (a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing: ${esc(a.channel || '')}" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>` : ''))
           : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg},undefined,false,${yearArg})">⏱ Record</button>` : '');
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}

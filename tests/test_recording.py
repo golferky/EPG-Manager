@@ -1807,3 +1807,47 @@ class PrivateRecordingTests(unittest.TestCase):
         self.assertIn('id="pm-private"', server.HTML)
         self.assertIn("togglePrivateWanted", server.HTML)
         self.assertIn("/epg-web/api/wanted/private", server.HTML)
+
+
+class RerecordChannelTests(unittest.TestCase):
+    def test_only_commercial_free_english_channels_qualify(self):
+        ok = server._is_rerecord_channel
+        self.assertTrue(ok("HBO"))
+        self.assertTrue(ok("Showtime East HD"))
+        self.assertTrue(ok("MGM+ Hits HD"))
+        self.assertFalse(ok("ANTENNA TV"))                 # ad-supported
+        self.assertFalse(ok("Paramount Network HD"))       # ad-supported
+        self.assertFalse(ok("HBO Latino"))                 # premium, but a Spanish feed
+        self.assertFalse(ok("Showtime Español"))
+        self.assertFalse(ok(""))
+        self.assertFalse(ok(None))
+
+    def _recs(self, in_plex, airings):
+        wanted = [{"id": 1, "title": "Heat", "normalized_title": "heat", "year": "1995", "type": "movie",
+                   "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        far = time.time() + 86400
+        progs = [dict(title="Heat", channel_id="c", channel=channel, stop_ts=far + 7200, start_ts=far + shift, start_fmt="")
+                 for shift, channel in airings]
+        key = server._norm_plex_show("Heat")
+        index = {"movies": {key} if in_plex else set(), "movie_versions": {(key, "1995")} if in_plex else set(),
+                 "unyearred_movies": set(), "shows": set(), "movie_counts": {}, "show_versions": set(),
+                 "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": progs}):
+            data = server.app.test_client().get("/epg-web/api/recommendations").get_json()
+        return data["recommendations"][0]["next_airing"]
+
+    def test_a_film_we_have_is_offered_again_only_from_a_commercial_free_english_channel(self):
+        airing = self._recs(True, [(0, "ANTENNA TV"), (60, "HBO Latino"), (120, "HBO")])
+        self.assertEqual(airing["channel"], "HBO")
+
+    def test_a_film_we_have_gets_no_offer_when_only_ad_supported_airings_exist(self):
+        self.assertIsNone(self._recs(True, [(0, "ANTENNA TV"), (60, "Paramount Network HD")]))
+
+    def test_a_film_we_do_not_have_is_still_offered_from_any_airing(self):
+        airing = self._recs(False, [(0, "ANTENNA TV"), (120, "HBO")])
+        self.assertEqual(airing["channel"], "ANTENNA TV")
+
+    def test_the_page_only_shows_check_upgrade_when_there_is_an_airing(self):
+        self.assertIn('(a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing', server.HTML)
