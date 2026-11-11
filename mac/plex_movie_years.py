@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Give every Plex movie folder a year:  Title  ->  Title (2004).
+"""Give every Plex movie (or TV show) folder a year:  Title  ->  Title (2004).
 
-Run on the Mac mini:   python3 ~/EPG-Manager/mac/plex_movie_years.py
+Run on the Mac mini:
+    python3 ~/EPG-Manager/mac/plex_movie_years.py          movies
+    python3 ~/EPG-Manager/mac/plex_tv_years.py             TV shows (same tool, --tv)
 Add --dry-run to see what it would ask without renaming anything.
 
-For each movie folder with no (YYYY) it shows a year suggested by the dashboard's
-film lookup.  The lookup goes by title, so for two films with one title it can
-suggest the wrong one: you decide each time.
+For each folder with no (YYYY) it shows a year suggested by the dashboard's lookup
+(a show's first year for TV).  The lookup goes by title, so for two films or shows
+with one title it can suggest the wrong one: you decide each time.
+
+It will not run while the recorder is copying a file into the library, and it never
+overwrites an existing folder.  Folders starting with _ (such as _Needs Episode Info)
+are left alone.  Plex sees a renamed folder as a new item, so watched marks and
+ratings for that title can be lost: rename titles you care about last, or skip them.
     Enter       accept the suggestion
     2004        type the year instead
     s           skip this one
@@ -60,33 +67,60 @@ def rename_with_year(movies_dir, name, year):
     return new_name
 
 
-def load_defaults(config_path):
+def load_defaults(config_path, tv=False):
+    """(library folder, dashboard address) from the recorder's config."""
     try:
         with open(os.path.expanduser(config_path), encoding='utf-8') as handle:
             cfg = json.load(handle)
     except (OSError, ValueError):
         return '', ''
-    return cfg.get('plex_path', ''), cfg.get('server_url', '')
+    folder = cfg.get('plex_tv_path', '') if tv else cfg.get('plex_path', '')
+    return folder, cfg.get('server_url', '')
+
+
+def recorder_copying(server):
+    """Titles the recorder is converting or copying into the library right now.
+
+    Renaming a folder under a copy in progress could send the file to the wrong place.
+    Returns [] when nothing is copying, or when the dashboard cannot be asked.
+    """
+    if not server:
+        return []
+    url = server.rstrip('/') + '/epg-web/api/recordings/overview'
+    try:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            data = json.load(response)
+    except (OSError, ValueError, urllib.error.URLError):
+        return []
+    return [str(item.get('title', '')) for item in data.get('finishing', [])]
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', default='~/EPG-Manager/recording_agent.json')
-    parser.add_argument('--movies', help='Plex Movies folder (default: plex_path from the recorder config)')
+    parser.add_argument('--tv', action='store_true', help='work on TV shows instead of movies')
+    parser.add_argument('--movies', help='library folder (default: plex_path, or plex_tv_path with --tv, from the recorder config)')
     parser.add_argument('--server', help='dashboard address (default: server_url from the recorder config)')
     parser.add_argument('--dry-run', action='store_true', help='ask and show, but rename nothing')
     args = parser.parse_args(argv)
-    default_movies, default_server = load_defaults(args.config)
+    default_movies, default_server = load_defaults(args.config, args.tv)
     movies_dir = args.movies or default_movies
     server = args.server or default_server
+    kind = 'TV show' if args.tv else 'movie'
     if not movies_dir or not os.path.isdir(movies_dir):
-        print(f'Cannot open the Movies folder ({movies_dir or "not set"}). Is the Plex share mounted?')
+        print(f'Cannot open the {kind} folder ({movies_dir or "not set"}). Is the Plex share mounted?')
         return 1
     todo = yearless_folders(movies_dir)
     if not todo:
-        print('Every movie folder already has a year.')
+        print(f'Every {kind} folder already has a year.')
         return 0
-    print(f'{len(todo)} movie folder(s) have no year in {movies_dir}\n')
+    if not args.dry_run:
+        copying = recorder_copying(server)
+        if copying:
+            print('The recorder is copying into the library right now (' + ', '.join(copying) +
+                  '). Run this again when it has finished.')
+            return 1
+    print(f'{len(todo)} {kind} folder(s) have no year in {movies_dir}\n')
     renamed = skipped = 0
     for name in todo:
         suggestion = suggest_year(server, name) if server else ''
@@ -116,7 +150,7 @@ def main(argv=None):
             print(f'  Renamed to "{new_name}"')
             renamed += 1
             break
-    print(f'\nDone. Renamed {renamed}, skipped {skipped}. Scan the Movies library in Plex to pick up the new names.')
+    print(f'\nDone. Renamed {renamed}, skipped {skipped}. Scan the {"TV Shows" if args.tv else "Movies"} library in Plex to pick up the new names.')
     return 0
 
 
