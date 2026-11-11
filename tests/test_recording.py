@@ -1348,3 +1348,178 @@ class SeriesYearTests(unittest.TestCase):
             self.assertEqual(server._wanted_series_year("Perry Mason"), "")
         with mock.patch.object(server, "db_rows", side_effect=RuntimeError("db")):
             self.assertEqual(server._wanted_series_year("Perry Mason"), "")
+
+
+class GuideYearRecordingTests(unittest.TestCase):
+    CHANNEL = "yr-chan-1"
+
+    def setUp(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._rec_cancel_events.clear()
+        server._init_recordings_table()
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("DELETE FROM guide WHERE channel_id IN (?, ?)", (self.CHANNEL, "yr-sd-1"))
+        conn.execute("DELETE FROM recordings")
+        conn.commit()
+        conn.close()
+        self.start = time.time() + 7200
+        self.start_key = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.start))
+        self.end_key = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.start + 6000))
+
+    def _guide(self, title, year, channel=None, shift=0):
+        key = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.start + shift))
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category, prog_type, year) "
+                     "VALUES (?,?,?,?,?,?,?,?,?)",
+                     (title, channel or self.CHANNEL, "Chan", key, self.end_key, "", "", "MV", year))
+        conn.commit()
+        conn.close()
+
+    def _record(self, **extra):
+        body = {"title": "Year Film", "channel_id": self.CHANNEL, "channel_name": "Chan",
+                "start_ts": self.start, "stop_ts": self.start + 6000}
+        body.update(extra)
+        with mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source",
+                               return_value=("http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"})):
+            return server.app.test_client().post("/epg-web/api/record", json=body)
+
+    def _saved_year(self):
+        conn = sqlite3.connect(server._guide_db_path())
+        row = conn.execute("SELECT year FROM recordings ORDER BY created_at DESC LIMIT 1").fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def test_the_guide_year_is_found_for_the_airing(self):
+        self._guide("Year Film", "2004")
+        found = server._guide_year_for_airing(server._guide_db_path(), self.CHANNEL, "Year Film", self.start)
+        self.assertEqual(found, "2004")
+
+    def test_the_year_is_found_from_another_channel_within_15_minutes(self):
+        self._guide("Year Film", "2004", channel="yr-sd-1", shift=300)
+        found = server._guide_year_for_airing(server._guide_db_path(), self.CHANNEL, "Year Film", self.start)
+        self.assertEqual(found, "2004")
+        far = server._guide_year_for_airing(server._guide_db_path(), self.CHANNEL, "Year Film", self.start + 7200)
+        self.assertEqual(far, "")
+
+    def test_two_different_years_nearby_is_a_guess_so_blank(self):
+        self._guide("Year Film", "2004", channel="yr-sd-1")
+        self._guide("Year Film", "2022", channel="yr-sd-2")
+        found = server._guide_year_for_airing(server._guide_db_path(), "elsewhere", "Year Film", self.start)
+        self.assertEqual(found, "")
+
+    def test_an_airing_of_a_different_film_is_refused(self):
+        self._guide("Year Film", "2022")
+        resp = self._record(year="2004")
+        self.assertEqual(resp.status_code, 409)
+        data = resp.get_json()
+        self.assertTrue(data["year_mismatch"])
+        self.assertIn("2022", data["error"])
+        self.assertIsNone(self._saved_year())
+
+    def test_the_matching_year_is_recorded(self):
+        self._guide("Year Film", "2004")
+        resp = self._record(year="2004")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._saved_year(), "2004")
+
+    def test_the_guide_year_is_used_when_the_caller_sends_none(self):
+        self._guide("Year Film", "2004")
+        self.assertEqual(self._record().status_code, 200)
+        self.assertEqual(self._saved_year(), "2004")
+
+    def test_no_guide_year_and_none_sent_still_records_without_a_year(self):
+        self.assertEqual(self._record().status_code, 200)
+        self.assertEqual(self._saved_year(), "")
+
+    def test_a_caller_year_is_kept_when_the_guide_has_none(self):
+        self.assertEqual(self._record(year="2004").status_code, 200)
+        self.assertEqual(self._saved_year(), "2004")
+
+
+class GuideYearLoadTests(unittest.TestCase):
+    def _programmes(self, rows):
+        db = os.path.join(TEST_DATA_DIR, "guide.db")
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM guide WHERE channel_id LIKE 'ld-%'")
+        for title, channel, start, year, ptype in rows:
+            conn.execute("INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category, prog_type, year) "
+                         "VALUES (?,?,?,?,?,?,?,?,?)", (title, channel, channel, start, "20990101020000", "", "", ptype, year))
+        conn.commit()
+        conn.close()
+        server.load_epg_from_db(db)
+        return {(p["channel_id"]): p for p in server._epg["programmes"] if p["channel_id"].startswith("ld-")}
+
+    def test_the_sd_year_reaches_the_provider_listing_of_the_same_film(self):
+        progs = self._programmes([
+            ("Employee of the Month", "ld-sd", "20990101000000", "2004", "MV"),
+            ("Employee of the Month", "ld-provider", "20990101000500", "", ""),
+        ])
+        self.assertEqual(progs["ld-sd"]["year"], "2004")
+        self.assertEqual(progs["ld-provider"]["year"], "2004")
+
+    def test_a_listing_with_no_matching_year_stays_blank(self):
+        progs = self._programmes([
+            ("Employee of the Month", "ld-sd", "20990101000000", "2004", "MV"),
+            ("Employee of the Month", "ld-provider", "20990101040000", "", ""),
+        ])
+        self.assertEqual(progs["ld-provider"]["year"], "")
+
+    def test_two_films_in_one_window_are_not_guessed(self):
+        progs = self._programmes([
+            ("Employee of the Month", "ld-sd1", "20990101000000", "2004", "MV"),
+            ("Employee of the Month", "ld-sd2", "20990101000600", "2022", "MV"),
+            ("Employee of the Month", "ld-provider", "20990101000300", "", ""),
+        ])
+        self.assertEqual(progs["ld-provider"]["year"], "")
+
+
+class UpgradeYearGateTests(unittest.TestCase):
+    INDEX = {"movies": {"employeeofthemonth", "heat"},
+             "movie_versions": {("employeeofthemonth", "2022"), ("heat", "1995")},
+             "movie_counts": {"employeeofthemonth": 1, "heat": 2}}
+
+    def test_a_known_year_must_match_the_plex_folder_year(self):
+        gate = server._upgrade_matches_plex
+        self.assertTrue(gate(self.INDEX, "employeeofthemonth", "2022"))
+        self.assertFalse(gate(self.INDEX, "employeeofthemonth", "2004"))      # the remake is not an upgrade
+        self.assertTrue(gate(self.INDEX, "heat", "1995"))                     # two copies, but the year picks one
+
+    def test_with_no_year_a_title_held_once_is_matched(self):
+        self.assertTrue(server._upgrade_matches_plex(self.INDEX, "employeeofthemonth", ""))
+
+    def test_with_no_year_a_title_held_twice_is_left_alone(self):
+        self.assertFalse(server._upgrade_matches_plex(self.INDEX, "heat", ""))
+
+    def test_a_title_not_in_plex_is_never_matched(self):
+        self.assertFalse(server._upgrade_matches_plex(self.INDEX, "unknown", ""))
+        self.assertFalse(server._upgrade_matches_plex(self.INDEX, "unknown", "2004"))
+
+
+class RecommendationAiringYearTests(unittest.TestCase):
+    def _recs(self, wanted_year, airings):
+        wanted = [{"id": 1, "title": "Employee of the Month", "normalized_title": "employee of the month",
+                   "year": wanted_year, "type": "movie", "status": "wanted", "notes": "", "source": "imdb",
+                   "imdb_id": "", "updated_at": ""}]
+        far = time.time() + 86400
+        progs = [dict(title="Employee of the Month", channel_id="c", stop_ts=far + 7200, start_ts=far + shift,
+                      channel="Chan", start_fmt="", **extra) for shift, extra in airings]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": progs}):
+            data = server.app.test_client().get("/epg-web/api/recommendations").get_json()
+        return data["recommendations"][0]["next_airing"]
+
+    def test_an_airing_of_another_year_is_not_offered(self):
+        self.assertIsNone(self._recs("2004", [(0, {"year": "2022"})]))
+
+    def test_the_matching_year_is_offered(self):
+        airing = self._recs("2004", [(0, {"year": "2022"}), (3600, {"year": "2004"})])
+        self.assertEqual(airing["year"], "2004")
+
+    def test_an_airing_with_no_year_is_still_offered(self):
+        airing = self._recs("2004", [(0, {"year": ""})])
+        self.assertIsNotNone(airing)
