@@ -27,7 +27,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111d"
+VERSION = "v20261111e"
 
 app = Flask(__name__)
 
@@ -78,7 +78,8 @@ def _bootstrap():
                 if 'duplicate column name' not in str(_e).lower():
                     raise
         # Migrate guide table — add episode columns if missing (safe no-op if already present)
-        for _col, _typedef in [('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'), ('prog_type', 'TEXT')]:
+        for _col, _typedef in [('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'), ('prog_type', 'TEXT'),
+                               ('year', 'TEXT'), ('program_id', 'TEXT')]:
             try:
                 _c.execute(f'ALTER TABLE guide ADD COLUMN {_col} {_typedef}')
             except Exception:
@@ -1184,8 +1185,10 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
         channels.append({'id': cid, 'name': name, 'icon': icon})
         channel_map[cid] = name
 
+    has_year = any(r[1] == 'year' for r in conn.execute('PRAGMA table_info(guide)'))
     query = ('SELECT title, channel_id, channel_name, start_utc, end_utc, desc, category, '
-             'episode_title, season_num, episode_num, prog_type FROM guide')
+             'episode_title, season_num, episode_num, prog_type'
+             + (', year' if has_year else '') + ' FROM guide')
     params = ()
     where = ''
     if window_start is not None and window_hours:
@@ -1235,6 +1238,7 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
             'season_num':    row['season_num'],
             'episode_num':   row['episode_num'],
             'prog_type':     row['prog_type'] or '',
+            'year':          (row['year'] or '') if has_year else '',
         })
         if progress and len(programmes) % 25000 == 0:
             progress('Reading guide listings', len(programmes), total)
@@ -1294,7 +1298,23 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
                         p['episode_num']   = ep['en']
                         p['episode_title'] = ep['et']
                         filled_ep += 1
-    print(f'[startup] Propagated prog_type={filled_pt}, episode info={filled_ep} XMLTV programmes')
+    # A film's year is on the Schedules Direct listing only.  Give the same film's provider
+    # listings that year too, matching by title and a start time within 15 minutes.
+    title_years = {}
+    for p in programmes:
+        if p.get('year'):
+            title_years.setdefault(p['title'], []).append((p['start_ts'], p['year']))
+    filled_year = 0
+    for p in programmes:
+        if p.get('year') or p['title'] not in title_years or p['prog_type'] not in ('MV', ''):
+            continue
+        near = [(abs(ts - p['start_ts']), y) for ts, y in title_years[p['title']]
+                if abs(ts - p['start_ts']) <= TOLERANCE]
+        years = {y for _d, y in near}
+        if len(years) == 1:        # two years inside the window would be a guess: leave it blank
+            p['year'] = years.pop()
+            filled_year += 1
+    print(f'[startup] Propagated prog_type={filled_pt}, episode info={filled_ep}, year={filled_year} XMLTV programmes')
 
     _epg['channels']    = channels
     _epg['channel_map'] = channel_map
@@ -2882,6 +2902,7 @@ def api_guide():
             'season_num':    p.get('season_num'),
             'episode_num':   p.get('episode_num'),
             'prog_type':     p.get('prog_type', ''),
+            'year':          p.get('year', ''),
         })
 
     # Deduplicate channels with the same name — merge SD + primestreams rows into one
@@ -4606,6 +4627,19 @@ def api_post_schedule():
 
     return jsonify({'error': 'Unknown action'}), 400
 
+def _upgrade_matches_plex(plex_index, title_key, airing_year):
+    """Is this airing safely the same film as a Plex copy, for an automatic upgrade?
+
+    With the airing's year known, only the Plex folder for that year is a match.  With no
+    year, the title must be in Plex exactly once: if Plex holds it more than once (a
+    remake, say) the airing cannot be matched to one film.
+    """
+    if airing_year:
+        return (title_key, airing_year) in plex_index.get('movie_versions', set())
+    return (title_key in plex_index.get('movies', set())
+            and plex_index.get('movie_counts', {}).get(title_key, 0) == 1)
+
+
 def _auto_schedule_movie_upgrades():
     """Queue a few clearly higher-resolution clean-airing Plex replacements.
 
@@ -4630,22 +4664,24 @@ def _auto_schedule_movie_upgrades():
         conn.row_factory = sqlite3.Row
         now_key = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
         until_key = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y%m%d%H%M%S')
-        rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc
+        rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc,
+                COALESCE(year, '') AS year
             FROM guide WHERE prog_type='MV' AND start_utc>? AND start_utc<?
             ORDER BY start_utc''', (now_key, until_key)).fetchall()
         reliability = _channel_recording_reliability()
         candidates_by_title = {}
         for row in rows:
             title_key = _norm_plex_show(row['title'])
-            # A guide airing carries no year.  If Plex holds the title more than once
-            # (a remake, say) the airing cannot be matched to one copy, so leave it alone.
-            if (title_key in plex_movies
-                    and plex_index.get('movie_counts', {}).get(title_key, 0) == 1
+            # With the airing's year known, only the Plex folder for THAT year is a match.
+            # With no year, the airing cannot be matched to one film if Plex holds the title
+            # more than once (a remake, say), so such a title is left alone.
+            row_year = _clean_year(row['year'])
+            if (_upgrade_matches_plex(plex_index, title_key, row_year)
                     and not _is_foreign_recording_feed(row['channel_name'])
                     and not _is_automatic_recording_quarantined_channel(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
                     and not _recent_same_source_failure(row['title'], row['channel_id'])):
-                candidates_by_title.setdefault(title_key, []).append(row)
+                candidates_by_title.setdefault((title_key, row_year), []).append(row)
         with _rec_lock:
             active_auto_upgrades = sum(
                 1 for rec in _recs.values()
@@ -4653,7 +4689,7 @@ def _auto_schedule_movie_upgrades():
             )
         slots_remaining = max(0, 2 - active_auto_upgrades)
         upgrade_options = []
-        for title_key, airings in candidates_by_title.items():
+        for (title_key, row_year), airings in candidates_by_title.items():
             title = airings[0]['title']
             # Do not schedule a duplicate if this guide refresh is repeated.
             with _rec_lock:
@@ -4661,8 +4697,8 @@ def _auto_schedule_movie_upgrades():
                        for r in _recs.values()):
                     continue
             _existing_path, existing = best_existing_copy(
-                find_plex_candidates(movie_root, title), cfg.get('ffprobe', 'ffprobe'))
-            existing_year = _plex_title_and_year(os.path.basename(os.path.dirname(str(_existing_path or ''))))[1]
+                find_plex_candidates(movie_root, title, row_year), cfg.get('ffprobe', 'ffprobe'))
+            existing_year = row_year or _plex_title_and_year(os.path.basename(os.path.dirname(str(_existing_path or ''))))[1]
             if not existing:
                 continue
             # A title can have several simultaneous guide listings: an SD
@@ -4765,6 +4801,10 @@ def api_recommendations():
         candidates = (future_airings.get(w['title'].lower()) or
                       future_airings.get(w['normalized_title'].lower() if w['normalized_title'] else '') or [])
         is_series_wanted = w['type'] == 'series'
+        wanted_year_now = _clean_year(w['year'])
+        if wanted_year_now and not is_series_wanted:
+            # An airing the guide says is another film (a remake) is not this film's airing.
+            candidates = [a for a in candidates if not a.get('year') or a.get('year') == wanted_year_now]
         airing = next(iter(candidates), None)
         title_key = _norm_plex_show(w['title'])
         wanted_year = str(w['year'] or '').strip()
@@ -7039,6 +7079,33 @@ def _recording_slot_conflicts(recs, start_ts, stop_ts, limit):
             peak, busiest = len(running), running
     return busiest if peak >= limit else []
 
+def _guide_year_for_airing(guide_db, channel_id, title, start_ts):
+    """The year the guide gives this airing, or '' if it gives none or is not sure.
+
+    Looks at this channel first, then the same title on any channel starting within
+    15 minutes (the year is on the Schedules Direct listing, the recording is usually
+    made from a provider channel).  Two different years in that window means a guess,
+    so the answer is blank.
+    """
+    try:
+        centre = datetime.fromtimestamp(float(start_ts), timezone.utc)
+        lower = (centre - timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+        upper = (centre + timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+        conn = sqlite3.connect(guide_db, timeout=10)
+        try:
+            rows = conn.execute('''SELECT year, channel_id FROM guide
+                                   WHERE lower(title)=lower(?) AND start_utc BETWEEN ? AND ?
+                                     AND year IS NOT NULL AND year != \'\'''', (title, lower, upper)).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError, TypeError):
+        return ''
+    here = {_clean_year(y) for y, cid in rows if str(cid) == str(channel_id)} - {''}
+    if len(here) == 1:
+        return here.pop()
+    anywhere = {_clean_year(y) for y, _cid in rows} - {''}
+    return anywhere.pop() if len(anywhere) == 1 else ''
+
 @app.route('/epg-web/api/record', methods=['POST'])
 def api_record():
     data       = request.json or {}
@@ -7170,6 +7237,15 @@ def api_record():
     is_sports_request = is_sports_request or _is_sports_guide_airing(
         channel_id, start_ts, title, guide_db
     )
+    # The film's year: the one the caller chose, checked against the guide's own year for
+    # this airing.  Two films can share a title, so a mismatch is refused, not guessed at.
+    requested_year = _clean_year(data.get('year'))
+    guide_year = _guide_year_for_airing(guide_db, channel_id, title, start_ts)
+    if requested_year and guide_year and requested_year != guide_year:
+        return jsonify({
+            'ok': False, 'year_mismatch': True, 'guide_year': guide_year,
+            'error': (f'This airing of "{title}" is the {guide_year} film, not the {requested_year} one. '
+                      'It was not scheduled.')}), 409
     guide_stop_ts = stop_ts
     overtime_cushion_seconds = SPORTS_OVERTIME_CUSHION_SECONDS if is_sports_request else 0
     if overtime_cushion_seconds:
@@ -7216,7 +7292,7 @@ def api_record():
         'episode_num': episode_num,
         'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
-        'year': _clean_year(data.get('year')) or (_wanted_series_year(title) if is_series_request else ''),
+        'year': requested_year or guide_year or (_wanted_series_year(title) if is_series_request else ''),
     }
     _url, stream_error, stream_debug = _resolve_recording_source(
         channel_id, start_ts, stop_ts, preferred_provider=requested_provider)
@@ -9107,7 +9183,7 @@ async function quickRecord(key, btnEl) {
 async function replacePlexCopy() {
   const p = _currentProg;
   if (!p || !p.title) return;
-  const year = String((_currentInfoYear || p.year || '')).slice(0, 4);
+  const year = String((p.year || _currentInfoYear || '')).slice(0, 4);
   const ok = confirm('Move the Plex copy of "' + p.title + '" aside and record a fresh one?\\n\\n'
     + 'The files are moved to a _wrong_movies folder, not deleted.');
   if (!ok) return;
@@ -9487,7 +9563,8 @@ function renderGuide() {
       const width  = Math.max(2, (pEnd - pStart) / 60 * PX_PER_MIN - 2);
       const isNow  = p.start_ts <= nowTs && p.stop_ts > nowTs;
       const pd = JSON.stringify(p).replace(/'/g, "\\'");
-      const hasPlex   = _plexTitles.has(_plexNorm(p.title));
+      // With the airing's year known, only a Plex copy of that year counts.
+      const hasPlex   = p.year ? _plexHasMovie(p.title, p.year) : _plexTitles.has(_plexNorm(p.title));
       const plexEpisodeKey = (p.season_num != null && p.episode_num != null)
         ? `${_normTitle(p.title).replace(/\s/g,'')}|${p.season_num}|${p.episode_num}` : '';
       const hasPlexEpisode = !!plexEpisodeKey && _plexEpisodes.has(plexEpisodeKey);
@@ -9889,11 +9966,11 @@ async function openProg(p) {
   } else { imdbLink.style.display = 'none'; }
 
   const libBadge = document.getElementById('pm-library-badge');
-  if (_plexHasMovie(p.title, info.year || p.year)) {
+  if (_plexHasMovie(p.title, p.year || info.year)) {
     libBadge.textContent = '▶ IN PLEX';
     libBadge.style.background = '#2d1f5e'; libBadge.style.color = '#a78bfa';
     libBadge.style.display = '';
-  } else if (_plexYearUnknown(p.title, info.year || p.year)) {
+  } else if (_plexYearUnknown(p.title, p.year || info.year)) {
     libBadge.textContent = '▶ Plex has this title, year not in its folder name';
     libBadge.style.background = '#3a3a3a'; libBadge.style.color = '#cbd5e1';
     libBadge.style.display = '';
@@ -9947,13 +10024,13 @@ async function openProg(p) {
   // Plex file info
   const plexWrap = document.getElementById('pm-plex-wrap');
   plexWrap.style.display = 'none';
-  _currentInfoYear = info.year || p.year || '';
-  if (_plexHasMovie(p.title, info.year || p.year)) {
+  _currentInfoYear = p.year || info.year || '';
+  if (_plexHasMovie(p.title, p.year || info.year)) {
     plexWrap.style.display = 'block';
     document.getElementById('pm-plex-info').textContent = 'Plex copy found';
     // File probing can take several seconds on the NAS.  It is display-only,
     // so do not hold up the live Play/Record controls for it.
-    fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}&year=${encodeURIComponent(String(info.year || p.year || '').slice(0, 4))}`).then(async pr => {
+    fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}&year=${encodeURIComponent(String(p.year || info.year || '').slice(0, 4))}`).then(async pr => {
       const pi = await pr.json();
       if (pi.found) {
         const parts = [];

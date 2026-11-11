@@ -4,6 +4,7 @@ Schedules Direct guide fetcher.
 Pulls up to 14 days of TV listings and stores them in guide.db.
 """
 
+import re
 import hashlib, json, os, sqlite3, time
 from datetime import datetime, timezone, timedelta
 from urllib import request as urlreq, error as urlerr
@@ -12,6 +13,17 @@ SD_BASE  = 'https://json.schedulesdirect.org/20141201'
 SD_TOKEN_FILE = os.path.join(os.path.dirname(__file__), 'sd_token.json')
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def program_year(program):
+    """The year Schedules Direct gives a film (its ``movie`` block), or '' when it has none.
+
+    Two films can share a title (a remake), so the year is what tells them apart.
+    """
+    movie = program.get('movie') if isinstance(program, dict) else None
+    year = movie.get('year') if isinstance(movie, dict) else ''
+    match = re.search(r'\b(19\d{2}|20\d{2})\b', str(year or ''))
+    return match.group(1) if match else ''
+
 
 def _req(method, path, body=None, token=None):
     url = SD_BASE + path
@@ -73,7 +85,8 @@ def ensure_guide_db(db_path):
         )
     ''')
     # Migrate existing DBs — safe: ADD COLUMN is a no-op if column already exists
-    for col, typedef in [('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'), ('prog_type', 'TEXT')]:
+    for col, typedef in [('episode_title', 'TEXT'), ('season_num', 'INTEGER'), ('episode_num', 'INTEGER'), ('prog_type', 'TEXT'),
+                         ('year', 'TEXT'), ('program_id', 'TEXT')]:
         try:
             conn.execute(f'ALTER TABLE guide ADD COLUMN {col} {typedef}')
         except Exception:
@@ -135,17 +148,18 @@ def write_listings(conn, station_ids, schedule_data, prog_details, station_map,
                 detail['title'], sid, ch_name, start_utc, end_utc,
                 detail['desc'], detail['category'],
                 detail.get('episode_title', ''), detail.get('season_num'),
-                detail.get('episode_num'), detail.get('prog_type', '')))
+                detail.get('episode_num'), detail.get('prog_type', ''),
+                detail.get('year', ''), detail.get('program_id', '')))
 
     insert_sql = '''
         INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category,
-                          episode_title, season_num, episode_num, prog_type)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                          episode_title, season_num, episode_num, prog_type, year, program_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(channel_id, start_utc, title) DO UPDATE SET
             desc=excluded.desc, category=excluded.category,
             episode_title=excluded.episode_title,
             season_num=excluded.season_num, episode_num=excluded.episode_num,
-            prog_type=excluded.prog_type
+            prog_type=excluded.prog_type, year=excluded.year, program_id=excluded.program_id
     '''
     inserted = removed = 0
     for offset in range(0, len(station_ids), STATION_GROUP):
@@ -301,7 +315,7 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
             prog_type  = pid[:2] if len(pid) >= 2 else ''  # MV/EP/SH/SP/DD
             prog_details[pid] = {'title': title, 'category': cat, 'desc': desc,
                                  'episode_title': ep_title, 'season_num': season_num, 'episode_num': ep_num,
-                                 'prog_type': prog_type}
+                                 'prog_type': prog_type, 'year': program_year(p), 'program_id': pid}
 
     # 7. Insert into guide.db
     log('Writing to guide.db…')

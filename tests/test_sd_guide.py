@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -196,3 +197,39 @@ class WriteListingsTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             sd_guide._retry_locked(action, attempts=5, pause=0)
         self.assertEqual(len(calls), 1)
+
+
+class GuideYearTests(unittest.TestCase):
+    def test_program_year_reads_the_movie_block(self):
+        self.assertEqual(sd_guide.program_year({"movie": {"year": "2004"}}), "2004")
+        self.assertEqual(sd_guide.program_year({"movie": {"year": 2022}}), "2022")
+        self.assertEqual(sd_guide.program_year({}), "")
+        self.assertEqual(sd_guide.program_year({"movie": None}), "")
+        self.assertEqual(sd_guide.program_year({"movie": {"year": "n/a"}}), "")
+
+    def test_year_and_program_id_are_saved_with_the_listing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = os.path.join(temp, "guide.db")
+            sd_guide.ensure_guide_db(db)
+            conn = sqlite3.connect(db)
+            airing = {"stationID": "S1", "start": "2026-11-12T20:00:00Z", "duration": 6000}
+            detail = {"title": "Employee of the Month", "category": "", "desc": "", "prog_type": "MV",
+                      "year": "2004", "program_id": "MV000000050000"}
+            sd_guide.write_listings(conn, ["S1"], {"MV000000050000": [airing]}, {"MV000000050000": detail},
+                                    {"S1": {"name": "One"}}, "20261101000000", "20261201000000", log=lambda m: None)
+            row = conn.execute("select year, program_id from guide").fetchone()
+            conn.close()
+            self.assertEqual(tuple(row), ("2004", "MV000000050000"))
+
+    def test_an_older_database_gets_the_new_columns(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = os.path.join(temp, "guide.db")
+            old = sqlite3.connect(db)
+            old.execute("create table guide (id integer primary key autoincrement, title text, channel_id text, "
+                        "channel_name text, start_utc text, end_utc text, desc text, category text)")
+            old.commit(); old.close()
+            sd_guide.ensure_guide_db(db)
+            conn = sqlite3.connect(db)
+            columns = {r[1] for r in conn.execute("pragma table_info(guide)")}
+            conn.close()
+            self.assertTrue({"year", "program_id"} <= columns)
