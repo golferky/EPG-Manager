@@ -841,3 +841,49 @@ class PlexTvYearsToolTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("1 TV show folder(s) have no year", result.stdout)
             self.assertTrue((Path(temp) / "TV Shows" / "Bewitched").is_dir())
+
+
+class SuggestYearKindTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_kind", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _suggest(self, kind, year_text="2014–2026"):
+        import io, json
+        seen = []
+
+        def fake_urlopen(url, timeout=0):
+            seen.append(url)
+            return io.BytesIO(json.dumps({"year": year_text}).encode())
+        with mock.patch.object(self.tool.urllib.request, "urlopen", side_effect=fake_urlopen):
+            year = self.tool.suggest_year("http://qnap:5001", "Outlander", kind)
+        return year, seen[0]
+
+    def test_a_tv_lookup_asks_for_a_series_and_takes_the_first_year(self):
+        year, url = self._suggest("series")
+        self.assertEqual(year, "2014")
+        self.assertIn("content_type=series", url)
+        self.assertIn("title=Outlander", url)
+
+    def test_a_movie_lookup_asks_for_a_movie(self):
+        _year, url = self._suggest("movie", "2008")
+        self.assertIn("content_type=movie", url)
+
+    def test_no_kind_keeps_the_plain_lookup(self):
+        _year, url = self._suggest("")
+        self.assertNotIn("content_type", url)
+
+    def test_main_passes_the_kind_for_tv_and_movies(self):
+        for flags, kind in (([], "movie"), (["--tv"], "series")):
+            with tempfile.TemporaryDirectory() as temp:
+                library = Path(temp) / "lib"
+                (library / "Show").mkdir(parents=True)
+                with mock.patch.object(self.tool, "suggest_year", return_value="") as suggest, \
+                     mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+                     mock.patch("builtins.input", side_effect=["q"]), mock.patch("builtins.print"):
+                    self.tool.main(["--movies", str(library), "--server", "http://x", *flags])
+                self.assertEqual(suggest.call_args.args[2], kind)

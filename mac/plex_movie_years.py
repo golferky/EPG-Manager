@@ -43,8 +43,16 @@ def yearless_folders(movies_dir):
     return found
 
 
-def suggest_year(server, title):
-    url = server.rstrip('/') + '/epg-web/api/prog-info?' + urllib.parse.urlencode({'title': title})
+def suggest_year(server, title, kind=''):
+    """A year for ``title`` from the dashboard's lookup.
+
+    ``kind`` is 'series' or 'movie'.  Without it the lookup can return a film that shares
+    a show's name (Outlander the 2008 film, Yellowstone the 1936 film).
+    """
+    query = {'title': title}
+    if kind in ('series', 'movie'):
+        query['content_type'] = kind
+    url = server.rstrip('/') + '/epg-web/api/prog-info?' + urllib.parse.urlencode(query)
     try:
         with urllib.request.urlopen(url, timeout=20) as response:
             info = json.load(response)
@@ -123,7 +131,7 @@ def main(argv=None):
     print(f'{len(todo)} {kind} folder(s) have no year in {movies_dir}\n')
     renamed = skipped = 0
     for name in todo:
-        suggestion = suggest_year(server, name) if server else ''
+        suggestion = suggest_year(server, name, 'series' if args.tv else 'movie') if server else ''
         hint = f'suggested {suggestion}' if suggestion else 'no suggestion'
         while True:
             answer = input(f'{name}  [{hint}]  Enter=accept, year, s=skip, q=quit: ').strip().lower()
