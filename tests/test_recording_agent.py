@@ -1,3 +1,4 @@
+import sys
 import time
 import shutil
 import tempfile
@@ -740,3 +741,149 @@ class SeriesYearFolderTests(unittest.TestCase):
             dest = recording_agent.verified_unidentified_episode_transfer(source, root, "Perry Mason", 0, year="2020")
             self.assertEqual(dest.parent.name, "Perry Mason (2020)")
             self.assertEqual(dest.parent.parent.name, "_Needs Episode Info")
+
+
+class PlexTvYearsToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        cls.mac = Path(__file__).resolve().parent.parent / "mac"
+        spec = importlib.util.spec_from_file_location("plex_movie_years_tv", cls.mac / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _config(self, temp, movies, tv):
+        import json
+        path = Path(temp) / "agent.json"
+        path.write_text(json.dumps({"plex_path": str(movies), "plex_tv_path": str(tv), "server_url": ""}))
+        return str(path)
+
+    def test_the_tv_folder_is_read_from_the_config_with_tv(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = self._config(temp, "/m", "/t")
+            self.assertEqual(self.tool.load_defaults(cfg, tv=True)[0], "/t")
+            self.assertEqual(self.tool.load_defaults(cfg, tv=False)[0], "/m")
+
+    def test_holding_folders_and_dated_shows_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ("I Dream of Jeannie", "Bewitched (1964)", "_Needs Episode Info", ".hidden"):
+                (Path(temp) / name).mkdir()
+            self.assertEqual(self.tool.yearless_folders(temp), ["I Dream of Jeannie"])
+
+    def test_it_reports_what_the_recorder_is_copying(self):
+        import io, json
+        body = io.BytesIO(json.dumps({"finishing": [{"title": "Bewitched"}], "recording": []}).encode())
+        with mock.patch.object(self.tool.urllib.request, "urlopen", return_value=body):
+            self.assertEqual(self.tool.recorder_copying("http://x"), ["Bewitched"])
+        with mock.patch.object(self.tool.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertEqual(self.tool.recorder_copying("http://x"), [])
+        self.assertEqual(self.tool.recorder_copying(""), [])
+
+    def _run(self, temp, answers, *flags, copying=()):
+        tv = Path(temp) / "TV Shows"
+        movies = Path(temp) / "Movies"
+        movies.mkdir(exist_ok=True)
+        cfg = self._config(temp, movies, tv)
+        with mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch.object(self.tool, "recorder_copying", return_value=list(copying)), \
+             mock.patch("builtins.print") as printed:
+            rc = self.tool.main(["--tv", "--config", cfg, *flags])
+        return rc, " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+
+    def test_a_show_is_renamed_with_the_year_typed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "TV Shows" / "I Dream of Jeannie" / "Season 01").mkdir(parents=True)
+            rc, out = self._run(temp, ["1965"])
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(temp) / "TV Shows" / "I Dream of Jeannie (1965)" / "Season 01").is_dir())
+            self.assertFalse((Path(temp) / "TV Shows" / "I Dream of Jeannie").exists())
+            self.assertIn("TV Shows library", out)
+
+    def test_a_dry_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "TV Shows" / "Bewitched").mkdir(parents=True)
+            rc, _out = self._run(temp, ["1964"], "--dry-run")
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(temp) / "TV Shows" / "Bewitched").is_dir())
+
+    def test_skip_and_quit_leave_folders_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ("Bewitched", "Cheers"):
+                (Path(temp) / "TV Shows" / name).mkdir(parents=True)
+            rc, _out = self._run(temp, ["s", "q"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(p.name for p in (Path(temp) / "TV Shows").iterdir()), ["Bewitched", "Cheers"])
+
+    def test_it_refuses_while_the_recorder_is_copying(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "TV Shows" / "Bewitched").mkdir(parents=True)
+            rc, out = self._run(temp, ["1964"], copying=["Bewitched"])
+            self.assertEqual(rc, 1)
+            self.assertIn("copying", out)
+            self.assertTrue((Path(temp) / "TV Shows" / "Bewitched").is_dir())
+
+    def test_an_existing_folder_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ("Bewitched", "Bewitched (1964)"):
+                (Path(temp) / "TV Shows" / name).mkdir(parents=True)
+            (Path(temp) / "TV Shows" / "Bewitched" / "a.mp4").write_bytes(b"a")
+            self._run(temp, ["1964"])
+            self.assertTrue((Path(temp) / "TV Shows" / "Bewitched" / "a.mp4").exists())
+
+    def test_the_tv_script_runs_the_tool_in_tv_mode(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "TV Shows" / "Bewitched").mkdir(parents=True)
+            (Path(temp) / "Movies").mkdir()
+            cfg = self._config(temp, Path(temp) / "Movies", Path(temp) / "TV Shows")
+            result = subprocess.run([sys.executable, str(self.mac / "plex_tv_years.py"), "--config", cfg, "--dry-run"],
+                                    input="q\n", capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("1 TV show folder(s) have no year", result.stdout)
+            self.assertTrue((Path(temp) / "TV Shows" / "Bewitched").is_dir())
+
+
+class SuggestYearKindTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_kind", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _suggest(self, kind, year_text="2014–2026"):
+        import io, json
+        seen = []
+
+        def fake_urlopen(url, timeout=0):
+            seen.append(url)
+            return io.BytesIO(json.dumps({"year": year_text}).encode())
+        with mock.patch.object(self.tool.urllib.request, "urlopen", side_effect=fake_urlopen):
+            year = self.tool.suggest_year("http://qnap:5001", "Outlander", kind)
+        return year, seen[0]
+
+    def test_a_tv_lookup_asks_for_a_series_and_takes_the_first_year(self):
+        year, url = self._suggest("series")
+        self.assertEqual(year, "2014")
+        self.assertIn("content_type=series", url)
+        self.assertIn("title=Outlander", url)
+
+    def test_a_movie_lookup_asks_for_a_movie(self):
+        _year, url = self._suggest("movie", "2008")
+        self.assertIn("content_type=movie", url)
+
+    def test_no_kind_keeps_the_plain_lookup(self):
+        _year, url = self._suggest("")
+        self.assertNotIn("content_type", url)
+
+    def test_main_passes_the_kind_for_tv_and_movies(self):
+        for flags, kind in (([], "movie"), (["--tv"], "series")):
+            with tempfile.TemporaryDirectory() as temp:
+                library = Path(temp) / "lib"
+                (library / "Show").mkdir(parents=True)
+                with mock.patch.object(self.tool, "suggest_year", return_value="") as suggest, \
+                     mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+                     mock.patch("builtins.input", side_effect=["q"]), mock.patch("builtins.print"):
+                    self.tool.main(["--movies", str(library), "--server", "http://x", *flags])
+                self.assertEqual(suggest.call_args.args[2], kind)
