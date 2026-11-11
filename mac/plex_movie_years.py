@@ -25,6 +25,7 @@ At the recap prompt:
     fix 32       rename junk-named number 32 in place to its cleaned name and year
     fix 32 2008  the same, with a year you give
     fix all      fix every junk-named folder that has a cleaned name and year
+    rename only  leave every junk-named folder alone: only the plain renames happen
     move 32      put a fixed one back to "move out of Plex"
     set 12 2008  give number 12 (or change its) year
     list         show the recap again
@@ -324,6 +325,15 @@ def parse_command(text, plan, move_root=''):
         for number in numbers:
             by_number[number]['skip'] = True
         return 'continue', f'Left alone: {", ".join(str(n) for n in numbers)}.  Type list to see the recap, y to go ahead.'
+    if command in ('rename', 'renameonly', 'rename-only') and (rest == ['only'] or command != 'rename'):
+        count = 0
+        for row in plan:
+            if row['action'] in ('move', 'fix') and not row['skip']:
+                row['skip'] = True
+                count += 1
+        return 'continue', (f'{count} junk-named folder(s) will be left alone. Only the plain renames will happen.  '
+                            'Type list to check, y to go ahead.' if count else
+                            'There are no junk-named folders to leave out.')
     if command == 'fix':
         if rest == ['all']:
             count = 0
@@ -462,6 +472,7 @@ def main(argv=None):
               '  skip 3 7     leave numbers 3 and 7 alone (use the numbers at the left of each line)\n'
               '  set 12 2008  give number 12 the year 2008\n'
               + ('  fix 32       rename junk-named number 32 in place to its cleaned name (fix all = every one)\n'
+                 '  rename only  leave every junk-named folder alone, just do the plain renames\n'
                  if any(row['action'] != 'rename' for row in plan) else '')
               + '  list         show the list again\n'
               '  q            quit without changing anything')
