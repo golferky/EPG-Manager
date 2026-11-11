@@ -793,7 +793,7 @@ class PlexTvYearsToolTests(unittest.TestCase):
     def test_a_show_is_renamed_with_the_year_typed(self):
         with tempfile.TemporaryDirectory() as temp:
             (Path(temp) / "TV Shows" / "I Dream of Jeannie" / "Season 01").mkdir(parents=True)
-            rc, out = self._run(temp, ["1965"])
+            rc, out = self._run(temp, ["set 1 1965", "y"])
             self.assertEqual(rc, 0)
             self.assertTrue((Path(temp) / "TV Shows" / "I Dream of Jeannie (1965)" / "Season 01").is_dir())
             self.assertFalse((Path(temp) / "TV Shows" / "I Dream of Jeannie").exists())
@@ -802,7 +802,7 @@ class PlexTvYearsToolTests(unittest.TestCase):
     def test_a_dry_run_changes_nothing(self):
         with tempfile.TemporaryDirectory() as temp:
             (Path(temp) / "TV Shows" / "Bewitched").mkdir(parents=True)
-            rc, _out = self._run(temp, ["1964"], "--dry-run")
+            rc, _out = self._run(temp, ["set 1 1964", "y"], "--dry-run")
             self.assertEqual(rc, 0)
             self.assertTrue((Path(temp) / "TV Shows" / "Bewitched").is_dir())
 
@@ -810,14 +810,14 @@ class PlexTvYearsToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             for name in ("Bewitched", "Cheers"):
                 (Path(temp) / "TV Shows" / name).mkdir(parents=True)
-            rc, _out = self._run(temp, ["s", "q"])
+            rc, _out = self._run(temp, ["set 1 1964", "q"])
             self.assertEqual(rc, 0)
             self.assertEqual(sorted(p.name for p in (Path(temp) / "TV Shows").iterdir()), ["Bewitched", "Cheers"])
 
     def test_it_refuses_while_the_recorder_is_copying(self):
         with tempfile.TemporaryDirectory() as temp:
             (Path(temp) / "TV Shows" / "Bewitched").mkdir(parents=True)
-            rc, out = self._run(temp, ["1964"], copying=["Bewitched"])
+            rc, out = self._run(temp, ["set 1 1964", "y"], copying=["Bewitched"])
             self.assertEqual(rc, 1)
             self.assertIn("copying", out)
             self.assertTrue((Path(temp) / "TV Shows" / "Bewitched").is_dir())
@@ -827,8 +827,9 @@ class PlexTvYearsToolTests(unittest.TestCase):
             for name in ("Bewitched", "Bewitched (1964)"):
                 (Path(temp) / "TV Shows" / name).mkdir(parents=True)
             (Path(temp) / "TV Shows" / "Bewitched" / "a.mp4").write_bytes(b"a")
-            self._run(temp, ["1964"])
+            _rc, out = self._run(temp, ["set 1 1964", "y"])
             self.assertTrue((Path(temp) / "TV Shows" / "Bewitched" / "a.mp4").exists())
+            self.assertIn("Not renamed", out)
 
     def test_the_tv_script_runs_the_tool_in_tv_mode(self):
         import subprocess
@@ -839,7 +840,8 @@ class PlexTvYearsToolTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(self.mac / "plex_tv_years.py"), "--config", cfg, "--dry-run"],
                                     input="q\n", capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("1 TV show folder(s) have no year", result.stdout)
+            self.assertIn("1 TV show folder(s) need attention", result.stdout)
+            self.assertIn("Nothing was renamed", result.stdout)
             self.assertTrue((Path(temp) / "TV Shows" / "Bewitched").is_dir())
 
 
@@ -887,3 +889,401 @@ class SuggestYearKindTests(unittest.TestCase):
                      mock.patch("builtins.input", side_effect=["q"]), mock.patch("builtins.print"):
                     self.tool.main(["--movies", str(library), "--server", "http://x", *flags])
                 self.assertEqual(suggest.call_args.args[2], kind)
+
+
+class YearRecapTests(unittest.TestCase):
+    """One recap and one question, instead of a question for every folder."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_recap", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    SUGGESTIONS = {"Heat": "1995", "Employee of the Month": "2004", "Odd Film": "", "Alien": "1979"}
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in self.SUGGESTIONS:
+            (root / name).mkdir(parents=True)
+        (root / "Dated (2001)").mkdir()
+        return root
+
+    def _run(self, root, answers, *flags):
+        def suggest(server, name, kind=""):
+            return self.SUGGESTIONS.get(name, "")
+        out = []
+        with mock.patch.object(self.tool, "suggest_year", side_effect=suggest), \
+             mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(str(x) for x in a))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", *flags])
+        return rc, "\n".join(out)
+
+    def _names(self, root):
+        return sorted(p.name for p in root.iterdir())
+
+    def test_the_recap_lists_every_folder_once_before_asking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["q"])
+            self.assertIn("Will be renamed (3):", out)
+            self.assertIn("Alien (1979)", out)
+            self.assertIn("Employee of the Month (2004)", out)
+            self.assertIn("No year found", out)
+            self.assertIn("Odd Film", out)
+            self.assertNotIn("Dated", out)                       # already has a year
+            self.assertEqual(self._names(root), ["Alien", "Dated (2001)", "Employee of the Month", "Heat", "Odd Film"])
+
+    def test_one_y_renames_every_suggestion_and_leaves_the_rest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            rc, out = self._run(root, ["y"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._names(root), ["Alien (1979)", "Dated (2001)", "Employee of the Month (2004)",
+                                                 "Heat (1995)", "Odd Film"])
+            self.assertIn("Renamed or fixed 3, moved 0, left alone 1", out)
+            self.assertIn("Left alone: Odd Film", out)
+
+    def test_skip_leaves_numbers_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            # order is alphabetical: 1 Alien, 2 Employee of the Month, 3 Heat, 4 Odd Film
+            self._run(root, ["skip 2", "y"])
+            self.assertIn("Employee of the Month", self._names(root))
+            self.assertIn("Alien (1979)", self._names(root))
+
+    def test_set_gives_a_year_to_a_folder_with_no_suggestion_and_can_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["set 4 1999", "set 3 2020", "y"])
+            names = self._names(root)
+            self.assertIn("Odd Film (1999)", names)
+            self.assertIn("Heat (2020)", names)
+
+    def test_a_dry_run_renames_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["y"], "--dry-run")
+            self.assertIn("would rename", out)
+            self.assertEqual(self._names(root), ["Alien", "Dated (2001)", "Employee of the Month", "Heat", "Odd Film"])
+
+    def test_yes_renames_without_asking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            rc, _out = self._run(root, [], "--yes")                # no answers available: input would fail
+            self.assertEqual(rc, 0)
+            self.assertIn("Heat (1995)", self._names(root))
+
+    def test_a_bad_command_is_explained_and_asked_again(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["skip 99", "set 4 20x4", "banana", "", "q"])
+            self.assertIn('"99" is not a number', out)
+            self.assertIn("four-digit year", out)
+            self.assertIn('Unknown command "banana"', out)
+            self.assertEqual(self._names(root), ["Alien", "Dated (2001)", "Employee of the Month", "Heat", "Odd Film"])
+
+    def test_an_existing_target_is_reported_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            (root / "Heat (1995)").mkdir()
+            (root / "Heat" / "a.mp4").write_bytes(b"a")
+            _rc, out = self._run(root, ["y"])
+            self.assertTrue((root / "Heat" / "a.mp4").exists())
+            self.assertIn("Not renamed: Heat", out)
+            self.assertIn("could not do 1", out)
+
+    def test_end_of_input_quits_without_renaming(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            out = []
+            with mock.patch.object(self.tool, "suggest_year", return_value="1999"), \
+                 mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+                 mock.patch("builtins.input", side_effect=EOFError()), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+                rc = self.tool.main(["--movies", str(root), "--server", "http://x"])
+            self.assertEqual(rc, 0)
+            self.assertIn("Nothing was renamed", "\n".join(out))
+            self.assertEqual(self._names(root), ["Alien", "Dated (2001)", "Employee of the Month", "Heat", "Odd Film"])
+
+    def test_parse_command_actions(self):
+        plan = self.tool.build_plan(["A", "B"], {"A": "2000", "B": ""})
+        self.assertEqual(self.tool.parse_command("y", plan)[0], "apply")
+        self.assertEqual(self.tool.parse_command("Q", plan)[0], "quit")
+        self.assertEqual(self.tool.parse_command("", plan)[0], "continue")
+        self.assertEqual(self.tool.parse_command("list", plan)[0], "continue")
+
+
+class JunkNameTests(unittest.TestCase):
+    """Folders named like leftovers are moved out of Plex for a person to look at."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_junk", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    JUNK = "Bottle Shock 20260205 181000-Copy(1)"
+
+    def test_the_junk_pattern(self):
+        junk = self.tool.JUNK_NAME
+        for name in (self.JUNK, "Movie - Copy", "Movie-Copy(2)", "Movie Copy (3)", "Show 20260205_181000",
+                     "Film 20260205 181000 (2008)"):
+            self.assertTrue(junk.search(name), name)
+        for name in ("Heat (1995)", "The Copy", "Copy Cat", "Blade Runner 2049", "Alien (1979)", "Copycat (1995)"):
+            self.assertFalse(junk.search(name), name)
+
+    def test_junk_folders_are_found_even_when_they_have_a_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in (self.JUNK, "Film 20260205 181000 (2008)", "Heat (1995)", "_wrong_movies", ".x"):
+                (Path(temp) / name).mkdir()
+            (Path(temp) / "Movie-Copy.mp4").write_bytes(b"x")          # a loose file is not a folder
+            self.assertEqual(self.tool.junk_folders(temp), [self.JUNK, "Film 20260205 181000 (2008)"])
+
+    def test_the_attention_folder_sits_next_to_the_library(self):
+        self.assertEqual(self.tool.attention_root("/Volumes/Plex/Movies"), "/Volumes/Plex/Movies Needing Attention")
+        self.assertEqual(self.tool.attention_root("/Volumes/Plex/TV Shows", tv=True),
+                         "/Volumes/Plex/TV Needing Attention")
+        self.assertEqual(self.tool.attention_root("/Volumes/Plex/Movies", configured="/x/Look"), "/x/Look")
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        (root / self.JUNK).mkdir(parents=True)
+        (root / self.JUNK / f"{self.JUNK}.mp4").write_bytes(b"film-data")
+        (root / "Heat").mkdir()
+        return root
+
+    def _run(self, root, answers, *flags, suggest=None):
+        out = []
+        looked_up = []
+
+        def fake_suggest(server, name, kind=""):
+            looked_up.append(name)
+            return "1995" if name == "Heat" else ""
+        with mock.patch.object(self.tool, "suggest_year", side_effect=suggest or fake_suggest), \
+             mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", *flags])
+        return rc, "\n".join(out), looked_up
+
+    def test_the_recap_shows_the_move_and_junk_is_not_looked_up(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, looked_up = self._run(root, ["q"])
+            self.assertIn("Will be moved out of Plex", out)
+            self.assertIn("Movies Needing Attention", out)
+            self.assertIn(self.JUNK, out)
+            self.assertEqual(sorted(looked_up), ["Bottle Shock", "Heat"])      # the CLEANED title, not the junk name
+
+    def test_y_moves_the_junk_folder_out_with_its_contents_and_renames_the_rest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            rc, out, _ = self._run(root, ["y"])
+            self.assertEqual(rc, 0)
+            moved = Path(temp) / "Movies Needing Attention" / self.JUNK
+            self.assertEqual((moved / f"{self.JUNK}.mp4").read_bytes(), b"film-data")   # nothing lost
+            self.assertFalse((root / self.JUNK).exists())
+            self.assertTrue((root / "Heat (1995)").is_dir())
+            self.assertIn("moved 1", out)
+            self.assertIn("Nothing was deleted", out)
+
+    def test_skip_leaves_a_junk_folder_in_place(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            # alphabetical: 1 Bottle Shock..., 2 Heat
+            self._run(root, ["skip 1", "y"])
+            self.assertTrue((root / self.JUNK).is_dir())
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+
+    def test_set_is_refused_for_a_junk_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, _ = self._run(root, ["set 1 2008", "q"])
+            self.assertIn("junk name", out)
+            self.assertIn("fix 1 2008", out)
+            self.assertTrue((root / self.JUNK).is_dir())
+
+    def test_a_dry_run_moves_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, _ = self._run(root, ["y"], "--dry-run")
+            self.assertIn("would move", out)
+            self.assertTrue((root / self.JUNK).is_dir())
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+
+    def test_a_name_already_in_the_attention_folder_is_reported_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            existing = Path(temp) / "Movies Needing Attention" / self.JUNK
+            existing.mkdir(parents=True)
+            (existing / "old.mp4").write_bytes(b"old")
+            _rc, out, _ = self._run(root, ["y"])
+            self.assertTrue((root / self.JUNK).is_dir())
+            self.assertTrue((existing / "old.mp4").exists())
+            self.assertIn("Not renamed", out)
+
+    def test_tv_mode_moves_to_tv_needing_attention(self):
+        with tempfile.TemporaryDirectory() as temp:
+            tv = Path(temp) / "TV Shows"
+            (tv / "Show 20260205 181000").mkdir(parents=True)
+            out = []
+            with mock.patch.object(self.tool, "suggest_year", return_value=""), \
+                 mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+                 mock.patch("builtins.input", side_effect=["y"]), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+                self.tool.main(["--tv", "--movies", str(tv), "--server", "http://x"])
+            self.assertTrue((Path(temp) / "TV Needing Attention" / "Show 20260205 181000").is_dir())
+
+    def test_the_attention_folder_can_be_set_in_the_config(self):
+        import json
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / "agent.json"
+            cfg.write_text(json.dumps({"needs_attention_path": "/x/Look"}))
+            self.assertEqual(self.tool.load_attention_path(str(cfg)), "/x/Look")
+            self.assertEqual(self.tool.load_attention_path(str(Path(temp) / "missing.json")), "")
+
+
+class CleanedTitleTests(unittest.TestCase):
+    """A junk-named folder gets a cleaned name and year to choose from."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_clean", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    JUNK = "Bottle Shock 20260205 181000-Copy(1)"
+
+    def test_the_title_is_cleaned(self):
+        clean = self.tool.clean_junk_title
+        self.assertEqual(clean(self.JUNK), ("Bottle Shock", ""))
+        self.assertEqual(clean("Film 20260205 181000 (2008)"), ("Film", "2008"))
+        self.assertEqual(clean("Movie - Copy"), ("Movie", ""))
+        self.assertEqual(clean("Movie-Copy(2)"), ("Movie", ""))
+        self.assertEqual(clean("The Hobbit: An Unexpected Journey 20260101_200000 - Copy (2)"),
+                         ("The Hobbit: An Unexpected Journey", ""))
+
+    def test_fix_in_place_renames_the_folder_and_the_files_with_its_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / self.JUNK
+            folder.mkdir()
+            for name in (f"{self.JUNK}.mp4", f"{self.JUNK}.en.srt", "poster.jpg"):
+                (folder / name).write_bytes(b"x")
+            new = self.tool.fix_in_place(temp, self.JUNK, "Bottle Shock", "2008")
+            self.assertEqual(new, "Bottle Shock (2008)")
+            self.assertEqual(sorted(p.name for p in (Path(temp) / new).iterdir()),
+                             ["Bottle Shock.en.srt", "Bottle Shock.mp4", "poster.jpg"])
+            self.assertFalse(folder.exists())
+
+    def test_fix_in_place_never_overwrites_and_checks_its_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / self.JUNK).mkdir()
+            (Path(temp) / "Bottle Shock (2008)").mkdir()
+            with self.assertRaises(FileExistsError):
+                self.tool.fix_in_place(temp, self.JUNK, "Bottle Shock", "2008")
+            self.assertTrue((Path(temp) / self.JUNK).is_dir())
+            with self.assertRaises(ValueError):
+                self.tool.fix_in_place(temp, self.JUNK, "", "2008")
+            with self.assertRaises(ValueError):
+                self.tool.fix_in_place(temp, self.JUNK, "Bottle Shock", "08")
+
+    def _run(self, root, answers, *flags, years=None):
+        years = {"Bottle Shock": "2008", "Heat": "1995"} if years is None else years
+        out = []
+        with mock.patch.object(self.tool, "suggest_year", side_effect=lambda s, n, k="": years.get(n, "")), \
+             mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", *flags])
+        return rc, "\n".join(out)
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        (root / self.JUNK).mkdir(parents=True)
+        (root / self.JUNK / f"{self.JUNK}.mp4").write_bytes(b"film")
+        (root / "Heat").mkdir()
+        return root
+
+    def test_the_recap_shows_the_cleaned_name_for_a_junk_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["q"])
+            self.assertIn('cleaned: "Bottle Shock (2008)"', out)
+            self.assertIn("fix 1", out)
+
+    def test_fix_renames_in_place_instead_of_moving(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 1", "y"])
+            self.assertTrue((root / "Bottle Shock (2008)" / "Bottle Shock.mp4").is_file())
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+            self.assertIn("Fixed to", out)
+
+    def test_list_shows_the_fixed_in_place_section(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 1", "list", "q"])
+            self.assertIn("Will be fixed in place", out)
+            self.assertIn("->  Bottle Shock (2008)", out)
+
+    def test_fix_with_a_given_year_overrides_the_lookup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["fix 1 2009", "y"])
+            self.assertTrue((root / "Bottle Shock (2009)").is_dir())
+
+    def test_fix_without_a_year_asks_for_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 1", "q"], years={})
+            self.assertIn("No year found", out)
+            self.assertTrue((root / self.JUNK).is_dir())
+
+    def test_fix_all_fixes_every_junk_folder_with_a_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            other = "Alien 20260101 090000 - Copy"
+            (root / other).mkdir()
+            self._run(root, ["fix all", "y"], years={"Bottle Shock": "2008", "Alien": "1979", "Heat": "1995"})
+            names = sorted(p.name for p in root.iterdir())
+            self.assertIn("Bottle Shock (2008)", names)
+            self.assertIn("Alien (1979)", names)
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+
+    def test_a_clashing_cleaned_name_is_flagged_and_not_fixed_by_fix_all(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            (root / "Bottle Shock (2008)").mkdir()
+            _rc, out = self._run(root, ["fix all", "fix 2", "y"])
+            self.assertIn("likely a duplicate", out)
+            self.assertIn("No junk-named folder has a cleaned name", out)
+            # the junk copy was moved out, the proper folder untouched
+            self.assertTrue((Path(temp) / "Movies Needing Attention" / self.JUNK).is_dir())
+            self.assertTrue((root / "Bottle Shock (2008)").is_dir())
+
+    def test_move_puts_a_fixed_one_back_to_move_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["fix 1", "move 1", "y"])
+            self.assertTrue((Path(temp) / "Movies Needing Attention" / self.JUNK).is_dir())
+
+    def test_the_year_in_the_junk_name_is_the_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "Movies"
+            (root / "Film 20260205 181000 (2008)").mkdir(parents=True)
+            self._run(root, ["fix 1", "y"], years={})
+            self.assertTrue((root / "Film (2008)").is_dir())
+
+    def test_fix_on_a_normal_folder_points_to_set(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 2", "q"])
+            self.assertIn("use set 2 YEAR", out)
