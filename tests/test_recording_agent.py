@@ -617,3 +617,53 @@ class SameTitleDifferentYearTests(unittest.TestCase):
             dest = recording_agent.verified_transfer(source, root, "Employee of the Month", year="2004")
             self.assertEqual(dest.parent.name, "Employee of the Month (2004)")
             self.assertEqual((root / "Employee of the Month (2022)" / "movie.mp4").read_bytes(), b"x")
+
+
+class NeedsYearTests(unittest.TestCase):
+    def test_a_film_without_a_year_goes_to_the_holding_folder_not_the_library(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = {"plex_path": temp + "/Movies"}
+            (Path(temp) / "Movies").mkdir()
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"film")
+            start = time.mktime((2026, 11, 11, 20, 0, 0, 0, 0, -1))
+            dest = recording_agent.verified_unyeared_movie_transfer(source, cfg, "Employee of the Month", start)
+            self.assertEqual(dest.parent.name, "Movies Needing Year")
+            self.assertEqual(dest.parent.parent, Path(temp))
+            self.assertEqual(dest.name, "Employee of the Month - 2026-11-11_2000.mp4")
+            self.assertEqual(dest.read_bytes(), b"film")
+            self.assertEqual(list((Path(temp) / "Movies").iterdir()), [])
+
+    def test_the_holding_folder_can_be_configured(self):
+        cfg = {"plex_path": "/Volumes/Plex/Movies", "needs_year_path": "/Volumes/Plex/Waiting"}
+        self.assertEqual(recording_agent.needs_year_root(cfg), Path("/Volumes/Plex/Waiting"))
+
+
+class PlexMovieYearsToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_it_finds_only_folders_without_a_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ("Employee of the Month", "Heat (1995)", ".hidden", "_wrong_movies", "Alien (1979) "):
+                (Path(temp) / name).mkdir()
+            (Path(temp) / "stray.mp4").write_bytes(b"x")
+            self.assertEqual(self.tool.yearless_folders(temp), ["Employee of the Month"])
+
+    def test_rename_adds_the_year_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Employee of the Month").mkdir()
+            (Path(temp) / "Employee of the Month" / "m.mp4").write_bytes(b"x")
+            self.assertEqual(self.tool.rename_with_year(temp, "Employee of the Month", "2022"),
+                             "Employee of the Month (2022)")
+            self.assertTrue((Path(temp) / "Employee of the Month (2022)" / "m.mp4").exists())
+            (Path(temp) / "Employee of the Month").mkdir()
+            with self.assertRaises(FileExistsError):
+                self.tool.rename_with_year(temp, "Employee of the Month", "2022")
+            with self.assertRaises(ValueError):
+                self.tool.rename_with_year(temp, "Employee of the Month", "22")

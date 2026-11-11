@@ -27,7 +27,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111b"
+VERSION = "v20261111c"
 
 app = Flask(__name__)
 
@@ -4903,6 +4903,9 @@ def api_wanted():
         item_type = data.get('type','movie')
         if not title:
             return jsonify({'error': 'Choose a title first.'}), 400
+        year = _clean_year(year)
+        if item_type != 'series' and not year:
+            return jsonify({'error': 'A movie needs a year. Pick it from the list so the right film is recorded.'}), 400
         norm  = title.lower().replace("'",'').replace('-',' ')
         # The chooser supplies OMDb's canonical title, year, and IMDb ID.
         # Preserve that provenance so a typed nickname never becomes the

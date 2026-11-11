@@ -1277,3 +1277,27 @@ class RecordingYearTests(unittest.TestCase):
         row = conn.execute("SELECT * FROM recordings WHERE rec_id='year_none1'").fetchone()
         conn.close()
         self.assertEqual(server._agent_job_dict(row)["year"], "")
+
+
+class WantedNeedsYearTests(unittest.TestCase):
+    def _add(self, **body):
+        data = {"action": "add", "title": "Needs Year Test Film", "type": "movie"}
+        data.update(body)
+        return server.app.test_client().post("/epg-web/api/wanted", json=data)
+
+    def test_a_movie_without_a_year_is_refused(self):
+        resp = self._add(year="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("needs a year", resp.get_json()["error"])
+        self.assertEqual(self._add(year="n/a").status_code, 400)
+
+    def test_a_movie_with_a_year_is_accepted(self):
+        server._init_recordings_table()
+        with mock.patch.object(server, "db_run") as db_run:
+            resp = self._add(year="2004")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db_run.call_args.args[1][2], "2004")
+
+    def test_a_series_does_not_need_a_year(self):
+        with mock.patch.object(server, "db_run"):
+            self.assertEqual(self._add(year="", type="series").status_code, 200)

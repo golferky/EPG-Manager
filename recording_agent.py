@@ -29,7 +29,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261111b"
+AGENT_VERSION = "v20261111c"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -688,6 +688,26 @@ def verified_episode_transfer(source, tv_root, show_title, season, episode,
     return _verified_copy(source, destination, progress_callback)
 
 
+def needs_year_root(cfg):
+    """Holding folder, outside the Movies library, for a film whose year is unknown."""
+    configured = str(cfg.get('needs_year_path', '') or '').strip()
+    if configured:
+        return Path(os.path.expanduser(configured))
+    return Path(cfg['plex_path']).parent / 'Movies Needing Year'
+
+
+def verified_unyeared_movie_transfer(source, cfg, title, start_ts, progress_callback=None):
+    """File a film whose year could not be found next to, not inside, the library.
+
+    Every film in Plex has a year in its folder name.  Without one it cannot be told
+    from a remake with the same title, so it waits here until the year is known.
+    """
+    name = safe_filename(split_title_year(title)[0])
+    aired = time.strftime('%Y-%m-%d_%H%M', time.localtime(start_ts))
+    return _verified_copy(source, needs_year_root(cfg) / f'{name} - {aired}.mp4',
+                          progress_callback)
+
+
 def verified_unidentified_episode_transfer(source, tv_root, show_title, start_ts,
                                            progress_callback=None):
     """Keep an identified-as-TV airing out of Movies until S/E data is available."""
@@ -1009,10 +1029,17 @@ def process_job(api, job, cfg):
             except Exception as exc:
                 print(f'[metadata] no year for {job["title"]}: {exc}', file=sys.stderr, flush=True)
                 movie_year = ''
-        destination = verified_transfer(
-            mp4_path, library_root, job['title'], existing_path,
-            progress_callback=transfer_progress, year=movie_year,
-        )
+        if movie_year or existing_path:
+            destination = verified_transfer(
+                mp4_path, library_root, job['title'], existing_path,
+                progress_callback=transfer_progress, year=movie_year,
+            )
+        else:
+            destination = verified_unyeared_movie_transfer(
+                mp4_path, cfg, job['title'], job['start_ts'],
+                progress_callback=transfer_progress,
+            )
+            print(f'[needs-year] {job["title"]}: no year found; saved to {destination}', flush=True)
     # The Plex file was copied atomically and byte-verified above.  Keep local
     # recordings only when a recording/transfer failed; successful transfers
     # should not silently fill the Mac's recording disk.
@@ -1020,7 +1047,8 @@ def process_job(api, job, cfg):
         api, job, 'done', log_path, file=str(mp4_path), quality_decision=decision,
         result={**quality, 'plex_path': str(destination),
                 'content_type': ('episode' if episode else
-                                 'episode_needs_metadata' if is_series else 'movie')},
+                                 'episode_needs_metadata' if is_series else
+                                 'movie' if (movie_year or existing_path) else 'movie_needs_year')},
     )
     try:
         mp4_path.unlink()
