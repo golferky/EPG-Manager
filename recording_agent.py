@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261111e"
+AGENT_VERSION = "v20261111f"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -386,6 +386,25 @@ def find_tv_episode_candidates(tv_root, show_title, season, episode, year=''):
                 and pattern.search(path.stem)]
     except OSError:
         return []
+
+
+def private_movies_root(cfg):
+    """Folder, outside the Plex Movies library, where private films are kept."""
+    configured = str(cfg.get('private_movies_path', '') or '').strip()
+    if configured:
+        return Path(os.path.expanduser(configured))
+    return Path(cfg['plex_path']).parent / 'Movies Private'
+
+
+def find_movie_candidates(cfg, library_root, title, year=''):
+    """Existing copies of a film: in the Plex library, and in the private folder.
+
+    A private film is hidden from Plex, but it is still a film we have: finding it here
+    stops the recorder making a second copy.
+    """
+    found = list(find_plex_candidates(library_root, title, year))
+    found += find_plex_candidates(private_movies_root(cfg), title, year)
+    return found
 
 
 def best_existing_copy(paths, ffprobe):
@@ -875,7 +894,7 @@ def process_job(api, job, cfg):
     api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
     candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
-        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
+        if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
     existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
     try:
         incoming_probe = probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
@@ -968,7 +987,7 @@ def process_job(api, job, cfg):
     # during preflight, or Plex may have received a better copy in the meantime.
     final_candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
-        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
+        if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
     final_existing_path, final_existing_probe = best_existing_copy(
         final_candidates, cfg['ffprobe']
     )

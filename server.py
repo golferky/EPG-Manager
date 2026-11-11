@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111g"
+VERSION = "v20261111h"
 
 app = Flask(__name__)
 
@@ -4945,38 +4945,51 @@ def _folder_has_video(path, depth=2):
     return False
 
 
+def _private_movies_path(cfg):
+    """Folder, outside the Plex Movies library, where private films are kept."""
+    configured = str(cfg.get('private_movies_path', '') or '').strip()
+    if configured:
+        return os.path.expanduser(configured)
+    return os.path.join(os.path.dirname(os.path.abspath(cfg.get('plex_path', '/Volumes/Plex/Movies'))),
+                        'Movies Private')
+
+
 def _plex_wanted_title_index():
     """Cache top-level Plex movie/show names for the Wanted Titles badges."""
     cfg = load_config()
     movie_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
     tv_root = _plex_tv_path(cfg)
-    roots = (movie_root, tv_root)
+    private_root = _private_movies_path(cfg)
+    roots = (movie_root, tv_root, private_root)
     now = time.time()
     if (_plex_title_cache['roots'] == roots and now - _plex_title_cache['loaded_at'] < 300):
         return _plex_title_cache
     movies, movie_versions, unyearred_movies, shows = set(), set(), set(), set()
     movie_counts = {}
     show_versions, unyearred_shows = set(), set()
-    try:
-        for entry in os.scandir(movie_root):
-            if entry.name.startswith('.'):
-                continue
-            if entry.is_dir() and not _folder_has_video(entry.path):
-                continue            # an empty folder is not a film in Plex
-            title = entry.name if entry.is_dir() else os.path.splitext(entry.name)[0]
-            match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', title)
-            year = match.group(2) if match else ''
-            title = (match.group(1) if match else title).strip()
-            if title:
-                key = _norm_plex_show(title)
-                movies.add(key)
-                movie_counts[key] = movie_counts.get(key, 0) + 1
-                if year:
-                    movie_versions.add((key, year))
-                else:
-                    unyearred_movies.add(key)
-    except OSError:
-        pass
+    # Private films live outside the Plex library but still count as films we have, so
+    # they are never offered for recording again.
+    for library in (movie_root, private_root):
+        try:
+            for entry in os.scandir(library):
+                if entry.name.startswith('.'):
+                    continue
+                if entry.is_dir() and not _folder_has_video(entry.path):
+                    continue            # an empty folder is not a film in Plex
+                title = entry.name if entry.is_dir() else os.path.splitext(entry.name)[0]
+                match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', title)
+                year = match.group(2) if match else ''
+                title = (match.group(1) if match else title).strip()
+                if title:
+                    key = _norm_plex_show(title)
+                    movies.add(key)
+                    movie_counts[key] = movie_counts.get(key, 0) + 1
+                    if year:
+                        movie_versions.add((key, year))
+                    else:
+                        unyearred_movies.add(key)
+        except OSError:
+            pass
     try:
         for entry in os.scandir(tv_root):
             if entry.is_dir() and not entry.name.startswith(('.', '_')):

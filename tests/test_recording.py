@@ -1679,3 +1679,35 @@ class EmptyPlexFolderTests(unittest.TestCase):
                  mock.patch.dict(server._epg, {"programmes": []}):
                 rec = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"][0]
             self.assertFalse(rec["in_plex"])
+
+
+class PrivateMoviesDashboardTests(unittest.TestCase):
+    def test_the_private_path_default_and_override(self):
+        self.assertEqual(server._private_movies_path({"plex_path": "/Volumes/Plex/Movies"}), "/Volumes/Plex/Movies Private")
+        self.assertEqual(server._private_movies_path({"plex_path": "/x/Movies", "private_movies_path": "/y/Hidden"}), "/y/Hidden")
+
+    def test_a_private_film_counts_as_in_the_library_for_duplicate_checks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies, private = os.path.join(temp, "Movies"), os.path.join(temp, "Movies Private")
+            os.makedirs(os.path.join(movies, "Heat (1995)"))
+            open(os.path.join(movies, "Heat (1995)", "Heat.mp4"), "wb").close()
+            os.makedirs(os.path.join(private, "Minority Report (2002)"))
+            open(os.path.join(private, "Minority Report (2002)", "m.mp4"), "wb").close()
+            os.makedirs(os.path.join(temp, "tv"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            n = server._norm_plex_show
+            self.assertIn((n("Heat"), "1995"), idx["movie_versions"])
+            self.assertIn((n("Minority Report"), "2002"), idx["movie_versions"])
+
+    def test_a_missing_private_folder_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = os.path.join(temp, "Movies")
+            os.makedirs(os.path.join(movies, "Heat (1995)"))
+            open(os.path.join(movies, "Heat (1995)", "Heat.mp4"), "wb").close()
+            os.makedirs(os.path.join(temp, "tv"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            self.assertEqual(len(idx["movie_versions"]), 1)

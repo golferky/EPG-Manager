@@ -207,6 +207,15 @@ def load_defaults(config_path, tv=False):
     return folder, cfg.get('server_url', '')
 
 
+def load_config_value(config_path, key):
+    """One text value from the recorder config, or ''."""
+    try:
+        with open(os.path.expanduser(config_path), encoding='utf-8') as handle:
+            return str(json.load(handle).get(key, '') or '')
+    except (OSError, ValueError):
+        return ''
+
+
 def load_attention_path(config_path):
     """needs_attention_path from the recorder config, or ''."""
     try:
