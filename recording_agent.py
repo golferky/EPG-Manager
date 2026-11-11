@@ -5,6 +5,7 @@ The agent polls an EPG Manager server for recording jobs, records locally with
 FFmpeg, and transfers verified MP4 files to a mounted Plex library.
 """
 
+import unicodedata
 import argparse
 import base64
 import difflib
@@ -29,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261111d"
+AGENT_VERSION = "v20261111e"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -162,9 +163,24 @@ def split_title_year(title):
     return (title or '').strip(), ''
 
 
+_TITLE_LIGATURES = {'\u00e6': 'ae', '\u0153': 'oe', '\u00df': 'ss', '\u00f8': 'o', '\u0111': 'd',
+                    '\u00f0': 'd', '\u00fe': 'th', '\u0142': 'l', '\u0131': 'i'}
+
+
+def fold_title(value):
+    """Lower case, accents and ligatures folded to plain letters, only letters and digits kept
+    (so "\u00c6on Flux" and "Aeon Flux" are the same title)."""
+    text = str(value or '').lower()
+    for special, plain in _TITLE_LIGATURES.items():
+        text = text.replace(special, plain)
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r'[^a-z0-9]', '', text)
+
+
 def normalized_title(title):
     base, _year = split_title_year(title)
-    return re.sub(r'[^a-z0-9]', '', base.lower())
+    return fold_title(base)
 
 
 def parse_rate(value):

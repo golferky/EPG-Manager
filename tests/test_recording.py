@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -1523,3 +1524,82 @@ class RecommendationAiringYearTests(unittest.TestCase):
     def test_an_airing_with_no_year_is_still_offered(self):
         airing = self._recs("2004", [(0, {"year": ""})])
         self.assertIsNotNone(airing)
+
+
+class FoldedTitleTests(unittest.TestCase):
+    def test_accents_and_ligatures_fold_to_plain_letters(self):
+        fold = server.fold_title
+        self.assertEqual(fold("Æon Flux"), "aeonflux")
+        self.assertEqual(fold("Aeon Flux"), "aeonflux")
+        self.assertEqual(fold("Amélie"), fold("Amelie"))
+        self.assertEqual(fold("Léon: The Professional"), fold("Leon The Professional"))
+        self.assertEqual(fold("Crème Brûlée"), "cremebrulee")
+        self.assertEqual(fold("Søren œuvre Straße"), "sorenoeuvrestrasse")
+        self.assertEqual(fold(None), "")
+
+    def test_plain_titles_are_unchanged(self):
+        self.assertEqual(server.fold_title("The Matrix (1999)"), "thematrix1999")
+        self.assertEqual(server.fold_title("Mad Max: Beyond Thunderdome"), "madmaxbeyondthunderdome")
+
+    def test_the_provider_title_with_a_ligature_matches_the_plex_title(self):
+        self.assertTrue(server._metadata_title_matches("Aeon Flux", "Æon Flux"))
+        self.assertTrue(server._metadata_title_matches("Amelie", "Amélie"))
+        self.assertFalse(server._metadata_title_matches("Wolves", "Dances with Wolves"))
+        self.assertFalse(server._metadata_title_matches("", "Anything"))
+
+    def test_plex_keys_ignore_accents(self):
+        self.assertEqual(server._norm_plex_show("Æon Flux (2005)"), server._norm_plex_show("Aeon Flux"))
+
+    def test_a_plex_folder_without_the_accent_is_found(self):
+        with tempfile.TemporaryDirectory() as temp:
+            os.makedirs(os.path.join(temp, "Aeon Flux (2005)"))
+            os.makedirs(os.path.join(temp, "Heat (1995)"))
+            found = server._find_plex_movie_folders(temp, "Æon Flux", "2005")
+            self.assertEqual([os.path.basename(p) for p in found], ["Aeon Flux (2005)"])
+
+
+class TmdbFallbackTests(unittest.TestCase):
+    """The provider lookup finds a film stored with a special spelling, and survives a failed extra request."""
+
+    def _lookup(self, title, search_results, credits_fails=False):
+        import io
+
+        def fake_urlopen(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if "omdbapi" in url:
+                return io.BytesIO(json.dumps({"Response": "False", "Error": "Request limit reached!"}).encode())
+            if "/search/" in url:
+                return io.BytesIO(json.dumps({"results": search_results}).encode())
+            if "/credits" in url:
+                if credits_fails:
+                    raise OSError("credits timed out")
+                return io.BytesIO(json.dumps({"cast": [{"name": "Charlize Theron"}], "crew": []}).encode())
+            raise AssertionError(url)
+        cfg = {"omdb_key": "x", "tmdb_key": "y"}
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(server, "db_rows", return_value=[]):
+            return server.app.test_client().get("/epg-web/api/prog-info?content_type=movie&title=" + title)
+
+    RESULT = [{"id": 8202, "title": "Æon Flux", "release_date": "2005-12-01", "overview": "x"}]
+
+    def test_a_ligature_title_is_found_through_tmdb(self):
+        resp = self._lookup("Aeon%20Flux", self.RESULT)
+        data = resp.get_json()
+        self.assertEqual(resp.status_code, 200, data)
+        self.assertEqual(data["year"], "2005")
+        self.assertEqual(data["source"], "tmdb")
+
+    def test_a_failed_credits_request_does_not_lose_the_year(self):
+        resp = self._lookup("Aeon%20Flux", self.RESULT, credits_fails=True)
+        self.assertEqual(resp.get_json()["year"], "2005")
+
+    def test_a_different_film_is_still_refused(self):
+        resp = self._lookup("Aeon%20Flux", [{"id": 1, "title": "Aeon Flux Returns", "release_date": "2010-01-01"}])
+        self.assertEqual(resp.status_code, 404)
+
+    def test_an_omdb_limit_is_written_to_the_log(self):
+        with mock.patch("builtins.print") as printed:
+            self._lookup("Aeon%20Flux", self.RESULT)
+        logged = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertIn("[OMDb] Request limit reached!", logged)

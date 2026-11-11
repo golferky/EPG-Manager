@@ -1363,3 +1363,13 @@ class RenameOnlyTests(unittest.TestCase):
             root = Path(temp) / "Movies"
             (root / "Heat").mkdir(parents=True)
             self.assertNotIn("rename only", self._run(root, ["q"]))
+
+
+class FoldedTitleAgentTests(unittest.TestCase):
+    def test_a_ligature_title_matches_its_plex_folder(self):
+        self.assertEqual(recording_agent.normalized_title("Æon Flux"), recording_agent.normalized_title("Aeon Flux (2005)"))
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Aeon Flux (2005)").mkdir()
+            (Path(temp) / "Aeon Flux (2005)" / "movie.mp4").write_bytes(b"x")
+            found = recording_agent.find_plex_candidates(temp, "Æon Flux", "2005")
+            self.assertEqual(len(found), 1)

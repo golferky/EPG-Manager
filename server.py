@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
+import unicodedata
 import faulthandler, hmac, json, os, re, shutil, signal, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
@@ -27,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111e"
+VERSION = "v20261111f"
 
 app = Flask(__name__)
 
@@ -390,6 +391,33 @@ def _quality_duplicate_channel_key(name):
     return re.sub(r'[^a-z0-9]', '', without_quality.lower())
 
 
+_TITLE_LIGATURES = {'\u00e6': 'ae', '\u0153': 'oe', '\u00df': 'ss', '\u00f8': 'o', '\u0111': 'd',
+                    '\u00f0': 'd', '\u00fe': 'th', '\u0142': 'l', '\u0131': 'i'}
+
+
+def fold_title(value):
+    """Title identity for matching: lower case, accents and ligatures folded to plain letters,
+    everything but letters and digits dropped.
+
+    "\u00c6on Flux" and "Aeon Flux" are the same film, as are "Am\u00e9lie" and "Amelie".  A
+    database stores the special spelling; a Plex folder usually has the plain one.
+    """
+    text = str(value or '').lower()
+    for special, plain in _TITLE_LIGATURES.items():
+        text = text.replace(special, plain)
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r'[^a-z0-9]', '', text)
+
+
+def _log_omdb_error(answer):
+    """Say in the log why OMDb gave nothing, unless it simply has no such title."""
+    if isinstance(answer, dict) and answer.get('Response') == 'False':
+        reason = str(answer.get('Error') or '')
+        if reason and 'not found' not in reason.lower():
+            print(f'[OMDb] {reason}')
+
+
 def _metadata_title_matches(requested_title, returned_title):
     """Require an exact normalized provider title before using its metadata.
 
@@ -397,8 +425,7 @@ def _metadata_title_matches(requested_title, returned_title):
     asking for *Wolves* can return *Dances with Wolves*).  A missing poster is
     safer than attaching the wrong poster, cast, plot, or Plex folder name.
     """
-    normalize = lambda value: re.sub(r'[^a-z0-9]', '', str(value or '').lower())
-    return bool(normalize(requested_title)) and normalize(requested_title) == normalize(returned_title)
+    return bool(fold_title(requested_title)) and fold_title(requested_title) == fold_title(returned_title)
 
 
 def _metadata_runtime_minutes(value):
@@ -5083,7 +5110,7 @@ def _norm_plex_show(value):
     so ``Bewitched`` and ``Bewitched (1964)`` are the same title.  The year is compared
     separately wherever it is known."""
     value = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', value or '')
-    return re.sub(r'[^a-z0-9]', '', value.lower())
+    return fold_title(value)
 
 def _wanted_series_year(title):
     """The first-air year of the Wanted series with this title, if there is exactly one."""
@@ -5441,7 +5468,7 @@ def api_plex_info():
     if not title:
         return jsonify({'error': 'no title'}), 400
     def _norm(t):
-        return re.sub(r'[^a-z0-9]', '', t.lower())
+        return fold_title(t)
     clean_title, requested_year = _plex_title_and_year(title)
     requested_year = requested_year or _clean_year(request.args.get('year', ''))
     cache_key = _norm(clean_title) + '|' + requested_year
@@ -5588,14 +5615,14 @@ def _find_plex_movie_folders(plex_dir, title, year=''):
     """
     clean, title_year = _plex_title_and_year(title)
     year = str(year or title_year or '')[:4]
-    wanted = re.sub(r'[^a-z0-9]', '', clean.lower())
+    wanted = fold_title(clean)
     found = []
     for name in sorted(os.listdir(plex_dir)):
         path = os.path.join(plex_dir, name)
         if os.path.islink(path) or not os.path.isdir(path):
             continue
         folder_title, folder_year = _plex_title_and_year(name)
-        if re.sub(r'[^a-z0-9]', '', folder_title.lower()) != wanted:
+        if fold_title(folder_title) != wanted:
             continue
         if year and folder_year and folder_year != year:
             continue
@@ -5915,6 +5942,7 @@ def api_prog_info():
                 url = f'http://www.omdbapi.com/?t={q}&type=series&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     od = json.loads(resp.read())
+                _log_omdb_error(od)
                 if (od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title'))
                         and _metadata_runtime_is_plausible(expected_minutes, od.get('Runtime'))):
                     return jsonify(_omdb_result(od))
@@ -5934,6 +5962,7 @@ def api_prog_info():
                 url = f'http://www.omdbapi.com/?s={q}&type={kind}&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     sr = json.loads(resp.read())
+                _log_omdb_error(sr)
                 hits = sr.get('Search', [])
                 if not hits:
                     # No search results — fall back to direct title lookup
@@ -6008,10 +6037,9 @@ def api_prog_info():
                 # one.  Only use a normalized exact title match; showing no
                 # metadata is much better than confidently showing the wrong
                 # show, actors, poster, and Plex badge.
-                wanted_title = _re.sub(r'[^a-z0-9]', '', title.lower())
+                wanted_title = fold_title(title)
                 exact_results = [item for item in results
-                                 if _re.sub(r'[^a-z0-9]', '',
-                                            (item.get('title') or item.get('name') or '').lower()) == wanted_title]
+                                 if fold_title(item.get('title') or item.get('name') or '') == wanted_title]
                 m = exact_results[0] if exact_results else None
                 # Same-title films need the same duration check as OMDb.  TMDb
                 # search results omit runtime, so fetch only the few exact
@@ -6044,8 +6072,13 @@ def api_prog_info():
                     # credits payload so fallback metadata is not poster/plot-only.
                     credits_url = (f'https://api.themoviedb.org/3/{media_kind}/{m["id"]}/credits'
                                    f'?api_key={tmdb_key}')
-                    with urlreq.urlopen(credits_url, timeout=5) as resp:
-                        credits = json.loads(resp.read())
+                    try:
+                        with urlreq.urlopen(credits_url, timeout=5) as resp:
+                            credits = json.loads(resp.read())
+                    except Exception as credits_error:
+                        # Cast and director are extras: losing them must not lose the year.
+                        print(f'[TMDB] credits unavailable: {credits_error}')
+                        credits = {}
                     cast = [person.get('name', '') for person in credits.get('cast', [])[:4]
                             if person.get('name')]
                     if media_kind == 'movie':
