@@ -565,3 +565,178 @@ class ShortRecordingFlowTests(unittest.TestCase):
     def test_a_complete_recording_is_not_saved_as_incomplete(self):
         _archive, preserve = self._run(138)
         preserve.assert_not_called()
+
+
+class SameTitleDifferentYearTests(unittest.TestCase):
+    """Two films with one title (a remake) must not be treated as the same copy."""
+
+    def _library(self, temp, *folders):
+        root = Path(temp)
+        for name in folders:
+            (root / name).mkdir()
+            (root / name / "movie.mp4").write_bytes(b"x")
+        return root
+
+    def test_a_copy_from_another_year_is_not_a_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            self.assertEqual(recording_agent.find_plex_candidates(root, "Employee of the Month", "2004"), [])
+
+    def test_the_same_year_is_a_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            found = recording_agent.find_plex_candidates(root, "Employee of the Month", "2022")
+            self.assertEqual([p.name for p in found], ["movie.mp4"])
+
+    def test_only_the_matching_year_is_picked_when_both_exist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2004)", "Employee of the Month (2022)")
+            found = recording_agent.find_plex_candidates(root, "Employee of the Month", "2004")
+            self.assertEqual([p.parent.name for p in found], ["Employee of the Month (2004)"])
+
+    def test_a_folder_with_no_year_is_not_assumed_to_be_the_same_film(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month")
+            self.assertEqual(recording_agent.find_plex_candidates(root, "Employee of the Month", "2004"), [])
+
+    def test_no_year_keeps_the_old_behaviour(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            self.assertEqual(len(recording_agent.find_plex_candidates(root, "Employee of the Month")), 1)
+
+    def test_a_year_in_the_title_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            self.assertEqual(recording_agent.find_plex_candidates(root, "Employee of the Month (2004)"), [])
+
+    def test_the_new_copy_goes_to_its_own_year_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"new-copy")
+            dest = recording_agent.verified_transfer(source, root, "Employee of the Month", year="2004")
+            self.assertEqual(dest.parent.name, "Employee of the Month (2004)")
+            self.assertEqual((root / "Employee of the Month (2022)" / "movie.mp4").read_bytes(), b"x")
+
+
+class NeedsYearTests(unittest.TestCase):
+    def test_a_film_without_a_year_goes_to_the_holding_folder_not_the_library(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = {"plex_path": temp + "/Movies"}
+            (Path(temp) / "Movies").mkdir()
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"film")
+            start = time.mktime((2026, 11, 11, 20, 0, 0, 0, 0, -1))
+            dest = recording_agent.verified_unyeared_movie_transfer(source, cfg, "Employee of the Month", start)
+            self.assertEqual(dest.parent.name, "Movies Needing Year")
+            self.assertEqual(dest.parent.parent, Path(temp))
+            self.assertEqual(dest.name, "Employee of the Month - 2026-11-11_2000.mp4")
+            self.assertEqual(dest.read_bytes(), b"film")
+            self.assertEqual(list((Path(temp) / "Movies").iterdir()), [])
+
+    def test_the_holding_folder_can_be_configured(self):
+        cfg = {"plex_path": "/Volumes/Plex/Movies", "needs_year_path": "/Volumes/Plex/Waiting"}
+        self.assertEqual(recording_agent.needs_year_root(cfg), Path("/Volumes/Plex/Waiting"))
+
+
+class PlexMovieYearsToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_it_finds_only_folders_without_a_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ("Employee of the Month", "Heat (1995)", ".hidden", "_wrong_movies", "Alien (1979) "):
+                (Path(temp) / name).mkdir()
+            (Path(temp) / "stray.mp4").write_bytes(b"x")
+            self.assertEqual(self.tool.yearless_folders(temp), ["Employee of the Month"])
+
+    def test_rename_adds_the_year_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Employee of the Month").mkdir()
+            (Path(temp) / "Employee of the Month" / "m.mp4").write_bytes(b"x")
+            self.assertEqual(self.tool.rename_with_year(temp, "Employee of the Month", "2022"),
+                             "Employee of the Month (2022)")
+            self.assertTrue((Path(temp) / "Employee of the Month (2022)" / "m.mp4").exists())
+            (Path(temp) / "Employee of the Month").mkdir()
+            with self.assertRaises(FileExistsError):
+                self.tool.rename_with_year(temp, "Employee of the Month", "2022")
+            with self.assertRaises(ValueError):
+                self.tool.rename_with_year(temp, "Employee of the Month", "22")
+
+
+class SeriesYearFolderTests(unittest.TestCase):
+    def _tv(self, temp, *folders):
+        root = Path(temp) / "TV Shows"
+        for name in folders:
+            season = root / name / "Season 01"
+            season.mkdir(parents=True)
+            (season / "Show - S01E01.mp4").write_bytes(b"x")
+        if not folders:
+            root.mkdir()
+        return root
+
+    def test_a_folder_with_or_without_a_year_is_the_same_show(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Bewitched (1964)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Bewitched").name, "Bewitched (1964)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Bewitched", "1964").name, "Bewitched (1964)")
+            self.assertEqual(len(recording_agent.find_tv_episode_candidates(root, "Bewitched", 1, 1)), 1)
+
+    def test_a_folder_without_a_year_is_still_used_while_the_library_is_renamed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "I Dream of Jeannie")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "I Dream of Jeannie", "1965").name, "I Dream of Jeannie")
+            self.assertEqual(len(recording_agent.find_tv_episode_candidates(root, "I Dream of Jeannie", 1, 1, "1965")), 1)
+
+    def test_a_reboot_is_not_mistaken_for_the_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Hawaii Five-0 (1968)")
+            self.assertEqual(recording_agent.find_tv_episode_candidates(root, "Hawaii Five-0", 1, 1, "2010"), [])
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Hawaii Five-0", "2010").name, "Hawaii Five-0 (2010)")
+
+    def test_both_versions_exist_and_the_right_one_is_picked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Hawaii Five-0 (1968)", "Hawaii Five-0 (2010)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Hawaii Five-0", "2010").name, "Hawaii Five-0 (2010)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Hawaii Five-0", "1968").name, "Hawaii Five-0 (1968)")
+
+    def test_a_new_show_gets_its_year_in_the_folder_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp)
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_episode_transfer(source, root, "Perry Mason", 1, 2, "Chapter Two", year="2020")
+            self.assertEqual(dest.parent.parent.name, "Perry Mason (2020)")
+            self.assertEqual(dest.parent.name, "Season 01")
+            self.assertEqual(dest.name, "Perry Mason - S01E02 - Chapter Two.mp4")
+
+    def test_a_new_show_without_a_year_keeps_the_plain_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp)
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_episode_transfer(source, root, "Perry Mason", 1, 2)
+            self.assertEqual(dest.parent.parent.name, "Perry Mason")
+
+    def test_an_existing_show_folder_is_reused_for_a_new_episode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Bewitched (1964)")
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_episode_transfer(source, root, "Bewitched", 1, 2, year="1964")
+            self.assertEqual(dest.parent.parent.name, "Bewitched (1964)")
+            self.assertFalse((root / "Bewitched").exists())
+
+    def test_unidentified_episodes_keep_the_year_in_the_holding_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp)
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_unidentified_episode_transfer(source, root, "Perry Mason", 0, year="2020")
+            self.assertEqual(dest.parent.name, "Perry Mason (2020)")
+            self.assertEqual(dest.parent.parent.name, "_Needs Episode Info")

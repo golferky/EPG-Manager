@@ -237,17 +237,48 @@ class RecordingTests(unittest.TestCase):
                 )
             self.assertTrue(response.get_json()["found"])
 
-    def test_plex_info_tolerates_unyearred_folder_and_extra_spaces(self):
+    def _plex_info(self, temp, query):
+        server._plex_info_cache.clear()
+        with mock.patch.object(server, "load_config", return_value={"plex_path": temp}):
+            return server.app.test_client().get("/epg-web/api/plex/info?" + query).get_json()
+
+    def test_plex_info_tolerates_extra_spaces_when_no_year_is_asked_for(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = os.path.join(temp, "Alvin and the Chipmunks  Chipwrecked")
             os.makedirs(folder)
             open(os.path.join(folder, "movie.mp4"), "wb").close()
-            server._plex_info_cache.clear()
-            with mock.patch.object(server, "load_config", return_value={"plex_path": temp}):
-                response = server.app.test_client().get(
-                    "/epg-web/api/plex/info?title=Alvin%20and%20the%20Chipmunks%3A%20Chipwrecked%20(2011)"
-                )
-            self.assertTrue(response.get_json()["found"])
+            data = self._plex_info(temp, "title=Alvin%20and%20the%20Chipmunks%3A%20Chipwrecked")
+            self.assertTrue(data["found"])
+
+    def test_plex_info_does_not_assume_a_folder_without_a_year_is_the_asked_for_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = os.path.join(temp, "Employee of the Month")
+            os.makedirs(folder)
+            open(os.path.join(folder, "movie.mp4"), "wb").close()
+            self.assertFalse(self._plex_info(temp, "title=Employee%20of%20the%20Month&year=2004")["found"])
+            self.assertFalse(self._plex_info(temp, "title=Employee%20of%20the%20Month%20(2004)")["found"])
+
+    def test_plex_info_picks_the_folder_of_the_asked_for_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name, content in (("Employee of the Month (2004)", b"a"), ("Employee of the Month (2022)", b"bb")):
+                os.makedirs(os.path.join(temp, name))
+                with open(os.path.join(temp, name, name + ".mp4"), "wb") as handle:
+                    handle.write(content)
+            data = self._plex_info(temp, "title=Employee%20of%20the%20Month&year=2022")
+            self.assertEqual(data["file"], "Employee of the Month (2022).mp4")
+            data = self._plex_info(temp, "title=Employee%20of%20the%20Month&year=2004")
+            self.assertEqual(data["file"], "Employee of the Month (2004).mp4")
+
+    def test_recommendation_with_a_year_is_not_in_plex_for_a_yearless_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            os.makedirs(os.path.join(temp, "Employee of the Month"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": temp, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            key = server._norm_plex_show("Employee of the Month")
+            self.assertIn(key, idx["unyearred_movies"])
+            self.assertNotIn((key, "2004"), idx["movie_versions"])
+            self.assertEqual(idx["movie_counts"][key], 1)
 
     def test_stream_info_returns_safe_incoming_quality(self):
         server._stream_info_cache.clear()
@@ -1197,3 +1228,123 @@ class MarkFinishedTests(unittest.TestCase):
     def test_unknown_or_missing_id(self):
         self.assertEqual(self._mark("nope_nope").status_code, 404)
         self.assertEqual(self._mark("").status_code, 400)
+
+
+class RecordingYearTests(unittest.TestCase):
+    def setUp(self):
+        server._init_recordings_table()
+
+    def test_clean_year(self):
+        self.assertEqual(server._clean_year("2004"), "2004")
+        self.assertEqual(server._clean_year(" (1999) "), "1999")
+        self.assertEqual(server._clean_year("2004-05-01"), "2004")
+        self.assertEqual(server._clean_year(None), "")
+        self.assertEqual(server._clean_year("n/a"), "")
+        self.assertEqual(server._clean_year("12345"), "")
+
+    def test_the_year_is_saved_and_handed_to_the_recorder(self):
+        now = time.time()
+        rec = {"title": "Year Test Movie", "channel_id": "5", "channel": "SHO", "start_ts": now + 600,
+               "stop_ts": now + 4200, "status": "queued", "progress": 0, "log": [], "pid": None,
+               "file": None, "backend": "agent", "stream_id": "1", "stream_provider": "primestreams",
+               "stream_extension": "ts", "episode_title": "", "season_num": None, "episode_num": None,
+               "is_series": False, "auto_upgrade": False, "year": "2004"}
+        server._db_upsert_rec("year12345", rec)
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM recordings WHERE rec_id=?", ("year12345",)).fetchone()
+        conn.close()
+        self.assertEqual(server._agent_job_dict(row)["year"], "2004")
+
+    def test_a_status_update_does_not_wipe_the_year(self):
+        now = time.time()
+        rec = {"title": "Year Keep Movie", "channel_id": "5", "start_ts": now, "stop_ts": now + 3600,
+               "status": "queued", "backend": "agent", "year": "2004"}
+        server._db_upsert_rec("year_keep1", rec)
+        rec2 = dict(rec, status="recording", year="")
+        server._db_upsert_rec("year_keep1", rec2)
+        conn = sqlite3.connect(server._guide_db_path())
+        year = conn.execute("SELECT year FROM recordings WHERE rec_id='year_keep1'").fetchone()[0]
+        conn.close()
+        self.assertEqual(year, "2004")
+
+    def test_a_row_without_a_year_gives_an_empty_year(self):
+        now = time.time()
+        server._db_upsert_rec("year_none1", {"title": "No Year", "channel_id": "5", "start_ts": now,
+                                             "stop_ts": now + 3600, "status": "queued", "backend": "agent"})
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM recordings WHERE rec_id='year_none1'").fetchone()
+        conn.close()
+        self.assertEqual(server._agent_job_dict(row)["year"], "")
+
+
+class WantedNeedsYearTests(unittest.TestCase):
+    def _add(self, **body):
+        data = {"action": "add", "title": "Needs Year Test Film", "type": "movie"}
+        data.update(body)
+        return server.app.test_client().post("/epg-web/api/wanted", json=data)
+
+    def test_a_movie_without_a_year_is_refused(self):
+        resp = self._add(year="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("needs a year", resp.get_json()["error"])
+        self.assertEqual(self._add(year="n/a").status_code, 400)
+
+    def test_a_movie_with_a_year_is_accepted(self):
+        server._init_recordings_table()
+        with mock.patch.object(server, "db_run") as db_run:
+            resp = self._add(year="2004")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db_run.call_args.args[1][2], "2004")
+
+    def test_a_series_needs_a_year_too(self):
+        resp = self._add(year="", type="series")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("series needs a year", resp.get_json()["error"].lower())
+
+    def test_a_series_range_keeps_its_first_year(self):
+        with mock.patch.object(server, "db_run") as db_run:
+            resp = self._add(year="1964\u20131972", type="series")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db_run.call_args.args[1][2], "1964")
+
+
+class SeriesYearTests(unittest.TestCase):
+    def test_a_year_in_the_folder_name_does_not_change_the_title_key(self):
+        n = server._norm_plex_show
+        self.assertEqual(n("Bewitched (1964)"), n("Bewitched"))
+        self.assertEqual(n("Star Trek: The Next Generation (1987)"), n("Star Trek The Next Generation"))
+        self.assertNotEqual(n("Blade Runner 2049"), n("Blade Runner"))
+
+    def test_episode_keys_ignore_the_year_in_the_show_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            season = os.path.join(temp, "Bewitched (1964)", "Season 01")
+            os.makedirs(season)
+            open(os.path.join(season, "Bewitched - S01E02.mp4"), "wb").close()
+            server._plex_episode_cache.update({"root": None, "loaded_at": 0})
+            self.assertIn("bewitched|1|2", server._plex_episode_keys(temp))
+
+    def test_the_show_index_tracks_years_and_yearless_folders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ("Hawaii Five-0 (1968)", "Magnum PI"):
+                os.makedirs(os.path.join(temp, "tv", name))
+            os.makedirs(os.path.join(temp, "Movies"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": temp + "/Movies", "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            n = server._norm_plex_show
+            self.assertIn((n("Hawaii Five-0"), "1968"), idx["show_versions"])
+            self.assertNotIn((n("Hawaii Five-0"), "2010"), idx["show_versions"])
+            self.assertIn(n("Magnum PI"), idx["unyearred_shows"])
+            self.assertIn(n("Hawaii Five-0"), idx["shows"])
+
+    def test_the_wanted_series_year_is_used_when_there_is_exactly_one(self):
+        rows = [{"title": "Perry Mason", "year": "2020"}]
+        with mock.patch.object(server, "db_rows", return_value=rows):
+            self.assertEqual(server._wanted_series_year("Perry Mason (2020)"), "2020")
+        rows = [{"title": "Perry Mason", "year": "1957"}, {"title": "Perry Mason", "year": "2020"}]
+        with mock.patch.object(server, "db_rows", return_value=rows):
+            self.assertEqual(server._wanted_series_year("Perry Mason"), "")
+        with mock.patch.object(server, "db_rows", side_effect=RuntimeError("db")):
+            self.assertEqual(server._wanted_series_year("Perry Mason"), "")
