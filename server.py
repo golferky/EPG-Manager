@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111f"
+VERSION = "v20261111g"
 
 app = Flask(__name__)
 
@@ -4922,6 +4922,29 @@ def api_recommendation_movie_upgrade():
         return jsonify({'error': f'Unable to compare: {exc}'}), 502
 
 
+_PLEX_VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.m4v', '.avi', '.mov', '.ts', '.wmv', '.mpg', '.mpeg'}
+
+
+def _folder_has_video(path, depth=2):
+    """Does this library folder (or a folder inside it, ``depth`` levels down) hold a video file?
+
+    An empty folder left behind after a film was deleted is not "in Plex".  If the folder
+    cannot be read, assume it does: a real film must never be hidden by a read error.
+    """
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name.startswith('.'):
+                    continue
+                if entry.is_file() and os.path.splitext(entry.name)[1].lower() in _PLEX_VIDEO_EXTENSIONS:
+                    return True
+                if depth > 1 and entry.is_dir() and _folder_has_video(entry.path, depth - 1):
+                    return True
+    except OSError:
+        return True
+    return False
+
+
 def _plex_wanted_title_index():
     """Cache top-level Plex movie/show names for the Wanted Titles badges."""
     cfg = load_config()
@@ -4938,6 +4961,8 @@ def _plex_wanted_title_index():
         for entry in os.scandir(movie_root):
             if entry.name.startswith('.'):
                 continue
+            if entry.is_dir() and not _folder_has_video(entry.path):
+                continue            # an empty folder is not a film in Plex
             title = entry.name if entry.is_dir() else os.path.splitext(entry.name)[0]
             match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', title)
             year = match.group(2) if match else ''
@@ -5092,7 +5117,7 @@ def api_plex_titles():
         return jsonify({'titles': []})
     titles, movies = [], []
     for name in os.listdir(plex_dir):
-        if os.path.isdir(os.path.join(plex_dir, name)):
+        if os.path.isdir(os.path.join(plex_dir, name)) and _folder_has_video(os.path.join(plex_dir, name)):
             match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', name)
             clean = (match.group(1) if match else name).strip()
             if clean:
@@ -5497,7 +5522,7 @@ def api_plex_info():
     mp4_file = next((os.path.join(matched_folder, f)
                      for f in os.listdir(matched_folder) if f.endswith('.mp4')), None)
     if not mp4_file:
-        return jsonify({'found': True, 'error': 'no mp4'})
+        return jsonify({'found': False})
     size_gb = os.path.getsize(mp4_file) / (1024**3)
     result = {'found': True, 'size': f'{size_gb:.2f} GB', 'file': os.path.basename(mp4_file)}
     try:

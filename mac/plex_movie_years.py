@@ -46,6 +46,7 @@ import os
 import re
 import shutil
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -179,6 +180,20 @@ def rename_with_year(movies_dir, name, year):
         raise FileExistsError(f'"{new_name}" already exists')
     os.rename(source, target)
     return new_name
+
+
+_TITLE_LIGATURES = {'\u00e6': 'ae', '\u0153': 'oe', '\u00df': 'ss', '\u00f8': 'o', '\u0111': 'd',
+                    '\u00f0': 'd', '\u00fe': 'th', '\u0142': 'l', '\u0131': 'i'}
+
+
+def fold_title(value):
+    """Lower case, accents and ligatures folded, only letters and digits kept."""
+    text = str(value or '').lower()
+    for special, plain in _TITLE_LIGATURES.items():
+        text = text.replace(special, plain)
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r'[^a-z0-9]', '', text)
 
 
 def load_defaults(config_path, tv=False):

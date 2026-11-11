@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 import shutil
@@ -1373,3 +1374,147 @@ class FoldedTitleAgentTests(unittest.TestCase):
             (Path(temp) / "Aeon Flux (2005)" / "movie.mp4").write_bytes(b"x")
             found = recording_agent.find_plex_candidates(temp, "Æon Flux", "2005")
             self.assertEqual(len(found), 1)
+
+
+class WantedFromEmptyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("wanted_from_empty_under_test", mac / "wanted_from_empty.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name, files in (("Minority Report (2002)", []), ("Quantum of Solace (2008)", ["q.convert.ffmpeg.log"]),
+                            ("Sahara (2005)", ["Sahara.mp4.partial"]), ("Heat (1995)", ["Heat.mp4"]),
+                            ("Nested (2001)", ["sub/n.mkv"]), ("Nobody s Fool (1994)", []),
+                            ("No Year Film", []), ("_wrong_movies", []), (".hidden", [])):
+            folder = root / name
+            folder.mkdir(parents=True)
+            for rel in files:
+                (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+                (folder / rel).write_bytes(b"x")
+        return root
+
+    def test_it_finds_folders_with_no_video_and_reads_title_and_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            found = {name: (title, year) for name, title, year in self.tool.empty_film_folders(self._library(temp))}
+            self.assertEqual(sorted(found), ["Minority Report (2002)", "No Year Film", "Nobody s Fool (1994)",
+                                             "Quantum of Solace (2008)", "Sahara (2005)"])
+            self.assertEqual(found["Minority Report (2002)"], ("Minority Report", "2002"))
+            self.assertEqual(found["No Year Film"], ("No Year Film", ""))
+
+    def test_the_wanted_list_is_read_and_a_failure_is_detected(self):
+        data = {"recommendations": [{"title": "Heat", "year": "1995", "type": "movie"},
+                                    {"title": "Bewitched", "year": "1964", "type": "series"}]}
+        with mock.patch.object(self.tool, "get_json", return_value=data):
+            self.assertEqual(self.tool.already_wanted("http://x"), {("heat", "1995")})
+        with mock.patch.object(self.tool, "get_json", return_value={}):
+            self.assertIsNone(self.tool.already_wanted("http://x"))
+
+    def test_the_database_title_is_used_only_for_the_same_film(self):
+        same = {"title": "Nobody's Fool", "year": "1994", "imdb_id": "tt0110684"}
+        with mock.patch.object(self.tool, "get_json", return_value=same):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody's Fool", "tt0110684"))
+        other_year = {"title": "Nobody's Fool", "year": "2018", "imdb_id": "tt1"}
+        with mock.patch.object(self.tool, "get_json", return_value=other_year):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody s Fool", ""))
+        other_title = {"title": "Something Else", "year": "1994", "imdb_id": "tt2"}
+        with mock.patch.object(self.tool, "get_json", return_value=other_title):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody s Fool", ""))
+        with mock.patch.object(self.tool, "get_json", return_value={}):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody s Fool", ""))
+
+    def _run(self, root, answers, *flags, wanted=None, add_result=""):
+        wanted = {("sahara", "2005")} if wanted is None else wanted
+        out, added = [], []
+        info = {"Nobody s Fool": {"title": "Nobody's Fool", "year": "1994", "imdb_id": "tt0110684"}}
+
+        def fake_get(server, path, params=None, timeout=20):
+            return info.get((params or {}).get("title"), {})
+
+        def fake_add(server, row):
+            added.append((row["title"], row["year"], row["imdb_id"]))
+            return add_result
+        with mock.patch.object(self.tool, "get_json", side_effect=fake_get), \
+             mock.patch.object(self.tool, "already_wanted", return_value=wanted), \
+             mock.patch.object(self.tool, "add_to_wanted", side_effect=fake_add), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", *flags])
+        return rc, "\n".join(out), added
+
+    def test_the_recap_sorts_folders_into_add_already_and_no_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, out, added = self._run(self._library(temp), ["q"])
+            self.assertIn("Will be added to Wanted (3):", out)
+            self.assertIn("Nobody's Fool (1994)", out)              # the database spelling
+            self.assertIn("Already on the Wanted list (1):", out)
+            self.assertIn("Sahara (2005)", out)
+            self.assertIn("no year in the folder name", out)
+            self.assertEqual(added, [])
+
+    def test_y_adds_each_film_with_its_year_and_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rc, out, added = self._run(self._library(temp), ["y"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(added), [("Minority Report", "2002", ""), ("Nobody's Fool", "1994", "tt0110684"),
+                                             ("Quantum of Solace", "2008", "")])
+            self.assertIn("Nothing was removed", out)
+
+    def test_skip_leaves_a_film_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, _out, added = self._run(self._library(temp), ["skip 1", "y"])
+            titles = [a[0] for a in added]
+            self.assertNotIn("Minority Report", titles)          # number 1 is Minority Report
+            self.assertEqual(len(titles), 2)
+
+    def test_a_dry_run_and_quit_add_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, added = self._run(root, ["y"], "--dry-run")
+            self.assertEqual(added, [])
+            self.assertIn("would add", out)
+            _rc, _out, added = self._run(root, ["q"])
+            self.assertEqual(added, [])
+
+    def test_yes_adds_without_asking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, _out, added = self._run(self._library(temp), [], "--yes")
+            self.assertEqual(len(added), 3)
+
+    def test_a_refused_add_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, out, _added = self._run(self._library(temp), ["y"], add_result="A movie needs a year.")
+            self.assertIn("could not add 3", out)
+            self.assertIn("A movie needs a year.", out)
+
+    def test_nothing_is_added_if_the_wanted_list_cannot_be_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out, added = [], []
+            with mock.patch.object(self.tool, "already_wanted", return_value=None), \
+                 mock.patch.object(self.tool, "add_to_wanted", side_effect=lambda *a: added.append(a) or ""), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+                rc = self.tool.main(["--movies", str(self._library(temp)), "--server", "http://x"])
+            self.assertEqual(rc, 1)
+            self.assertEqual(added, [])
+            self.assertIn("Could not read the Wanted list", "\n".join(out))
+
+    def test_add_to_wanted_posts_the_film_and_reads_the_answer(self):
+        import io
+        sent = []
+
+        def fake_urlopen(request, timeout=0):
+            sent.append((request.full_url, json.loads(request.data), request.get_method()))
+            return io.BytesIO(json.dumps({"ok": True}).encode())
+        row = {"title": "Heat", "year": "1995", "imdb_id": "tt1"}
+        with mock.patch.object(self.tool.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.assertEqual(self.tool.add_to_wanted("http://q:5001", row), "")
+        url, body, method = sent[0]
+        self.assertEqual((url, method), ("http://q:5001/epg-web/api/wanted", "POST"))
+        self.assertEqual(body, {"action": "add", "title": "Heat", "year": "1995", "imdb_id": "tt1", "type": "movie"})
+        with mock.patch.object(self.tool.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertIn("down", self.tool.add_to_wanted("http://q:5001", row))

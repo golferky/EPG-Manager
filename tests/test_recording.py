@@ -213,6 +213,7 @@ class RecordingTests(unittest.TestCase):
             movies = os.path.join(temp, "Movies")
             shows = os.path.join(temp, "TV Shows")
             os.makedirs(os.path.join(movies, "F X (1986)"))
+            open(os.path.join(movies, "F X (1986)", "F X.mp4"), "wb").close()       # a folder counts when a film is in it
             os.makedirs(os.path.join(shows, "Bewitched"))
             server._plex_title_cache.update({
                 "roots": (), "loaded_at": 0, "movies": set(), "shows": set(),
@@ -273,6 +274,7 @@ class RecordingTests(unittest.TestCase):
     def test_recommendation_with_a_year_is_not_in_plex_for_a_yearless_folder(self):
         with tempfile.TemporaryDirectory() as temp:
             os.makedirs(os.path.join(temp, "Employee of the Month"))
+            open(os.path.join(temp, "Employee of the Month", "film.mp4"), "wb").close()
             server._plex_title_cache.update({"roots": None, "loaded_at": 0})
             with mock.patch.object(server, "load_config", return_value={"plex_path": temp, "plex_tv_path": temp + "/tv"}):
                 idx = server._plex_wanted_title_index()
@@ -1603,3 +1605,77 @@ class TmdbFallbackTests(unittest.TestCase):
             self._lookup("Aeon%20Flux", self.RESULT)
         logged = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
         self.assertIn("[OMDb] Request limit reached!", logged)
+
+
+class EmptyPlexFolderTests(unittest.TestCase):
+    def _library(self, temp):
+        movies = os.path.join(temp, "Movies")
+        for name, files in (("Heat (1995)", ["Heat.mp4"]), ("Minority Report (2002)", []),
+                            ("Quantum of Solace (2008)", ["Quantum.convert.ffmpeg.log"]),
+                            ("Sahara (2005)", ["Sahara.mp4.partial"]), ("Alien (1979)", ["Alien.MKV"]),
+                            ("Nested (2001)", ["sub/Nested.mp4"])):
+            for rel in files or [""]:
+                path = os.path.join(movies, name, rel)
+                if rel:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    open(path, "wb").close()
+                else:
+                    os.makedirs(path, exist_ok=True)
+        os.makedirs(os.path.join(temp, "tv"))
+        return movies
+
+    def test_folder_has_video(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            has = lambda name: server._folder_has_video(os.path.join(movies, name))
+            self.assertTrue(has("Heat (1995)"))
+            self.assertTrue(has("Alien (1979)"))            # extension in capitals
+            self.assertTrue(has("Nested (2001)"))           # one level down
+            self.assertFalse(has("Minority Report (2002)"))  # empty
+            self.assertFalse(has("Quantum of Solace (2008)"))   # only a log
+            self.assertFalse(has("Sahara (2005)"))          # only an unfinished copy
+
+    def test_an_unreadable_folder_is_assumed_to_have_a_film(self):
+        self.assertTrue(server._folder_has_video("/no/such/folder"))
+
+    def test_empty_folders_are_not_in_plex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            n = server._norm_plex_show
+            self.assertIn((n("Heat"), "1995"), idx["movie_versions"])
+            self.assertIn((n("Nested"), "2001"), idx["movie_versions"])
+            self.assertNotIn((n("Minority Report"), "2002"), idx["movie_versions"])
+            self.assertNotIn(n("Quantum of Solace"), idx["movies"])
+            self.assertNotIn(n("Sahara"), idx["movies"])
+            self.assertNotIn(n("Sahara"), idx["movie_counts"])
+
+    def test_the_title_list_for_the_browser_skips_empty_folders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies}):
+                data = server.app.test_client().get("/epg-web/api/plex/titles").get_json()
+            self.assertIn("Heat", data["titles"])
+            self.assertNotIn("Minority Report", data["titles"])
+
+    def test_plex_info_says_not_found_for_an_empty_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            server._plex_info_cache.clear()
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies}):
+                data = server.app.test_client().get("/epg-web/api/plex/info?title=Minority%20Report&year=2002").get_json()
+            self.assertFalse(data["found"])
+
+    def test_a_wanted_film_with_only_an_empty_folder_is_not_marked_in_plex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            wanted = [{"id": 1, "title": "Minority Report", "normalized_title": "minority report", "year": "2002",
+                       "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}), \
+                 mock.patch.object(server, "db_rows", return_value=wanted), \
+                 mock.patch.dict(server._epg, {"programmes": []}):
+                rec = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"][0]
+            self.assertFalse(rec["in_plex"])
