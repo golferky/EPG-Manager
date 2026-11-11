@@ -667,3 +667,76 @@ class PlexMovieYearsToolTests(unittest.TestCase):
                 self.tool.rename_with_year(temp, "Employee of the Month", "2022")
             with self.assertRaises(ValueError):
                 self.tool.rename_with_year(temp, "Employee of the Month", "22")
+
+
+class SeriesYearFolderTests(unittest.TestCase):
+    def _tv(self, temp, *folders):
+        root = Path(temp) / "TV Shows"
+        for name in folders:
+            season = root / name / "Season 01"
+            season.mkdir(parents=True)
+            (season / "Show - S01E01.mp4").write_bytes(b"x")
+        if not folders:
+            root.mkdir()
+        return root
+
+    def test_a_folder_with_or_without_a_year_is_the_same_show(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Bewitched (1964)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Bewitched").name, "Bewitched (1964)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Bewitched", "1964").name, "Bewitched (1964)")
+            self.assertEqual(len(recording_agent.find_tv_episode_candidates(root, "Bewitched", 1, 1)), 1)
+
+    def test_a_folder_without_a_year_is_still_used_while_the_library_is_renamed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "I Dream of Jeannie")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "I Dream of Jeannie", "1965").name, "I Dream of Jeannie")
+            self.assertEqual(len(recording_agent.find_tv_episode_candidates(root, "I Dream of Jeannie", 1, 1, "1965")), 1)
+
+    def test_a_reboot_is_not_mistaken_for_the_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Hawaii Five-0 (1968)")
+            self.assertEqual(recording_agent.find_tv_episode_candidates(root, "Hawaii Five-0", 1, 1, "2010"), [])
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Hawaii Five-0", "2010").name, "Hawaii Five-0 (2010)")
+
+    def test_both_versions_exist_and_the_right_one_is_picked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Hawaii Five-0 (1968)", "Hawaii Five-0 (2010)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Hawaii Five-0", "2010").name, "Hawaii Five-0 (2010)")
+            self.assertEqual(recording_agent.resolve_show_dir(root, "Hawaii Five-0", "1968").name, "Hawaii Five-0 (1968)")
+
+    def test_a_new_show_gets_its_year_in_the_folder_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp)
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_episode_transfer(source, root, "Perry Mason", 1, 2, "Chapter Two", year="2020")
+            self.assertEqual(dest.parent.parent.name, "Perry Mason (2020)")
+            self.assertEqual(dest.parent.name, "Season 01")
+            self.assertEqual(dest.name, "Perry Mason - S01E02 - Chapter Two.mp4")
+
+    def test_a_new_show_without_a_year_keeps_the_plain_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp)
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_episode_transfer(source, root, "Perry Mason", 1, 2)
+            self.assertEqual(dest.parent.parent.name, "Perry Mason")
+
+    def test_an_existing_show_folder_is_reused_for_a_new_episode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp, "Bewitched (1964)")
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_episode_transfer(source, root, "Bewitched", 1, 2, year="1964")
+            self.assertEqual(dest.parent.parent.name, "Bewitched (1964)")
+            self.assertFalse((root / "Bewitched").exists())
+
+    def test_unidentified_episodes_keep_the_year_in_the_holding_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._tv(temp)
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"ep")
+            dest = recording_agent.verified_unidentified_episode_transfer(source, root, "Perry Mason", 0, year="2020")
+            self.assertEqual(dest.parent.name, "Perry Mason (2020)")
+            self.assertEqual(dest.parent.parent.name, "_Needs Episode Info")

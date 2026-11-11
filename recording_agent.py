@@ -29,7 +29,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261111c"
+AGENT_VERSION = "v20261111d"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -324,9 +324,43 @@ def episode_metadata(job):
     }
 
 
-def find_tv_episode_candidates(tv_root, show_title, season, episode):
+def resolve_show_dir(tv_root, show_title, year=''):
+    """The Plex folder for a show: an existing one if there is one, else the new name.
+
+    ``Show`` and ``Show (1964)`` are the same title, so either is found.  With a year,
+    a folder named for a DIFFERENT year is another show (a reboot) and is never used.
+    A folder with no year is used while the library is being renamed; a folder for the
+    exact year is preferred.  A show Plex does not have yet gets ``Show (Year)`` when
+    the year is known, else ``Show``.
+    """
+    base, title_year = split_title_year(show_title)
+    year = str(year or '').strip()[:4] or title_year
+    wanted = normalized_title(base)
+    root = Path(tv_root)
+    matches = []
+    try:
+        entries = sorted(root.iterdir()) if root.is_dir() else []
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.is_dir() or entry.name.startswith(('.', '_')):
+            continue
+        if normalized_title(entry.name) != wanted:
+            continue
+        entry_year = _name_year(entry.name)
+        if year and entry_year and entry_year != year:
+            continue
+        matches.append(entry)
+    if matches:
+        matches.sort(key=lambda entry: _name_year(entry.name) != year)   # exact year first
+        return matches[0]
+    name = f'{base} ({year})' if year else base
+    return root / safe_filename(name)
+
+
+def find_tv_episode_candidates(tv_root, show_title, season, episode, year=''):
     """Find only the matching SxxExx episode within this show's Plex folder."""
-    show_dir = Path(tv_root) / safe_filename(show_title)
+    show_dir = resolve_show_dir(tv_root, show_title, year)
     if not show_dir.is_dir():
         return []
     pattern = re.compile(rf'\bS{season:02d}E{episode:02d}\b', re.IGNORECASE)
@@ -677,14 +711,15 @@ def verified_transfer(source, plex_root, title, existing_path=None, progress_cal
 
 def verified_episode_transfer(source, tv_root, show_title, season, episode,
                               episode_title='', existing_path=None,
-                              progress_callback=None):
+                              progress_callback=None, year=''):
     if existing_path and Path(existing_path).suffix.lower() == '.mp4':
         destination = Path(existing_path)
     else:
-        show = safe_filename(show_title)
+        show = safe_filename(split_title_year(show_title)[0])
         episode_suffix = f' - {safe_filename(episode_title)}' if episode_title else ''
         filename = f'{show} - S{season:02d}E{episode:02d}{episode_suffix}.mp4'
-        destination = Path(tv_root) / show / f'Season {season:02d}' / filename
+        destination = (resolve_show_dir(tv_root, show_title, year) /
+                       f'Season {season:02d}' / filename)
     return _verified_copy(source, destination, progress_callback)
 
 
@@ -709,11 +744,14 @@ def verified_unyeared_movie_transfer(source, cfg, title, start_ts, progress_call
 
 
 def verified_unidentified_episode_transfer(source, tv_root, show_title, start_ts,
-                                           progress_callback=None):
+                                           progress_callback=None, year=''):
     """Keep an identified-as-TV airing out of Movies until S/E data is available."""
-    show = safe_filename(show_title)
+    base, title_year = split_title_year(show_title)
+    year = str(year or '').strip()[:4] or title_year
+    show = safe_filename(base)
+    folder = safe_filename(f'{base} ({year})' if year else base)
     aired = time.strftime('%Y-%m-%d_%H%M', time.localtime(start_ts))
-    destination = (Path(tv_root) / '_Needs Episode Info' / show /
+    destination = (Path(tv_root) / '_Needs Episode Info' / folder /
                    f'{show} - {aired}.mp4')
     return _verified_copy(source, destination, progress_callback)
 
@@ -820,7 +858,7 @@ def process_job(api, job, cfg):
 
     api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
     candidates = (find_tv_episode_candidates(
-        library_root, job['title'], episode['season'], episode['episode'])
+        library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
         if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
     existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
     try:
@@ -913,7 +951,7 @@ def process_job(api, job, cfg):
     # Recheck the library after recording. The share may have been unavailable
     # during preflight, or Plex may have received a better copy in the meantime.
     final_candidates = (find_tv_episode_candidates(
-        library_root, job['title'], episode['season'], episode['episode'])
+        library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
         if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
     final_existing_path, final_existing_probe = best_existing_copy(
         final_candidates, cfg['ffprobe']
@@ -1012,12 +1050,12 @@ def process_job(api, job, cfg):
         destination = verified_episode_transfer(
             mp4_path, library_root, job['title'], episode['season'],
             episode['episode'], episode['title'], existing_path,
-            progress_callback=transfer_progress,
+            progress_callback=transfer_progress, year=job.get('year', ''),
         )
     elif is_series:
         destination = verified_unidentified_episode_transfer(
             mp4_path, library_root, job['title'], job['start_ts'],
-            progress_callback=transfer_progress,
+            progress_callback=transfer_progress, year=job.get('year', ''),
         )
     else:
         # The year chosen when the recording was set up beats a title lookup, which

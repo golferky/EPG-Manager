@@ -1298,6 +1298,53 @@ class WantedNeedsYearTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(db_run.call_args.args[1][2], "2004")
 
-    def test_a_series_does_not_need_a_year(self):
-        with mock.patch.object(server, "db_run"):
-            self.assertEqual(self._add(year="", type="series").status_code, 200)
+    def test_a_series_needs_a_year_too(self):
+        resp = self._add(year="", type="series")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("series needs a year", resp.get_json()["error"].lower())
+
+    def test_a_series_range_keeps_its_first_year(self):
+        with mock.patch.object(server, "db_run") as db_run:
+            resp = self._add(year="1964\u20131972", type="series")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db_run.call_args.args[1][2], "1964")
+
+
+class SeriesYearTests(unittest.TestCase):
+    def test_a_year_in_the_folder_name_does_not_change_the_title_key(self):
+        n = server._norm_plex_show
+        self.assertEqual(n("Bewitched (1964)"), n("Bewitched"))
+        self.assertEqual(n("Star Trek: The Next Generation (1987)"), n("Star Trek The Next Generation"))
+        self.assertNotEqual(n("Blade Runner 2049"), n("Blade Runner"))
+
+    def test_episode_keys_ignore_the_year_in_the_show_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            season = os.path.join(temp, "Bewitched (1964)", "Season 01")
+            os.makedirs(season)
+            open(os.path.join(season, "Bewitched - S01E02.mp4"), "wb").close()
+            server._plex_episode_cache.update({"root": None, "loaded_at": 0})
+            self.assertIn("bewitched|1|2", server._plex_episode_keys(temp))
+
+    def test_the_show_index_tracks_years_and_yearless_folders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name in ("Hawaii Five-0 (1968)", "Magnum PI"):
+                os.makedirs(os.path.join(temp, "tv", name))
+            os.makedirs(os.path.join(temp, "Movies"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": temp + "/Movies", "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            n = server._norm_plex_show
+            self.assertIn((n("Hawaii Five-0"), "1968"), idx["show_versions"])
+            self.assertNotIn((n("Hawaii Five-0"), "2010"), idx["show_versions"])
+            self.assertIn(n("Magnum PI"), idx["unyearred_shows"])
+            self.assertIn(n("Hawaii Five-0"), idx["shows"])
+
+    def test_the_wanted_series_year_is_used_when_there_is_exactly_one(self):
+        rows = [{"title": "Perry Mason", "year": "2020"}]
+        with mock.patch.object(server, "db_rows", return_value=rows):
+            self.assertEqual(server._wanted_series_year("Perry Mason (2020)"), "2020")
+        rows = [{"title": "Perry Mason", "year": "1957"}, {"title": "Perry Mason", "year": "2020"}]
+        with mock.patch.object(server, "db_rows", return_value=rows):
+            self.assertEqual(server._wanted_series_year("Perry Mason"), "")
+        with mock.patch.object(server, "db_rows", side_effect=RuntimeError("db")):
+            self.assertEqual(server._wanted_series_year("Perry Mason"), "")

@@ -27,7 +27,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111c"
+VERSION = "v20261111d"
 
 app = Flask(__name__)
 
@@ -4775,6 +4775,11 @@ def api_recommendations():
         year_unknown = bool(wanted_year and not in_movies and
                             title_key in plex_titles.get('unyearred_movies', set()))
         in_shows = title_key in plex_titles['shows']
+        if is_series_wanted and wanted_year and in_shows:
+            # A show folder for another year is a different show (a reboot).  While the
+            # library is being renamed, a folder with no year still counts.
+            in_shows = ((title_key, wanted_year) in plex_titles.get('show_versions', set()) or
+                        title_key in plex_titles.get('unyearred_shows', set()))
         result.append({
             'id':         w['id'],
             'title':      w['title'],
@@ -4861,6 +4866,7 @@ def _plex_wanted_title_index():
         return _plex_title_cache
     movies, movie_versions, unyearred_movies, shows = set(), set(), set(), set()
     movie_counts = {}
+    show_versions, unyearred_shows = set(), set()
     try:
         for entry in os.scandir(movie_root):
             if entry.name.startswith('.'):
@@ -4882,13 +4888,19 @@ def _plex_wanted_title_index():
     try:
         for entry in os.scandir(tv_root):
             if entry.is_dir() and not entry.name.startswith(('.', '_')):
-                shows.add(_norm_plex_show(entry.name))
+                show_title, show_year = _plex_title_and_year(entry.name)
+                shows.add(_norm_plex_show(show_title))
+                if show_year:
+                    show_versions.add((_norm_plex_show(show_title), show_year))
+                else:
+                    unyearred_shows.add(_norm_plex_show(show_title))
     except OSError:
         pass
     _plex_title_cache.update({
         'roots': roots, 'loaded_at': now, 'movies': movies,
         'movie_versions': movie_versions, 'unyearred_movies': unyearred_movies,
         'shows': shows, 'movie_counts': movie_counts,
+        'show_versions': show_versions, 'unyearred_shows': unyearred_shows,
     })
     return _plex_title_cache
 
@@ -4904,8 +4916,9 @@ def api_wanted():
         if not title:
             return jsonify({'error': 'Choose a title first.'}), 400
         year = _clean_year(year)
-        if item_type != 'series' and not year:
-            return jsonify({'error': 'A movie needs a year. Pick it from the list so the right film is recorded.'}), 400
+        if not year:
+            what = 'A series' if item_type == 'series' else 'A movie'
+            return jsonify({'error': f'{what} needs a year. Pick it from the list so the right title is recorded.'}), 400
         norm  = title.lower().replace("'",'').replace('-',' ')
         # The chooser supplies OMDb's canonical title, year, and IMDb ID.
         # Preserve that provenance so a typed nickname never becomes the
@@ -5026,7 +5039,22 @@ def _plex_tv_path(cfg):
     )
 
 def _norm_plex_show(value):
-    return re.sub(r'[^a-z0-9]', '', (value or '').lower())
+    """Title identity for matching: letters and digits only, a trailing (YYYY) ignored,
+    so ``Bewitched`` and ``Bewitched (1964)`` are the same title.  The year is compared
+    separately wherever it is known."""
+    value = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', value or '')
+    return re.sub(r'[^a-z0-9]', '', value.lower())
+
+def _wanted_series_year(title):
+    """The first-air year of the Wanted series with this title, if there is exactly one."""
+    key = _norm_plex_show(title)
+    try:
+        rows = db_rows("SELECT title, year FROM wanted_titles WHERE type='series'")
+    except Exception:
+        return ''
+    years = {_clean_year(r['year']) for r in rows if _norm_plex_show(r['title']) == key}
+    years.discard('')
+    return years.pop() if len(years) == 1 else ''
 
 
 def _plex_title_and_year(value):
@@ -7188,7 +7216,7 @@ def api_record():
         'episode_num': episode_num,
         'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
-        'year': _clean_year(data.get('year')),
+        'year': _clean_year(data.get('year')) or (_wanted_series_year(title) if is_series_request else ''),
     }
     _url, stream_error, stream_debug = _resolve_recording_source(
         channel_id, start_ts, stop_ts, preferred_provider=requested_provider)
