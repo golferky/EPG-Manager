@@ -565,3 +565,55 @@ class ShortRecordingFlowTests(unittest.TestCase):
     def test_a_complete_recording_is_not_saved_as_incomplete(self):
         _archive, preserve = self._run(138)
         preserve.assert_not_called()
+
+
+class SameTitleDifferentYearTests(unittest.TestCase):
+    """Two films with one title (a remake) must not be treated as the same copy."""
+
+    def _library(self, temp, *folders):
+        root = Path(temp)
+        for name in folders:
+            (root / name).mkdir()
+            (root / name / "movie.mp4").write_bytes(b"x")
+        return root
+
+    def test_a_copy_from_another_year_is_not_a_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            self.assertEqual(recording_agent.find_plex_candidates(root, "Employee of the Month", "2004"), [])
+
+    def test_the_same_year_is_a_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            found = recording_agent.find_plex_candidates(root, "Employee of the Month", "2022")
+            self.assertEqual([p.name for p in found], ["movie.mp4"])
+
+    def test_only_the_matching_year_is_picked_when_both_exist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2004)", "Employee of the Month (2022)")
+            found = recording_agent.find_plex_candidates(root, "Employee of the Month", "2004")
+            self.assertEqual([p.parent.name for p in found], ["Employee of the Month (2004)"])
+
+    def test_a_folder_with_no_year_still_matches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month")
+            self.assertEqual(len(recording_agent.find_plex_candidates(root, "Employee of the Month", "2004")), 1)
+
+    def test_no_year_keeps_the_old_behaviour(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            self.assertEqual(len(recording_agent.find_plex_candidates(root, "Employee of the Month")), 1)
+
+    def test_a_year_in_the_title_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            self.assertEqual(recording_agent.find_plex_candidates(root, "Employee of the Month (2004)"), [])
+
+    def test_the_new_copy_goes_to_its_own_year_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp, "Employee of the Month (2022)")
+            source = Path(temp) / "rec.mp4"
+            source.write_bytes(b"new-copy")
+            dest = recording_agent.verified_transfer(source, root, "Employee of the Month", year="2004")
+            self.assertEqual(dest.parent.name, "Employee of the Month (2004)")
+            self.assertEqual((root / "Employee of the Month (2022)" / "movie.mp4").read_bytes(), b"x")

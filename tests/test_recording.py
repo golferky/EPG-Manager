@@ -1197,3 +1197,52 @@ class MarkFinishedTests(unittest.TestCase):
     def test_unknown_or_missing_id(self):
         self.assertEqual(self._mark("nope_nope").status_code, 404)
         self.assertEqual(self._mark("").status_code, 400)
+
+
+class RecordingYearTests(unittest.TestCase):
+    def setUp(self):
+        server._init_recordings_table()
+
+    def test_clean_year(self):
+        self.assertEqual(server._clean_year("2004"), "2004")
+        self.assertEqual(server._clean_year(" (1999) "), "1999")
+        self.assertEqual(server._clean_year("2004-05-01"), "2004")
+        self.assertEqual(server._clean_year(None), "")
+        self.assertEqual(server._clean_year("n/a"), "")
+        self.assertEqual(server._clean_year("12345"), "")
+
+    def test_the_year_is_saved_and_handed_to_the_recorder(self):
+        now = time.time()
+        rec = {"title": "Year Test Movie", "channel_id": "5", "channel": "SHO", "start_ts": now + 600,
+               "stop_ts": now + 4200, "status": "queued", "progress": 0, "log": [], "pid": None,
+               "file": None, "backend": "agent", "stream_id": "1", "stream_provider": "primestreams",
+               "stream_extension": "ts", "episode_title": "", "season_num": None, "episode_num": None,
+               "is_series": False, "auto_upgrade": False, "year": "2004"}
+        server._db_upsert_rec("year12345", rec)
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM recordings WHERE rec_id=?", ("year12345",)).fetchone()
+        conn.close()
+        self.assertEqual(server._agent_job_dict(row)["year"], "2004")
+
+    def test_a_status_update_does_not_wipe_the_year(self):
+        now = time.time()
+        rec = {"title": "Year Keep Movie", "channel_id": "5", "start_ts": now, "stop_ts": now + 3600,
+               "status": "queued", "backend": "agent", "year": "2004"}
+        server._db_upsert_rec("year_keep1", rec)
+        rec2 = dict(rec, status="recording", year="")
+        server._db_upsert_rec("year_keep1", rec2)
+        conn = sqlite3.connect(server._guide_db_path())
+        year = conn.execute("SELECT year FROM recordings WHERE rec_id='year_keep1'").fetchone()[0]
+        conn.close()
+        self.assertEqual(year, "2004")
+
+    def test_a_row_without_a_year_gives_an_empty_year(self):
+        now = time.time()
+        server._db_upsert_rec("year_none1", {"title": "No Year", "channel_id": "5", "start_ts": now,
+                                             "stop_ts": now + 3600, "status": "queued", "backend": "agent"})
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM recordings WHERE rec_id='year_none1'").fetchone()
+        conn.close()
+        self.assertEqual(server._agent_job_dict(row)["year"], "")

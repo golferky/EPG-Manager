@@ -29,7 +29,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261110d"
+AGENT_VERSION = "v20261111a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -271,7 +271,19 @@ def recording_missing_seconds(recorded, start_ts, stop_ts):
     return missing if missing > allowed else 0
 
 
-def find_plex_candidates(plex_root, title):
+def _name_year(name):
+    """The (YYYY) at the end of a Plex folder or file name, or ''."""
+    return split_title_year(name)[1]
+
+
+def find_plex_candidates(plex_root, title, year=''):
+    """Existing Plex copies of ``title``.
+
+    With a ``year``, an entry named for a different year is a different film (a
+    remake with the same title) and is not a candidate.  An entry with no year in
+    its name still matches, because older folders often have none.
+    """
+    year = str(year or '').strip()[:4] or split_title_year(title)[1]
     root = Path(plex_root)
     if not root.is_dir():
         return []
@@ -282,6 +294,9 @@ def find_plex_candidates(plex_root, title):
     except OSError:
         return []
     for entry in entries:
+        entry_year = _name_year(entry.name if entry.is_dir() else entry.stem)
+        if year and entry_year and entry_year != year:
+            continue
         if entry.is_dir() and normalized_title(entry.name) == wanted:
             candidates.extend(
                 path for path in entry.iterdir()
@@ -786,7 +801,7 @@ def process_job(api, job, cfg):
     api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
     candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'])
-        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'])))
+        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
     existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
     try:
         incoming_probe = probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
@@ -879,7 +894,7 @@ def process_job(api, job, cfg):
     # during preflight, or Plex may have received a better copy in the meantime.
     final_candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'])
-        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'])))
+        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
     final_existing_path, final_existing_probe = best_existing_copy(
         final_candidates, cfg['ffprobe']
     )
@@ -985,11 +1000,15 @@ def process_job(api, job, cfg):
             progress_callback=transfer_progress,
         )
     else:
-        try:
-            movie_year = api.movie_year(job['title'])
-        except Exception as exc:
-            print(f'[metadata] no year for {job["title"]}: {exc}', file=sys.stderr, flush=True)
-            movie_year = ''
+        # The year chosen when the recording was set up beats a title lookup, which
+        # cannot tell two films of the same name apart.
+        movie_year = str(job.get('year') or '').strip()[:4]
+        if not movie_year:
+            try:
+                movie_year = api.movie_year(job['title'])
+            except Exception as exc:
+                print(f'[metadata] no year for {job["title"]}: {exc}', file=sys.stderr, flush=True)
+                movie_year = ''
         destination = verified_transfer(
             mp4_path, library_root, job['title'], existing_path,
             progress_callback=transfer_progress, year=movie_year,

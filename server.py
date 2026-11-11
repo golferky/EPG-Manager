@@ -27,7 +27,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261110c"
+VERSION = "v20261111a"
 
 app = Flask(__name__)
 
@@ -1681,6 +1681,7 @@ def _init_recordings_table():
             ('stream_extension', "TEXT DEFAULT 'ts'"),
             ('guide_stop_ts', 'REAL'),
             ('overtime_cushion_seconds', 'INTEGER DEFAULT 0'),
+            ('year', 'TEXT'),
         ]
         for column, typedef in migrations:
             try:
@@ -1702,8 +1703,8 @@ def _db_upsert_rec(rec_id, rec):
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
              status, failure_reason, file, created_at, backend, stream_id, updated_at,
              episode_title, season_num, episode_num, is_series, auto_upgrade, stream_provider, stream_extension,
-             guide_stop_ts, overtime_cushion_seconds)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             guide_stop_ts, overtime_cushion_seconds, year)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
@@ -1744,6 +1745,7 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('stream_extension', 'ts'),
             rec.get('guide_stop_ts', rec.get('stop_ts', 0)),
             rec.get('overtime_cushion_seconds', 0),
+            rec.get('year', ''),
         ))
         conn.commit()
         conn.close()
@@ -7168,6 +7170,7 @@ def api_record():
         'episode_num': episode_num,
         'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
+        'year': _clean_year(data.get('year')),
     }
     _url, stream_error, stream_debug = _resolve_recording_source(
         channel_id, start_ts, stop_ts, preferred_provider=requested_provider)
@@ -7417,6 +7420,15 @@ def _agent_authorized():
 def _agent_auth_failure():
     return jsonify({'ok': False, 'error': 'Unauthorized recording agent'}), 401
 
+def _clean_year(value):
+    """A four-digit year (1900-2099) from user or database text, or '' if there is none.
+
+    A film's year tells a remake from the original (two "Employee of the Month"
+    films), so it travels with the recording to the recorder.
+    """
+    match = re.search(r'\b(19\d{2}|20\d{2})\b', str(value or ''))
+    return match.group(1) if match else ''
+
 def _agent_job_dict(row):
     return {
         'id': row['rec_id'], 'title': row['title'], 'channel': row['channel'],
@@ -7430,6 +7442,7 @@ def _agent_job_dict(row):
         'season_num': row['season_num'], 'episode_num': row['episode_num'],
         'is_series': bool(row['is_series']),
         'auto_upgrade': bool(row['auto_upgrade']),
+        'year': _clean_year(row['year']),
     }
 
 @app.route('/epg-web/api/agent/health')
@@ -9017,7 +9030,8 @@ async function quickRecord(key, btnEl) {
       body: JSON.stringify({title: p.title, channel_id: p.channel_id, channel_name: p.channel,
                             start_ts: p.start_ts, stop_ts: p.stop_ts,
                             episode_title: p.episode_title || '',
-                            season_num: p.season_num, episode_num: p.episode_num})
+                            season_num: p.season_num, episode_num: p.episode_num,
+                            year: String(p.year || '').slice(0, 4)})
     });
     const d = await r.json();
     if (d.ok && !d.error) {
@@ -10651,6 +10665,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
     episode_num: airing.episode_num,
     sports_event: !!(airing.sports_event || (_currentProg && _currentProg.sports_event)),
     allow_commercial_movie: allowCommercialMovie,
+    year: String((_currentInfoYear || airing.year || '')).slice(0, 4),
   });
   if (r.ok) {
     btn.textContent = '✅ Scheduled';
