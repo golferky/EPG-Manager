@@ -1711,3 +1711,99 @@ class PrivateMoviesDashboardTests(unittest.TestCase):
             with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}):
                 idx = server._plex_wanted_title_index()
             self.assertEqual(len(idx["movie_versions"]), 1)
+
+
+class PrivateRecordingTests(unittest.TestCase):
+    CHANNEL = "pv-chan-1"
+
+    def setUp(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._rec_cancel_events.clear()
+        server._init_recordings_table()
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("DELETE FROM recordings")
+        conn.execute("DELETE FROM private_titles")
+        conn.commit()
+        conn.close()
+        self.start = time.time() + 7200
+
+    def _record(self, **extra):
+        body = {"title": "Private Film", "channel_id": self.CHANNEL, "channel_name": "Chan",
+                "start_ts": self.start, "stop_ts": self.start + 6000, "year": "2004"}
+        body.update(extra)
+        with mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source",
+                               return_value=("http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"})):
+            return server.app.test_client().post("/epg-web/api/record", json=body)
+
+    def _saved(self):
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM recordings ORDER BY created_at DESC LIMIT 1").fetchone()
+        conn.close()
+        return row
+
+    def _mark(self, private, title="Private Film", year="2004"):
+        return server.app.test_client().post("/epg-web/api/wanted/private",
+                                             json={"title": title, "year": year, "private": private})
+
+    def test_a_recording_asked_to_be_private_is_saved_private_and_sent_to_the_recorder(self):
+        self.assertEqual(self._record(private=True).status_code, 200)
+        row = self._saved()
+        self.assertEqual(row["private"], 1)
+        self.assertTrue(server._agent_job_dict(row)["private"])
+
+    def test_a_plain_recording_is_not_private(self):
+        self._record()
+        row = self._saved()
+        self.assertEqual(row["private"], 0)
+        self.assertFalse(server._agent_job_dict(row)["private"])
+
+    def test_a_wanted_film_marked_private_records_privately_without_being_asked(self):
+        self.assertTrue(self._mark(True).get_json()["ok"])
+        self._record()
+        self.assertEqual(self._saved()["private"], 1)
+
+    def test_marking_it_public_again_stops_that(self):
+        self._mark(True)
+        self._mark(False)
+        self._record()
+        self.assertEqual(self._saved()["private"], 0)
+
+    def test_privacy_belongs_to_the_year_not_just_the_title(self):
+        self._mark(True, year="2022")
+        self._record(year="2004")
+        self.assertEqual(self._saved()["private"], 0)
+
+    def test_the_mark_needs_a_title_and_a_year(self):
+        self.assertEqual(self._mark(True, year="").status_code, 400)
+        self.assertEqual(self._mark(True, title="").status_code, 400)
+
+    def test_accents_do_not_change_which_film_is_private(self):
+        self._mark(True, title="Æon Flux", year="2005")
+        self.assertTrue(server._is_private_title("Aeon Flux", "2005"))
+
+    def test_a_tv_episode_is_never_private(self):
+        self._record(private=True, season_num=1, episode_num=2, episode_title="Pilot")
+        row = self._saved()
+        self.assertEqual(row["private"], 0)
+
+    def test_recommendations_show_which_films_are_private(self):
+        self._mark(True, title="Private Film", year="2004")
+        wanted = [{"id": 1, "title": "Private Film", "normalized_title": "private film", "year": "2004",
+                   "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""},
+                  {"id": 2, "title": "Other Film", "normalized_title": "other film", "year": "1999",
+                   "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": []}):
+            recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        self.assertEqual([r["private"] for r in recs], [True, False])
+
+    def test_the_page_has_the_private_checkbox_and_toggle(self):
+        self.assertIn('id="pm-private"', server.HTML)
+        self.assertIn("togglePrivateWanted", server.HTML)
+        self.assertIn("/epg-web/api/wanted/private", server.HTML)

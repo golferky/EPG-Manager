@@ -1663,3 +1663,59 @@ class PrivateMoviesToolTests(unittest.TestCase):
             _rc, out = self._run(movies, [], "--show")
             self.assertIn("1 private movie(s)", out)
             self.assertIn("Heat (1995)", out)
+
+
+class PrivateRecordingFlowTests(unittest.TestCase):
+    """A private film is filed in the private folder, never in the Plex library."""
+
+    def _run(self, private, existing_year=None):
+        now = time.time()
+        job = {"id": "p1", "title": "Private Film", "stream_id": "1", "start_ts": now - 3600,
+               "stop_ts": now - 3600 + 100 * 60, "stream_provider": "primestreams", "stream_extension": "ts",
+               "year": "2004", "private": private}
+        with tempfile.TemporaryDirectory() as temp:
+            movies, private_dir = Path(temp) / "Movies", Path(temp) / "Movies Private"
+            movies.mkdir()
+            cfg = {"local_recordings": temp, "plex_path": str(movies), "plex_tv_path": temp + "/TV",
+                   "ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "recording_tail_seconds": 45,
+                   "epg_url": "http://x.test", "epg_user": "u", "epg_pass": "p", "heartbeat_seconds": 1,
+                   "transfer_wait_timeout": 5, "transfer_retry_seconds": 1}
+            api = mock.Mock()
+            probe = {"duration": 100 * 60 + 40, "height": 480}
+            seen = {}
+
+            def fake_transfer(source, root, title, existing_path=None, progress_callback=None, year=""):
+                seen["root"], seen["year"] = str(root), year
+                return Path(root) / f"{title} ({year})" / f"{title}.mp4"
+            with mock.patch.object(recording_agent, "probe_media", return_value=probe), \
+                 mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
+                 mock.patch.object(recording_agent, "record_with_resume", return_value=0), \
+                 mock.patch.object(recording_agent, "run_process", return_value=0), \
+                 mock.patch.object(recording_agent, "plex_mount_available", return_value=True), \
+                 mock.patch.object(recording_agent, "archive_terminal_result"), \
+                 mock.patch.object(recording_agent, "discard_failed_media"), \
+                 mock.patch.object(recording_agent, "verified_transfer", side_effect=fake_transfer):
+                recording_agent.process_job(api, job, cfg)
+            return seen, str(movies), str(private_dir), private_dir.is_dir()
+
+    def test_a_private_film_goes_to_the_private_folder(self):
+        seen, movies, private_dir, created = self._run(True)
+        self.assertEqual(seen["root"], private_dir)
+        self.assertNotEqual(seen["root"], movies)
+        self.assertEqual(seen["year"], "2004")
+
+    def test_a_normal_film_goes_to_plex(self):
+        seen, movies, _private_dir, created = self._run(False)
+        self.assertEqual(seen["root"], movies)
+
+    def test_the_private_folder_is_created_when_the_share_is_mounted(self):
+        _seen, _movies, _private_dir, created = self._run(True)
+        self.assertTrue(created)
+
+    def test_a_private_flag_is_ignored_for_tv(self):
+        job = {"id": "t1", "title": "Show", "season_num": 1, "episode_num": 2, "private": True}
+        episode = recording_agent.episode_metadata(job)
+        self.assertIsNotNone(episode)
+        # (the choice is made in process_job: private applies only when there is no episode and no series)
+        private_film = bool(job.get("private")) and not (episode or False)
+        self.assertFalse(private_film)

@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261111f"
+AGENT_VERSION = "v20261111g"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -402,9 +402,23 @@ def find_movie_candidates(cfg, library_root, title, year=''):
     A private film is hidden from Plex, but it is still a film we have: finding it here
     stops the recorder making a second copy.
     """
-    found = list(find_plex_candidates(library_root, title, year))
-    found += find_plex_candidates(private_movies_root(cfg), title, year)
+    roots, found = [], []
+    for root in (library_root, cfg.get('plex_path', ''), private_movies_root(cfg)):
+        if root and str(root) not in roots:
+            roots.append(str(root))
+            found += find_plex_candidates(root, title, year)
     return found
+
+
+def ensure_private_root(cfg):
+    """The private folder, created if the Plex share is mounted and it is not there yet."""
+    root = private_movies_root(cfg)
+    if not root.is_dir() and plex_mount_available(Path(cfg['plex_path']), cfg.get('plex_mount_marker', '')):
+        try:
+            root.mkdir(parents=False, exist_ok=True)
+        except OSError:
+            pass
+    return root
 
 
 def best_existing_copy(paths, ffprobe):
@@ -889,7 +903,10 @@ def process_job(api, job, cfg):
                      job.get('stream_extension', 'ts'))
     episode = episode_metadata(job)
     is_series = bool(job.get('is_series'))
-    library_root = cfg['plex_tv_path'] if (episode or is_series) else cfg['plex_path']
+    # A film recorded privately goes to the private folder, never into the Plex library.
+    private_film = bool(job.get('private')) and not (episode or is_series)
+    library_root = (cfg['plex_tv_path'] if (episode or is_series) else
+                    str(ensure_private_root(cfg)) if private_film else cfg['plex_path'])
 
     api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
     candidates = (find_tv_episode_candidates(

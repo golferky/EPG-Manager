@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111h"
+VERSION = "v20261111i"
 
 app = Flask(__name__)
 
@@ -72,7 +72,8 @@ def _bootstrap():
                 ('stream_provider', "TEXT DEFAULT 'primestreams'"),
                 ('stream_extension', "TEXT DEFAULT 'ts'"),
                 ('guide_stop_ts', 'REAL'),
-                ('overtime_cushion_seconds', 'INTEGER DEFAULT 0')]:
+                ('overtime_cushion_seconds', 'INTEGER DEFAULT 0'),
+                ('private', 'INTEGER DEFAULT 0')]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -1710,6 +1711,9 @@ def _init_recordings_table():
             file        TEXT,
             created_at  TEXT
         )''')
+        # Wanted films whose recordings are kept private (out of Plex).  Kept here, in the guide
+        # database this server owns, not in the shared Movies database.
+        conn.execute('CREATE TABLE IF NOT EXISTS private_titles (norm TEXT, year TEXT, PRIMARY KEY (norm, year))')
         migrations = [
             ('backend', "TEXT DEFAULT 'local'"),
             ('stream_id', 'TEXT'),
@@ -1729,6 +1733,7 @@ def _init_recordings_table():
             ('guide_stop_ts', 'REAL'),
             ('overtime_cushion_seconds', 'INTEGER DEFAULT 0'),
             ('year', 'TEXT'),
+            ('private', 'INTEGER DEFAULT 0'),
         ]
         for column, typedef in migrations:
             try:
@@ -1750,8 +1755,8 @@ def _db_upsert_rec(rec_id, rec):
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
              status, failure_reason, file, created_at, backend, stream_id, updated_at,
              episode_title, season_num, episode_num, is_series, auto_upgrade, stream_provider, stream_extension,
-             guide_stop_ts, overtime_cushion_seconds, year)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             guide_stop_ts, overtime_cushion_seconds, year, private)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
@@ -1793,6 +1798,7 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('guide_stop_ts', rec.get('stop_ts', 0)),
             rec.get('overtime_cushion_seconds', 0),
             rec.get('year', ''),
+            1 if rec.get('private') else 0,
         ))
         conn.commit()
         conn.close()
@@ -4818,6 +4824,7 @@ def api_recommendations():
             future_airings.setdefault(t, []).append(p)
 
     plex_titles = _plex_wanted_title_index()
+    private_set = _private_titles()
     with _rec_lock:
         active_upgrade_titles = {
             _norm_plex_show(r.get('title', '')) for r in _recs.values()
@@ -4860,6 +4867,7 @@ def api_recommendations():
             'updated_at': w['updated_at'],
             'next_airing': airing,
             'in_plex': in_movies or in_shows,
+            'private': (title_key, wanted_year) in private_set,
             'plex_year_unknown': year_unknown,
             'upgrade_scheduled': bool(in_movies and title_key in active_upgrade_titles),
             'plex_kind': ('Movie' if in_movies else '') + (' & TV' if in_movies and in_shows else 'TV' if in_shows else ''),
@@ -7150,6 +7158,56 @@ def _recording_slot_conflicts(recs, start_ts, stop_ts, limit):
             peak, busiest = len(running), running
     return busiest if peak >= limit else []
 
+def _is_private_title(title, year):
+    """Is this Wanted film marked private?  (A film is private by its title and year.)"""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        try:
+            row = conn.execute('SELECT 1 FROM private_titles WHERE norm=? AND year=?',
+                               (fold_title(title), _clean_year(year))).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return bool(row)
+
+
+def _private_titles():
+    """{(folded title, year)} of every film marked private."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        try:
+            return {(r[0], r[1]) for r in conn.execute('SELECT norm, year FROM private_titles')}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return set()
+
+
+@app.route('/epg-web/api/wanted/private', methods=['POST'])
+def api_wanted_private():
+    """Mark a film private (recordings go to the private folder, not Plex) or not."""
+    data = request.json or {}
+    title = str(data.get('title', '')).strip()
+    year = _clean_year(data.get('year'))
+    if not title or not year:
+        return jsonify({'ok': False, 'error': 'A title and a year are needed.'}), 400
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        try:
+            conn.execute('CREATE TABLE IF NOT EXISTS private_titles (norm TEXT, year TEXT, PRIMARY KEY (norm, year))')
+            if data.get('private'):
+                conn.execute('INSERT OR IGNORE INTO private_titles(norm, year) VALUES (?, ?)', (fold_title(title), year))
+            else:
+                conn.execute('DELETE FROM private_titles WHERE norm=? AND year=?', (fold_title(title), year))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    return jsonify({'ok': True, 'private': bool(data.get('private'))})
+
+
 def _guide_year_for_airing(guide_db, channel_id, title, start_ts):
     """The year the guide gives this airing, or '' if it gives none or is not sure.
 
@@ -7317,6 +7375,11 @@ def api_record():
             'ok': False, 'year_mismatch': True, 'guide_year': guide_year,
             'error': (f'This airing of "{title}" is the {guide_year} film, not the {requested_year} one. '
                       'It was not scheduled.')}), 409
+    # A film can be recorded privately (straight into the private folder, never into Plex):
+    # because this recording was asked to be, or because the Wanted film is marked private.
+    # Only films: TV episodes always go to the TV library.
+    film_year = requested_year or guide_year
+    wants_private = bool(data.get('private')) or (bool(film_year) and _is_private_title(title, film_year))
     guide_stop_ts = stop_ts
     overtime_cushion_seconds = SPORTS_OVERTIME_CUSHION_SECONDS if is_sports_request else 0
     if overtime_cushion_seconds:
@@ -7364,6 +7427,7 @@ def api_record():
         'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
         'year': requested_year or guide_year or (_wanted_series_year(title) if is_series_request else ''),
+        'private': bool(wants_private and not is_series_request),
     }
     _url, stream_error, stream_debug = _resolve_recording_source(
         channel_id, start_ts, stop_ts, preferred_provider=requested_provider)
@@ -7636,6 +7700,7 @@ def _agent_job_dict(row):
         'is_series': bool(row['is_series']),
         'auto_upgrade': bool(row['auto_upgrade']),
         'year': _clean_year(row['year']),
+        'private': bool(row['private']),
     }
 
 @app.route('/epg-web/api/agent/health')
@@ -8219,6 +8284,7 @@ tr:hover td{background:#141414;}
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
           <span id="pm-airings-heading" style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📡 Available Airings</span>
+          <label id="pm-private-wrap" title="Record this film into the private folder, never into Plex" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#c4b5fd;cursor:pointer;white-space:nowrap;"><input id="pm-private" type="checkbox"> 🔒 Private (keep out of Plex)</label>
           <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Identified Episodes</button>
           <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unscheduled Only</button>
         </div>
@@ -9873,6 +9939,7 @@ async function openProg(p) {
   _modalGeneration += 1;
   _currentProg = p;
   _nextAiring = null;
+  { const privateBox = document.getElementById('pm-private'); if (privateBox) privateBox.checked = false; }
   { const busyLbl = document.getElementById('pm-play-busy'); if (busyLbl) busyLbl.style.display = 'none'; }
   // Show overlay in loading state
   const overlay = document.getElementById('prog-modal-overlay');
@@ -10853,6 +10920,11 @@ function closeProg() {
   btn.textContent = '▶ Play'; btn.disabled = false;
   btn.onclick = playStream;
 }
+async function togglePrivateWanted(title, year, makePrivate) {
+  const r = await post('/epg-web/api/wanted/private', {title, year, private: makePrivate});
+  if (!r.ok) { alert(r.error || 'Could not change it'); return; }
+  loadRecs();
+}
 async function recordAiring(airing, title, button, allowCommercialMovie=false, year='') {
   const modalGeneration = _modalGeneration;
   const btn = button || event.target;
@@ -10869,6 +10941,9 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
     episode_num: airing.episode_num,
     sports_event: !!(airing.sports_event || (_currentProg && _currentProg.sports_event)),
     allow_commercial_movie: allowCommercialMovie,
+    // Private is asked for only while the window shows THIS film.  A Wanted film marked private
+    // is private anyway: the server knows.
+    private: ((_currentProg && _currentProg.title === title && (document.getElementById('pm-private') || {}).checked) ? true : undefined),
     // The year must belong to THIS title: the programme window's year only counts while
     // that window shows the same title (it can be left over from a different film).
     year: String(year || airing.year || ((_currentProg && _currentProg.title === title) ? _currentInfoYear : '') || '').slice(0, 4),
@@ -11211,6 +11286,7 @@ async function loadRecs() {
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
+          ${(!isSeries && r.year)?`<button class="btn btn-ghost btn-sm" style="margin:0 0 0 5px;padding:1px 6px;${r.private?'color:#c4b5fd;border-color:#7c3aed;':''}" title="${r.private?'Private: recordings go to the private folder, not Plex. Click to make it public.':'Click to record this film privately, outside Plex.'}" onclick="togglePrivateWanted(${titleArg},${yearArg},${r.private?'false':'true'})">${r.private?'🔒 Private':'🔓'}</button>`:''}
           ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
           <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
         </td>
