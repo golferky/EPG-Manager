@@ -457,8 +457,14 @@ def main(argv=None):
     if not will_rename(plan) and not will_move(plan) and not will_fix(plan):
         print('\nNothing to do. Use  set N YEAR  to give a folder a year, or q to quit.' if not args.yes else '\nNothing to do.')
     if not args.yes:
-        print('\nCommands:  y = go ahead (rename and move as listed)   skip 3 7 = leave numbers alone   '
-              'set 12 2008 = give a year   list   q = quit')
+        print('\nType one command and press Enter:\n'
+              '  y            go ahead and do everything listed above\n'
+              '  skip 3 7     leave numbers 3 and 7 alone (use the numbers at the left of each line)\n'
+              '  set 12 2008  give number 12 the year 2008\n'
+              + ('  fix 32       rename junk-named number 32 in place to its cleaned name (fix all = every one)\n'
+                 if any(row['action'] != 'rename' for row in plan) else '')
+              + '  list         show the list again\n'
+              '  q            quit without changing anything')
         while True:
             try:
                 text = input('> ')
