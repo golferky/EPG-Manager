@@ -13,9 +13,19 @@ Folders with a junk name (a YYYYMMDD HHMMSS stamp, or a -Copy(1) ending) are not
 they are moved out of Plex, into "Movies Needing Attention" (or "TV Needing Attention")
 next to the library, so you can look at each one.  Nothing is deleted.
 
+For a junk-named folder it also works out a cleaned title (stamp and copy suffix removed),
+looks that up, and shows what the folder could be called, for example
+"Bottle Shock (2008)".  You decide: leave it to be moved out, or  fix 32  to rename it
+(and the file inside) in place.
+
 At the recap prompt:
-    y            rename the "Will be renamed" list and move the "Will be moved" list
-    skip 3 7     leave numbers 3 and 7 alone (renamed or moved, either list)
+    y            rename the "Will be renamed" list, fix the "fixed in place" list and
+                 move the "Will be moved" list
+    skip 3 7     leave numbers 3 and 7 alone (renamed, fixed or moved)
+    fix 32       rename junk-named number 32 in place to its cleaned name and year
+    fix 32 2008  the same, with a year you give
+    fix all      fix every junk-named folder that has a cleaned name and year
+    move 32      put a fixed one back to "move out of Plex"
     set 12 2008  give number 12 (or change its) year
     list         show the recap again
     q            quit without renaming anything
@@ -68,6 +78,55 @@ def junk_folders(library_dir):
         if os.path.isdir(os.path.join(library_dir, name)) and JUNK_NAME.search(name):
             found.append(name)
     return found
+
+
+_STAMP = re.compile(r'\b\d{8}[ _-]\d{4,6}\b')
+_COPY_SUFFIX = re.compile(r'(?:[-_]\s*copy(?:\s*\(\d+\))?|\s+copy\s*\(\d+\))\s*$', re.IGNORECASE)
+_TRAILING_YEAR = re.compile(r'\(\s*((?:19|20)\d{2})\s*\)\s*$')
+
+
+def clean_junk_title(name):
+    """(title, year hint) from a junk folder name: the stamp and copy suffix removed.
+
+    "Bottle Shock 20260205 181000-Copy(1)" -> ("Bottle Shock", "").  A year already in the
+    name is kept as the hint:  "Film 20260205 181000 (2008)" -> ("Film", "2008").
+    """
+    text = name
+    year = ''
+    for _ in range(4):                      # the pieces can come in any order
+        before = text
+        text = _STAMP.sub(' ', text)
+        text = _COPY_SUFFIX.sub('', text.strip())
+        match = _TRAILING_YEAR.search(text.strip())
+        if match:
+            year = match.group(1)
+            text = text.strip()[:match.start()]
+        text = re.sub(r'[ _]+', ' ', text).strip(' -_.')
+        if text == before:
+            break
+    return text, year
+
+
+def fix_in_place(library_dir, old_name, title, year):
+    """Rename a junk-named folder to "Title (Year)" and the files in it that carry its old name.
+
+    Never overwrites.  Returns the new folder name.
+    """
+    if not title or not re.fullmatch(r'(19|20)\d{2}', str(year)):
+        raise ValueError('a cleaned title and a four-digit year are needed')
+    new_name = f'{title} ({year})'
+    source = os.path.join(library_dir, old_name)
+    target = os.path.join(library_dir, new_name)
+    if os.path.exists(target):
+        raise FileExistsError(f'"{new_name}" already exists')
+    os.rename(source, target)
+    for entry in sorted(os.listdir(target)):
+        path = os.path.join(target, entry)
+        if os.path.isfile(path) and entry.startswith(old_name):
+            renamed = title + entry[len(old_name):]
+            if not os.path.exists(os.path.join(target, renamed)):
+                os.rename(path, os.path.join(target, renamed))
+    return new_name
 
 
 def attention_root(library_dir, tv=False, configured=''):
@@ -167,12 +226,22 @@ def gather_suggestions(server, names, kind, workers=8):
     return dict(zip(names, years))
 
 
-def build_plan(names, suggestions, junk=()):
-    """One row per folder, numbered from 1.  A junk-named folder is moved, not renamed."""
+def build_plan(names, suggestions, junk=(), cleaned=None):
+    """One row per folder, numbered from 1.
+
+    A junk-named folder is moved out by default.  ``cleaned`` maps its name to
+    {'title', 'year', 'exists'}: what it could be called, and whether that folder is taken.
+    """
     junk = set(junk)
-    return [{'n': i, 'name': name, 'year': '' if name in junk else suggestions.get(name, ''),
-             'action': 'move' if name in junk else 'rename', 'skip': False}
-            for i, name in enumerate(names, 1)]
+    cleaned = cleaned or {}
+    rows = []
+    for i, name in enumerate(names, 1):
+        info = cleaned.get(name, {})
+        rows.append({'n': i, 'name': name, 'year': '' if name in junk else suggestions.get(name, ''),
+                     'action': 'move' if name in junk else 'rename', 'skip': False,
+                     'clean': info.get('title', ''), 'clean_year': info.get('year', ''),
+                     'exists': bool(info.get('exists'))})
+    return rows
 
 
 def will_rename(plan):
@@ -183,10 +252,19 @@ def will_move(plan):
     return [row for row in plan if row['action'] == 'move' and not row['skip']]
 
 
+def will_fix(plan):
+    return [row for row in plan if row['action'] == 'fix' and not row['skip']]
+
+
+def cleaned_name(row):
+    """\"Title (Year)\" for a junk row, or '' when there is no usable title and year."""
+    return f"{row['clean']} ({row['clean_year']})" if row.get('clean') and row.get('clean_year') else ''
+
+
 def format_recap(plan, move_root=''):
     """The recap text: what will be renamed, moved, or left alone, and why."""
     lines = []
-    go, move = will_rename(plan), will_move(plan)
+    go, move, fix = will_rename(plan), will_move(plan), will_fix(plan)
     width = min(52, max([len(row['name']) for row in plan] + [10]))
 
     def entry(row, arrow):
@@ -194,9 +272,20 @@ def format_recap(plan, move_root=''):
         return f"  {row['n']:>3}. {name:<{width}}  {arrow}"
     lines.append(f'Will be renamed ({len(go)}):')
     lines += [entry(row, f"->  {row['name']} ({row['year']})") for row in go] or ['  (none)']
+    if fix:
+        lines.append(f'\nWill be fixed in place, folder and file renamed ({len(fix)}):')
+        lines += [entry(row, f"->  {row['clean']} ({row['year']})") for row in fix]
     if move:
         lines.append(f'\nWill be moved out of Plex to {move_root or "a Needing Attention folder"} ({len(move)}):')
-        lines += [entry(row, 'junk name: needs a look') for row in move]
+        for row in move:
+            hint = cleaned_name(row)
+            if hint and row.get('exists'):
+                note = f'junk name; "{hint}" already exists: likely a duplicate'
+            elif hint:
+                note = f'junk name; cleaned: "{hint}"  (fix {row["n"]} to rename it in place)'
+            else:
+                note = 'junk name: needs a look'
+            lines.append(entry(row, note))
     skipped = [row for row in plan if row['skip']]
     if skipped:
         lines.append(f'\nSkipped by you ({len(skipped)}):')
@@ -235,14 +324,45 @@ def parse_command(text, plan, move_root=''):
         for number in numbers:
             by_number[number]['skip'] = True
         return 'continue', f'Left alone: {", ".join(str(n) for n in numbers)}.  Type list to see the recap, y to go ahead.'
+    if command == 'fix':
+        if rest == ['all']:
+            count = 0
+            for row in plan:
+                if row['action'] == 'move' and not row['skip'] and cleaned_name(row) and not row['exists']:
+                    row['action'], row['year'] = 'fix', row['clean_year']
+                    count += 1
+            return 'continue', (f'{count} folder(s) will be fixed in place.  Type list to see them, y to go ahead.'
+                                if count else 'No junk-named folder has a cleaned name and year without a clash.')
+        if not rest or not rest[0].isdigit() or int(rest[0]) not in by_number or len(rest) > 2:
+            return 'continue', 'fix needs a list number, and optionally a year: fix 32   or   fix 32 2008'
+        row = by_number[int(rest[0])]
+        if row['action'] not in ('move', 'fix'):
+            return 'continue', f'{row["n"]}. {row["name"]} does not have a junk name; use set {row["n"]} YEAR.'
+        year = rest[1] if len(rest) == 2 else row['clean_year']
+        if not re.fullmatch(r'(19|20)\d{2}', year or ''):
+            return 'continue', f'No year found for "{row["clean"]}". Give one: fix {row["n"]} 2008'
+        if not row['clean']:
+            return 'continue', f'Could not work out a title from "{row["name"]}".'
+        row['clean_year'] = year
+        if row['exists'] and not len(rest) == 2:
+            return 'continue', f'"{cleaned_name(row)}" already exists, so this is likely a duplicate. Skip it, or move it out.'
+        row['action'], row['year'], row['skip'] = 'fix', year, False
+        return 'continue', f'{row["n"]}. will be renamed to "{row["clean"]} ({year})".'
+    if command == 'move':
+        if len(rest) != 1 or not rest[0].isdigit() or int(rest[0]) not in by_number:
+            return 'continue', 'move needs a list number: move 32'
+        row = by_number[int(rest[0])]
+        if row['action'] == 'fix':
+            row['action'], row['year'] = 'move', ''
+        return 'continue', f'{row["n"]}. will be moved out of Plex.'
     if command == 'set':
         if (len(rest) != 2 or not rest[0].isdigit() or int(rest[0]) not in by_number
                 or not re.fullmatch(r'(19|20)\d{2}', rest[1])):
             return 'continue', 'set needs a list number and a four-digit year, for example: set 12 2008'
         row = by_number[int(rest[0])]
-        if row['action'] == 'move':
-            return 'continue', (f'{row["n"]}. {row["name"]} has a junk name, so it is moved out, not renamed. '
-                                'Clean up its name first, or skip it.')
+        if row['action'] in ('move', 'fix'):
+            return 'continue', (f'{row["n"]}. {row["name"]} has a junk name. Use  fix {row["n"]} {rest[1]}  '
+                                'to rename it in place with that year, or skip it.')
         row['year'], row['skip'] = rest[1], False
         return 'continue', f'{row["n"]}. {row["name"]} will be renamed to "{row["name"]} ({row["year"]})".'
     return 'continue', f'Unknown command "{command}". Type y, skip N, set N YEAR, list, or q.'
@@ -251,9 +371,21 @@ def parse_command(text, plan, move_root=''):
 def apply_plan(movies_dir, plan, dry_run=False, move_root=''):
     """Rename the rows with a year and move the junk-named rows out.
 
-    Returns (renamed rows, moved rows, [(row, error)]).
+    Returns (renamed rows, moved rows, [(row, error)]); fixed rows count as renamed.
     """
     renamed, moved, failed = [], [], []
+    for row in will_fix(plan):
+        if dry_run:
+            print(f'  (dry run) would fix "{row["name"]}" to "{row["clean"]} ({row["year"]})"')
+            renamed.append(row)
+            continue
+        try:
+            new_name = fix_in_place(movies_dir, row['name'], row['clean'], row['year'])
+        except (OSError, ValueError) as exc:
+            failed.append((row, str(exc)))
+            continue
+        print(f'  Fixed to "{new_name}"')
+        renamed.append(row)
     for row in will_rename(plan):
         if dry_run:
             print(f'  (dry run) would rename "{row["name"]}" to "{row["name"]} ({row["year"]})"')
@@ -312,10 +444,17 @@ def main(argv=None):
             return 1
     print(f'{len(todo)} {kind} folder(s) need attention in {movies_dir} ({len(junk)} with a junk name).  '
           'Looking up years...\n')
-    lookup = [name for name in todo if name not in set(junk)]
-    plan = build_plan(todo, gather_suggestions(server, lookup, 'series' if args.tv else 'movie'), junk)
+    cleaned = {name: dict(zip(('title', 'hint'), clean_junk_title(name))) for name in junk}
+    lookup = sorted({name for name in todo if name not in set(junk)} |
+                    {info['title'] for info in cleaned.values() if info['title']})
+    suggestions = gather_suggestions(server, lookup, 'series' if args.tv else 'movie')
+    for name, info in cleaned.items():
+        year = suggestions.get(info['title'], '') or info['hint']
+        target = f"{info['title']} ({year})" if info['title'] and year else ''
+        info.update(year=year, exists=bool(target and os.path.exists(os.path.join(movies_dir, target))))
+    plan = build_plan(todo, suggestions, junk, cleaned)
     print(format_recap(plan, move_root))
-    if not will_rename(plan) and not will_move(plan):
+    if not will_rename(plan) and not will_move(plan) and not will_fix(plan):
         print('\nNothing to do. Use  set N YEAR  to give a folder a year, or q to quit.' if not args.yes else '\nNothing to do.')
     if not args.yes:
         print('\nCommands:  y = go ahead (rename and move as listed)   skip 3 7 = leave numbers alone   '
@@ -335,7 +474,7 @@ def main(argv=None):
                 break
     renamed, moved, failed = apply_plan(movies_dir, plan, args.dry_run, move_root)
     left = [row for row in plan if row['skip'] or (row['action'] == 'rename' and not row['year'])]
-    verb = ('Would rename', 'would move') if args.dry_run else ('Renamed', 'moved')
+    verb = ('Would rename or fix', 'would move') if args.dry_run else ('Renamed or fixed', 'moved')
     print(f'\nDone. {verb[0]} {len(renamed)}, {verb[1]} {len(moved)}, '
           f'left alone {len(left)}, could not do {len(failed)}.')
     for row, error in failed:

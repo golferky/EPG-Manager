@@ -944,7 +944,7 @@ class YearRecapTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(self._names(root), ["Alien (1979)", "Dated (2001)", "Employee of the Month (2004)",
                                                  "Heat (1995)", "Odd Film"])
-            self.assertIn("Renamed 3, moved 0, left alone 1", out)
+            self.assertIn("Renamed or fixed 3, moved 0, left alone 1", out)
             self.assertIn("Left alone: Odd Film", out)
 
     def test_skip_leaves_numbers_out(self):
@@ -1079,7 +1079,7 @@ class JunkNameTests(unittest.TestCase):
             self.assertIn("Will be moved out of Plex", out)
             self.assertIn("Movies Needing Attention", out)
             self.assertIn(self.JUNK, out)
-            self.assertEqual(looked_up, ["Heat"])
+            self.assertEqual(sorted(looked_up), ["Bottle Shock", "Heat"])      # the CLEANED title, not the junk name
 
     def test_y_moves_the_junk_folder_out_with_its_contents_and_renames_the_rest(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1106,6 +1106,7 @@ class JunkNameTests(unittest.TestCase):
             root = self._library(temp)
             _rc, out, _ = self._run(root, ["set 1 2008", "q"])
             self.assertIn("junk name", out)
+            self.assertIn("fix 1 2008", out)
             self.assertTrue((root / self.JUNK).is_dir())
 
     def test_a_dry_run_moves_nothing(self):
@@ -1146,3 +1147,143 @@ class JunkNameTests(unittest.TestCase):
             cfg.write_text(json.dumps({"needs_attention_path": "/x/Look"}))
             self.assertEqual(self.tool.load_attention_path(str(cfg)), "/x/Look")
             self.assertEqual(self.tool.load_attention_path(str(Path(temp) / "missing.json")), "")
+
+
+class CleanedTitleTests(unittest.TestCase):
+    """A junk-named folder gets a cleaned name and year to choose from."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_clean", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    JUNK = "Bottle Shock 20260205 181000-Copy(1)"
+
+    def test_the_title_is_cleaned(self):
+        clean = self.tool.clean_junk_title
+        self.assertEqual(clean(self.JUNK), ("Bottle Shock", ""))
+        self.assertEqual(clean("Film 20260205 181000 (2008)"), ("Film", "2008"))
+        self.assertEqual(clean("Movie - Copy"), ("Movie", ""))
+        self.assertEqual(clean("Movie-Copy(2)"), ("Movie", ""))
+        self.assertEqual(clean("The Hobbit: An Unexpected Journey 20260101_200000 - Copy (2)"),
+                         ("The Hobbit: An Unexpected Journey", ""))
+
+    def test_fix_in_place_renames_the_folder_and_the_files_with_its_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / self.JUNK
+            folder.mkdir()
+            for name in (f"{self.JUNK}.mp4", f"{self.JUNK}.en.srt", "poster.jpg"):
+                (folder / name).write_bytes(b"x")
+            new = self.tool.fix_in_place(temp, self.JUNK, "Bottle Shock", "2008")
+            self.assertEqual(new, "Bottle Shock (2008)")
+            self.assertEqual(sorted(p.name for p in (Path(temp) / new).iterdir()),
+                             ["Bottle Shock.en.srt", "Bottle Shock.mp4", "poster.jpg"])
+            self.assertFalse(folder.exists())
+
+    def test_fix_in_place_never_overwrites_and_checks_its_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / self.JUNK).mkdir()
+            (Path(temp) / "Bottle Shock (2008)").mkdir()
+            with self.assertRaises(FileExistsError):
+                self.tool.fix_in_place(temp, self.JUNK, "Bottle Shock", "2008")
+            self.assertTrue((Path(temp) / self.JUNK).is_dir())
+            with self.assertRaises(ValueError):
+                self.tool.fix_in_place(temp, self.JUNK, "", "2008")
+            with self.assertRaises(ValueError):
+                self.tool.fix_in_place(temp, self.JUNK, "Bottle Shock", "08")
+
+    def _run(self, root, answers, *flags, years=None):
+        years = {"Bottle Shock": "2008", "Heat": "1995"} if years is None else years
+        out = []
+        with mock.patch.object(self.tool, "suggest_year", side_effect=lambda s, n, k="": years.get(n, "")), \
+             mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", *flags])
+        return rc, "\n".join(out)
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        (root / self.JUNK).mkdir(parents=True)
+        (root / self.JUNK / f"{self.JUNK}.mp4").write_bytes(b"film")
+        (root / "Heat").mkdir()
+        return root
+
+    def test_the_recap_shows_the_cleaned_name_for_a_junk_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["q"])
+            self.assertIn('cleaned: "Bottle Shock (2008)"', out)
+            self.assertIn("fix 1", out)
+
+    def test_fix_renames_in_place_instead_of_moving(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 1", "y"])
+            self.assertTrue((root / "Bottle Shock (2008)" / "Bottle Shock.mp4").is_file())
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+            self.assertIn("Fixed to", out)
+
+    def test_list_shows_the_fixed_in_place_section(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 1", "list", "q"])
+            self.assertIn("Will be fixed in place", out)
+            self.assertIn("->  Bottle Shock (2008)", out)
+
+    def test_fix_with_a_given_year_overrides_the_lookup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["fix 1 2009", "y"])
+            self.assertTrue((root / "Bottle Shock (2009)").is_dir())
+
+    def test_fix_without_a_year_asks_for_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 1", "q"], years={})
+            self.assertIn("No year found", out)
+            self.assertTrue((root / self.JUNK).is_dir())
+
+    def test_fix_all_fixes_every_junk_folder_with_a_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            other = "Alien 20260101 090000 - Copy"
+            (root / other).mkdir()
+            self._run(root, ["fix all", "y"], years={"Bottle Shock": "2008", "Alien": "1979", "Heat": "1995"})
+            names = sorted(p.name for p in root.iterdir())
+            self.assertIn("Bottle Shock (2008)", names)
+            self.assertIn("Alien (1979)", names)
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+
+    def test_a_clashing_cleaned_name_is_flagged_and_not_fixed_by_fix_all(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            (root / "Bottle Shock (2008)").mkdir()
+            _rc, out = self._run(root, ["fix all", "fix 2", "y"])
+            self.assertIn("likely a duplicate", out)
+            self.assertIn("No junk-named folder has a cleaned name", out)
+            # the junk copy was moved out, the proper folder untouched
+            self.assertTrue((Path(temp) / "Movies Needing Attention" / self.JUNK).is_dir())
+            self.assertTrue((root / "Bottle Shock (2008)").is_dir())
+
+    def test_move_puts_a_fixed_one_back_to_move_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["fix 1", "move 1", "y"])
+            self.assertTrue((Path(temp) / "Movies Needing Attention" / self.JUNK).is_dir())
+
+    def test_the_year_in_the_junk_name_is_the_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "Movies"
+            (root / "Film 20260205 181000 (2008)").mkdir(parents=True)
+            self._run(root, ["fix 1", "y"], years={})
+            self.assertTrue((root / "Film (2008)").is_dir())
+
+    def test_fix_on_a_normal_folder_points_to_set(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out = self._run(root, ["fix 2", "q"])
+            self.assertIn("use set 2 YEAR", out)
