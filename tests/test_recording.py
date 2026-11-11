@@ -237,17 +237,48 @@ class RecordingTests(unittest.TestCase):
                 )
             self.assertTrue(response.get_json()["found"])
 
-    def test_plex_info_tolerates_unyearred_folder_and_extra_spaces(self):
+    def _plex_info(self, temp, query):
+        server._plex_info_cache.clear()
+        with mock.patch.object(server, "load_config", return_value={"plex_path": temp}):
+            return server.app.test_client().get("/epg-web/api/plex/info?" + query).get_json()
+
+    def test_plex_info_tolerates_extra_spaces_when_no_year_is_asked_for(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = os.path.join(temp, "Alvin and the Chipmunks  Chipwrecked")
             os.makedirs(folder)
             open(os.path.join(folder, "movie.mp4"), "wb").close()
-            server._plex_info_cache.clear()
-            with mock.patch.object(server, "load_config", return_value={"plex_path": temp}):
-                response = server.app.test_client().get(
-                    "/epg-web/api/plex/info?title=Alvin%20and%20the%20Chipmunks%3A%20Chipwrecked%20(2011)"
-                )
-            self.assertTrue(response.get_json()["found"])
+            data = self._plex_info(temp, "title=Alvin%20and%20the%20Chipmunks%3A%20Chipwrecked")
+            self.assertTrue(data["found"])
+
+    def test_plex_info_does_not_assume_a_folder_without_a_year_is_the_asked_for_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = os.path.join(temp, "Employee of the Month")
+            os.makedirs(folder)
+            open(os.path.join(folder, "movie.mp4"), "wb").close()
+            self.assertFalse(self._plex_info(temp, "title=Employee%20of%20the%20Month&year=2004")["found"])
+            self.assertFalse(self._plex_info(temp, "title=Employee%20of%20the%20Month%20(2004)")["found"])
+
+    def test_plex_info_picks_the_folder_of_the_asked_for_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name, content in (("Employee of the Month (2004)", b"a"), ("Employee of the Month (2022)", b"bb")):
+                os.makedirs(os.path.join(temp, name))
+                with open(os.path.join(temp, name, name + ".mp4"), "wb") as handle:
+                    handle.write(content)
+            data = self._plex_info(temp, "title=Employee%20of%20the%20Month&year=2022")
+            self.assertEqual(data["file"], "Employee of the Month (2022).mp4")
+            data = self._plex_info(temp, "title=Employee%20of%20the%20Month&year=2004")
+            self.assertEqual(data["file"], "Employee of the Month (2004).mp4")
+
+    def test_recommendation_with_a_year_is_not_in_plex_for_a_yearless_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            os.makedirs(os.path.join(temp, "Employee of the Month"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": temp, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            key = server._norm_plex_show("Employee of the Month")
+            self.assertIn(key, idx["unyearred_movies"])
+            self.assertNotIn((key, "2004"), idx["movie_versions"])
+            self.assertEqual(idx["movie_counts"][key], 1)
 
     def test_stream_info_returns_safe_incoming_quality(self):
         server._stream_info_cache.clear()

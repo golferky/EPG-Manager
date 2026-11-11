@@ -594,10 +594,10 @@ class SameTitleDifferentYearTests(unittest.TestCase):
             found = recording_agent.find_plex_candidates(root, "Employee of the Month", "2004")
             self.assertEqual([p.parent.name for p in found], ["Employee of the Month (2004)"])
 
-    def test_a_folder_with_no_year_still_matches(self):
+    def test_a_folder_with_no_year_is_not_assumed_to_be_the_same_film(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self._library(temp, "Employee of the Month")
-            self.assertEqual(len(recording_agent.find_plex_candidates(root, "Employee of the Month", "2004")), 1)
+            self.assertEqual(recording_agent.find_plex_candidates(root, "Employee of the Month", "2004"), [])
 
     def test_no_year_keeps_the_old_behaviour(self):
         with tempfile.TemporaryDirectory() as temp:

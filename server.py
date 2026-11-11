@@ -27,7 +27,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111a"
+VERSION = "v20261111b"
 
 app = Flask(__name__)
 
@@ -4622,7 +4622,8 @@ def _auto_schedule_movie_upgrades():
         if not os.path.isdir(movie_root):
             print('[auto-upgrade] Plex Movies is not mounted; skipping')
             return
-        plex_movies = _plex_wanted_title_index().get('movies', set())
+        plex_index = _plex_wanted_title_index()
+        plex_movies = plex_index.get('movies', set())
         if not plex_movies:
             return
         conn = sqlite3.connect(guide_db)
@@ -4636,7 +4637,10 @@ def _auto_schedule_movie_upgrades():
         candidates_by_title = {}
         for row in rows:
             title_key = _norm_plex_show(row['title'])
+            # A guide airing carries no year.  If Plex holds the title more than once
+            # (a remake, say) the airing cannot be matched to one copy, so leave it alone.
             if (title_key in plex_movies
+                    and plex_index.get('movie_counts', {}).get(title_key, 0) == 1
                     and not _is_foreign_recording_feed(row['channel_name'])
                     and not _is_automatic_recording_quarantined_channel(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
@@ -4658,6 +4662,7 @@ def _auto_schedule_movie_upgrades():
                     continue
             _existing_path, existing = best_existing_copy(
                 find_plex_candidates(movie_root, title), cfg.get('ffprobe', 'ffprobe'))
+            existing_year = _plex_title_and_year(os.path.basename(os.path.dirname(str(_existing_path or ''))))[1]
             if not existing:
                 continue
             # A title can have several simultaneous guide listings: an SD
@@ -4678,7 +4683,7 @@ def _auto_schedule_movie_upgrades():
             incoming_pixels = int(incoming.get('width', 0)) * int(incoming.get('height', 0))
             upgrade_options.append({
                 'title': title, 'candidate': candidate, 'start': start, 'stop': stop,
-                'existing': existing, 'incoming': incoming,
+                'existing': existing, 'incoming': incoming, 'year': existing_year,
                 'gain': incoming_pixels - existing_pixels,
             })
 
@@ -4700,7 +4705,7 @@ def _auto_schedule_movie_upgrades():
                 'title': option['title'], 'channel_id': option['candidate']['channel_id'],
                 'channel_name': option['candidate']['channel_name'],
                 'start_ts': option['start'].timestamp(), 'stop_ts': option['stop'].timestamp(),
-                'auto_upgrade': True,
+                'auto_upgrade': True, 'year': option.get('year', ''),
             }):
                 queued = api_record().get_json()
             if queued.get('ok') and not queued.get('dup'):
@@ -4763,9 +4768,12 @@ def api_recommendations():
         airing = next(iter(candidates), None)
         title_key = _norm_plex_show(w['title'])
         wanted_year = str(w['year'] or '').strip()
+        # With a year, only a folder for THAT year counts.  A folder with no year in its
+        # name could be a different film with the same title, so it is flagged, not assumed.
         in_movies = (title_key in plex_titles['movies'] if not wanted_year else
-                     ((title_key, wanted_year) in plex_titles.get('movie_versions', set()) or
-                      title_key in plex_titles.get('unyearred_movies', set())))
+                     (title_key, wanted_year) in plex_titles.get('movie_versions', set()))
+        year_unknown = bool(wanted_year and not in_movies and
+                            title_key in plex_titles.get('unyearred_movies', set()))
         in_shows = title_key in plex_titles['shows']
         result.append({
             'id':         w['id'],
@@ -4780,6 +4788,7 @@ def api_recommendations():
             'updated_at': w['updated_at'],
             'next_airing': airing,
             'in_plex': in_movies or in_shows,
+            'plex_year_unknown': year_unknown,
             'upgrade_scheduled': bool(in_movies and title_key in active_upgrade_titles),
             'plex_kind': ('Movie' if in_movies else '') + (' & TV' if in_movies and in_shows else 'TV' if in_shows else ''),
         })
@@ -4851,6 +4860,7 @@ def _plex_wanted_title_index():
     if (_plex_title_cache['roots'] == roots and now - _plex_title_cache['loaded_at'] < 300):
         return _plex_title_cache
     movies, movie_versions, unyearred_movies, shows = set(), set(), set(), set()
+    movie_counts = {}
     try:
         for entry in os.scandir(movie_root):
             if entry.name.startswith('.'):
@@ -4862,6 +4872,7 @@ def _plex_wanted_title_index():
             if title:
                 key = _norm_plex_show(title)
                 movies.add(key)
+                movie_counts[key] = movie_counts.get(key, 0) + 1
                 if year:
                     movie_versions.add((key, year))
                 else:
@@ -4877,7 +4888,7 @@ def _plex_wanted_title_index():
     _plex_title_cache.update({
         'roots': roots, 'loaded_at': now, 'movies': movies,
         'movie_versions': movie_versions, 'unyearred_movies': unyearred_movies,
-        'shows': shows,
+        'shows': shows, 'movie_counts': movie_counts,
     })
     return _plex_title_cache
 
@@ -5361,7 +5372,8 @@ def api_plex_info():
     def _norm(t):
         return re.sub(r'[^a-z0-9]', '', t.lower())
     clean_title, requested_year = _plex_title_and_year(title)
-    cache_key = _norm(title)
+    requested_year = requested_year or _clean_year(request.args.get('year', ''))
+    cache_key = _norm(clean_title) + '|' + requested_year
     if cache_key in _plex_info_cache:
         return jsonify(_plex_info_cache[cache_key])
     cfg = load_config()
@@ -5375,10 +5387,13 @@ def api_plex_info():
         if not os.path.isdir(fp):
             continue
         folder_title, folder_year = _plex_title_and_year(name)
-        if (_norm(folder_title) == norm_title and
-                (not requested_year or not folder_year or folder_year == requested_year)):
-            matched_folder = fp
-            break
+        if _norm(folder_title) != norm_title:
+            continue
+        # Same title, so the year decides: with a year asked for, only that year's folder.
+        if requested_year and folder_year != requested_year:
+            continue
+        matched_folder = fp
+        break
     if not matched_folder:
         return jsonify({'found': False})
     mp4_file = next((os.path.join(matched_folder, f)
@@ -8950,8 +8965,14 @@ function _plexHasMovie(title, year) {
   if (!_plexTitles.has(k)) return false;
   const years = _plexYears[k];
   const y = String(year || '').slice(0, 4);
-  if (!y || !years || years.size === 0 || years.has('')) return true;
-  return years.has(y);
+  if (!y || !years || years.size === 0) return true;
+  return years.has(y);   // a folder with no year is not assumed to be this film
+}
+// The title is in Plex only under a folder with no year in its name, so it may be a different film.
+function _plexYearUnknown(title, year) {
+  const years = _plexYears[_plexNorm(title)];
+  const y = String(year || '').slice(0, 4);
+  return !!(y && years && years.has('') && !years.has(y));
 }
 let _plexTitlesReady = false;
 let _plexTitlesPromise = null;
@@ -9841,6 +9862,10 @@ async function openProg(p) {
     libBadge.textContent = '▶ IN PLEX';
     libBadge.style.background = '#2d1f5e'; libBadge.style.color = '#a78bfa';
     libBadge.style.display = '';
+  } else if (_plexYearUnknown(p.title, info.year || p.year)) {
+    libBadge.textContent = '▶ Plex has this title, year not in its folder name';
+    libBadge.style.background = '#3a3a3a'; libBadge.style.color = '#cbd5e1';
+    libBadge.style.display = '';
   } else { libBadge.style.display = 'none'; }
 
   const posterEl = document.getElementById('pm-poster');
@@ -9897,7 +9922,7 @@ async function openProg(p) {
     document.getElementById('pm-plex-info').textContent = 'Plex copy found';
     // File probing can take several seconds on the NAS.  It is display-only,
     // so do not hold up the live Play/Record controls for it.
-    fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}`).then(async pr => {
+    fetch(`/epg-web/api/plex/info?title=${encodeURIComponent(p.title)}&year=${encodeURIComponent(String(info.year || p.year || '').slice(0, 4))}`).then(async pr => {
       const pi = await pr.json();
       if (pi.found) {
         const parts = [];
@@ -10649,7 +10674,7 @@ function closeProg() {
   btn.textContent = '▶ Play'; btn.disabled = false;
   btn.onclick = playStream;
 }
-async function recordAiring(airing, title, button, allowCommercialMovie=false) {
+async function recordAiring(airing, title, button, allowCommercialMovie=false, year='') {
   const modalGeneration = _modalGeneration;
   const btn = button || event.target;
   btn.disabled = true; btn.textContent = '…';
@@ -10665,7 +10690,9 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false) {
     episode_num: airing.episode_num,
     sports_event: !!(airing.sports_event || (_currentProg && _currentProg.sports_event)),
     allow_commercial_movie: allowCommercialMovie,
-    year: String((_currentInfoYear || airing.year || '')).slice(0, 4),
+    // The year must belong to THIS title: the programme window's year only counts while
+    // that window shows the same title (it can be left over from a different film).
+    year: String(year || airing.year || ((_currentProg && _currentProg.title === title) ? _currentInfoYear : '') || '').slice(0, 4),
   });
   if (r.ok) {
     btn.textContent = '✅ Scheduled';
@@ -11001,10 +11028,11 @@ async function loadRecs() {
           ? (r.upgrade_scheduled
               ? `<span class="badge badge-record" title="A better commercial-free airing was found and scheduled automatically">✓ Upgrade scheduled</span>`
               : `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>`)
-          : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg})">⏱ Record</button>` : '');
+          : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg},undefined,false,${yearArg})">⏱ Record</button>` : '');
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
+          ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
           <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
         </td>
         <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>

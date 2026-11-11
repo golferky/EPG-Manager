@@ -29,7 +29,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261111a"
+AGENT_VERSION = "v20261111b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -279,9 +279,9 @@ def _name_year(name):
 def find_plex_candidates(plex_root, title, year=''):
     """Existing Plex copies of ``title``.
 
-    With a ``year``, an entry named for a different year is a different film (a
-    remake with the same title) and is not a candidate.  An entry with no year in
-    its name still matches, because older folders often have none.
+    With a ``year`` only an entry for that year is a candidate.  One named for a
+    different year is a different film (a remake with the same title), and one with
+    no year in its name cannot be shown to be the same film, so it is not assumed.
     """
     year = str(year or '').strip()[:4] or split_title_year(title)[1]
     root = Path(plex_root)
@@ -295,7 +295,7 @@ def find_plex_candidates(plex_root, title, year=''):
         return []
     for entry in entries:
         entry_year = _name_year(entry.name if entry.is_dir() else entry.stem)
-        if year and entry_year and entry_year != year:
+        if year and entry_year != year:
             continue
         if entry.is_dir() and normalized_title(entry.name) == wanted:
             candidates.extend(
