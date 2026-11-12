@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112b"
+VERSION = "v20261112c"
 
 app = Flask(__name__)
 
@@ -7320,6 +7320,62 @@ def _film_year_by_title(title, minutes=0):
         print(f'[year-lookup] {exc}')
     _film_year_cache[key] = (year, time.time())
     return year
+
+
+_film_signals_cache = {}
+
+
+@app.route('/epg-web/api/film-signals')
+def api_film_signals():
+    """What the film database says about a film's content: adult flag, rating, genres, keywords.
+
+    Used by the private-movies tool to suggest films that may be adult.  The TMDb key stays
+    on this server.  Only an exact title (and the year, if one is given) counts as a match.
+    """
+    from urllib import request as urlreq
+    from urllib.parse import quote
+    title = request.args.get('title', '').strip()
+    year = _clean_year(request.args.get('year'))
+    if not title:
+        return jsonify({'found': False, 'error': 'No title'}), 400
+    key = (fold_title(title), year)
+    if key in _film_signals_cache:
+        return jsonify(_film_signals_cache[key])
+    tmdb_key = load_config().get('tmdb_key', '')
+    if not tmdb_key:
+        return jsonify({'found': False, 'error': 'No TMDb key is set on this server.'}), 503
+    try:
+        url = f'https://api.themoviedb.org/3/search/movie?api_key={tmdb_key}&query={quote(title)}'
+        with urlreq.urlopen(url, timeout=8) as resp:
+            results = json.loads(resp.read()).get('results', [])
+        wanted = fold_title(title)
+        exact = [r for r in results if wanted in (fold_title(r.get('title')), fold_title(r.get('original_title')))]
+        if year:
+            exact = [r for r in exact if _clean_year((r.get('release_date') or '')[:4]) == year]
+        if not exact:
+            return jsonify({'found': False})
+        film = exact[0]
+        url = (f'https://api.themoviedb.org/3/movie/{film["id"]}?api_key={tmdb_key}'
+               '&append_to_response=release_dates,keywords')
+        with urlreq.urlopen(url, timeout=8) as resp:
+            details = json.loads(resp.read())
+    except Exception as exc:
+        return jsonify({'found': False, 'error': str(exc)}), 502
+    certification = ''
+    for country in (details.get('release_dates') or {}).get('results', []):
+        if country.get('iso_3166_1') == 'US':
+            certification = next((r.get('certification') for r in country.get('release_dates', [])
+                                  if r.get('certification')), '')
+            break
+    answer = {
+        'found': True, 'id': film['id'], 'title': details.get('title') or film.get('title'),
+        'year': _clean_year((details.get('release_date') or '')[:4]),
+        'adult': bool(details.get('adult')), 'certification': certification,
+        'genres': [g.get('name', '') for g in details.get('genres', [])],
+        'keywords': [k.get('name', '') for k in (details.get('keywords') or {}).get('keywords', [])],
+    }
+    _film_signals_cache[key] = answer
+    return jsonify(answer)
 
 
 # Time shifts to try, in order, when matching one listing of a film to another: the same time,

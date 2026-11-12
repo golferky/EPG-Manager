@@ -18,15 +18,19 @@ same share, and it never overwrites a folder that is already there.
 At the prompt:
     list            show every movie that can be chosen
     find TEXT       show the movies whose name contains TEXT
-    add 3 5 7       choose numbers from the list on screen
+    adult           check every movie against the film database and list the ones that look
+                    adult (flag, NC-17/X rating, keywords like "softcore"), with the reasons
+    add 3 5 7       choose numbers from the list on screen   (add all: every number on screen)
     chosen          show your choices
     drop 5          take one off your choices
     go              move the chosen movies
     q               quit without moving anything
 """
 import argparse
+import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import plex_movie_years as base  # noqa: E402
@@ -68,6 +72,86 @@ def show_numbered(names, title):
         print(f'  {number:>3}. {name}')
 
 
+# Keywords in the film database that point to adult content, strongest first.  A rating of
+# NC-17 or X, or the database's adult flag, counts for more.  Nothing here is certain: the
+# list is a set of suggestions, and you choose.
+ADULT_KEYWORDS = ('softcore', 'erotica', 'erotic movie', 'erotic thriller', 'sexploitation',
+                  'adult film', 'pornograph', 'erotic')
+LIKELY_SCORE = 2
+
+
+def adult_signals(info):
+    """(score, reasons) from one film's database entry.  Score 2 or more is a likely adult film."""
+    if not info or not info.get('found'):
+        return 0, []
+    score, reasons = 0, []
+    if info.get('adult'):
+        score += 3
+        reasons.append('adult flag')
+    rating = str(info.get('certification') or '').upper()
+    if rating in ('NC-17', 'X'):
+        score += 3
+        reasons.append(f'rated {rating}')
+    elif rating in ('NR', 'UNRATED', 'NOT RATED'):
+        score += 1
+        reasons.append('unrated')
+    hits = [k for k in info.get('keywords', []) if any(word in str(k).lower() for word in ADULT_KEYWORDS)]
+    if hits:
+        score += 2
+        reasons.append('keywords: ' + ', '.join(hits[:3]))
+    return score, reasons
+
+
+def default_cache_path(config_path):
+    return os.path.join(os.path.dirname(os.path.expanduser(config_path)), 'film_signals_cache.json')
+
+
+def load_cache(path):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(path, cache):
+    try:
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(cache, handle)
+    except OSError:
+        pass
+
+
+def scan_adult(server, names, cache, workers=4):
+    """Ask the dashboard about every film.  Returns (candidates, checked, not_found).
+
+    ``candidates`` is [(name, score, reasons)] with a score of 2 or more, strongest first.
+    Answers the dashboard found are kept in ``cache`` (by folder name), so a second scan
+    only asks about what is new.
+    """
+    def ask(name):
+        if name in cache:
+            return name, cache[name]
+        match = scan.TITLE_AND_YEAR.match(name)
+        title, year = (match.group(1).strip(), match.group(2)) if match else (name.strip(), '')
+        info = scan.get_json(server, '/epg-web/api/film-signals', {'title': title, 'year': year}, timeout=30)
+        return name, info
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        answers = list(pool.map(ask, names))
+    candidates, not_found = [], 0
+    for name, info in answers:
+        if info and info.get('found'):
+            cache[name] = info
+        else:
+            not_found += 1
+        score, reasons = adult_signals(info)
+        if score >= LIKELY_SCORE:
+            candidates.append((name, score, reasons))
+    candidates.sort(key=lambda item: (-item[1], item[0].lower()))
+    return candidates, len(names), not_found
+
+
 def parse_numbers(words, limit):
     """([numbers], error message) from the words after add/drop."""
     numbers = []
@@ -86,6 +170,7 @@ def main(argv=None):
     parser.add_argument('--server', help='dashboard address (default: server_url from the recorder config)')
     parser.add_argument('--restore', action='store_true', help='put private movies back into the library')
     parser.add_argument('--show', action='store_true', help='list the private movies and exit')
+    parser.add_argument('--cache', help='where to remember what the film database said (default: film_signals_cache.json next to the config)')
     parser.add_argument('--dry-run', action='store_true', help='show what would be moved, move nothing')
     args = parser.parse_args(argv)
     default_movies, default_server = base.load_defaults(args.config)
@@ -115,6 +200,7 @@ def main(argv=None):
             return 1
     print(f'{len(names)} movie(s) in {source_dir}.  Moving a movie sends it to {target_dir}.')
     print('Type find TEXT to look for one, add N to choose it, go to move your choices, q to quit.')
+    cache_path = args.cache or default_cache_path(args.config)
     shown, chosen = names, []
     while True:
         try:
@@ -138,6 +224,31 @@ def main(argv=None):
             else:
                 shown = found
                 show_numbered(shown, f'Movies matching "{" ".join(rest)}"')
+        elif command == 'adult':
+            if args.restore:
+                print('adult works on the Movies library, not on the private folder.')
+                continue
+            if not server:
+                print('The dashboard address is needed: set server_url in the recorder config or use --server.')
+                continue
+            print(f'Checking {len(names)} movie(s) with the film database (a few minutes the first time)...')
+            cache = load_cache(cache_path)
+            candidates, checked, not_found = scan_adult(server, names, cache)
+            save_cache(cache_path, cache)
+            if not_found == checked:
+                print('None of them could be looked up: the dashboard may have no TMDb key, or cannot reach TMDb.')
+                continue
+            shown = [name for name, _score, _reasons in candidates]
+            print(f'\n{len(candidates)} of {checked} look adult ({not_found} not found in the database):')
+            for number, (name, _score, reasons) in enumerate(candidates, 1):
+                print(f'  {number:>3}. {name}   [{"; ".join(reasons)}]')
+            if candidates:
+                print('Type add 3 5 to choose some, add all for every one, then go.  Check the list first: it is a guess.')
+        elif command == 'add' and rest == ['all']:
+            for name in shown:
+                if name not in chosen:
+                    chosen.append(name)
+            print(f'{len(chosen)} chosen.  Type chosen to see them, go to move them.')
         elif command == 'add':
             numbers, error = parse_numbers(rest, len(shown))
             if error:
