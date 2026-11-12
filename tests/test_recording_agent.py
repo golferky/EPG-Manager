@@ -2462,3 +2462,68 @@ class StreamEndReasonTests(unittest.TestCase):
     def test_no_log_gives_no_reason(self):
         self.assertEqual(recording_agent.ffmpeg_end_reason("/no/such/file.log"), "")
         self.assertEqual(self._reason("   \n"), "")
+
+
+class IncomingProbeTests(unittest.TestCase):
+    """A refused stream at the start: say why, never show the address, and try again."""
+
+    def _failed(self, stderr, returncode=1):
+        return mock.Mock(returncode=returncode, stdout="", stderr=stderr)
+
+    def test_the_failure_names_the_refusal_and_hides_the_address(self):
+        stderr = ("[http @ 0x1] HTTP error 403 Forbidden\n"
+                  "http://host:826/live/user/secret/1.ts: Server returned 403 Forbidden (access denied)\n")
+        with mock.patch("recording_agent.subprocess.run", return_value=self._failed(stderr)):
+            with self.assertRaises(RuntimeError) as caught:
+                recording_agent.probe_media("http://host:826/live/user/secret/1.ts")
+        message = str(caught.exception)
+        self.assertIn("403", message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("http://", message)
+
+    def test_a_silent_failure_still_has_the_old_message(self):
+        with mock.patch("recording_agent.subprocess.run", return_value=self._failed("")):
+            with self.assertRaises(RuntimeError) as caught:
+                recording_agent.probe_media("http://host/live/u/p/1.ts")
+        self.assertEqual(str(caught.exception), "ffprobe failed for incoming stream")
+
+    def test_a_timeout_says_so(self):
+        with mock.patch("recording_agent.subprocess.run",
+                        side_effect=recording_agent.subprocess.TimeoutExpired("ffprobe", 45)):
+            with self.assertRaises(RuntimeError) as caught:
+                recording_agent.probe_media("http://host/live/u/p/1.ts", timeout=45)
+        self.assertIn("no answer in 45 s", str(caught.exception))
+
+    def test_a_refused_probe_is_tried_again_and_can_succeed(self):
+        calls = []
+        def probe(url, ffprobe="ffprobe", timeout=30):
+            calls.append(url)
+            if len(calls) < 3:
+                raise RuntimeError("ffprobe failed for incoming stream: Server returned 403 Forbidden")
+            return {"duration": 0}
+        job = {"title": "Film", "id": "j1"}
+        with mock.patch.object(recording_agent, "probe_media", probe):
+            result = recording_agent.probe_incoming_stream(
+                None, job, {"ffprobe": "ffprobe"}, "http://x", sleep=lambda *a, **k: True)
+        self.assertEqual(result, {"duration": 0})
+        self.assertEqual(len(calls), 3)
+
+    def test_it_gives_up_after_the_last_attempt_with_the_reason(self):
+        def probe(url, ffprobe="ffprobe", timeout=30):
+            raise RuntimeError("ffprobe failed for incoming stream: Server returned 403 Forbidden")
+        with mock.patch.object(recording_agent, "probe_media", probe):
+            with self.assertRaises(RuntimeError) as caught:
+                recording_agent.probe_incoming_stream(
+                    None, {"title": "Film", "id": "j1"}, {"ffprobe": "ffprobe"}, "http://x",
+                    sleep=lambda *a, **k: True)
+        self.assertIn("403", str(caught.exception))
+        self.assertIn("tried 3 times", str(caught.exception))
+
+    def test_a_cancelled_job_stops_waiting(self):
+        def probe(url, ffprobe="ffprobe", timeout=30):
+            raise RuntimeError("ffprobe failed for incoming stream")
+        with mock.patch.object(recording_agent, "probe_media", probe):
+            result = recording_agent.probe_incoming_stream(
+                None, {"title": "Film", "id": "j1"}, {"ffprobe": "ffprobe"}, "http://x",
+                sleep=lambda *a, **k: False)
+        self.assertIsNone(result)

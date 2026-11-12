@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261112b"
+AGENT_VERSION = "v20261112c"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -193,6 +193,20 @@ def parse_rate(value):
         return 0.0
 
 
+def safe_probe_reason(stderr):
+    """A short reason from ffprobe's error text, with every stream address removed.
+
+    The address holds the provider login, so it must never reach a log or the dashboard.
+    """
+    text = str(stderr or '')
+    found = None
+    for found in STREAM_ERROR_LINE.finditer(text):
+        pass
+    line = found.group(1) if found else next((ln for ln in text.splitlines() if ln.strip()), '')
+    line = re.sub(r'\b\w+://\S+', '<address>', line)
+    return re.sub(r'\s+', ' ', line).strip(' .')[:120]
+
+
 def probe_media(target, ffprobe='ffprobe', timeout=30):
     cmd = [
         ffprobe, '-v', 'error', '-show_entries',
@@ -201,10 +215,17 @@ def probe_media(target, ffprobe='ffprobe', timeout=30):
         'r_frame_rate,bit_rate,sample_rate,channels',
         '-of', 'json', str(target),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    is_stream = str(target).startswith(('http://', 'https://'))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if is_stream:
+            raise RuntimeError(f'ffprobe failed for incoming stream: no answer in {timeout} s')
+        raise
     if result.returncode != 0:
-        if str(target).startswith(('http://', 'https://')):
-            raise RuntimeError('ffprobe failed for incoming stream')
+        if is_stream:
+            reason = safe_probe_reason(result.stderr)
+            raise RuntimeError('ffprobe failed for incoming stream' + (f': {reason}' if reason else ''))
         raise RuntimeError(result.stderr.strip() or f'ffprobe failed for {target}')
     raw = json.loads(result.stdout)
     video = next((s for s in raw.get('streams', []) if s.get('codec_type') == 'video'), {})
@@ -939,6 +960,30 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
     return rc
 
 
+PROBE_ATTEMPTS = 3
+PROBE_PAUSE_SECONDS = 20
+
+
+def probe_incoming_stream(api, job, cfg, url, sleep=None):
+    """Probe the incoming stream, trying again a couple of times if it is refused.
+
+    A provider can refuse a new connection for a few seconds while a finished one is still
+    counted, so one refusal must not fail the recording.  Returns the probe, None if the job
+    was cancelled while waiting, or raises the last error.
+    """
+    sleep = sleep or heartbeat_sleep
+    for attempt in range(1, PROBE_ATTEMPTS + 1):
+        try:
+            return probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
+        except Exception as exc:
+            if attempt == PROBE_ATTEMPTS:
+                raise RuntimeError(f'{exc} (tried {PROBE_ATTEMPTS} times)')
+            print(f'[probe] {job["title"]}: {exc}; trying again in {PROBE_PAUSE_SECONDS}s '
+                  f'(attempt {attempt} of {PROBE_ATTEMPTS})', flush=True)
+            if not sleep(api, job, 'preflight', PROBE_PAUSE_SECONDS, cfg):
+                return None
+
+
 def process_job(api, job, cfg):
     local_dir = Path(os.path.expanduser(cfg['local_recordings']))
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -961,9 +1006,11 @@ def process_job(api, job, cfg):
         if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
     existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
     try:
-        incoming_probe = probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
+        incoming_probe = probe_incoming_stream(api, job, cfg, url)
     except Exception as exc:
         api.patient_heartbeat(job['id'], 'failed', message=f'Incoming stream probe failed: {exc}')
+        return
+    if incoming_probe is None:        # cancelled while waiting to try again
         return
 
     incomplete_copy = bool(existing_probe and incomplete_for_scheduled_window(
