@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112i"
+VERSION = "v20261112j"
 
 app = Flask(__name__)
 
@@ -7251,6 +7251,21 @@ def _recording_slot_conflicts(recs, start_ts, stop_ts, limit):
             peak, busiest = len(running), running
     return busiest if peak >= limit else []
 
+def _slot_conflict_items(recs, conflicts):
+    """The jobs that fill the slots, with their ids so one can be removed: [{id, title, ...}].
+
+    ``recs`` is an iterable of (rec_id, rec) pairs; ``conflicts`` the rec dicts that overlap.
+    """
+    wanted = {id(r) for r in conflicts}
+    items = [{'id': rec_id, 'title': str(rec.get('title', '')),
+              'channel': str(rec.get('channel') or rec.get('channel_id') or ''),
+              'start_ts': float(rec.get('start_ts') or 0), 'stop_ts': float(rec.get('stop_ts') or 0),
+              'status': _rec_status_base(rec.get('status')),
+              'running': _rec_status_base(rec.get('status')) in ('recording', 'converting', 'awaiting_transfer',
+                                                                  'transferring', 'copying')}
+             for rec_id, rec in recs if id(rec) in wanted]
+    return sorted(items, key=lambda i: (i['start_ts'], i['title'].lower()))
+
 def _is_private_title(title, year):
     """Is this Wanted film marked private?  (A film is private by its title and year.)"""
     try:
@@ -7711,11 +7726,13 @@ def api_record():
         slot_limit = DEFAULT_MAX_CONCURRENT_RECORDINGS
     with _rec_lock:
         full_with = _recording_slot_conflicts(list(_recs.values()), start_ts, stop_ts, slot_limit)
+        conflict_items = _slot_conflict_items(_recs.items(), full_with)
     if full_with:
         return jsonify({
             'ok': False, 'slot_full': True, 'max': slot_limit,
             'error': f'All {slot_limit} recording slots are already in use at that time.',
             'conflicts': sorted({str(r.get('title', '')) for r in full_with}),
+            'conflict_items': conflict_items,
         }), 409
 
     rec = {
@@ -9593,19 +9610,44 @@ async function refreshGuideRecMap() {
 
 let _progMap = {};
 
-function showSlotFullModal(d) {
+function showSlotFullModal(d, retry) {
   const old = document.getElementById('slot-full-modal');
   if (old) old.remove();
   const o = document.createElement('div');
   o.id = 'slot-full-modal';
   o.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;padding:16px;';
+  const items = d.conflict_items || [];
+  const when = ts => new Date(ts * 1000).toLocaleString([], {weekday: 'short', hour: 'numeric', minute: '2-digit'});
+  const rows = items.map((it, i) => '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #1e293b;">'
+    + '<div><div>' + esc(it.title) + '</div><div style="font-size:12px;color:#94a3b8;">' + esc(it.channel) + ' · ' + esc(when(it.start_ts)) + (it.running ? ' · recording now' : '') + '</div></div>'
+    + '<button class="btn btn-ghost btn-sm" data-i="' + i + '" style="margin:0;white-space:nowrap;">' + (it.running ? '■ Stop' : '✕ Remove') + '</button></div>').join('');
   const list = (d.conflicts || []).map(t => '<li>' + esc(t) + '</li>').join('');
-  o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:440px;width:100%;padding:22px;color:#e2e8f0;">'
+  o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:480px;width:100%;padding:22px;color:#e2e8f0;">'
     + '<h3 style="margin:0 0 10px;color:#fca5a5;">Cannot schedule this recording</h3>'
     + '<p style="margin:0 0 10px;">All ' + esc(d.max) + ' recording slots are already in use at that time.</p>'
-    + (list ? '<p style="margin:0 0 4px;color:#94a3b8;">Already recording or scheduled:</p><ul style="margin:0 0 14px;padding-left:20px;">' + list + '</ul>' : '')
-    + '<button class="btn btn-primary" style="margin:0;">OK</button></div>';
-  o.querySelector('button').onclick = () => o.remove();
+    + (items.length ? '<p style="margin:0 0 4px;color:#94a3b8;">Remove one to make room, and this recording is scheduled for you:</p><div style="margin:0 0 14px;">' + rows + '</div>'
+       : (list ? '<p style="margin:0 0 4px;color:#94a3b8;">Already recording or scheduled:</p><ul style="margin:0 0 14px;padding-left:20px;">' + list + '</ul>' : ''))
+    + '<div id="slot-full-msg" style="margin:0 0 10px;color:#fca5a5;font-size:13px;"></div>'
+    + '<button class="btn btn-primary" id="slot-full-ok" style="margin:0;">OK</button></div>';
+  o.querySelector('#slot-full-ok').onclick = () => o.remove();
+  o.querySelectorAll('button[data-i]').forEach(btn => {
+    btn.onclick = async () => {
+      const it = items[Number(btn.dataset.i)];
+      const question = it.running
+        ? 'Stop the recording of "' + it.title + '" that is in progress? It will not be finished.'
+        : 'Remove "' + it.title + '" from the schedule?';
+      if (!confirm(question)) return;
+      btn.disabled = true;
+      const msg = o.querySelector('#slot-full-msg');
+      try {
+        const r = await post('/epg-web/api/record/cancel', {id: it.id});
+        if (!r.ok) { btn.disabled = false; msg.textContent = r.error || 'Could not remove it'; return; }
+      } catch (e) { btn.disabled = false; msg.textContent = 'Could not remove it: ' + e.message; return; }
+      o.remove();
+      if (typeof refreshRecBadge === 'function') refreshRecBadge();
+      if (typeof retry === 'function') retry();
+    };
+  });
   o.onclick = e => { if (e.target === o) o.remove(); };
   document.body.appendChild(o);
 }
@@ -9633,7 +9675,7 @@ async function quickRecord(key, btnEl) {
       btnEl.textContent = '⏺';
       btnEl.className = 'rec-btn';
       btnEl.onclick = e => { e.stopPropagation(); quickRecord(key, btnEl); };
-      if (d.slot_full) showSlotFullModal(d);
+      if (d.slot_full) showSlotFullModal(d, () => quickRecord(key, btnEl));
       else if (d.error) alert(d.error);
     }
   } catch(e) {
@@ -11291,7 +11333,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
     refreshGuideRecMap().then(() => renderGuide());
   } else {
     btn.disabled = false; btn.textContent = allowCommercialMovie ? '● Record remaining' : '⏱ Record';
-    if (r.slot_full) showSlotFullModal(r);
+    if (r.slot_full) showSlotFullModal(r, () => recordAiring(airing, title, btn, allowCommercialMovie, year));
     if (modalGeneration === _modalGeneration) {
       document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
       document.getElementById('pm-status').className = 'status-msg err';
