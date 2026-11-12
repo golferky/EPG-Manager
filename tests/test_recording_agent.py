@@ -1842,20 +1842,33 @@ class AdultSearchTests(unittest.TestCase):
     def test_scoring(self):
         sig = self.tool.adult_signals
         self.assertEqual(sig({"found": True, "adult": True})[0], 3)
-        self.assertEqual(sig({"found": True, "certification": "NC-17"})[0], 3)
+        self.assertEqual(sig({"found": True, "keywords": ["softcore"]})[0], 2)
+        self.assertEqual(sig({"found": True, "keywords": ["softcore", "erotica"]})[0], 3)       # two strong ones
+        self.assertEqual(sig({"found": True, "keywords": ["eroticism"]})[0], 1)                 # weak
+        self.assertEqual(sig({"found": True, "certification": "NC-17"})[0], 1)                  # a rating alone is not enough
         self.assertEqual(sig({"found": True, "certification": "X"})[1], ["rated X"])
-        self.assertEqual(sig({"found": True, "keywords": ["softcore", "erotica", "nudity"]})[0], 2)
-        self.assertIn("keywords: softcore, erotica", sig({"found": True, "keywords": ["softcore", "erotica"]})[1][0])
-        self.assertEqual(sig({"found": True, "certification": "R", "keywords": ["nudity", "violence"]})[0], 0)   # an ordinary R film
-        self.assertEqual(sig({"found": True, "certification": "Unrated"})[0], 1)          # not enough on its own
+        self.assertEqual(sig({"found": True, "certification": "Unrated"})[0], 0)
+        self.assertEqual(sig({"found": True, "certification": "R", "keywords": ["nudity", "violence"]})[0], 0)
         self.assertEqual(sig({"found": False}), (0, []))
         self.assertEqual(sig({}), (0, []))
-        total = sig({"found": True, "adult": True, "certification": "NC-17", "keywords": ["softcore"]})
-        self.assertEqual(total[0], 8)
+        self.assertEqual(sig({"found": True, "adult": True, "certification": "NC-17", "keywords": ["softcore"]})[0], 6)
+
+    def test_keywords_are_matched_whole_and_plot_details_are_ignored(self):
+        sig = self.tool.adult_signals
+        self.assertEqual(sig({"found": True, "keywords": ["homoeroticism"]})[0], 0)             # not "eroticism"
+        self.assertEqual(sig({"found": True, "keywords": ["pornography", "pornographic video"]})[0], 0)
+        self.assertEqual(sig({"found": True, "keywords": ["Erotic Thriller"]})[0], 2)           # capitals do not matter
+        self.assertEqual(sig({"found": True, "keywords": ["sexploitation"], "certification": "NC-17"})[0], 3)
+
+    def test_the_tiers(self):
+        self.assertEqual(self.tool.tier(2), "maybe")
+        self.assertEqual(self.tool.tier(3), "likely")
+        self.assertEqual(self.tool.tier(8), "likely")
 
     def _library(self, temp):
         root = Path(temp) / "Movies"
-        for name in ("Heat (1995)", "Adult One (1998)", "Raunchy Two (2003)", "Unknown Film (1990)", "Unrated Only (2001)"):
+        for name in ("Heat (1995)", "Adult One (1998)", "Raunchy Two (2003)", "Unknown Film (1990)", "Unrated Only (2001)",
+                     "Violent Cut (1980)"):
             (root / name).mkdir(parents=True)
             (root / name / "film.mp4").write_bytes(name.encode())
         return root
@@ -1863,7 +1876,8 @@ class AdultSearchTests(unittest.TestCase):
     SIGNALS = {
         "Heat": {"found": True, "certification": "R", "keywords": ["heist"], "adult": False},
         "Adult One": {"found": True, "adult": True, "certification": "NC-17", "keywords": ["erotic thriller"]},
-        "Raunchy Two": {"found": True, "certification": "R", "keywords": ["softcore", "erotica"]},
+        "Raunchy Two": {"found": True, "certification": "R", "keywords": ["erotic thriller"]},
+        "Violent Cut": {"found": True, "certification": "NC-17", "keywords": ["dystopia"]},
         "Unrated Only": {"found": True, "certification": "NR", "keywords": []},
     }
 
@@ -1885,11 +1899,12 @@ class AdultSearchTests(unittest.TestCase):
     def test_adult_lists_likely_films_with_reasons_strongest_first(self):
         with tempfile.TemporaryDirectory() as temp:
             out = self._run(self._library(temp), ["adult", "q"], Path(temp) / "cache.json")
-            self.assertIn("2 of 5 look adult (1 not found in the database)", out)
-            self.assertIn("1. Adult One (1998)   [adult flag; rated NC-17; keywords: erotic thriller]", out)
-            self.assertIn("2. Raunchy Two (2003)   [keywords: softcore, erotica]", out)
-            self.assertNotIn("Heat (1995)   [", out)
-            self.assertNotIn("Unrated Only (2001)   [", out)
+            self.assertIn("2 of 6 may be adult: 1 likely, 1 maybe (1 not found in the database", out)
+            self.assertIn("1. Adult One (1998)   likely: adult flag; keywords: erotic thriller; rated NC-17", out)
+            self.assertIn("2. Raunchy Two (2003)   maybe: keywords: erotic thriller", out)
+            self.assertNotIn("Heat (1995)   ", out)
+            self.assertNotIn("Violent Cut (1980)   ", out)            # an NC-17 rating alone is not listed
+            self.assertNotIn("Unrated Only (2001)   ", out)
 
     def test_add_all_and_go_move_the_suggestions_to_the_private_folder(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1912,7 +1927,7 @@ class AdultSearchTests(unittest.TestCase):
             calls = []
             self._run(root, ["adult", "q"], cache, calls=calls)
             first = len(calls)
-            self.assertGreaterEqual(first, 5)
+            self.assertGreaterEqual(first, 6)
             calls.clear()
             self._run(root, ["adult", "q"], cache, calls=calls)
             self.assertEqual(calls, ["Unknown Film"])          # not found last time, so asked again; the rest are remembered
@@ -1943,3 +1958,294 @@ class AdultSearchTests(unittest.TestCase):
             self.assertEqual(self.tool.load_cache(str(Path(temp) / "missing.json")), {})
             self.assertEqual(self.tool.default_cache_path("~/EPG-Manager/recording_agent.json").endswith(
                 "EPG-Manager/film_signals_cache.json"), True)
+
+
+class NotFoundListTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("private_movies_notfound", mac / "private_movies.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _run(self, root, answers, cache_path):
+        out = []
+
+        def fake_get(server, path, params=None, timeout=20):
+            return {"found": True, "certification": "R", "keywords": []} if params["title"] == "Heat" else {"found": False}
+        with mock.patch.object(self.tool.scan, "get_json", side_effect=fake_get), \
+             mock.patch.object(self.tool.base, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            self.tool.main(["--movies", str(root), "--server", "http://x", "--cache", str(cache_path)])
+        return "\n".join(out)
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in ("Heat (1995)", "Obscure Two (1975)", "Obscure One (1972)"):
+            (root / name).mkdir(parents=True)
+            (root / name / "film.mp4").write_bytes(b"x")
+        return root
+
+    def test_notfound_lists_the_unknown_films_and_add_works_on_that_list(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            out = self._run(root, ["adult", "notfound", "add 2", "go"], Path(temp) / "c.json")
+            self.assertIn("2 not found in the database", out)
+            self.assertIn("1. Obscure One (1972)", out)
+            self.assertIn("2. Obscure Two (1975)", out)
+            self.assertEqual(sorted(p.name for p in (Path(temp) / "Movies Private").iterdir()), ["Obscure Two (1975)"])
+
+    def test_notfound_before_a_scan_says_to_run_adult_first(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = self._run(self._library(temp), ["notfound", "q"], Path(temp) / "c.json")
+            self.assertIn("run adult first", out)
+
+
+class CheckYearsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("check_years_under_test", mac / "check_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_judge(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        one = [{"year": "2005", "runtime": 0}]
+        self.assertEqual(judge("2005", one, 0)[1], "ok")                       # the year is a real film's year
+        self.assertEqual(judge("2026", one, 0)[:2], ("2005", "the only film with this title"))
+        self.assertEqual(judge("2026", [], 0), ("", "unknown", ""))
+        two = [{"year": "1981", "runtime": 97}, {"year": "2011", "runtime": 110}]
+        self.assertEqual(judge("2026", two, 96)[0], "1981")                    # the file's length picks the film
+        self.assertEqual(judge("2026", two, 111)[0], "2011")
+        self.assertEqual(judge("2011", two, 98)[1], "ok")                      # the year matches one of them
+        guess, reason, options = judge("2026", two, 104)                       # between the two: not guessed
+        self.assertEqual((guess, reason), ("", "choose"))
+        self.assertIn("1981 (97 min), 2011 (110 min)", options)
+        self.assertIn("your file is 104 min", options)
+        self.assertEqual(judge("2026", two, 0)[1], "choose")                   # no file length: not guessed
+
+    def test_a_year_one_off_is_fine(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        for folder, film in (("2006", "2007"), ("2002", "2001"), ("2005", "2006")):
+            self.assertEqual(judge(folder, [{"year": film, "runtime": 120}], 125)[1], "ok", folder)
+        self.assertEqual(judge("2016", [{"year": "2014", "runtime": 100}], 100)[0], "2014")     # two off is not
+
+    def test_a_big_change_is_not_renamed_unless_confirmed(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        guess, reason, options = judge("1961", [{"year": "1983", "runtime": 100}], 106)         # Breathless
+        self.assertEqual((guess, reason), ("", "big"))
+        self.assertIn("22-year change", options)
+        self.assertIn("set N 1983", options)
+        self.assertEqual(judge("2013", [{"year": "1993", "runtime": 109}], 121)[1], "big")
+        self.assertEqual(judge("1990", [{"year": "2020", "runtime": 100}], 100)[1], "big")
+
+    def test_a_folder_year_this_year_or_later_is_clearly_wrong_so_it_is_renamed(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        self.assertEqual(judge("2026", [{"year": "1964", "runtime": 87}], 87)[:2], ("1964", "the only film with this title"))
+        self.assertEqual(judge("2026", [{"year": "1956", "runtime": 220}], 220)[0], "1956")
+
+    def test_short_films_and_episodes_of_the_wrong_length_are_ignored(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        cands = [{"year": "2009", "runtime": 9}, {"year": "2017", "runtime": 12}, {"year": "2023", "runtime": 2}]
+        self.assertEqual(judge("1980", cands, 116)[1], "unknown")              # 9 to 5: none is a feature of that length
+        mixed = [{"year": "2011", "runtime": 12}, {"year": "1986", "runtime": 107}]
+        self.assertEqual(judge("2026", mixed, 108)[:2], ("1986", "the only film with this title"))
+
+    def test_a_single_film_whose_length_does_not_fit_is_a_choice(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        guess, reason, options = judge("2026", [{"year": "2005", "runtime": 60}], 100)
+        self.assertEqual((guess, reason), ("", "choose"))
+        self.assertIn("the length does not fit well", options)
+
+    def test_only_dated_folders_with_a_video_are_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name, video in (("Contagion (2026)", True), ("Heat (1995)", True), ("Empty (2000)", False),
+                                ("No Year", True), ("_wrong (2001)", True)):
+                (Path(temp) / name).mkdir()
+                if video:
+                    (Path(temp) / name / "f.mp4").write_bytes(b"x")
+            names = [n for n, _t, _y in self.tool.dated_folders(temp)]
+            self.assertEqual(names, ["Contagion (2026)", "Heat (1995)"])
+
+    def test_change_year_renames_the_folder_and_files_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "Contagion (2026)"
+            folder.mkdir()
+            (folder / "Contagion (2026).mp4").write_bytes(b"x")
+            (folder / "poster.jpg").write_bytes(b"p")
+            new = self.tool.change_year(temp, "Contagion (2026)", "Contagion", "2011")
+            self.assertEqual(new, "Contagion (2011)")
+            self.assertEqual(sorted(p.name for p in (Path(temp) / new).iterdir()), ["Contagion (2011).mp4", "poster.jpg"])
+            (Path(temp) / "Heat (2026)").mkdir()
+            (Path(temp) / "Heat (1995)").mkdir()
+            (Path(temp) / "Heat (1995)" / "keep.mp4").write_bytes(b"k")
+            with self.assertRaises(FileExistsError):
+                self.tool.change_year(temp, "Heat (2026)", "Heat", "1995")
+            self.assertTrue((Path(temp) / "Heat (1995)" / "keep.mp4").exists())
+            with self.assertRaises(ValueError):
+                self.tool.change_year(temp, "Heat (2026)", "Heat", "95")
+
+    def test_an_empty_folder_of_the_new_name_is_replaced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Spider-Man 3 (2026)").mkdir()
+            (Path(temp) / "Spider-Man 3 (2026)" / "s.mp4").write_bytes(b"s")
+            (Path(temp) / "Spider-Man 3 (2007)").mkdir()           # an empty leftover
+            self.tool.change_year(temp, "Spider-Man 3 (2026)", "Spider-Man 3", "2007")
+            self.assertEqual([p.name for p in (Path(temp) / "Spider-Man 3 (2007)").iterdir()], ["s.mp4"])
+            self.assertFalse((Path(temp) / "Spider-Man 3 (2026)").exists())
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in ("Contagion (2026)", "Arthur (2026)", "Nobody s Fool (1995)", "Mystery Film (2001)", "Heat (1995)",
+                     "Verified Film (1999)", "Big Jump (1961)"):
+            (root / name).mkdir(parents=True)
+            (root / name / "f.mp4").write_bytes(name.encode())
+        return root
+
+    CANDIDATES = {
+        "Contagion": [{"year": "2011", "runtime": 106}],
+        "Arthur": [{"year": "1981", "runtime": 97}, {"year": "2011", "runtime": 110}],
+        "Nobody s Fool": [{"year": "1994", "runtime": 110}],            # one year off: fine
+        "Big Jump": [{"year": "1983", "runtime": 100}],
+        "Mystery Film": [],
+        "Heat": [{"year": "1995", "runtime": 170}],
+        "Verified Film": [{"year": "1999", "runtime": 90}],
+    }
+
+    def _run(self, root, answers, *flags, minutes=0, copying=(), cache=None):
+        out = []
+        asked = []
+
+        def fake_get(server, path, params=None, timeout=20):
+            asked.append(params["title"])
+            return {"candidates": self.CANDIDATES.get(params["title"], [])}
+        cache_path = Path(root).parent / "cache.json"
+        cache_path.write_text(json.dumps(cache or {}))
+        with mock.patch.object(self.tool.scan, "get_json", side_effect=fake_get), \
+             mock.patch.object(self.tool, "file_minutes", return_value=minutes), \
+             mock.patch.object(self.tool.base, "recorder_copying", return_value=list(copying)), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", "--cache", str(cache_path), *flags])
+        return rc, "\n".join(out), asked
+
+    def _names(self, root):
+        return sorted(p.name for p in Path(root).iterdir())
+
+    def test_the_recap_sorts_the_folders_and_skips_confirmed_ones(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            cache = {"Verified Film (1999)": {"found": True}}
+            _rc, out, asked = self._run(root, ["q"], cache=cache)
+            self.assertNotIn("Verified Film", asked)                           # confirmed by the earlier scan
+            self.assertIn("Contagion (2026)  ->  Contagion (2011)   [the only film with this title]", out)
+            self.assertIn("2 of them have a year that matches a real film", out)    # Heat and Nobody s Fool (a year off)
+            self.assertNotIn("Nobody s Fool", out)
+            self.assertIn("Big changes, check these first", out)
+            self.assertIn("Big Jump (1961)", out)
+            self.assertIn("Several films share the title: you choose (1)", out)
+            self.assertIn("Arthur (2026)", out)
+            self.assertIn("Could not check, the title is not in the film database (1)", out)
+            self.assertIn("Mystery Film (2001)", out)
+            self.assertEqual(self._names(root)[:1], ["Arthur (2026)"])         # nothing renamed on q
+
+    def test_y_renames_the_certain_ones_and_leaves_the_rest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, _asked = self._run(root, ["y"])
+            names = self._names(root)
+            self.assertIn("Contagion (2011)", names)
+            self.assertIn("Big Jump (1961)", names)                            # a big change: not renamed by y
+            self.assertIn("Arthur (2026)", names)                              # a choice: not renamed
+            self.assertIn("Mystery Film (2001)", names)
+            self.assertIn("Heat (1995)", names)
+            self.assertIn("Renamed 1", out)
+
+    def test_the_file_length_resolves_a_choice(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["y"], minutes=96)             # 97 min fits the 1981 film, 110 min does not
+            self.assertIn("Arthur (1981)", self._names(root))
+
+    def test_set_resolves_a_choice_and_skip_leaves_one_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            # the list is numbered alphabetically by folder: 1 Arthur, 2 Big Jump, 3 Contagion, 4 Mystery Film
+            self._run(root, ["set 1 2011", "skip 3", "y"])
+            names = self._names(root)
+            self.assertIn("Arthur (2011)", names)
+            self.assertIn("Contagion (2026)", names)
+
+    def test_a_dry_run_renames_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, _asked = self._run(root, ["y"], "--dry-run")
+            self.assertIn("would rename", out)
+            self.assertIn("Contagion (2026)", self._names(root))
+
+    def test_yes_renames_without_asking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, [], "--yes")
+            self.assertIn("Contagion (2011)", self._names(root))
+
+    def test_it_refuses_while_the_recorder_is_copying(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            rc, out, _asked = self._run(root, ["y"], copying=["Heat"])
+            self.assertEqual(rc, 1)
+            self.assertIn("copying", out)
+            self.assertIn("Contagion (2026)", self._names(root))
+
+    def test_when_everything_is_confirmed_it_says_so(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            cache = {n: {"found": True} for n in self._names(root)}
+            _rc, out, asked = self._run(root, [], cache=cache)
+            self.assertIn("already confirmed", out)
+            self.assertEqual(asked, [])
+
+    def test_set_confirms_a_big_change_and_renames(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            # 1 Arthur, 2 Big Jump, 3 Contagion, 4 Mystery Film
+            self._run(root, ["set 2 1983", "y"])
+            self.assertIn("Big Jump (1983)", self._names(root))
+
+    def test_bad_commands_are_explained(self):
+        plan = [{"n": 1, "name": "A (2026)", "title": "A", "year": "2026", "new": "", "reason": "choose",
+                 "options": "", "skip": False}]
+        self.assertIn("is not a number", self.tool.parse_command("skip 9", plan)[1])
+        self.assertIn("set needs", self.tool.parse_command("set 1 20", plan)[1])
+        self.assertIn("Unknown command", self.tool.parse_command("banana", plan)[1])
+        self.assertEqual(self.tool.parse_command("q", plan)[0], "quit")
+
+
+
+class LooseMatchToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("private_movies_loose", mac / "private_movies.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_an_ampersand_is_and_in_the_agent_and_the_tool(self):
+        self.assertEqual(recording_agent.normalized_title("Dumb & Dumber (1994)"), recording_agent.normalized_title("Dumb and Dumber"))
+        self.assertEqual(self.tool.base.fold_title("Dumb & Dumber"), "dumbanddumber")
+
+    def test_a_loose_match_says_so_in_the_reasons(self):
+        score, reasons = self.tool.adult_signals({"found": True, "match": "loose", "title": "Some Film", "keywords": ["softcore"]})
+        self.assertEqual(score, 2)
+        self.assertIn('close title match, found as "Some Film": check it is the same film', reasons[-1])
+        exact = self.tool.adult_signals({"found": True, "match": "exact", "title": "Some Film", "keywords": ["softcore"]})
+        self.assertEqual(len(exact[1]), 1)
+        self.assertEqual(self.tool.adult_signals({"found": True, "match": "loose", "title": "X"}), (0, []))      # nothing to check

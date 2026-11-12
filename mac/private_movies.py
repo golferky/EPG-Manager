@@ -19,7 +19,9 @@ At the prompt:
     list            show every movie that can be chosen
     find TEXT       show the movies whose name contains TEXT
     adult           check every movie against the film database and list the ones that look
-                    adult (flag, NC-17/X rating, keywords like "softcore"), with the reasons
+                    adult, as "likely" or "maybe", with the reasons
+    notfound        list the movies the database did not know (after an adult check): soft
+                    films are often obscure, so it is worth reading this list yourself
     add 3 5 7       choose numbers from the list on screen   (add all: every number on screen)
     chosen          show your choices
     drop 5          take one off your choices
@@ -72,34 +74,48 @@ def show_numbered(names, title):
         print(f'  {number:>3}. {name}')
 
 
-# Keywords in the film database that point to adult content, strongest first.  A rating of
-# NC-17 or X, or the database's adult flag, counts for more.  Nothing here is certain: the
-# list is a set of suggestions, and you choose.
-ADULT_KEYWORDS = ('softcore', 'erotica', 'erotic movie', 'erotic thriller', 'sexploitation',
-                  'adult film', 'pornograph', 'erotic')
-LIKELY_SCORE = 2
+# Keywords in the film database.  Whole keywords only: "eroticism" must not match
+# "homoeroticism", and plot details such as "pornography" say nothing about the film itself.
+STRONG_KEYWORDS = {'softcore', 'softcore porn', 'erotica', 'erotic movie', 'erotic thriller',
+                   'erotic drama', 'erotic romance', 'sexploitation', 'adult film'}
+WEAK_KEYWORDS = {'eroticism', 'erotic'}
+MAYBE_SCORE = 2          # listed as "maybe"
+LIKELY_SCORE = 3         # listed as "likely"
 
 
 def adult_signals(info):
-    """(score, reasons) from one film's database entry.  Score 2 or more is a likely adult film."""
+    """(score, reasons) from one film's database entry.
+
+    The adult flag counts 3; a strong keyword counts 2 (3 for two or more); an NC-17 or X
+    rating, or a weak keyword like "eroticism", counts 1 each.  A rating alone is not enough:
+    uncut versions of violent films carry NC-17.  2 is a "maybe", 3 or more is "likely".
+    """
     if not info or not info.get('found'):
         return 0, []
     score, reasons = 0, []
     if info.get('adult'):
         score += 3
         reasons.append('adult flag')
+    keywords = {str(k).strip().lower() for k in info.get('keywords', [])}
+    strong = sorted(keywords & STRONG_KEYWORDS)
+    if strong:
+        score += 3 if len(strong) > 1 else 2
+        reasons.append('keywords: ' + ', '.join(strong[:3]))
+    weak = sorted(keywords & WEAK_KEYWORDS)
+    if weak:
+        score += 1
+        reasons.append('keyword: ' + ', '.join(weak))
     rating = str(info.get('certification') or '').upper()
     if rating in ('NC-17', 'X'):
-        score += 3
-        reasons.append(f'rated {rating}')
-    elif rating in ('NR', 'UNRATED', 'NOT RATED'):
         score += 1
-        reasons.append('unrated')
-    hits = [k for k in info.get('keywords', []) if any(word in str(k).lower() for word in ADULT_KEYWORDS)]
-    if hits:
-        score += 2
-        reasons.append('keywords: ' + ', '.join(hits[:3]))
+        reasons.append(f'rated {rating}')
+    if score and info.get('match') == 'loose':
+        reasons.append(f'close title match, found as "{info.get("title", "")}": check it is the same film')
     return score, reasons
+
+
+def tier(score):
+    return 'likely' if score >= LIKELY_SCORE else 'maybe'
 
 
 def default_cache_path(config_path):
@@ -124,7 +140,7 @@ def save_cache(path, cache):
 
 
 def scan_adult(server, names, cache, workers=4):
-    """Ask the dashboard about every film.  Returns (candidates, checked, not_found).
+    """Ask the dashboard about every film.  Returns (candidates, checked, not_found names).
 
     ``candidates`` is [(name, score, reasons)] with a score of 2 or more, strongest first.
     Answers the dashboard found are kept in ``cache`` (by folder name), so a second scan
@@ -139,17 +155,17 @@ def scan_adult(server, names, cache, workers=4):
         return name, info
     with ThreadPoolExecutor(max_workers=workers) as pool:
         answers = list(pool.map(ask, names))
-    candidates, not_found = [], 0
+    candidates, not_found = [], []
     for name, info in answers:
         if info and info.get('found'):
             cache[name] = info
         else:
-            not_found += 1
+            not_found.append(name)
         score, reasons = adult_signals(info)
-        if score >= LIKELY_SCORE:
+        if score >= MAYBE_SCORE:
             candidates.append((name, score, reasons))
     candidates.sort(key=lambda item: (-item[1], item[0].lower()))
-    return candidates, len(names), not_found
+    return candidates, len(names), sorted(not_found, key=str.lower)
 
 
 def parse_numbers(words, limit):
@@ -201,7 +217,7 @@ def main(argv=None):
     print(f'{len(names)} movie(s) in {source_dir}.  Moving a movie sends it to {target_dir}.')
     print('Type find TEXT to look for one, add N to choose it, go to move your choices, q to quit.')
     cache_path = args.cache or default_cache_path(args.config)
-    shown, chosen = names, []
+    shown, chosen, last_not_found = names, [], []
     while True:
         try:
             text = input('> ')
@@ -233,17 +249,25 @@ def main(argv=None):
                 continue
             print(f'Checking {len(names)} movie(s) with the film database (a few minutes the first time)...')
             cache = load_cache(cache_path)
-            candidates, checked, not_found = scan_adult(server, names, cache)
+            candidates, checked, last_not_found = scan_adult(server, names, cache)
             save_cache(cache_path, cache)
-            if not_found == checked:
+            if len(last_not_found) == checked:
                 print('None of them could be looked up: the dashboard may have no TMDb key, or cannot reach TMDb.')
                 continue
             shown = [name for name, _score, _reasons in candidates]
-            print(f'\n{len(candidates)} of {checked} look adult ({not_found} not found in the database):')
-            for number, (name, _score, reasons) in enumerate(candidates, 1):
-                print(f'  {number:>3}. {name}   [{"; ".join(reasons)}]')
+            likely = sum(1 for _n, score, _r in candidates if score >= LIKELY_SCORE)
+            print(f'\n{len(candidates)} of {checked} may be adult: {likely} likely, {len(candidates) - likely} maybe '
+                  f'({len(last_not_found)} not found in the database: type notfound to read them):')
+            for number, (name, score, reasons) in enumerate(candidates, 1):
+                print(f'  {number:>3}. {name}   {tier(score)}: {"; ".join(reasons)}')
             if candidates:
                 print('Type add 3 5 to choose some, add all for every one, then go.  Check the list first: it is a guess.')
+        elif command == 'notfound':
+            if not last_not_found:
+                print('Nothing to show: run adult first (and some may have been found).')
+            else:
+                shown = last_not_found
+                show_numbered(shown, 'Not found in the film database (add N works on this list)')
         elif command == 'add' and rest == ['all']:
             for name in shown:
                 if name not in chosen:

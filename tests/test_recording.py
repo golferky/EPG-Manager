@@ -2131,3 +2131,108 @@ class FilmSignalsTests(unittest.TestCase):
     def test_no_key_and_no_title_are_explained(self):
         self.assertEqual(self._get("title=Some%20Film", [], tmdb_key="").status_code, 503)
         self.assertEqual(self._get("title=", []).status_code, 400)
+
+
+class FilmYearsEndpointTests(unittest.TestCase):
+    def setUp(self):
+        server._film_years_cache.clear()
+
+    def _get(self, query, search, runtimes=None, calls=None):
+        import io
+        runtimes = runtimes or {}
+
+        def fake(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if calls is not None:
+                calls.append(url)
+            if "/search/movie" in url:
+                return io.BytesIO(json.dumps({"results": search}).encode())
+            if "themoviedb.org/3/movie/" in url:
+                ident = int(url.split("/movie/")[1].split("?")[0])
+                return io.BytesIO(json.dumps({"runtime": runtimes.get(ident, 0)}).encode())
+            raise AssertionError(url)
+        with mock.patch.object(server, "load_config", return_value={"tmdb_key": "t"}), \
+             mock.patch("urllib.request.urlopen", side_effect=fake):
+            return server.app.test_client().get("/epg-web/api/film-years?" + query)
+
+    SEARCH = [{"id": 1, "title": "Arthur", "release_date": "2011-04-08"},
+              {"id": 2, "title": "Arthur", "release_date": "1981-09-25"},
+              {"id": 3, "title": "Arthur Christmas", "release_date": "2011-11-23"}]
+
+    def test_it_lists_the_films_with_exactly_that_title_by_year(self):
+        data = self._get("title=Arthur", self.SEARCH).get_json()
+        self.assertEqual([c["year"] for c in data["candidates"]], ["1981", "2011"])      # not "Arthur Christmas"
+
+    def test_runtime_is_added_when_asked_for(self):
+        data = self._get("title=Arthur&runtime=1", self.SEARCH, runtimes={1: 110, 2: 97}).get_json()
+        self.assertEqual([(c["year"], c["runtime"]) for c in data["candidates"]], [("1981", 97), ("2011", 110)])
+
+    def test_no_runtime_means_no_extra_requests(self):
+        calls = []
+        self._get("title=Arthur", self.SEARCH, calls=calls)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_title_with_no_match_gives_an_empty_list_and_no_title_is_refused(self):
+        self.assertEqual(self._get("title=Nothing%20Here", []).get_json()["candidates"], [])
+        self.assertEqual(self._get("title=", []).status_code, 400)
+
+    def test_an_answer_is_remembered(self):
+        calls = []
+        self._get("title=Arthur", self.SEARCH, calls=calls)
+        n = len(calls)
+        self._get("title=Arthur", self.SEARCH, calls=calls)
+        self.assertEqual(len(calls), n)
+
+
+class AmpersandAndLooseTitleTests(unittest.TestCase):
+    def setUp(self):
+        server._film_signals_cache.clear()
+
+    def test_an_ampersand_is_and(self):
+        self.assertEqual(server.fold_title("Dumb & Dumber"), server.fold_title("Dumb and Dumber"))
+        self.assertEqual(server.fold_title("Ex-Husbands & Wives"), "exhusbandsandwives")
+        self.assertTrue(server._metadata_title_matches("Dumb & Dumber", "Dumb and Dumber"))
+        self.assertEqual(server._norm_plex_show("Dumb & Dumber (1994)"), server._norm_plex_show("Dumb and Dumber"))
+
+    def test_loose_title_rules(self):
+        loose = server._loose_title_match
+        self.assertTrue(loose(server.fold_title("Superman The Movie"), {"title": "Superman"}))
+        self.assertTrue(loose(server.fold_title("Superman"), {"title": "Superman The Movie"}))
+        self.assertFalse(loose(server.fold_title("It"), {"title": "It Follows"}))              # too short for a loose match
+        self.assertFalse(loose(server.fold_title("Heat"), {"title": "Heat Wave"}))
+        self.assertFalse(loose(server.fold_title("Jaws III"), {"title": "Jaws 3-D"}))          # not close enough: left alone
+
+    def _signals(self, query, search, details=None):
+        import io
+
+        def fake(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if "/search/movie" in url:
+                return io.BytesIO(json.dumps({"results": search}).encode())
+            return io.BytesIO(json.dumps(details or {"title": search[0]["title"], "release_date": search[0]["release_date"],
+                                                      "adult": False, "genres": [], "keywords": {"keywords": []}}).encode())
+        with mock.patch.object(server, "load_config", return_value={"tmdb_key": "t"}), \
+             mock.patch("urllib.request.urlopen", side_effect=fake):
+            return server.app.test_client().get("/epg-web/api/film-signals?" + query).get_json()
+
+    def test_a_close_title_in_the_same_year_is_found_and_marked_loose(self):
+        data = self._signals("title=Superman%20The%20Movie&year=1978",
+                             [{"id": 1, "title": "Superman", "release_date": "1978-12-15"}])
+        self.assertTrue(data["found"])
+        self.assertEqual(data["match"], "loose")
+        self.assertEqual(data["title"], "Superman")
+
+    def test_a_close_title_is_accepted_one_year_off_but_not_two(self):
+        film = [{"id": 1, "title": "Superman", "release_date": "1978-12-15"}]
+        self.assertTrue(self._signals("title=Superman%20The%20Movie&year=1979", film)["found"])
+        self.assertFalse(self._signals("title=Superman%20The%20Movie&year=1981", film)["found"])
+
+    def test_a_close_title_needs_a_year(self):
+        film = [{"id": 1, "title": "Superman", "release_date": "1978-12-15"}]
+        self.assertFalse(self._signals("title=Superman%20The%20Movie", film)["found"])
+
+    def test_an_exact_match_is_preferred_and_marked_exact(self):
+        film = [{"id": 1, "title": "Dumb and Dumber", "release_date": "1994-12-16"}]
+        data = self._signals("title=Dumb%20%26%20Dumber&year=1994", film)
+        self.assertTrue(data["found"])
+        self.assertEqual(data["match"], "exact")
