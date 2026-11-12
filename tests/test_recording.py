@@ -1917,3 +1917,151 @@ class WestFeedYearTests(unittest.TestCase):
         self.assertEqual(found, "1995")
         none = server._guide_year_for_airing(server._guide_db_path(), "wf-west", "Shifted Film", west + 6 * 3600)
         self.assertEqual(none, "")
+
+
+class FilmYearByTitleTests(unittest.TestCase):
+    """A film with no year from the guide: look it up by title, but only when that is certain."""
+
+    def setUp(self):
+        server._film_year_cache.clear()
+
+    def _urlopen(self, tmdb_results=None, runtimes=None, omdb=None, calls=None, fail_tmdb=False):
+        import io
+        runtimes = runtimes or {}
+
+        def fake(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if calls is not None:
+                calls.append(url)
+            if "themoviedb.org/3/search" in url:
+                if fail_tmdb:
+                    raise OSError("tmdb down")
+                return io.BytesIO(json.dumps({"results": tmdb_results or []}).encode())
+            if "themoviedb.org/3/movie/" in url:
+                ident = int(url.split("/movie/")[1].split("?")[0])
+                return io.BytesIO(json.dumps({"runtime": runtimes.get(ident, 0)}).encode())
+            if "omdbapi.com" in url:
+                return io.BytesIO(json.dumps(omdb or {"Response": "False", "Error": "Movie not found!"}).encode())
+            raise AssertionError(url)
+        return mock.patch("urllib.request.urlopen", side_effect=fake)
+
+    def _lookup(self, title, minutes, **kw):
+        with mock.patch.object(server, "load_config", return_value={"tmdb_key": "t", "omdb_key": "o"}), \
+             self._urlopen(**kw):
+            return server._film_year_by_title(title, minutes)
+
+    def test_one_film_with_that_title_gives_its_year(self):
+        results = [{"id": 1, "title": "Aeon Flux", "release_date": "2005-12-01"}]
+        self.assertEqual(self._lookup("Aeon Flux", 93, tmdb_results=results), "2005")
+
+    def test_a_longer_title_is_not_taken(self):
+        results = [{"id": 1, "title": "Aeon Flux Returns", "release_date": "2010-01-01"}]
+        self.assertEqual(self._lookup("Aeon Flux", 93, tmdb_results=results), "")
+
+    def test_the_special_spelling_matches(self):
+        results = [{"id": 8202, "title": "Æon Flux", "release_date": "2005-12-01"}]
+        self.assertEqual(self._lookup("Aeon Flux", 93, tmdb_results=results), "2005")
+
+    def test_two_films_are_told_apart_by_running_time(self):
+        results = [{"id": 10, "title": "Employee of the Month", "release_date": "2004-10-08"},
+                   {"id": 20, "title": "Employee of the Month", "release_date": "2022-01-01"}]
+        runtimes = {10: 103, 20: 88}
+        self.assertEqual(self._lookup("Employee of the Month", 104, tmdb_results=results, runtimes=runtimes), "2004")
+        self.assertEqual(self._lookup("Employee of the Month ", 88, tmdb_results=results, runtimes=runtimes), "2022")
+
+    def test_two_films_of_a_similar_length_are_not_guessed(self):
+        results = [{"id": 10, "title": "Arthur", "release_date": "1981-09-25"},
+                   {"id": 20, "title": "Arthur", "release_date": "2011-04-08"}]
+        self.assertEqual(self._lookup("Arthur", 108, tmdb_results=results, runtimes={10: 97, 20: 110}), "")
+
+    def test_two_films_with_no_airing_length_are_not_guessed(self):
+        results = [{"id": 10, "title": "Arthur", "release_date": "1981-09-25"},
+                   {"id": 20, "title": "Arthur", "release_date": "2011-04-08"}]
+        self.assertEqual(self._lookup("Arthur", 0, tmdb_results=results), "")
+
+    def test_omdb_is_used_when_tmdb_has_nothing(self):
+        omdb = {"Search": [{"Title": "Heat", "Year": "1995", "imdbID": "tt1"}, {"Title": "Heat Wave", "Year": "1990", "imdbID": "tt2"}]}
+        self.assertEqual(self._lookup("Heat", 170, omdb=omdb), "1995")
+
+    def test_a_failing_service_gives_no_year_and_no_error(self):
+        self.assertEqual(self._lookup("Heat", 170, fail_tmdb=True), "")
+
+    def test_an_answer_is_remembered(self):
+        calls = []
+        results = [{"id": 1, "title": "Aeon Flux", "release_date": "2005-12-01"}]
+        self.assertEqual(self._lookup("Aeon Flux", 93, tmdb_results=results, calls=calls), "2005")
+        n = len(calls)
+        self.assertEqual(self._lookup("Aeon Flux", 93, tmdb_results=results, calls=calls), "2005")
+        self.assertEqual(len(calls), n)
+
+    def test_nothing_found_is_not_asked_again_straight_away(self):
+        calls = []
+        self.assertEqual(self._lookup("Nonexistent Film", 90, calls=calls), "")
+        n = len(calls)
+        self.assertEqual(self._lookup("Nonexistent Film", 90, calls=calls), "")
+        self.assertEqual(len(calls), n)
+
+
+class RecordUsesTitleLookupTests(unittest.TestCase):
+    CHANNEL = "tl-chan-1"
+
+    def setUp(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._rec_cancel_events.clear()
+        server._init_recordings_table()
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("DELETE FROM recordings")
+        conn.execute("DELETE FROM guide WHERE channel_id LIKE 'tl-%'")
+        conn.commit()
+        conn.close()
+        self.start = time.time() + 7200
+
+    def _record(self, minutes=110, lookup="1995", **extra):
+        body = {"title": "Lookup Film", "channel_id": self.CHANNEL, "channel_name": "Chan",
+                "start_ts": self.start, "stop_ts": self.start + minutes * 60}
+        body.update(extra)
+        with mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source",
+                               return_value=("http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"})), \
+             mock.patch.object(server, "_film_year_by_title", return_value=lookup) as looked:
+            resp = server.app.test_client().post("/epg-web/api/record", json=body)
+        conn = sqlite3.connect(server._guide_db_path())
+        row = conn.execute("SELECT year FROM recordings ORDER BY created_at DESC LIMIT 1").fetchone()
+        conn.close()
+        return resp, (row[0] if row else None), looked
+
+    def test_a_film_with_no_year_is_looked_up_and_saved_with_the_year(self):
+        resp, year, looked = self._record()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(year, "1995")
+        self.assertEqual(looked.call_args.args[0], "Lookup Film")
+        self.assertAlmostEqual(looked.call_args.args[1], 110, delta=1)
+
+    def test_an_uncertain_lookup_records_without_a_year(self):
+        _resp, year, _looked = self._record(lookup="")
+        self.assertEqual(year, "")
+
+    def test_a_year_from_the_caller_is_not_looked_up_or_overridden(self):
+        _resp, year, looked = self._record(year="2004")
+        self.assertEqual(year, "2004")
+        looked.assert_not_called()
+
+    def test_a_year_from_the_guide_is_not_looked_up(self):
+        key = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.start))
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category, prog_type, year) "
+                     "VALUES ('Lookup Film', ?, 'Chan', ?, ?, '', '', 'MV', '1988')", (self.CHANNEL, key, key))
+        conn.commit()
+        conn.close()
+        _resp, year, looked = self._record()
+        self.assertEqual(year, "1988")
+        looked.assert_not_called()
+
+    def test_a_short_programme_is_not_looked_up(self):
+        _resp, year, looked = self._record(minutes=30)
+        looked.assert_not_called()
+
+    def test_a_tv_episode_is_not_looked_up_as_a_film(self):
+        _resp, _year, looked = self._record(season_num=1, episode_num=2, episode_title="Pilot")
+        looked.assert_not_called()
