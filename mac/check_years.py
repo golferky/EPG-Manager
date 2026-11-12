@@ -7,12 +7,18 @@ Run on the Mac mini:
 
 A folder like "Spider-Man 3 (2026)" has a year that is not the film's year (it was probably
 the year it aired).  This checks each folder's title against the film database: if no film
-with that title came out in the folder's year, it looks for the right one.
+with that title came out within a year of the folder's year, it looks for the right one.
 
-  - One film has that title: its year is suggested.
-  - Several films share the title (a remake): the length of the file in the folder picks
-    the one that matches, if exactly one does.  Otherwise the options are listed and you
-    choose with  set N YEAR.
+  - A year one off is fine: release dates differ by a year between countries and festivals,
+    and Plex copes with that.  Such folders are not listed.
+  - One film has that title and the file's length fits it: its year is suggested.
+  - Several films share the title: the length of the file picks the one that fits, if exactly
+    one does.  Otherwise the options are listed and you choose with  set N YEAR.
+  - A suggestion that moves the year by 10 or more years is a BIG CHANGE (the folder may be an
+    original or a TV series, not the remake or film found): it is listed apart and not renamed
+    unless you confirm it with  set N YEAR.  A folder year of this year or later is clearly
+    wrong, so those are renamed normally.
+  - Films whose length is wildly different from the file's (shorts, TV episodes) are ignored.
   - The title is not in the database at all: it is listed as "could not check" and left alone.
 
 Folders the private-movies scan has already confirmed (film_signals_cache.json) are skipped:
@@ -74,26 +80,49 @@ def file_minutes(folder, ffprobe='ffprobe'):
     return longest / 60
 
 
-def judge(year, candidates, minutes):
+BIG_CHANGE_YEARS = 10
+
+
+def judge(year, candidates, minutes, this_year=None):
     """(suggested year, reason, options text) for a folder named with ``year``.
 
-    suggested '' with an empty reason means the folder is fine or cannot be judged.
+    Reasons: ok (nothing to do), unknown, fix (rename), big (a change of 10+ years: needs your
+    confirmation), choose (several films fit).  ``suggested`` is '' unless the reason is fix.
     """
-    years = [c['year'] for c in candidates]
-    if not years:
+    if this_year is None:
+        import datetime
+        this_year = datetime.date.today().year
+    if not candidates:
         return '', 'unknown', ''
-    if year in years:
+    # Films whose running time is wildly different from the file are not this film.
+    plausible = [c for c in candidates
+                 if not minutes or not c.get('runtime') or 0.6 * minutes <= c['runtime'] <= 1.6 * minutes]
+    if any(abs(int(year) - int(c['year'])) <= 1 for c in plausible):
         return '', 'ok', ''
-    if len(years) == 1:
-        return years[0], 'the only film with this title', ''
-    if minutes:
-        tolerance = max(8.0, minutes * 0.12)
-        close = [c for c in candidates if c.get('runtime') and abs(c['runtime'] - minutes) <= tolerance]
-        if len(close) == 1:
-            return close[0]['year'], f'its length ({minutes:.0f} min) fits only this one', ''
-    options = ', '.join(f"{c['year']}" + (f" ({c['runtime']} min)" if c.get('runtime') else '') for c in candidates)
+    if not plausible:
+        return '', 'unknown', ''
+
+    def describe(c):
+        return f"{c['year']}" + (f" ({c['runtime']} min)" if c.get('runtime') else '')
     mine = f' your file is {minutes:.0f} min;' if minutes else ''
-    return '', 'choose', f'{options};{mine} choose with set N YEAR'
+    pick = None
+    if len(plausible) == 1:
+        c = plausible[0]
+        if minutes and c.get('runtime') and abs(c['runtime'] - minutes) > max(15.0, minutes * 0.2):
+            return '', 'choose', f'{describe(c)};{mine} the length does not fit well: choose with set N YEAR'
+        pick, reason = c, 'the only film with this title'
+    elif minutes:
+        tolerance = max(8.0, minutes * 0.12)
+        close = [c for c in plausible if c.get('runtime') and abs(c['runtime'] - minutes) <= tolerance]
+        if len(close) == 1:
+            pick, reason = close[0], f'its length ({minutes:.0f} min) fits only this one'
+    if pick is None:
+        return '', 'choose', ', '.join(describe(c) for c in plausible) + f';{mine} choose with set N YEAR'
+    jump = abs(int(year) - int(pick['year']))
+    if jump >= BIG_CHANGE_YEARS and int(year) < this_year:
+        return '', 'big', (f"possibly {describe(pick)};{mine} a {jump}-year change, so it may be a different film "
+                           f"or a TV series: confirm with set N {pick['year']}")
+    return pick['year'], reason, ''
 
 
 def build_plan(server, folders, movies_dir, ffprobe, workers=4):
@@ -102,7 +131,7 @@ def build_plan(server, folders, movies_dir, ffprobe, workers=4):
         name, title, year = item
         info = scan.get_json(server, '/epg-web/api/film-years', {'title': title, 'runtime': 1}, timeout=60)
         candidates = info.get('candidates') or []
-        minutes = file_minutes(os.path.join(movies_dir, name), ffprobe) if len(candidates) > 1 else 0
+        minutes = file_minutes(os.path.join(movies_dir, name), ffprobe) if candidates else 0
         suggestion, reason, options = judge(year, candidates, minutes)
         return {'name': name, 'title': title, 'year': year, 'new': suggestion, 'reason': reason,
                 'options': options, 'skip': False}
@@ -122,6 +151,10 @@ def format_recap(plan):
     go = will_rename(plan)
     lines = [f'Will be renamed ({len(go)}):']
     lines += [f"  {row['n']:>3}. {row['name']}  ->  {row['title']} ({row['new']})   [{row['reason']}]" for row in go] or ['  (none)']
+    big = [row for row in plan if row['reason'] == 'big' and not row['new']]
+    if big:
+        lines.append(f'\nBig changes, check these first: NOT renamed unless you confirm ({len(big)}):')
+        lines += [f"  {row['n']:>3}. {row['name']}   {row['options']}" for row in big]
     choose = [row for row in plan if row['reason'] == 'choose' and not row['new']]
     if choose:
         lines.append(f'\nSeveral films share the title: you choose ({len(choose)}):')
@@ -167,7 +200,7 @@ def parse_command(text, plan):
             return 'continue', 'set needs a list number and a four-digit year, for example: set 12 1987'
         row = by_number[int(rest[0])]
         row['new'], row['skip'] = rest[1], False
-        if row['reason'] in ('choose', 'unknown'):
+        if row['reason'] in ('choose', 'unknown', 'big'):
             row['reason'] = 'your choice'
         return 'continue', f'{row["n"]}. {row["name"]} will be renamed to "{row["title"]} ({rest[1]})".'
     return 'continue', f'Unknown command "{command}". Type y, skip N, set N YEAR, list, or q.'

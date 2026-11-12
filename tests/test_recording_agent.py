@@ -2015,13 +2015,13 @@ class CheckYearsTests(unittest.TestCase):
         spec.loader.exec_module(cls.tool)
 
     def test_judge(self):
-        judge = self.tool.judge
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
         one = [{"year": "2005", "runtime": 0}]
         self.assertEqual(judge("2005", one, 0)[1], "ok")                       # the year is a real film's year
         self.assertEqual(judge("2026", one, 0)[:2], ("2005", "the only film with this title"))
         self.assertEqual(judge("2026", [], 0), ("", "unknown", ""))
         two = [{"year": "1981", "runtime": 97}, {"year": "2011", "runtime": 110}]
-        self.assertEqual(judge("2026", two, 98)[0], "1981")                    # the file's length picks the film
+        self.assertEqual(judge("2026", two, 96)[0], "1981")                    # the file's length picks the film
         self.assertEqual(judge("2026", two, 111)[0], "2011")
         self.assertEqual(judge("2011", two, 98)[1], "ok")                      # the year matches one of them
         guess, reason, options = judge("2026", two, 104)                       # between the two: not guessed
@@ -2029,6 +2029,39 @@ class CheckYearsTests(unittest.TestCase):
         self.assertIn("1981 (97 min), 2011 (110 min)", options)
         self.assertIn("your file is 104 min", options)
         self.assertEqual(judge("2026", two, 0)[1], "choose")                   # no file length: not guessed
+
+    def test_a_year_one_off_is_fine(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        for folder, film in (("2006", "2007"), ("2002", "2001"), ("2005", "2006")):
+            self.assertEqual(judge(folder, [{"year": film, "runtime": 120}], 125)[1], "ok", folder)
+        self.assertEqual(judge("2016", [{"year": "2014", "runtime": 100}], 100)[0], "2014")     # two off is not
+
+    def test_a_big_change_is_not_renamed_unless_confirmed(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        guess, reason, options = judge("1961", [{"year": "1983", "runtime": 100}], 106)         # Breathless
+        self.assertEqual((guess, reason), ("", "big"))
+        self.assertIn("22-year change", options)
+        self.assertIn("set N 1983", options)
+        self.assertEqual(judge("2013", [{"year": "1993", "runtime": 109}], 121)[1], "big")
+        self.assertEqual(judge("1990", [{"year": "2020", "runtime": 100}], 100)[1], "big")
+
+    def test_a_folder_year_this_year_or_later_is_clearly_wrong_so_it_is_renamed(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        self.assertEqual(judge("2026", [{"year": "1964", "runtime": 87}], 87)[:2], ("1964", "the only film with this title"))
+        self.assertEqual(judge("2026", [{"year": "1956", "runtime": 220}], 220)[0], "1956")
+
+    def test_short_films_and_episodes_of_the_wrong_length_are_ignored(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        cands = [{"year": "2009", "runtime": 9}, {"year": "2017", "runtime": 12}, {"year": "2023", "runtime": 2}]
+        self.assertEqual(judge("1980", cands, 116)[1], "unknown")              # 9 to 5: none is a feature of that length
+        mixed = [{"year": "2011", "runtime": 12}, {"year": "1986", "runtime": 107}]
+        self.assertEqual(judge("2026", mixed, 108)[:2], ("1986", "the only film with this title"))
+
+    def test_a_single_film_whose_length_does_not_fit_is_a_choice(self):
+        judge = lambda *a, **k: self.tool.judge(*a, this_year=2026, **k)
+        guess, reason, options = judge("2026", [{"year": "2005", "runtime": 60}], 100)
+        self.assertEqual((guess, reason), ("", "choose"))
+        self.assertIn("the length does not fit well", options)
 
     def test_only_dated_folders_with_a_video_are_checked(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2069,7 +2102,8 @@ class CheckYearsTests(unittest.TestCase):
 
     def _library(self, temp):
         root = Path(temp) / "Movies"
-        for name in ("Contagion (2026)", "Arthur (2026)", "Nobody s Fool (1994)", "Mystery Film (2001)", "Heat (1995)", "Verified Film (1999)"):
+        for name in ("Contagion (2026)", "Arthur (2026)", "Nobody s Fool (1995)", "Mystery Film (2001)", "Heat (1995)",
+                     "Verified Film (1999)", "Big Jump (1961)"):
             (root / name).mkdir(parents=True)
             (root / name / "f.mp4").write_bytes(name.encode())
         return root
@@ -2077,7 +2111,8 @@ class CheckYearsTests(unittest.TestCase):
     CANDIDATES = {
         "Contagion": [{"year": "2011", "runtime": 106}],
         "Arthur": [{"year": "1981", "runtime": 97}, {"year": "2011", "runtime": 110}],
-        "Nobody s Fool": [{"year": "1994", "runtime": 110}],
+        "Nobody s Fool": [{"year": "1994", "runtime": 110}],            # one year off: fine
+        "Big Jump": [{"year": "1983", "runtime": 100}],
         "Mystery Film": [],
         "Heat": [{"year": "1995", "runtime": 170}],
         "Verified Film": [{"year": "1999", "runtime": 90}],
@@ -2110,8 +2145,10 @@ class CheckYearsTests(unittest.TestCase):
             _rc, out, asked = self._run(root, ["q"], cache=cache)
             self.assertNotIn("Verified Film", asked)                           # confirmed by the earlier scan
             self.assertIn("Contagion (2026)  ->  Contagion (2011)   [the only film with this title]", out)
-            self.assertIn("2 of them have a year that matches a real film", out)    # Heat and Nobody s Fool: fine, not listed
-            self.assertNotIn("Nobody s Fool (1994)", out)
+            self.assertIn("2 of them have a year that matches a real film", out)    # Heat and Nobody s Fool (a year off)
+            self.assertNotIn("Nobody s Fool", out)
+            self.assertIn("Big changes, check these first", out)
+            self.assertIn("Big Jump (1961)", out)
             self.assertIn("Several films share the title: you choose (1)", out)
             self.assertIn("Arthur (2026)", out)
             self.assertIn("Could not check, the title is not in the film database (1)", out)
@@ -2124,6 +2161,7 @@ class CheckYearsTests(unittest.TestCase):
             _rc, out, _asked = self._run(root, ["y"])
             names = self._names(root)
             self.assertIn("Contagion (2011)", names)
+            self.assertIn("Big Jump (1961)", names)                            # a big change: not renamed by y
             self.assertIn("Arthur (2026)", names)                              # a choice: not renamed
             self.assertIn("Mystery Film (2001)", names)
             self.assertIn("Heat (1995)", names)
@@ -2138,8 +2176,8 @@ class CheckYearsTests(unittest.TestCase):
     def test_set_resolves_a_choice_and_skip_leaves_one_alone(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self._library(temp)
-            # the list is numbered alphabetically by folder: 1 Arthur, 2 Contagion, 3 Mystery Film
-            self._run(root, ["set 1 2011", "skip 2", "y"])
+            # the list is numbered alphabetically by folder: 1 Arthur, 2 Big Jump, 3 Contagion, 4 Mystery Film
+            self._run(root, ["set 1 2011", "skip 3", "y"])
             names = self._names(root)
             self.assertIn("Arthur (2011)", names)
             self.assertIn("Contagion (2026)", names)
@@ -2173,6 +2211,13 @@ class CheckYearsTests(unittest.TestCase):
             self.assertIn("already confirmed", out)
             self.assertEqual(asked, [])
 
+    def test_set_confirms_a_big_change_and_renames(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            # 1 Arthur, 2 Big Jump, 3 Contagion, 4 Mystery Film
+            self._run(root, ["set 2 1983", "y"])
+            self.assertIn("Big Jump (1983)", self._names(root))
+
     def test_bad_commands_are_explained(self):
         plan = [{"n": 1, "name": "A (2026)", "title": "A", "year": "2026", "new": "", "reason": "choose",
                  "options": "", "skip": False}]
@@ -2180,3 +2225,4 @@ class CheckYearsTests(unittest.TestCase):
         self.assertIn("set needs", self.tool.parse_command("set 1 20", plan)[1])
         self.assertIn("Unknown command", self.tool.parse_command("banana", plan)[1])
         self.assertEqual(self.tool.parse_command("q", plan)[0], "quit")
+
