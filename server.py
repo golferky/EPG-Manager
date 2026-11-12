@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112c"
+VERSION = "v20261112d"
 
 app = Flask(__name__)
 
@@ -7323,6 +7323,37 @@ def _film_year_by_title(title, minutes=0):
 
 
 _film_signals_cache = {}
+_film_years_cache = {}
+
+
+@app.route('/epg-web/api/film-years')
+def api_film_years():
+    """Every film that has exactly this title, with its year (and running time if asked).
+
+    Used by the year-check tool: a folder named with the wrong year can be matched to the
+    right film by its title alone, and by the length of the file when several films share
+    the title.  ``runtime=1`` adds each film's running time (one more request per film).
+    """
+    title = request.args.get('title', '').strip()
+    want_runtime = request.args.get('runtime') == '1'
+    if not title:
+        return jsonify({'candidates': [], 'error': 'No title'}), 400
+    key = (fold_title(title), want_runtime)
+    cached = _film_years_cache.get(key)
+    if cached and time.time() - cached[1] < FILM_YEAR_CACHE_SECONDS:
+        return jsonify({'candidates': cached[0]})
+    cfg = load_config()
+    try:
+        found = _film_candidates(title, cfg)
+    except Exception as exc:
+        return jsonify({'candidates': [], 'error': str(exc)}), 502
+    by_year = {}
+    for year, _runtime, ident in found:
+        runtime = _candidate_runtime(ident, cfg) if want_runtime and len(by_year) < 6 and year not in by_year else 0
+        by_year.setdefault(year, {'year': year, 'runtime': runtime, 'source': ident[0]})
+    candidates = [by_year[y] for y in sorted(by_year)]
+    _film_years_cache[key] = (candidates, time.time())
+    return jsonify({'candidates': candidates})
 
 
 @app.route('/epg-web/api/film-signals')

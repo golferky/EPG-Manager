@@ -2131,3 +2131,54 @@ class FilmSignalsTests(unittest.TestCase):
     def test_no_key_and_no_title_are_explained(self):
         self.assertEqual(self._get("title=Some%20Film", [], tmdb_key="").status_code, 503)
         self.assertEqual(self._get("title=", []).status_code, 400)
+
+
+class FilmYearsEndpointTests(unittest.TestCase):
+    def setUp(self):
+        server._film_years_cache.clear()
+
+    def _get(self, query, search, runtimes=None, calls=None):
+        import io
+        runtimes = runtimes or {}
+
+        def fake(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if calls is not None:
+                calls.append(url)
+            if "/search/movie" in url:
+                return io.BytesIO(json.dumps({"results": search}).encode())
+            if "themoviedb.org/3/movie/" in url:
+                ident = int(url.split("/movie/")[1].split("?")[0])
+                return io.BytesIO(json.dumps({"runtime": runtimes.get(ident, 0)}).encode())
+            raise AssertionError(url)
+        with mock.patch.object(server, "load_config", return_value={"tmdb_key": "t"}), \
+             mock.patch("urllib.request.urlopen", side_effect=fake):
+            return server.app.test_client().get("/epg-web/api/film-years?" + query)
+
+    SEARCH = [{"id": 1, "title": "Arthur", "release_date": "2011-04-08"},
+              {"id": 2, "title": "Arthur", "release_date": "1981-09-25"},
+              {"id": 3, "title": "Arthur Christmas", "release_date": "2011-11-23"}]
+
+    def test_it_lists_the_films_with_exactly_that_title_by_year(self):
+        data = self._get("title=Arthur", self.SEARCH).get_json()
+        self.assertEqual([c["year"] for c in data["candidates"]], ["1981", "2011"])      # not "Arthur Christmas"
+
+    def test_runtime_is_added_when_asked_for(self):
+        data = self._get("title=Arthur&runtime=1", self.SEARCH, runtimes={1: 110, 2: 97}).get_json()
+        self.assertEqual([(c["year"], c["runtime"]) for c in data["candidates"]], [("1981", 97), ("2011", 110)])
+
+    def test_no_runtime_means_no_extra_requests(self):
+        calls = []
+        self._get("title=Arthur", self.SEARCH, calls=calls)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_title_with_no_match_gives_an_empty_list_and_no_title_is_refused(self):
+        self.assertEqual(self._get("title=Nothing%20Here", []).get_json()["candidates"], [])
+        self.assertEqual(self._get("title=", []).status_code, 400)
+
+    def test_an_answer_is_remembered(self):
+        calls = []
+        self._get("title=Arthur", self.SEARCH, calls=calls)
+        n = len(calls)
+        self._get("title=Arthur", self.SEARCH, calls=calls)
+        self.assertEqual(len(calls), n)

@@ -2002,3 +2002,181 @@ class NotFoundListTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             out = self._run(self._library(temp), ["notfound", "q"], Path(temp) / "c.json")
             self.assertIn("run adult first", out)
+
+
+class CheckYearsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("check_years_under_test", mac / "check_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_judge(self):
+        judge = self.tool.judge
+        one = [{"year": "2005", "runtime": 0}]
+        self.assertEqual(judge("2005", one, 0)[1], "ok")                       # the year is a real film's year
+        self.assertEqual(judge("2026", one, 0)[:2], ("2005", "the only film with this title"))
+        self.assertEqual(judge("2026", [], 0), ("", "unknown", ""))
+        two = [{"year": "1981", "runtime": 97}, {"year": "2011", "runtime": 110}]
+        self.assertEqual(judge("2026", two, 98)[0], "1981")                    # the file's length picks the film
+        self.assertEqual(judge("2026", two, 111)[0], "2011")
+        self.assertEqual(judge("2011", two, 98)[1], "ok")                      # the year matches one of them
+        guess, reason, options = judge("2026", two, 104)                       # between the two: not guessed
+        self.assertEqual((guess, reason), ("", "choose"))
+        self.assertIn("1981 (97 min), 2011 (110 min)", options)
+        self.assertIn("your file is 104 min", options)
+        self.assertEqual(judge("2026", two, 0)[1], "choose")                   # no file length: not guessed
+
+    def test_only_dated_folders_with_a_video_are_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for name, video in (("Contagion (2026)", True), ("Heat (1995)", True), ("Empty (2000)", False),
+                                ("No Year", True), ("_wrong (2001)", True)):
+                (Path(temp) / name).mkdir()
+                if video:
+                    (Path(temp) / name / "f.mp4").write_bytes(b"x")
+            names = [n for n, _t, _y in self.tool.dated_folders(temp)]
+            self.assertEqual(names, ["Contagion (2026)", "Heat (1995)"])
+
+    def test_change_year_renames_the_folder_and_files_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "Contagion (2026)"
+            folder.mkdir()
+            (folder / "Contagion (2026).mp4").write_bytes(b"x")
+            (folder / "poster.jpg").write_bytes(b"p")
+            new = self.tool.change_year(temp, "Contagion (2026)", "Contagion", "2011")
+            self.assertEqual(new, "Contagion (2011)")
+            self.assertEqual(sorted(p.name for p in (Path(temp) / new).iterdir()), ["Contagion (2011).mp4", "poster.jpg"])
+            (Path(temp) / "Heat (2026)").mkdir()
+            (Path(temp) / "Heat (1995)").mkdir()
+            (Path(temp) / "Heat (1995)" / "keep.mp4").write_bytes(b"k")
+            with self.assertRaises(FileExistsError):
+                self.tool.change_year(temp, "Heat (2026)", "Heat", "1995")
+            self.assertTrue((Path(temp) / "Heat (1995)" / "keep.mp4").exists())
+            with self.assertRaises(ValueError):
+                self.tool.change_year(temp, "Heat (2026)", "Heat", "95")
+
+    def test_an_empty_folder_of_the_new_name_is_replaced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Spider-Man 3 (2026)").mkdir()
+            (Path(temp) / "Spider-Man 3 (2026)" / "s.mp4").write_bytes(b"s")
+            (Path(temp) / "Spider-Man 3 (2007)").mkdir()           # an empty leftover
+            self.tool.change_year(temp, "Spider-Man 3 (2026)", "Spider-Man 3", "2007")
+            self.assertEqual([p.name for p in (Path(temp) / "Spider-Man 3 (2007)").iterdir()], ["s.mp4"])
+            self.assertFalse((Path(temp) / "Spider-Man 3 (2026)").exists())
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in ("Contagion (2026)", "Arthur (2026)", "Nobody s Fool (1994)", "Mystery Film (2001)", "Heat (1995)", "Verified Film (1999)"):
+            (root / name).mkdir(parents=True)
+            (root / name / "f.mp4").write_bytes(name.encode())
+        return root
+
+    CANDIDATES = {
+        "Contagion": [{"year": "2011", "runtime": 106}],
+        "Arthur": [{"year": "1981", "runtime": 97}, {"year": "2011", "runtime": 110}],
+        "Nobody s Fool": [{"year": "1994", "runtime": 110}],
+        "Mystery Film": [],
+        "Heat": [{"year": "1995", "runtime": 170}],
+        "Verified Film": [{"year": "1999", "runtime": 90}],
+    }
+
+    def _run(self, root, answers, *flags, minutes=0, copying=(), cache=None):
+        out = []
+        asked = []
+
+        def fake_get(server, path, params=None, timeout=20):
+            asked.append(params["title"])
+            return {"candidates": self.CANDIDATES.get(params["title"], [])}
+        cache_path = Path(root).parent / "cache.json"
+        cache_path.write_text(json.dumps(cache or {}))
+        with mock.patch.object(self.tool.scan, "get_json", side_effect=fake_get), \
+             mock.patch.object(self.tool, "file_minutes", return_value=minutes), \
+             mock.patch.object(self.tool.base, "recorder_copying", return_value=list(copying)), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", "--cache", str(cache_path), *flags])
+        return rc, "\n".join(out), asked
+
+    def _names(self, root):
+        return sorted(p.name for p in Path(root).iterdir())
+
+    def test_the_recap_sorts_the_folders_and_skips_confirmed_ones(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            cache = {"Verified Film (1999)": {"found": True}}
+            _rc, out, asked = self._run(root, ["q"], cache=cache)
+            self.assertNotIn("Verified Film", asked)                           # confirmed by the earlier scan
+            self.assertIn("Contagion (2026)  ->  Contagion (2011)   [the only film with this title]", out)
+            self.assertIn("2 of them have a year that matches a real film", out)    # Heat and Nobody s Fool: fine, not listed
+            self.assertNotIn("Nobody s Fool (1994)", out)
+            self.assertIn("Several films share the title: you choose (1)", out)
+            self.assertIn("Arthur (2026)", out)
+            self.assertIn("Could not check, the title is not in the film database (1)", out)
+            self.assertIn("Mystery Film (2001)", out)
+            self.assertEqual(self._names(root)[:1], ["Arthur (2026)"])         # nothing renamed on q
+
+    def test_y_renames_the_certain_ones_and_leaves_the_rest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, _asked = self._run(root, ["y"])
+            names = self._names(root)
+            self.assertIn("Contagion (2011)", names)
+            self.assertIn("Arthur (2026)", names)                              # a choice: not renamed
+            self.assertIn("Mystery Film (2001)", names)
+            self.assertIn("Heat (1995)", names)
+            self.assertIn("Renamed 1", out)
+
+    def test_the_file_length_resolves_a_choice(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["y"], minutes=96)             # 97 min fits the 1981 film, 110 min does not
+            self.assertIn("Arthur (1981)", self._names(root))
+
+    def test_set_resolves_a_choice_and_skip_leaves_one_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            # the list is numbered alphabetically by folder: 1 Arthur, 2 Contagion, 3 Mystery Film
+            self._run(root, ["set 1 2011", "skip 2", "y"])
+            names = self._names(root)
+            self.assertIn("Arthur (2011)", names)
+            self.assertIn("Contagion (2026)", names)
+
+    def test_a_dry_run_renames_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, _asked = self._run(root, ["y"], "--dry-run")
+            self.assertIn("would rename", out)
+            self.assertIn("Contagion (2026)", self._names(root))
+
+    def test_yes_renames_without_asking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, [], "--yes")
+            self.assertIn("Contagion (2011)", self._names(root))
+
+    def test_it_refuses_while_the_recorder_is_copying(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            rc, out, _asked = self._run(root, ["y"], copying=["Heat"])
+            self.assertEqual(rc, 1)
+            self.assertIn("copying", out)
+            self.assertIn("Contagion (2026)", self._names(root))
+
+    def test_when_everything_is_confirmed_it_says_so(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            cache = {n: {"found": True} for n in self._names(root)}
+            _rc, out, asked = self._run(root, [], cache=cache)
+            self.assertIn("already confirmed", out)
+            self.assertEqual(asked, [])
+
+    def test_bad_commands_are_explained(self):
+        plan = [{"n": 1, "name": "A (2026)", "title": "A", "year": "2026", "new": "", "reason": "choose",
+                 "options": "", "skip": False}]
+        self.assertIn("is not a number", self.tool.parse_command("skip 9", plan)[1])
+        self.assertIn("set needs", self.tool.parse_command("set 1 20", plan)[1])
+        self.assertIn("Unknown command", self.tool.parse_command("banana", plan)[1])
+        self.assertEqual(self.tool.parse_command("q", plan)[0], "quit")
