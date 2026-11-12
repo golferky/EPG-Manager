@@ -190,7 +190,7 @@ _TITLE_LIGATURES = {'\u00e6': 'ae', '\u0153': 'oe', '\u00df': 'ss', '\u00f8': 'o
 
 def fold_title(value):
     """Lower case, accents and ligatures folded, only letters and digits kept."""
-    text = str(value or '').lower()
+    text = str(value or '').lower().replace('&', ' and ')
     for special, plain in _TITLE_LIGATURES.items():
         text = text.replace(special, plain)
     text = unicodedata.normalize('NFKD', text)

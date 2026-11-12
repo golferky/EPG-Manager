@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112d"
+VERSION = "v20261112e"
 
 app = Flask(__name__)
 
@@ -412,7 +412,7 @@ def fold_title(value):
     "\u00c6on Flux" and "Aeon Flux" are the same film, as are "Am\u00e9lie" and "Amelie".  A
     database stores the special spelling; a Plex folder usually has the plain one.
     """
-    text = str(value or '').lower()
+    text = str(value or '').lower().replace('&', ' and ')
     for special, plain in _TITLE_LIGATURES.items():
         text = text.replace(special, plain)
     text = unicodedata.normalize('NFKD', text)
@@ -7326,6 +7326,17 @@ _film_signals_cache = {}
 _film_years_cache = {}
 
 
+def _loose_title_match(wanted, result):
+    """Is a search result's title close enough to the folder's folded title?  One contains the other
+    and the shorter one has at least 5 letters, so very short titles never match loosely."""
+    for candidate in (result.get('title'), result.get('original_title')):
+        folded = fold_title(candidate)
+        shorter, longer = sorted((wanted, folded), key=len)
+        if len(shorter) >= 5 and shorter in longer:
+            return True
+    return False
+
+
 @app.route('/epg-web/api/film-years')
 def api_film_years():
     """Every film that has exactly this title, with its year (and running time if asked).
@@ -7383,6 +7394,14 @@ def api_film_signals():
         exact = [r for r in results if wanted in (fold_title(r.get('title')), fold_title(r.get('original_title')))]
         if year:
             exact = [r for r in exact if _clean_year((r.get('release_date') or '')[:4]) == year]
+        loose = False
+        if not exact and year:
+            # A closer-enough title in the same year (or one off): "Superman The Movie" is
+            # "Superman" in the database.  Only for a title of 5+ letters, and only when the year
+            # is known, so a short title cannot match just anything.
+            exact = [r for r in results if _loose_title_match(wanted, r) and
+                     abs(int(_clean_year((r.get('release_date') or '')[:4]) or 0) - int(year)) <= 1]
+            loose = bool(exact)
         if not exact:
             return jsonify({'found': False})
         film = exact[0]
@@ -7401,6 +7420,7 @@ def api_film_signals():
     answer = {
         'found': True, 'id': film['id'], 'title': details.get('title') or film.get('title'),
         'year': _clean_year((details.get('release_date') or '')[:4]),
+        'match': 'loose' if loose else 'exact',
         'adult': bool(details.get('adult')), 'certification': certification,
         'genres': [g.get('name', '') for g in details.get('genres', [])],
         'keywords': [k.get('name', '') for k in (details.get('keywords') or {}).get('keywords', [])],

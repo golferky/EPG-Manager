@@ -2226,3 +2226,26 @@ class CheckYearsTests(unittest.TestCase):
         self.assertIn("Unknown command", self.tool.parse_command("banana", plan)[1])
         self.assertEqual(self.tool.parse_command("q", plan)[0], "quit")
 
+
+
+class LooseMatchToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("private_movies_loose", mac / "private_movies.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_an_ampersand_is_and_in_the_agent_and_the_tool(self):
+        self.assertEqual(recording_agent.normalized_title("Dumb & Dumber (1994)"), recording_agent.normalized_title("Dumb and Dumber"))
+        self.assertEqual(self.tool.base.fold_title("Dumb & Dumber"), "dumbanddumber")
+
+    def test_a_loose_match_says_so_in_the_reasons(self):
+        score, reasons = self.tool.adult_signals({"found": True, "match": "loose", "title": "Some Film", "keywords": ["softcore"]})
+        self.assertEqual(score, 2)
+        self.assertIn('close title match, found as "Some Film": check it is the same film', reasons[-1])
+        exact = self.tool.adult_signals({"found": True, "match": "exact", "title": "Some Film", "keywords": ["softcore"]})
+        self.assertEqual(len(exact[1]), 1)
+        self.assertEqual(self.tool.adult_signals({"found": True, "match": "loose", "title": "X"}), (0, []))      # nothing to check

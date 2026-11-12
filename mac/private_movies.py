@@ -109,6 +109,8 @@ def adult_signals(info):
     if rating in ('NC-17', 'X'):
         score += 1
         reasons.append(f'rated {rating}')
+    if score and info.get('match') == 'loose':
+        reasons.append(f'close title match, found as "{info.get("title", "")}": check it is the same film')
     return score, reasons
 
 
