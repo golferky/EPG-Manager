@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
+import unicodedata
 import faulthandler, hmac, json, os, re, shutil, signal, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
@@ -27,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111e"
+VERSION = "v20261111j"
 
 app = Flask(__name__)
 
@@ -71,7 +72,8 @@ def _bootstrap():
                 ('stream_provider', "TEXT DEFAULT 'primestreams'"),
                 ('stream_extension', "TEXT DEFAULT 'ts'"),
                 ('guide_stop_ts', 'REAL'),
-                ('overtime_cushion_seconds', 'INTEGER DEFAULT 0')]:
+                ('overtime_cushion_seconds', 'INTEGER DEFAULT 0'),
+                ('private', 'INTEGER DEFAULT 0')]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -297,6 +299,15 @@ def _is_commercial_free_channel(name):
     return _is_premium_channel(name)
 
 
+def _is_rerecord_channel(name):
+    """May a film we already have be recorded again from this channel?
+
+    Only from a commercial-free channel that is not an explicitly non-English feed: a
+    second copy from an ad-supported or foreign channel is not wanted.
+    """
+    return _is_commercial_free_channel(name) and not _is_foreign_recording_feed(name)
+
+
 def _is_premium_movie_channel(name):
     """Premium, commercial-free movie networks for the Eaglecast premium view."""
     return _is_premium_channel(name)
@@ -390,6 +401,33 @@ def _quality_duplicate_channel_key(name):
     return re.sub(r'[^a-z0-9]', '', without_quality.lower())
 
 
+_TITLE_LIGATURES = {'\u00e6': 'ae', '\u0153': 'oe', '\u00df': 'ss', '\u00f8': 'o', '\u0111': 'd',
+                    '\u00f0': 'd', '\u00fe': 'th', '\u0142': 'l', '\u0131': 'i'}
+
+
+def fold_title(value):
+    """Title identity for matching: lower case, accents and ligatures folded to plain letters,
+    everything but letters and digits dropped.
+
+    "\u00c6on Flux" and "Aeon Flux" are the same film, as are "Am\u00e9lie" and "Amelie".  A
+    database stores the special spelling; a Plex folder usually has the plain one.
+    """
+    text = str(value or '').lower()
+    for special, plain in _TITLE_LIGATURES.items():
+        text = text.replace(special, plain)
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r'[^a-z0-9]', '', text)
+
+
+def _log_omdb_error(answer):
+    """Say in the log why OMDb gave nothing, unless it simply has no such title."""
+    if isinstance(answer, dict) and answer.get('Response') == 'False':
+        reason = str(answer.get('Error') or '')
+        if reason and 'not found' not in reason.lower():
+            print(f'[OMDb] {reason}')
+
+
 def _metadata_title_matches(requested_title, returned_title):
     """Require an exact normalized provider title before using its metadata.
 
@@ -397,8 +435,7 @@ def _metadata_title_matches(requested_title, returned_title):
     asking for *Wolves* can return *Dances with Wolves*).  A missing poster is
     safer than attaching the wrong poster, cast, plot, or Plex folder name.
     """
-    normalize = lambda value: re.sub(r'[^a-z0-9]', '', str(value or '').lower())
-    return bool(normalize(requested_title)) and normalize(requested_title) == normalize(returned_title)
+    return bool(fold_title(requested_title)) and fold_title(requested_title) == fold_title(returned_title)
 
 
 def _metadata_runtime_minutes(value):
@@ -1683,6 +1720,9 @@ def _init_recordings_table():
             file        TEXT,
             created_at  TEXT
         )''')
+        # Wanted films whose recordings are kept private (out of Plex).  Kept here, in the guide
+        # database this server owns, not in the shared Movies database.
+        conn.execute('CREATE TABLE IF NOT EXISTS private_titles (norm TEXT, year TEXT, PRIMARY KEY (norm, year))')
         migrations = [
             ('backend', "TEXT DEFAULT 'local'"),
             ('stream_id', 'TEXT'),
@@ -1702,6 +1742,7 @@ def _init_recordings_table():
             ('guide_stop_ts', 'REAL'),
             ('overtime_cushion_seconds', 'INTEGER DEFAULT 0'),
             ('year', 'TEXT'),
+            ('private', 'INTEGER DEFAULT 0'),
         ]
         for column, typedef in migrations:
             try:
@@ -1723,8 +1764,8 @@ def _db_upsert_rec(rec_id, rec):
             (rec_id, title, channel, channel_id, start_ts, stop_ts, start_time,
              status, failure_reason, file, created_at, backend, stream_id, updated_at,
              episode_title, season_num, episode_num, is_series, auto_upgrade, stream_provider, stream_extension,
-             guide_stop_ts, overtime_cushion_seconds, year)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             guide_stop_ts, overtime_cushion_seconds, year, private)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(rec_id) DO UPDATE SET
               status=excluded.status,
               failure_reason=excluded.failure_reason,
@@ -1766,6 +1807,7 @@ def _db_upsert_rec(rec_id, rec):
             rec.get('guide_stop_ts', rec.get('stop_ts', 0)),
             rec.get('overtime_cushion_seconds', 0),
             rec.get('year', ''),
+            1 if rec.get('private') else 0,
         ))
         conn.commit()
         conn.close()
@@ -4677,7 +4719,7 @@ def _auto_schedule_movie_upgrades():
             # more than once (a remake, say), so such a title is left alone.
             row_year = _clean_year(row['year'])
             if (_upgrade_matches_plex(plex_index, title_key, row_year)
-                    and not _is_foreign_recording_feed(row['channel_name'])
+                    and _is_rerecord_channel(row['channel_name'])
                     and not _is_automatic_recording_quarantined_channel(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
                     and not _recent_same_source_failure(row['title'], row['channel_id'])):
@@ -4791,6 +4833,7 @@ def api_recommendations():
             future_airings.setdefault(t, []).append(p)
 
     plex_titles = _plex_wanted_title_index()
+    private_set = _private_titles()
     with _rec_lock:
         active_upgrade_titles = {
             _norm_plex_show(r.get('title', '')) for r in _recs.values()
@@ -4820,6 +4863,10 @@ def api_recommendations():
             # library is being renamed, a folder with no year still counts.
             in_shows = ((title_key, wanted_year) in plex_titles.get('show_versions', set()) or
                         title_key in plex_titles.get('unyearred_shows', set()))
+        if in_movies and not is_series_wanted:
+            # A film we already have is offered for recording again only from a
+            # commercial-free English channel.
+            airing = next((a for a in candidates if _is_rerecord_channel(a.get('channel'))), None)
         result.append({
             'id':         w['id'],
             'title':      w['title'],
@@ -4833,6 +4880,7 @@ def api_recommendations():
             'updated_at': w['updated_at'],
             'next_airing': airing,
             'in_plex': in_movies or in_shows,
+            'private': (title_key, wanted_year) in private_set,
             'plex_year_unknown': year_unknown,
             'upgrade_scheduled': bool(in_movies and title_key in active_upgrade_titles),
             'plex_kind': ('Movie' if in_movies else '') + (' & TV' if in_movies and in_shows else 'TV' if in_shows else ''),
@@ -4870,6 +4918,8 @@ def api_recommendation_movie_upgrade():
                 title, clean_title, datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
             )).fetchall()
         conn.close()
+        # Recording a film we already have again: only from a commercial-free English channel.
+        rows = [row for row in rows if _is_rerecord_channel(row['channel_name'])]
         candidate = next(iter(rows), None)
         if not candidate:
             return jsonify({'better': False, 'decision': 'No future airing found'})
@@ -4895,36 +4945,74 @@ def api_recommendation_movie_upgrade():
         return jsonify({'error': f'Unable to compare: {exc}'}), 502
 
 
+_PLEX_VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.m4v', '.avi', '.mov', '.ts', '.wmv', '.mpg', '.mpeg'}
+
+
+def _folder_has_video(path, depth=2):
+    """Does this library folder (or a folder inside it, ``depth`` levels down) hold a video file?
+
+    An empty folder left behind after a film was deleted is not "in Plex".  If the folder
+    cannot be read, assume it does: a real film must never be hidden by a read error.
+    """
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name.startswith('.'):
+                    continue
+                if entry.is_file() and os.path.splitext(entry.name)[1].lower() in _PLEX_VIDEO_EXTENSIONS:
+                    return True
+                if depth > 1 and entry.is_dir() and _folder_has_video(entry.path, depth - 1):
+                    return True
+    except OSError:
+        return True
+    return False
+
+
+def _private_movies_path(cfg):
+    """Folder, outside the Plex Movies library, where private films are kept."""
+    configured = str(cfg.get('private_movies_path', '') or '').strip()
+    if configured:
+        return os.path.expanduser(configured)
+    return os.path.join(os.path.dirname(os.path.abspath(cfg.get('plex_path', '/Volumes/Plex/Movies'))),
+                        'Movies Private')
+
+
 def _plex_wanted_title_index():
     """Cache top-level Plex movie/show names for the Wanted Titles badges."""
     cfg = load_config()
     movie_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
     tv_root = _plex_tv_path(cfg)
-    roots = (movie_root, tv_root)
+    private_root = _private_movies_path(cfg)
+    roots = (movie_root, tv_root, private_root)
     now = time.time()
     if (_plex_title_cache['roots'] == roots and now - _plex_title_cache['loaded_at'] < 300):
         return _plex_title_cache
     movies, movie_versions, unyearred_movies, shows = set(), set(), set(), set()
     movie_counts = {}
     show_versions, unyearred_shows = set(), set()
-    try:
-        for entry in os.scandir(movie_root):
-            if entry.name.startswith('.'):
-                continue
-            title = entry.name if entry.is_dir() else os.path.splitext(entry.name)[0]
-            match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', title)
-            year = match.group(2) if match else ''
-            title = (match.group(1) if match else title).strip()
-            if title:
-                key = _norm_plex_show(title)
-                movies.add(key)
-                movie_counts[key] = movie_counts.get(key, 0) + 1
-                if year:
-                    movie_versions.add((key, year))
-                else:
-                    unyearred_movies.add(key)
-    except OSError:
-        pass
+    # Private films live outside the Plex library but still count as films we have, so
+    # they are never offered for recording again.
+    for library in (movie_root, private_root):
+        try:
+            for entry in os.scandir(library):
+                if entry.name.startswith('.'):
+                    continue
+                if entry.is_dir() and not _folder_has_video(entry.path):
+                    continue            # an empty folder is not a film in Plex
+                title = entry.name if entry.is_dir() else os.path.splitext(entry.name)[0]
+                match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', title)
+                year = match.group(2) if match else ''
+                title = (match.group(1) if match else title).strip()
+                if title:
+                    key = _norm_plex_show(title)
+                    movies.add(key)
+                    movie_counts[key] = movie_counts.get(key, 0) + 1
+                    if year:
+                        movie_versions.add((key, year))
+                    else:
+                        unyearred_movies.add(key)
+        except OSError:
+            pass
     try:
         for entry in os.scandir(tv_root):
             if entry.is_dir() and not entry.name.startswith(('.', '_')):
@@ -5065,7 +5153,7 @@ def api_plex_titles():
         return jsonify({'titles': []})
     titles, movies = [], []
     for name in os.listdir(plex_dir):
-        if os.path.isdir(os.path.join(plex_dir, name)):
+        if os.path.isdir(os.path.join(plex_dir, name)) and _folder_has_video(os.path.join(plex_dir, name)):
             match = re.match(r'^(.*?)\s*\((\d{4})\)\s*$', name)
             clean = (match.group(1) if match else name).strip()
             if clean:
@@ -5083,7 +5171,7 @@ def _norm_plex_show(value):
     so ``Bewitched`` and ``Bewitched (1964)`` are the same title.  The year is compared
     separately wherever it is known."""
     value = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', value or '')
-    return re.sub(r'[^a-z0-9]', '', value.lower())
+    return fold_title(value)
 
 def _wanted_series_year(title):
     """The first-air year of the Wanted series with this title, if there is exactly one."""
@@ -5441,7 +5529,7 @@ def api_plex_info():
     if not title:
         return jsonify({'error': 'no title'}), 400
     def _norm(t):
-        return re.sub(r'[^a-z0-9]', '', t.lower())
+        return fold_title(t)
     clean_title, requested_year = _plex_title_and_year(title)
     requested_year = requested_year or _clean_year(request.args.get('year', ''))
     cache_key = _norm(clean_title) + '|' + requested_year
@@ -5470,7 +5558,7 @@ def api_plex_info():
     mp4_file = next((os.path.join(matched_folder, f)
                      for f in os.listdir(matched_folder) if f.endswith('.mp4')), None)
     if not mp4_file:
-        return jsonify({'found': True, 'error': 'no mp4'})
+        return jsonify({'found': False})
     size_gb = os.path.getsize(mp4_file) / (1024**3)
     result = {'found': True, 'size': f'{size_gb:.2f} GB', 'file': os.path.basename(mp4_file)}
     try:
@@ -5588,14 +5676,14 @@ def _find_plex_movie_folders(plex_dir, title, year=''):
     """
     clean, title_year = _plex_title_and_year(title)
     year = str(year or title_year or '')[:4]
-    wanted = re.sub(r'[^a-z0-9]', '', clean.lower())
+    wanted = fold_title(clean)
     found = []
     for name in sorted(os.listdir(plex_dir)):
         path = os.path.join(plex_dir, name)
         if os.path.islink(path) or not os.path.isdir(path):
             continue
         folder_title, folder_year = _plex_title_and_year(name)
-        if re.sub(r'[^a-z0-9]', '', folder_title.lower()) != wanted:
+        if fold_title(folder_title) != wanted:
             continue
         if year and folder_year and folder_year != year:
             continue
@@ -5915,6 +6003,7 @@ def api_prog_info():
                 url = f'http://www.omdbapi.com/?t={q}&type=series&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     od = json.loads(resp.read())
+                _log_omdb_error(od)
                 if (od.get('Response') == 'True' and _metadata_title_matches(title, od.get('Title'))
                         and _metadata_runtime_is_plausible(expected_minutes, od.get('Runtime'))):
                     return jsonify(_omdb_result(od))
@@ -5934,6 +6023,7 @@ def api_prog_info():
                 url = f'http://www.omdbapi.com/?s={q}&type={kind}&apikey={omdb_key}'
                 with urlreq.urlopen(url, timeout=5) as resp:
                     sr = json.loads(resp.read())
+                _log_omdb_error(sr)
                 hits = sr.get('Search', [])
                 if not hits:
                     # No search results — fall back to direct title lookup
@@ -6008,10 +6098,9 @@ def api_prog_info():
                 # one.  Only use a normalized exact title match; showing no
                 # metadata is much better than confidently showing the wrong
                 # show, actors, poster, and Plex badge.
-                wanted_title = _re.sub(r'[^a-z0-9]', '', title.lower())
+                wanted_title = fold_title(title)
                 exact_results = [item for item in results
-                                 if _re.sub(r'[^a-z0-9]', '',
-                                            (item.get('title') or item.get('name') or '').lower()) == wanted_title]
+                                 if fold_title(item.get('title') or item.get('name') or '') == wanted_title]
                 m = exact_results[0] if exact_results else None
                 # Same-title films need the same duration check as OMDb.  TMDb
                 # search results omit runtime, so fetch only the few exact
@@ -6044,8 +6133,13 @@ def api_prog_info():
                     # credits payload so fallback metadata is not poster/plot-only.
                     credits_url = (f'https://api.themoviedb.org/3/{media_kind}/{m["id"]}/credits'
                                    f'?api_key={tmdb_key}')
-                    with urlreq.urlopen(credits_url, timeout=5) as resp:
-                        credits = json.loads(resp.read())
+                    try:
+                        with urlreq.urlopen(credits_url, timeout=5) as resp:
+                            credits = json.loads(resp.read())
+                    except Exception as credits_error:
+                        # Cast and director are extras: losing them must not lose the year.
+                        print(f'[TMDB] credits unavailable: {credits_error}')
+                        credits = {}
                     cast = [person.get('name', '') for person in credits.get('cast', [])[:4]
                             if person.get('name')]
                     if media_kind == 'movie':
@@ -7079,6 +7173,56 @@ def _recording_slot_conflicts(recs, start_ts, stop_ts, limit):
             peak, busiest = len(running), running
     return busiest if peak >= limit else []
 
+def _is_private_title(title, year):
+    """Is this Wanted film marked private?  (A film is private by its title and year.)"""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        try:
+            row = conn.execute('SELECT 1 FROM private_titles WHERE norm=? AND year=?',
+                               (fold_title(title), _clean_year(year))).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return bool(row)
+
+
+def _private_titles():
+    """{(folded title, year)} of every film marked private."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        try:
+            return {(r[0], r[1]) for r in conn.execute('SELECT norm, year FROM private_titles')}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return set()
+
+
+@app.route('/epg-web/api/wanted/private', methods=['POST'])
+def api_wanted_private():
+    """Mark a film private (recordings go to the private folder, not Plex) or not."""
+    data = request.json or {}
+    title = str(data.get('title', '')).strip()
+    year = _clean_year(data.get('year'))
+    if not title or not year:
+        return jsonify({'ok': False, 'error': 'A title and a year are needed.'}), 400
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        try:
+            conn.execute('CREATE TABLE IF NOT EXISTS private_titles (norm TEXT, year TEXT, PRIMARY KEY (norm, year))')
+            if data.get('private'):
+                conn.execute('INSERT OR IGNORE INTO private_titles(norm, year) VALUES (?, ?)', (fold_title(title), year))
+            else:
+                conn.execute('DELETE FROM private_titles WHERE norm=? AND year=?', (fold_title(title), year))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    return jsonify({'ok': True, 'private': bool(data.get('private'))})
+
+
 def _guide_year_for_airing(guide_db, channel_id, title, start_ts):
     """The year the guide gives this airing, or '' if it gives none or is not sure.
 
@@ -7246,6 +7390,11 @@ def api_record():
             'ok': False, 'year_mismatch': True, 'guide_year': guide_year,
             'error': (f'This airing of "{title}" is the {guide_year} film, not the {requested_year} one. '
                       'It was not scheduled.')}), 409
+    # A film can be recorded privately (straight into the private folder, never into Plex):
+    # because this recording was asked to be, or because the Wanted film is marked private.
+    # Only films: TV episodes always go to the TV library.
+    film_year = requested_year or guide_year
+    wants_private = bool(data.get('private')) or (bool(film_year) and _is_private_title(title, film_year))
     guide_stop_ts = stop_ts
     overtime_cushion_seconds = SPORTS_OVERTIME_CUSHION_SECONDS if is_sports_request else 0
     if overtime_cushion_seconds:
@@ -7293,6 +7442,7 @@ def api_record():
         'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
         'year': requested_year or guide_year or (_wanted_series_year(title) if is_series_request else ''),
+        'private': bool(wants_private and not is_series_request),
     }
     _url, stream_error, stream_debug = _resolve_recording_source(
         channel_id, start_ts, stop_ts, preferred_provider=requested_provider)
@@ -7565,6 +7715,7 @@ def _agent_job_dict(row):
         'is_series': bool(row['is_series']),
         'auto_upgrade': bool(row['auto_upgrade']),
         'year': _clean_year(row['year']),
+        'private': bool(row['private']),
     }
 
 @app.route('/epg-web/api/agent/health')
@@ -8148,6 +8299,7 @@ tr:hover td{background:#141414;}
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
           <span id="pm-airings-heading" style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📡 Available Airings</span>
+          <label id="pm-private-wrap" title="Record this film into the private folder, never into Plex" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#c4b5fd;cursor:pointer;white-space:nowrap;"><input id="pm-private" type="checkbox"> 🔒 Private (keep out of Plex)</label>
           <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Identified Episodes</button>
           <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unscheduled Only</button>
         </div>
@@ -9802,6 +9954,7 @@ async function openProg(p) {
   _modalGeneration += 1;
   _currentProg = p;
   _nextAiring = null;
+  { const privateBox = document.getElementById('pm-private'); if (privateBox) privateBox.checked = false; }
   { const busyLbl = document.getElementById('pm-play-busy'); if (busyLbl) busyLbl.style.display = 'none'; }
   // Show overlay in loading state
   const overlay = document.getElementById('prog-modal-overlay');
@@ -10782,6 +10935,11 @@ function closeProg() {
   btn.textContent = '▶ Play'; btn.disabled = false;
   btn.onclick = playStream;
 }
+async function togglePrivateWanted(title, year, makePrivate) {
+  const r = await post('/epg-web/api/wanted/private', {title, year, private: makePrivate});
+  if (!r.ok) { alert(r.error || 'Could not change it'); return; }
+  loadRecs();
+}
 async function recordAiring(airing, title, button, allowCommercialMovie=false, year='') {
   const modalGeneration = _modalGeneration;
   const btn = button || event.target;
@@ -10798,6 +10956,9 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
     episode_num: airing.episode_num,
     sports_event: !!(airing.sports_event || (_currentProg && _currentProg.sports_event)),
     allow_commercial_movie: allowCommercialMovie,
+    // Private is asked for only while the window shows THIS film.  A Wanted film marked private
+    // is private anyway: the server knows.
+    private: ((_currentProg && _currentProg.title === title && (document.getElementById('pm-private') || {}).checked) ? true : undefined),
     // The year must belong to THIS title: the programme window's year only counts while
     // that window shows the same title (it can be left over from a different film).
     year: String(year || airing.year || ((_currentProg && _currentProg.title === title) ? _currentInfoYear : '') || '').slice(0, 4),
@@ -11135,11 +11296,12 @@ async function loadRecs() {
         : r.in_plex
           ? (r.upgrade_scheduled
               ? `<span class="badge badge-record" title="A better commercial-free airing was found and scheduled automatically">✓ Upgrade scheduled</span>`
-              : `<button class="btn btn-ghost btn-sm" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>`)
+              : (a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing: ${esc(a.channel || '')}" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>` : ''))
           : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg},undefined,false,${yearArg})">⏱ Record</button>` : '');
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
+          ${(!isSeries && r.year)?`<button class="btn btn-ghost btn-sm" style="margin:0 0 0 5px;padding:1px 6px;${r.private?'color:#c4b5fd;border-color:#7c3aed;':''}" title="${r.private?'Private: recordings go to the private folder, not Plex. Click to make it public.':'Click to record this film privately, outside Plex.'}" onclick="togglePrivateWanted(${titleArg},${yearArg},${r.private?'false':'true'})">${r.private?'🔒 Private':'🔓'}</button>`:''}
           ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
           <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
         </td>

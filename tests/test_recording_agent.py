@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 import shutil
@@ -1363,3 +1364,358 @@ class RenameOnlyTests(unittest.TestCase):
             root = Path(temp) / "Movies"
             (root / "Heat").mkdir(parents=True)
             self.assertNotIn("rename only", self._run(root, ["q"]))
+
+
+class FoldedTitleAgentTests(unittest.TestCase):
+    def test_a_ligature_title_matches_its_plex_folder(self):
+        self.assertEqual(recording_agent.normalized_title("Æon Flux"), recording_agent.normalized_title("Aeon Flux (2005)"))
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Aeon Flux (2005)").mkdir()
+            (Path(temp) / "Aeon Flux (2005)" / "movie.mp4").write_bytes(b"x")
+            found = recording_agent.find_plex_candidates(temp, "Æon Flux", "2005")
+            self.assertEqual(len(found), 1)
+
+
+class WantedFromEmptyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("wanted_from_empty_under_test", mac / "wanted_from_empty.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name, files in (("Minority Report (2002)", []), ("Quantum of Solace (2008)", ["q.convert.ffmpeg.log"]),
+                            ("Sahara (2005)", ["Sahara.mp4.partial"]), ("Heat (1995)", ["Heat.mp4"]),
+                            ("Nested (2001)", ["sub/n.mkv"]), ("Nobody s Fool (1994)", []),
+                            ("No Year Film", []), ("_wrong_movies", []), (".hidden", [])):
+            folder = root / name
+            folder.mkdir(parents=True)
+            for rel in files:
+                (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+                (folder / rel).write_bytes(b"x")
+        return root
+
+    def test_it_finds_folders_with_no_video_and_reads_title_and_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            found = {name: (title, year) for name, title, year in self.tool.empty_film_folders(self._library(temp))}
+            self.assertEqual(sorted(found), ["Minority Report (2002)", "No Year Film", "Nobody s Fool (1994)",
+                                             "Quantum of Solace (2008)", "Sahara (2005)"])
+            self.assertEqual(found["Minority Report (2002)"], ("Minority Report", "2002"))
+            self.assertEqual(found["No Year Film"], ("No Year Film", ""))
+
+    def test_the_wanted_list_is_read_and_a_failure_is_detected(self):
+        data = {"recommendations": [{"title": "Heat", "year": "1995", "type": "movie"},
+                                    {"title": "Bewitched", "year": "1964", "type": "series"}]}
+        with mock.patch.object(self.tool, "get_json", return_value=data):
+            self.assertEqual(self.tool.already_wanted("http://x"), {("heat", "1995")})
+        with mock.patch.object(self.tool, "get_json", return_value={}):
+            self.assertIsNone(self.tool.already_wanted("http://x"))
+
+    def test_the_database_title_is_used_only_for_the_same_film(self):
+        same = {"title": "Nobody's Fool", "year": "1994", "imdb_id": "tt0110684"}
+        with mock.patch.object(self.tool, "get_json", return_value=same):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody's Fool", "tt0110684"))
+        other_year = {"title": "Nobody's Fool", "year": "2018", "imdb_id": "tt1"}
+        with mock.patch.object(self.tool, "get_json", return_value=other_year):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody s Fool", ""))
+        other_title = {"title": "Something Else", "year": "1994", "imdb_id": "tt2"}
+        with mock.patch.object(self.tool, "get_json", return_value=other_title):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody s Fool", ""))
+        with mock.patch.object(self.tool, "get_json", return_value={}):
+            self.assertEqual(self.tool.canonical("http://x", "Nobody s Fool", "1994"), ("Nobody s Fool", ""))
+
+    def _run(self, root, answers, *flags, wanted=None, add_result=""):
+        wanted = {("sahara", "2005")} if wanted is None else wanted
+        out, added = [], []
+        info = {"Nobody s Fool": {"title": "Nobody's Fool", "year": "1994", "imdb_id": "tt0110684"}}
+
+        def fake_get(server, path, params=None, timeout=20):
+            return info.get((params or {}).get("title"), {})
+
+        def fake_add(server, row):
+            added.append((row["title"], row["year"], row["imdb_id"]))
+            return add_result
+        with mock.patch.object(self.tool, "get_json", side_effect=fake_get), \
+             mock.patch.object(self.tool, "already_wanted", return_value=wanted), \
+             mock.patch.object(self.tool, "add_to_wanted", side_effect=fake_add), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(root), "--server", "http://x", *flags])
+        return rc, "\n".join(out), added
+
+    def test_the_recap_sorts_folders_into_add_already_and_no_year(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, out, added = self._run(self._library(temp), ["q"])
+            self.assertIn("Will be added to Wanted (3):", out)
+            self.assertIn("Nobody's Fool (1994)", out)              # the database spelling
+            self.assertIn("Already on the Wanted list (1):", out)
+            self.assertIn("Sahara (2005)", out)
+            self.assertIn("no year in the folder name", out)
+            self.assertEqual(added, [])
+
+    def test_y_adds_each_film_with_its_year_and_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rc, out, added = self._run(self._library(temp), ["y"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(added), [("Minority Report", "2002", ""), ("Nobody's Fool", "1994", "tt0110684"),
+                                             ("Quantum of Solace", "2008", "")])
+            self.assertIn("Nothing was removed", out)
+
+    def test_skip_leaves_a_film_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, _out, added = self._run(self._library(temp), ["skip 1", "y"])
+            titles = [a[0] for a in added]
+            self.assertNotIn("Minority Report", titles)          # number 1 is Minority Report
+            self.assertEqual(len(titles), 2)
+
+    def test_a_dry_run_and_quit_add_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            _rc, out, added = self._run(root, ["y"], "--dry-run")
+            self.assertEqual(added, [])
+            self.assertIn("would add", out)
+            _rc, _out, added = self._run(root, ["q"])
+            self.assertEqual(added, [])
+
+    def test_yes_adds_without_asking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, _out, added = self._run(self._library(temp), [], "--yes")
+            self.assertEqual(len(added), 3)
+
+    def test_a_refused_add_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _rc, out, _added = self._run(self._library(temp), ["y"], add_result="A movie needs a year.")
+            self.assertIn("could not add 3", out)
+            self.assertIn("A movie needs a year.", out)
+
+    def test_nothing_is_added_if_the_wanted_list_cannot_be_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out, added = [], []
+            with mock.patch.object(self.tool, "already_wanted", return_value=None), \
+                 mock.patch.object(self.tool, "add_to_wanted", side_effect=lambda *a: added.append(a) or ""), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+                rc = self.tool.main(["--movies", str(self._library(temp)), "--server", "http://x"])
+            self.assertEqual(rc, 1)
+            self.assertEqual(added, [])
+            self.assertIn("Could not read the Wanted list", "\n".join(out))
+
+    def test_add_to_wanted_posts_the_film_and_reads_the_answer(self):
+        import io
+        sent = []
+
+        def fake_urlopen(request, timeout=0):
+            sent.append((request.full_url, json.loads(request.data), request.get_method()))
+            return io.BytesIO(json.dumps({"ok": True}).encode())
+        row = {"title": "Heat", "year": "1995", "imdb_id": "tt1"}
+        with mock.patch.object(self.tool.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.assertEqual(self.tool.add_to_wanted("http://q:5001", row), "")
+        url, body, method = sent[0]
+        self.assertEqual((url, method), ("http://q:5001/epg-web/api/wanted", "POST"))
+        self.assertEqual(body, {"action": "add", "title": "Heat", "year": "1995", "imdb_id": "tt1", "type": "movie"})
+        with mock.patch.object(self.tool.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertIn("down", self.tool.add_to_wanted("http://q:5001", row))
+
+
+class PrivateMoviesRecorderTests(unittest.TestCase):
+    def test_the_private_folder_defaults_to_next_to_the_movies_folder(self):
+        self.assertEqual(recording_agent.private_movies_root({"plex_path": "/Volumes/Plex/Movies"}),
+                         Path("/Volumes/Plex/Movies Private"))
+        self.assertEqual(recording_agent.private_movies_root({"plex_path": "/x/Movies", "private_movies_path": "/y/Hidden"}),
+                         Path("/y/Hidden"))
+
+    def test_a_private_film_counts_as_a_film_we_have(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies, private = Path(temp) / "Movies", Path(temp) / "Movies Private"
+            (movies / "Heat (1995)").mkdir(parents=True)
+            (movies / "Heat (1995)" / "Heat.mp4").write_bytes(b"a")
+            (private / "Minority Report (2002)").mkdir(parents=True)
+            (private / "Minority Report (2002)" / "m.mp4").write_bytes(b"b")
+            cfg = {"plex_path": str(movies)}
+            found = recording_agent.find_movie_candidates(cfg, movies, "Minority Report", "2002")
+            self.assertEqual([p.name for p in found], ["m.mp4"])
+            self.assertEqual([p.name for p in recording_agent.find_movie_candidates(cfg, movies, "Heat", "1995")],
+                             ["Heat.mp4"])
+
+    def test_a_missing_private_folder_is_fine(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp) / "Movies"
+            movies.mkdir()
+            self.assertEqual(recording_agent.find_movie_candidates({"plex_path": str(movies)}, movies, "Heat", "1995"), [])
+
+    def test_the_same_title_in_another_year_is_still_a_different_film(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies, private = Path(temp) / "Movies", Path(temp) / "Movies Private"
+            movies.mkdir()
+            (private / "Employee of the Month (2022)").mkdir(parents=True)
+            (private / "Employee of the Month (2022)" / "e.mp4").write_bytes(b"x")
+            cfg = {"plex_path": str(movies)}
+            self.assertEqual(recording_agent.find_movie_candidates(cfg, movies, "Employee of the Month", "2004"), [])
+
+
+class PrivateMoviesToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("private_movies_under_test", mac / "private_movies.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _library(self, temp):
+        movies = Path(temp) / "Movies"
+        for name in ("Heat (1995)", "Minority Report (2002)", "Amélie (2001)", "Empty Folder (2000)"):
+            (movies / name).mkdir(parents=True)
+            if name != "Empty Folder (2000)":
+                (movies / name / "film.mp4").write_bytes(name.encode())
+        (movies / "_wrong_movies").mkdir()
+        return movies
+
+    def _run(self, movies, answers, *flags, copying=()):
+        out = []
+        with mock.patch.object(self.tool.base, "recorder_copying", return_value=list(copying)), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = self.tool.main(["--movies", str(movies), "--server", "http://x", *flags])
+        return rc, "\n".join(out)
+
+    def test_the_private_folder_default_and_override(self):
+        self.assertEqual(self.tool.private_root("/Volumes/Plex/Movies"), "/Volumes/Plex/Movies Private")
+        self.assertEqual(self.tool.private_root("/Volumes/Plex/Movies", "/x/Hidden"), "/x/Hidden")
+
+    def test_only_folders_with_a_film_in_them_can_be_chosen(self):
+        with tempfile.TemporaryDirectory() as temp:
+            names = self.tool.library_films(str(self._library(temp)))
+            self.assertEqual(names, ["Amélie (2001)", "Heat (1995)", "Minority Report (2002)"])
+
+    def test_find_ignores_accents_and_capitals(self):
+        names = ["Amélie (2001)", "Heat (1995)"]
+        self.assertEqual(self.tool.matching(names, "amelie"), ["Amélie (2001)"])
+        self.assertEqual(self.tool.matching(names, "HEAT"), ["Heat (1995)"])
+        self.assertEqual(self.tool.matching(names, ""), [])
+
+    def test_find_add_go_moves_the_folder_with_its_film(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            rc, out = self._run(movies, ["find minority", "add 1", "go"])
+            self.assertEqual(rc, 0)
+            private = Path(temp) / "Movies Private" / "Minority Report (2002)"
+            self.assertEqual((private / "film.mp4").read_bytes(), b"Minority Report (2002)")
+            self.assertFalse((movies / "Minority Report (2002)").exists())
+            self.assertTrue((movies / "Heat (1995)").is_dir())          # the others are untouched
+            self.assertIn("Nothing was deleted", out)
+            self.assertIn("do not share it", out)
+
+    def test_quit_and_dry_run_move_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            self._run(movies, ["find heat", "add 1", "q"])
+            self._run(movies, ["find heat", "add 1", "go"], "--dry-run")
+            self.assertTrue((movies / "Heat (1995)").is_dir())
+            self.assertFalse((Path(temp) / "Movies Private").exists())
+
+    def test_drop_and_chosen_and_bad_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            _rc, out = self._run(movies, ["go", "add 99", "chosen", "add 1 2", "drop 1", "chosen", "banana", "q"])
+            self.assertIn("Nothing chosen yet: use find and add first.", out)          # go before choosing
+            self.assertIn("is not a number", out)
+            self.assertIn("Type list, find TEXT", out)
+            self.assertIn("1 chosen.", out)                      # two added, one dropped
+            self.assertFalse((Path(temp) / "Movies Private").exists())
+
+    def test_it_refuses_while_the_recorder_is_copying(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            rc, out = self._run(movies, ["find heat", "add 1", "go"], copying=["Heat"])
+            self.assertEqual(rc, 1)
+            self.assertIn("copying", out)
+            self.assertTrue((movies / "Heat (1995)").is_dir())
+
+    def test_a_folder_already_in_the_private_folder_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            existing = Path(temp) / "Movies Private" / "Heat (1995)"
+            existing.mkdir(parents=True)
+            (existing / "old.mp4").write_bytes(b"old")
+            _rc, out = self._run(movies, ["find heat", "add 1", "go"])
+            self.assertTrue((movies / "Heat (1995)" / "film.mp4").exists())
+            self.assertTrue((existing / "old.mp4").exists())
+            self.assertIn("Not moved", out)
+
+    def test_restore_puts_a_private_film_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            self._run(movies, ["find heat", "add 1", "go"])
+            _rc, out = self._run(movies, ["list", "add 1", "go"], "--restore")
+            self.assertTrue((movies / "Heat (1995)" / "film.mp4").exists())
+            self.assertFalse((Path(temp) / "Movies Private" / "Heat (1995)").exists())
+            self.assertIn("Scan the Movies library", out)
+
+    def test_show_lists_the_private_films(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            self._run(movies, ["find heat", "add 1", "go"])
+            _rc, out = self._run(movies, [], "--show")
+            self.assertIn("1 private movie(s)", out)
+            self.assertIn("Heat (1995)", out)
+
+
+class PrivateRecordingFlowTests(unittest.TestCase):
+    """A private film is filed in the private folder, never in the Plex library."""
+
+    def _run(self, private, existing_year=None):
+        now = time.time()
+        job = {"id": "p1", "title": "Private Film", "stream_id": "1", "start_ts": now - 3600,
+               "stop_ts": now - 3600 + 100 * 60, "stream_provider": "primestreams", "stream_extension": "ts",
+               "year": "2004", "private": private}
+        with tempfile.TemporaryDirectory() as temp:
+            movies, private_dir = Path(temp) / "Movies", Path(temp) / "Movies Private"
+            movies.mkdir()
+            cfg = {"local_recordings": temp, "plex_path": str(movies), "plex_tv_path": temp + "/TV",
+                   "ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "recording_tail_seconds": 45,
+                   "epg_url": "http://x.test", "epg_user": "u", "epg_pass": "p", "heartbeat_seconds": 1,
+                   "transfer_wait_timeout": 5, "transfer_retry_seconds": 1}
+            api = mock.Mock()
+            probe = {"duration": 100 * 60 + 40, "height": 480}
+            seen = {}
+
+            def fake_transfer(source, root, title, existing_path=None, progress_callback=None, year=""):
+                seen["root"], seen["year"] = str(root), year
+                return Path(root) / f"{title} ({year})" / f"{title}.mp4"
+            with mock.patch.object(recording_agent, "probe_media", return_value=probe), \
+                 mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
+                 mock.patch.object(recording_agent, "record_with_resume", return_value=0), \
+                 mock.patch.object(recording_agent, "run_process", return_value=0), \
+                 mock.patch.object(recording_agent, "plex_mount_available", return_value=True), \
+                 mock.patch.object(recording_agent, "archive_terminal_result"), \
+                 mock.patch.object(recording_agent, "discard_failed_media"), \
+                 mock.patch.object(recording_agent, "verified_transfer", side_effect=fake_transfer):
+                recording_agent.process_job(api, job, cfg)
+            return seen, str(movies), str(private_dir), private_dir.is_dir()
+
+    def test_a_private_film_goes_to_the_private_folder(self):
+        seen, movies, private_dir, created = self._run(True)
+        self.assertEqual(seen["root"], private_dir)
+        self.assertNotEqual(seen["root"], movies)
+        self.assertEqual(seen["year"], "2004")
+
+    def test_a_normal_film_goes_to_plex(self):
+        seen, movies, _private_dir, created = self._run(False)
+        self.assertEqual(seen["root"], movies)
+
+    def test_the_private_folder_is_created_when_the_share_is_mounted(self):
+        _seen, _movies, _private_dir, created = self._run(True)
+        self.assertTrue(created)
+
+    def test_a_private_flag_is_ignored_for_tv(self):
+        job = {"id": "t1", "title": "Show", "season_num": 1, "episode_num": 2, "private": True}
+        episode = recording_agent.episode_metadata(job)
+        self.assertIsNotNone(episode)
+        # (the choice is made in process_job: private applies only when there is no episode and no series)
+        private_film = bool(job.get("private")) and not (episode or False)
+        self.assertFalse(private_film)

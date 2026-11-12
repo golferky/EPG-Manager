@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -212,6 +213,7 @@ class RecordingTests(unittest.TestCase):
             movies = os.path.join(temp, "Movies")
             shows = os.path.join(temp, "TV Shows")
             os.makedirs(os.path.join(movies, "F X (1986)"))
+            open(os.path.join(movies, "F X (1986)", "F X.mp4"), "wb").close()       # a folder counts when a film is in it
             os.makedirs(os.path.join(shows, "Bewitched"))
             server._plex_title_cache.update({
                 "roots": (), "loaded_at": 0, "movies": set(), "shows": set(),
@@ -272,6 +274,7 @@ class RecordingTests(unittest.TestCase):
     def test_recommendation_with_a_year_is_not_in_plex_for_a_yearless_folder(self):
         with tempfile.TemporaryDirectory() as temp:
             os.makedirs(os.path.join(temp, "Employee of the Month"))
+            open(os.path.join(temp, "Employee of the Month", "film.mp4"), "wb").close()
             server._plex_title_cache.update({"roots": None, "loaded_at": 0})
             with mock.patch.object(server, "load_config", return_value={"plex_path": temp, "plex_tv_path": temp + "/tv"}):
                 idx = server._plex_wanted_title_index()
@@ -1523,3 +1526,328 @@ class RecommendationAiringYearTests(unittest.TestCase):
     def test_an_airing_with_no_year_is_still_offered(self):
         airing = self._recs("2004", [(0, {"year": ""})])
         self.assertIsNotNone(airing)
+
+
+class FoldedTitleTests(unittest.TestCase):
+    def test_accents_and_ligatures_fold_to_plain_letters(self):
+        fold = server.fold_title
+        self.assertEqual(fold("Æon Flux"), "aeonflux")
+        self.assertEqual(fold("Aeon Flux"), "aeonflux")
+        self.assertEqual(fold("Amélie"), fold("Amelie"))
+        self.assertEqual(fold("Léon: The Professional"), fold("Leon The Professional"))
+        self.assertEqual(fold("Crème Brûlée"), "cremebrulee")
+        self.assertEqual(fold("Søren œuvre Straße"), "sorenoeuvrestrasse")
+        self.assertEqual(fold(None), "")
+
+    def test_plain_titles_are_unchanged(self):
+        self.assertEqual(server.fold_title("The Matrix (1999)"), "thematrix1999")
+        self.assertEqual(server.fold_title("Mad Max: Beyond Thunderdome"), "madmaxbeyondthunderdome")
+
+    def test_the_provider_title_with_a_ligature_matches_the_plex_title(self):
+        self.assertTrue(server._metadata_title_matches("Aeon Flux", "Æon Flux"))
+        self.assertTrue(server._metadata_title_matches("Amelie", "Amélie"))
+        self.assertFalse(server._metadata_title_matches("Wolves", "Dances with Wolves"))
+        self.assertFalse(server._metadata_title_matches("", "Anything"))
+
+    def test_plex_keys_ignore_accents(self):
+        self.assertEqual(server._norm_plex_show("Æon Flux (2005)"), server._norm_plex_show("Aeon Flux"))
+
+    def test_a_plex_folder_without_the_accent_is_found(self):
+        with tempfile.TemporaryDirectory() as temp:
+            os.makedirs(os.path.join(temp, "Aeon Flux (2005)"))
+            os.makedirs(os.path.join(temp, "Heat (1995)"))
+            found = server._find_plex_movie_folders(temp, "Æon Flux", "2005")
+            self.assertEqual([os.path.basename(p) for p in found], ["Aeon Flux (2005)"])
+
+
+class TmdbFallbackTests(unittest.TestCase):
+    """The provider lookup finds a film stored with a special spelling, and survives a failed extra request."""
+
+    def _lookup(self, title, search_results, credits_fails=False):
+        import io
+
+        def fake_urlopen(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if "omdbapi" in url:
+                return io.BytesIO(json.dumps({"Response": "False", "Error": "Request limit reached!"}).encode())
+            if "/search/" in url:
+                return io.BytesIO(json.dumps({"results": search_results}).encode())
+            if "/credits" in url:
+                if credits_fails:
+                    raise OSError("credits timed out")
+                return io.BytesIO(json.dumps({"cast": [{"name": "Charlize Theron"}], "crew": []}).encode())
+            raise AssertionError(url)
+        cfg = {"omdb_key": "x", "tmdb_key": "y"}
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(server, "db_rows", return_value=[]):
+            return server.app.test_client().get("/epg-web/api/prog-info?content_type=movie&title=" + title)
+
+    RESULT = [{"id": 8202, "title": "Æon Flux", "release_date": "2005-12-01", "overview": "x"}]
+
+    def test_a_ligature_title_is_found_through_tmdb(self):
+        resp = self._lookup("Aeon%20Flux", self.RESULT)
+        data = resp.get_json()
+        self.assertEqual(resp.status_code, 200, data)
+        self.assertEqual(data["year"], "2005")
+        self.assertEqual(data["source"], "tmdb")
+
+    def test_a_failed_credits_request_does_not_lose_the_year(self):
+        resp = self._lookup("Aeon%20Flux", self.RESULT, credits_fails=True)
+        self.assertEqual(resp.get_json()["year"], "2005")
+
+    def test_a_different_film_is_still_refused(self):
+        resp = self._lookup("Aeon%20Flux", [{"id": 1, "title": "Aeon Flux Returns", "release_date": "2010-01-01"}])
+        self.assertEqual(resp.status_code, 404)
+
+    def test_an_omdb_limit_is_written_to_the_log(self):
+        with mock.patch("builtins.print") as printed:
+            self._lookup("Aeon%20Flux", self.RESULT)
+        logged = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertIn("[OMDb] Request limit reached!", logged)
+
+
+class EmptyPlexFolderTests(unittest.TestCase):
+    def _library(self, temp):
+        movies = os.path.join(temp, "Movies")
+        for name, files in (("Heat (1995)", ["Heat.mp4"]), ("Minority Report (2002)", []),
+                            ("Quantum of Solace (2008)", ["Quantum.convert.ffmpeg.log"]),
+                            ("Sahara (2005)", ["Sahara.mp4.partial"]), ("Alien (1979)", ["Alien.MKV"]),
+                            ("Nested (2001)", ["sub/Nested.mp4"])):
+            for rel in files or [""]:
+                path = os.path.join(movies, name, rel)
+                if rel:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    open(path, "wb").close()
+                else:
+                    os.makedirs(path, exist_ok=True)
+        os.makedirs(os.path.join(temp, "tv"))
+        return movies
+
+    def test_folder_has_video(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            has = lambda name: server._folder_has_video(os.path.join(movies, name))
+            self.assertTrue(has("Heat (1995)"))
+            self.assertTrue(has("Alien (1979)"))            # extension in capitals
+            self.assertTrue(has("Nested (2001)"))           # one level down
+            self.assertFalse(has("Minority Report (2002)"))  # empty
+            self.assertFalse(has("Quantum of Solace (2008)"))   # only a log
+            self.assertFalse(has("Sahara (2005)"))          # only an unfinished copy
+
+    def test_an_unreadable_folder_is_assumed_to_have_a_film(self):
+        self.assertTrue(server._folder_has_video("/no/such/folder"))
+
+    def test_empty_folders_are_not_in_plex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            n = server._norm_plex_show
+            self.assertIn((n("Heat"), "1995"), idx["movie_versions"])
+            self.assertIn((n("Nested"), "2001"), idx["movie_versions"])
+            self.assertNotIn((n("Minority Report"), "2002"), idx["movie_versions"])
+            self.assertNotIn(n("Quantum of Solace"), idx["movies"])
+            self.assertNotIn(n("Sahara"), idx["movies"])
+            self.assertNotIn(n("Sahara"), idx["movie_counts"])
+
+    def test_the_title_list_for_the_browser_skips_empty_folders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies}):
+                data = server.app.test_client().get("/epg-web/api/plex/titles").get_json()
+            self.assertIn("Heat", data["titles"])
+            self.assertNotIn("Minority Report", data["titles"])
+
+    def test_plex_info_says_not_found_for_an_empty_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            server._plex_info_cache.clear()
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies}):
+                data = server.app.test_client().get("/epg-web/api/plex/info?title=Minority%20Report&year=2002").get_json()
+            self.assertFalse(data["found"])
+
+    def test_a_wanted_film_with_only_an_empty_folder_is_not_marked_in_plex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp)
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            wanted = [{"id": 1, "title": "Minority Report", "normalized_title": "minority report", "year": "2002",
+                       "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}), \
+                 mock.patch.object(server, "db_rows", return_value=wanted), \
+                 mock.patch.dict(server._epg, {"programmes": []}):
+                rec = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"][0]
+            self.assertFalse(rec["in_plex"])
+
+
+class PrivateMoviesDashboardTests(unittest.TestCase):
+    def test_the_private_path_default_and_override(self):
+        self.assertEqual(server._private_movies_path({"plex_path": "/Volumes/Plex/Movies"}), "/Volumes/Plex/Movies Private")
+        self.assertEqual(server._private_movies_path({"plex_path": "/x/Movies", "private_movies_path": "/y/Hidden"}), "/y/Hidden")
+
+    def test_a_private_film_counts_as_in_the_library_for_duplicate_checks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies, private = os.path.join(temp, "Movies"), os.path.join(temp, "Movies Private")
+            os.makedirs(os.path.join(movies, "Heat (1995)"))
+            open(os.path.join(movies, "Heat (1995)", "Heat.mp4"), "wb").close()
+            os.makedirs(os.path.join(private, "Minority Report (2002)"))
+            open(os.path.join(private, "Minority Report (2002)", "m.mp4"), "wb").close()
+            os.makedirs(os.path.join(temp, "tv"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            n = server._norm_plex_show
+            self.assertIn((n("Heat"), "1995"), idx["movie_versions"])
+            self.assertIn((n("Minority Report"), "2002"), idx["movie_versions"])
+
+    def test_a_missing_private_folder_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = os.path.join(temp, "Movies")
+            os.makedirs(os.path.join(movies, "Heat (1995)"))
+            open(os.path.join(movies, "Heat (1995)", "Heat.mp4"), "wb").close()
+            os.makedirs(os.path.join(temp, "tv"))
+            server._plex_title_cache.update({"roots": None, "loaded_at": 0})
+            with mock.patch.object(server, "load_config", return_value={"plex_path": movies, "plex_tv_path": temp + "/tv"}):
+                idx = server._plex_wanted_title_index()
+            self.assertEqual(len(idx["movie_versions"]), 1)
+
+
+class PrivateRecordingTests(unittest.TestCase):
+    CHANNEL = "pv-chan-1"
+
+    def setUp(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._rec_cancel_events.clear()
+        server._init_recordings_table()
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("DELETE FROM recordings")
+        conn.execute("DELETE FROM private_titles")
+        conn.commit()
+        conn.close()
+        self.start = time.time() + 7200
+
+    def _record(self, **extra):
+        body = {"title": "Private Film", "channel_id": self.CHANNEL, "channel_name": "Chan",
+                "start_ts": self.start, "stop_ts": self.start + 6000, "year": "2004"}
+        body.update(extra)
+        with mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source",
+                               return_value=("http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"})):
+            return server.app.test_client().post("/epg-web/api/record", json=body)
+
+    def _saved(self):
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM recordings ORDER BY created_at DESC LIMIT 1").fetchone()
+        conn.close()
+        return row
+
+    def _mark(self, private, title="Private Film", year="2004"):
+        return server.app.test_client().post("/epg-web/api/wanted/private",
+                                             json={"title": title, "year": year, "private": private})
+
+    def test_a_recording_asked_to_be_private_is_saved_private_and_sent_to_the_recorder(self):
+        self.assertEqual(self._record(private=True).status_code, 200)
+        row = self._saved()
+        self.assertEqual(row["private"], 1)
+        self.assertTrue(server._agent_job_dict(row)["private"])
+
+    def test_a_plain_recording_is_not_private(self):
+        self._record()
+        row = self._saved()
+        self.assertEqual(row["private"], 0)
+        self.assertFalse(server._agent_job_dict(row)["private"])
+
+    def test_a_wanted_film_marked_private_records_privately_without_being_asked(self):
+        self.assertTrue(self._mark(True).get_json()["ok"])
+        self._record()
+        self.assertEqual(self._saved()["private"], 1)
+
+    def test_marking_it_public_again_stops_that(self):
+        self._mark(True)
+        self._mark(False)
+        self._record()
+        self.assertEqual(self._saved()["private"], 0)
+
+    def test_privacy_belongs_to_the_year_not_just_the_title(self):
+        self._mark(True, year="2022")
+        self._record(year="2004")
+        self.assertEqual(self._saved()["private"], 0)
+
+    def test_the_mark_needs_a_title_and_a_year(self):
+        self.assertEqual(self._mark(True, year="").status_code, 400)
+        self.assertEqual(self._mark(True, title="").status_code, 400)
+
+    def test_accents_do_not_change_which_film_is_private(self):
+        self._mark(True, title="Æon Flux", year="2005")
+        self.assertTrue(server._is_private_title("Aeon Flux", "2005"))
+
+    def test_a_tv_episode_is_never_private(self):
+        self._record(private=True, season_num=1, episode_num=2, episode_title="Pilot")
+        row = self._saved()
+        self.assertEqual(row["private"], 0)
+
+    def test_recommendations_show_which_films_are_private(self):
+        self._mark(True, title="Private Film", year="2004")
+        wanted = [{"id": 1, "title": "Private Film", "normalized_title": "private film", "year": "2004",
+                   "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""},
+                  {"id": 2, "title": "Other Film", "normalized_title": "other film", "year": "1999",
+                   "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": []}):
+            recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        self.assertEqual([r["private"] for r in recs], [True, False])
+
+    def test_the_page_has_the_private_checkbox_and_toggle(self):
+        self.assertIn('id="pm-private"', server.HTML)
+        self.assertIn("togglePrivateWanted", server.HTML)
+        self.assertIn("/epg-web/api/wanted/private", server.HTML)
+
+
+class RerecordChannelTests(unittest.TestCase):
+    def test_only_commercial_free_english_channels_qualify(self):
+        ok = server._is_rerecord_channel
+        self.assertTrue(ok("HBO"))
+        self.assertTrue(ok("Showtime East HD"))
+        self.assertTrue(ok("MGM+ Hits HD"))
+        self.assertFalse(ok("ANTENNA TV"))                 # ad-supported
+        self.assertFalse(ok("Paramount Network HD"))       # ad-supported
+        self.assertFalse(ok("HBO Latino"))                 # premium, but a Spanish feed
+        self.assertFalse(ok("Showtime Español"))
+        self.assertFalse(ok(""))
+        self.assertFalse(ok(None))
+
+    def _recs(self, in_plex, airings):
+        wanted = [{"id": 1, "title": "Heat", "normalized_title": "heat", "year": "1995", "type": "movie",
+                   "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        far = time.time() + 86400
+        progs = [dict(title="Heat", channel_id="c", channel=channel, stop_ts=far + 7200, start_ts=far + shift, start_fmt="")
+                 for shift, channel in airings]
+        key = server._norm_plex_show("Heat")
+        index = {"movies": {key} if in_plex else set(), "movie_versions": {(key, "1995")} if in_plex else set(),
+                 "unyearred_movies": set(), "shows": set(), "movie_counts": {}, "show_versions": set(),
+                 "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": progs}):
+            data = server.app.test_client().get("/epg-web/api/recommendations").get_json()
+        return data["recommendations"][0]["next_airing"]
+
+    def test_a_film_we_have_is_offered_again_only_from_a_commercial_free_english_channel(self):
+        airing = self._recs(True, [(0, "ANTENNA TV"), (60, "HBO Latino"), (120, "HBO")])
+        self.assertEqual(airing["channel"], "HBO")
+
+    def test_a_film_we_have_gets_no_offer_when_only_ad_supported_airings_exist(self):
+        self.assertIsNone(self._recs(True, [(0, "ANTENNA TV"), (60, "Paramount Network HD")]))
+
+    def test_a_film_we_do_not_have_is_still_offered_from_any_airing(self):
+        airing = self._recs(False, [(0, "ANTENNA TV"), (120, "HBO")])
+        self.assertEqual(airing["channel"], "ANTENNA TV")
+
+    def test_the_page_only_shows_check_upgrade_when_there_is_an_airing(self):
+        self.assertIn('(a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing', server.HTML)

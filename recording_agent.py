@@ -5,6 +5,7 @@ The agent polls an EPG Manager server for recording jobs, records locally with
 FFmpeg, and transfers verified MP4 files to a mounted Plex library.
 """
 
+import unicodedata
 import argparse
 import base64
 import difflib
@@ -29,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261111d"
+AGENT_VERSION = "v20261111g"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -162,9 +163,24 @@ def split_title_year(title):
     return (title or '').strip(), ''
 
 
+_TITLE_LIGATURES = {'\u00e6': 'ae', '\u0153': 'oe', '\u00df': 'ss', '\u00f8': 'o', '\u0111': 'd',
+                    '\u00f0': 'd', '\u00fe': 'th', '\u0142': 'l', '\u0131': 'i'}
+
+
+def fold_title(value):
+    """Lower case, accents and ligatures folded to plain letters, only letters and digits kept
+    (so "\u00c6on Flux" and "Aeon Flux" are the same title)."""
+    text = str(value or '').lower()
+    for special, plain in _TITLE_LIGATURES.items():
+        text = text.replace(special, plain)
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r'[^a-z0-9]', '', text)
+
+
 def normalized_title(title):
     base, _year = split_title_year(title)
-    return re.sub(r'[^a-z0-9]', '', base.lower())
+    return fold_title(base)
 
 
 def parse_rate(value):
@@ -370,6 +386,39 @@ def find_tv_episode_candidates(tv_root, show_title, season, episode, year=''):
                 and pattern.search(path.stem)]
     except OSError:
         return []
+
+
+def private_movies_root(cfg):
+    """Folder, outside the Plex Movies library, where private films are kept."""
+    configured = str(cfg.get('private_movies_path', '') or '').strip()
+    if configured:
+        return Path(os.path.expanduser(configured))
+    return Path(cfg['plex_path']).parent / 'Movies Private'
+
+
+def find_movie_candidates(cfg, library_root, title, year=''):
+    """Existing copies of a film: in the Plex library, and in the private folder.
+
+    A private film is hidden from Plex, but it is still a film we have: finding it here
+    stops the recorder making a second copy.
+    """
+    roots, found = [], []
+    for root in (library_root, cfg.get('plex_path', ''), private_movies_root(cfg)):
+        if root and str(root) not in roots:
+            roots.append(str(root))
+            found += find_plex_candidates(root, title, year)
+    return found
+
+
+def ensure_private_root(cfg):
+    """The private folder, created if the Plex share is mounted and it is not there yet."""
+    root = private_movies_root(cfg)
+    if not root.is_dir() and plex_mount_available(Path(cfg['plex_path']), cfg.get('plex_mount_marker', '')):
+        try:
+            root.mkdir(parents=False, exist_ok=True)
+        except OSError:
+            pass
+    return root
 
 
 def best_existing_copy(paths, ffprobe):
@@ -854,12 +903,15 @@ def process_job(api, job, cfg):
                      job.get('stream_extension', 'ts'))
     episode = episode_metadata(job)
     is_series = bool(job.get('is_series'))
-    library_root = cfg['plex_tv_path'] if (episode or is_series) else cfg['plex_path']
+    # A film recorded privately goes to the private folder, never into the Plex library.
+    private_film = bool(job.get('private')) and not (episode or is_series)
+    library_root = (cfg['plex_tv_path'] if (episode or is_series) else
+                    str(ensure_private_root(cfg)) if private_film else cfg['plex_path'])
 
     api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
     candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
-        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
+        if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
     existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
     try:
         incoming_probe = probe_media(url, ffprobe=cfg['ffprobe'], timeout=45)
@@ -952,7 +1004,7 @@ def process_job(api, job, cfg):
     # during preflight, or Plex may have received a better copy in the meantime.
     final_candidates = (find_tv_episode_candidates(
         library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
-        if episode else ([] if is_series else find_plex_candidates(library_root, job['title'], job.get('year', ''))))
+        if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
     final_existing_path, final_existing_probe = best_existing_copy(
         final_candidates, cfg['ffprobe']
     )
