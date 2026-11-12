@@ -2270,6 +2270,9 @@ class TidyLibraryTests(unittest.TestCase):
         self.assertEqual(clean("FUGITIVE_16X9.mp4"), ("FUGITIVE", "", False))
         self.assertEqual(clean("2012.mp4"), ("2012", "", False))            # a title that is a year stays a title
         self.assertEqual(clean("IF.mp4"), ("IF", "", False))
+        self.assertEqual(clean("Ferris Bueller s Day Off.mp4")[0], "Ferris Bueller's Day Off")
+        self.assertEqual(clean("Won t Back Down.mp4")[0], "Won't Back Down")
+        self.assertEqual(clean("Kill Bill Vol1.mp4")[0], "Kill Bill Vol 1")
 
     def test_only_loose_videos_are_listed(self):
         with tempfile.TemporaryDirectory() as temp:

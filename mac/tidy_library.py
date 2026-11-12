@@ -46,6 +46,8 @@ import wanted_from_empty as scan  # noqa: E402
 TITLE_AND_YEAR = re.compile(r'^(.*?)\s*\(((?:19|20)\d{2})\)\s*$')
 FILE_TAGS = re.compile(r'\b(16x9|1080p|720p|480p|3d|hd|dvdrip|bluray|brrip|webrip)\b', re.IGNORECASE)
 COPY_MARK = re.compile(r'\s*-\s*copy(?:\s*\(\d{1,3}\))?\s*$', re.IGNORECASE)
+APOSTROPHE = re.compile(r"(?<=[A-Za-z]) (s|t|re|ll|ve)\b(?=\s|$)")
+VOLUME = re.compile(r'\b(Vol)(\d)\b', re.IGNORECASE)
 FILE_YEAR = re.compile(r'\(?\b((?:19|20)\d{2})\b\)?\s*$')
 
 
@@ -70,6 +72,7 @@ def clean_file_name(filename):
         stem = stem.strip()[:match.start()]
     stem = FILE_TAGS.sub(' ', stem)
     title = re.sub(r'\s+', ' ', stem).strip(' -.')
+    title = VOLUME.sub(r'\1 \2', APOSTROPHE.sub(r"'\1", title))
     return title, year, is_copy
 
 
