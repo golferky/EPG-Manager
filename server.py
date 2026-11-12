@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112h"
+VERSION = "v20261112i"
 
 app = Flask(__name__)
 
@@ -11401,6 +11401,15 @@ async function refreshRecWindow() {
     body.innerHTML = d.ok ? renderRecWindow(d) : '<div style="color:#fca5a5;">Could not load recordings: ' + esc(d.error || '') + '</div>';
   } catch (e) { body.innerHTML = '<div style="color:#fca5a5;">Could not load recordings: ' + esc(e.message) + '</div>'; }
 }
+async function refreshRecWindowNow() {
+  const b = document.getElementById('rec-window-refresh');
+  if (b) { b.disabled = true; b.textContent = '↻ Refreshing…'; }
+  try { await refreshRecWindow(); refreshRecBadge(); }
+  finally {
+    const again = document.getElementById('rec-window-refresh');
+    if (again) { again.disabled = false; again.textContent = '↻ Refresh'; }
+  }
+}
 function closeRecWindow() {
   const o = document.getElementById('rec-window');
   if (o) o.remove();
@@ -11413,7 +11422,8 @@ function openRecWindow() {
   o.style.cssText = 'position:fixed;inset:0;z-index:100002;background:rgba(0,0,0,.7);display:flex;align-items:flex-start;justify-content:center;padding:40px 12px;overflow:auto;';
   o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:760px;width:100%;padding:18px 22px;color:#e2e8f0;">'
     + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><h3 style="margin:0;">Recordings</h3>'
-    + '<button class="btn btn-ghost btn-sm" style="margin:0;" onclick="closeRecWindow()">✕ Close</button></div>'
+    + '<div style="display:flex;gap:8px;"><button id="rec-window-refresh" class="btn btn-ghost btn-sm" style="margin:0;" onclick="refreshRecWindowNow()" title="Reload this list now (it also updates by itself every 10 seconds)">↻ Refresh</button>'
+    + '<button class="btn btn-ghost btn-sm" style="margin:0;" onclick="closeRecWindow()">✕ Close</button></div></div>'
     + '<div id="rec-window-body" style="font-size:13px;">Loading…</div></div>';
   o.onclick = e => { if (e.target === o) closeRecWindow(); };
   document.body.appendChild(o);

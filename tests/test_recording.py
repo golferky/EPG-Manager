@@ -1155,6 +1155,12 @@ class VersionLabelTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn(server.VERSION, html)
 
+    def test_the_recordings_window_has_a_refresh_button(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="rec-window-refresh"', html)
+        self.assertIn("onclick=\"refreshRecWindowNow()\"", html)
+        self.assertIn("async function refreshRecWindowNow()", html)
+
 
 class AgentSeenTests(unittest.TestCase):
     def setUp(self):
