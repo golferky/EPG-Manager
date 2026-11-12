@@ -146,6 +146,7 @@ def build_loose_plan(movies_dir, files, server, ffprobe, workers=4):
     for number, row in enumerate(rows, 1):
         row['n'] = number
         refresh_loose_row(row, keys)
+        add_compare(row, movies_dir, ffprobe)
     return rows
 
 
@@ -172,6 +173,60 @@ def loose_to_send_out(plan):
     return [r for r in plan if r['out']]
 
 
+def matching_folders(movies_dir, row):
+    """Movie folders that hold the same film as a loose file: same title, and the same year if known."""
+    found = []
+    for name in sorted(os.listdir(movies_dir), key=str.lower):
+        match = TITLE_AND_YEAR.match(name)
+        if not match or name.startswith(('.', '_')) or not os.path.isdir(os.path.join(movies_dir, name)):
+            continue
+        if base.fold_title(match.group(1)) != base.fold_title(row['title']):
+            continue
+        if row['year'] and abs(int(match.group(2)) - int(row['year'])) > 1:
+            continue
+        if scan.has_video(os.path.join(movies_dir, name)):
+            found.append(name)
+    return found
+
+
+def compare_note(loose, folder):
+    """Which is the better copy, a loose file or a folder's video: 'folder', 'loose' or 'unsure'."""
+    pick = suggest_keep([loose, folder])
+    return 'unsure' if pick is None else ('loose' if pick == 0 else 'folder')
+
+
+def add_compare(row, movies_dir, ffprobe):
+    """Fill row['compare'] with size and length of the loose file and of the folder(s) it may duplicate."""
+    row['compare'] = []
+    if row['state'] not in ('exists', 'copy'):
+        return
+    path = os.path.join(movies_dir, row['file'])
+    try:
+        loose = {'size': os.path.getsize(path), 'minutes': video_minutes(path, ffprobe)}
+    except OSError:
+        return
+    folders = [row['folder']] if row.get('folder') else matching_folders(movies_dir, row)
+    for name in folders:
+        size, minutes = folder_video_info(os.path.join(movies_dir, name), ffprobe)
+        folder = {'size': size, 'minutes': minutes}
+        verdict = compare_note(loose, folder)
+        row['compare'].append({'folder': name, 'loose': loose, 'copy': folder, 'verdict': verdict})
+
+
+def compare_lines(row):
+    lines = []
+    advice = {'folder': 'the folder copy is better, so out N is safe',
+              'loose': 'the loose file is the larger one: look at it before moving anything',
+              'unsure': 'cannot tell by size and length: play both'}
+    for item in row.get('compare') or []:
+        loose, copy = item['loose'], item['copy']
+        lines.append(f"       loose {size_text(loose['size'])} {loose['minutes']:.0f} min   "
+                     f"folder \"{item['folder']}\" {size_text(copy['size'])} {copy['minutes']:.0f} min   -> {advice[item['verdict']]}")
+    if row['state'] == 'copy' and not row.get('compare'):
+        lines.append('       (no folder with this title found)')
+    return lines
+
+
 def format_loose_recap(plan):
     ready = loose_to_move(plan)
     lines = [f'Will be moved into folders ({len(ready)}):']
@@ -184,11 +239,15 @@ def format_loose_recap(plan):
     exists = [r for r in plan if r['state'] == 'exists' and not r['out']]
     if exists:
         lines.append(f'\nThe film already has a folder: compare, then  out N  if this is the copy to remove ({len(exists)}):')
-        lines += [f"  {r['n']:>3}. {r['file']}   (folder: {r['folder']})" for r in exists]
+        for r in exists:
+            lines.append(f"  {r['n']:>3}. {r['file']}   (folder: {r['folder']})")
+            lines += compare_lines(r)
     copies = [r for r in plan if r['state'] == 'copy' and not r['out']]
     if copies:
         lines.append(f'\nLooks like a copy ("-Copy"): probably a duplicate, so  out N  ({len(copies)}):')
-        lines += [f"  {r['n']:>3}. {r['file']}" for r in copies]
+        for r in copies:
+            lines.append(f"  {r['n']:>3}. {r['file']}")
+            lines += compare_lines(r)
     unknown = [r for r in plan if r['state'] in ('noyear', 'notitle') and not r['out'] and not r['skip']]
     if unknown:
         lines.append(f'\nNo year found: give one with  set N YEAR  (or a title with  title N ...) ({len(unknown)}):')
@@ -230,6 +289,7 @@ def parse_loose_command(text, plan, keys, movies_dir, server='', ffprobe='ffprob
         row = by_number[int(rest[0])]
         row['year'], row['skip'], row['out'], row['copy'] = rest[1], False, False, False
         refresh_loose_row(row, keys)
+        add_compare(row, movies_dir, ffprobe)
         return 'continue', f'{row["n"]}. {row["file"]}: {row["title"]} ({row["year"]})' + ('  (its folder already exists: compare)' if row['state'] == 'exists' else '')
     if command == 'title':
         if len(rest) < 2 or not rest[0].isdigit() or int(rest[0]) not in by_number:
@@ -239,6 +299,7 @@ def parse_loose_command(text, plan, keys, movies_dir, server='', ffprobe='ffprob
         if not row['year'] and server:
             row['year'], row['note'] = lookup_year(server, row['title'], row['minutes'] or video_minutes(os.path.join(movies_dir, row['file']), ffprobe))
         refresh_loose_row(row, keys)
+        add_compare(row, movies_dir, ffprobe)
         found = f' ({row["year"]})' if row['year'] else f'  [{row["note"]}]'
         return 'continue', f'{row["n"]}. {row["file"]}: {row["title"]}{found}'
     return 'continue', f'Unknown command "{command}". Type y, skip N, set N YEAR, title N NAME, out N, list, or q.'
