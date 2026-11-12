@@ -2395,3 +2395,26 @@ class TidyLibraryTests(unittest.TestCase):
             (movies / "Alien (1979).mp4").write_bytes(b"x")
             self.tool.run_loose(args, str(movies), "", "no-such-ffprobe", str(Path(temp) / "out"))
             self.assertTrue((movies / "Alien (1979).mp4").exists())
+
+    def test_loose_file_is_compared_with_its_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp)
+            (movies / "Cleaner (2025)").mkdir()
+            (movies / "Cleaner (2025)" / "Cleaner.mp4").write_bytes(b"x" * 3000)
+            (movies / "Cleaner__2025_.mp4").write_bytes(b"x" * 1000)
+            (movies / "Joker (2019)").mkdir()
+            (movies / "Joker (2019)" / "Joker.mp4").write_bytes(b"x" * 1000)
+            (movies / "Joker-Copy(1).mp4").write_bytes(b"x" * 3000)
+            (movies / "Odd-Copy(1).mp4").write_bytes(b"x" * 10)
+            plan = self.tool.build_loose_plan(str(movies), self.tool.loose_files(str(movies)), "", "no-such-ffprobe")
+            rows = {r["file"]: r for r in plan}
+            self.assertEqual(rows["Cleaner__2025_.mp4"]["compare"][0]["verdict"], "folder")
+            self.assertEqual(rows["Joker-Copy(1).mp4"]["compare"][0]["folder"], "Joker (2019)")
+            self.assertEqual(rows["Joker-Copy(1).mp4"]["compare"][0]["verdict"], "loose")
+            self.assertEqual(rows["Odd-Copy(1).mp4"]["compare"], [])
+            recap = self.tool.format_loose_recap(plan)
+            self.assertIn('folder "Cleaner (2025)"', recap)
+            self.assertIn("the folder copy is better, so out N is safe", recap)
+            self.assertIn("the loose file is the larger one", recap)
+            self.assertIn("no folder with this title found", recap)
+            self.assertEqual(self.tool.compare_note({"size": 500, "minutes": 100}, {"size": 505, "minutes": 100}), "unsure")
