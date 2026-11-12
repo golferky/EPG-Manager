@@ -1421,6 +1421,12 @@ class GuideYearRecordingTests(unittest.TestCase):
         self.assertIn("2022", data["error"])
         self.assertIsNone(self._saved_year())
 
+    def test_a_year_one_apart_is_the_same_film_and_the_guide_year_is_used(self):
+        self._guide("Year Film", "2016")
+        resp = self._record(year="2017")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._saved_year(), "2016")
+
     def test_the_matching_year_is_recorded(self):
         self._guide("Year Film", "2004")
         resp = self._record(year="2004")

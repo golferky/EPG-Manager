@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112g"
+VERSION = "v20261112h"
 
 app = Flask(__name__)
 
@@ -7676,7 +7676,9 @@ def api_record():
     # this airing.  Two films can share a title, so a mismatch is refused, not guessed at.
     requested_year = _clean_year(data.get('year'))
     guide_year = _guide_year_for_airing(guide_db, channel_id, title, start_ts)
-    if requested_year and guide_year and requested_year != guide_year:
+    # Sources often differ by a year for one film (a festival year and a release year), so a
+    # difference of one year is the same film; the guide's year for this airing is the one used.
+    if requested_year and guide_year and abs(int(requested_year) - int(guide_year)) > 1:
         return jsonify({
             'ok': False, 'year_mismatch': True, 'guide_year': guide_year,
             'error': (f'This airing of "{title}" is the {guide_year} film, not the {requested_year} one. '
@@ -7690,7 +7692,7 @@ def api_record():
     if (not requested_year and not guide_year and not is_series_request and not is_sports_request
             and (stop_ts - start_ts) >= 60 * 60):
         lookup_year = _film_year_by_title(title, (stop_ts - start_ts) / 60)
-    film_year = requested_year or guide_year or lookup_year
+    film_year = guide_year or requested_year or lookup_year
     wants_private = bool(data.get('private')) or (bool(film_year) and _is_private_title(title, film_year))
     guide_stop_ts = stop_ts
     overtime_cushion_seconds = SPORTS_OVERTIME_CUSHION_SECONDS if is_sports_request else 0
