@@ -1851,3 +1851,69 @@ class RerecordChannelTests(unittest.TestCase):
 
     def test_the_page_only_shows_check_upgrade_when_there_is_an_airing(self):
         self.assertIn('(a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing', server.HTML)
+
+
+class WestFeedYearTests(unittest.TestCase):
+    """A West feed airs a film three hours after the East listing; the year still reaches it."""
+
+    def _programmes(self, rows):
+        db = os.path.join(TEST_DATA_DIR, "guide.db")
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM guide WHERE channel_id LIKE 'wf-%' OR channel_id LIKE 'ld-%'")   # other tests' rows
+        for title, channel, start, year, ptype in rows:
+            conn.execute("INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category, prog_type, year) "
+                         "VALUES (?,?,?,?,?,?,?,?,?)", (title, channel, channel, start, "20990101200000", "", "", ptype, year))
+        conn.commit()
+        conn.close()
+        server.load_epg_from_db(db)
+        return {p["channel_id"]: p for p in server._epg["programmes"] if p["channel_id"].startswith("wf-")}
+
+    def test_the_year_reaches_the_west_feed_three_hours_later(self):
+        progs = self._programmes([
+            ("Grumpier Old Men", "wf-sd-east", "20990101000000", "1995", "MV"),
+            ("Grumpier Old Men", "wf-prov-west", "20990101030000", "", ""),
+        ])
+        self.assertEqual(progs["wf-prov-west"]["year"], "1995")
+
+    def test_it_reaches_an_earlier_feed_too(self):
+        progs = self._programmes([
+            ("Grumpier Old Men", "wf-sd-west", "20990101030000", "1995", "MV"),
+            ("Grumpier Old Men", "wf-prov-east", "20990101000000", "", ""),
+        ])
+        self.assertEqual(progs["wf-prov-east"]["year"], "1995")
+
+    def test_some_other_time_does_not_match(self):
+        progs = self._programmes([
+            ("Grumpier Old Men", "wf-sd-east", "20990101000000", "1995", "MV"),
+            ("Grumpier Old Men", "wf-prov-late", "20990101060000", "", ""),
+        ])
+        self.assertEqual(progs["wf-prov-late"]["year"], "")
+
+    def test_a_match_at_the_same_time_wins_over_a_shifted_one(self):
+        progs = self._programmes([
+            ("Employee of the Month", "wf-sd-a", "20990101000000", "2004", "MV"),
+            ("Employee of the Month", "wf-sd-b", "20990101030000", "2022", "MV"),
+            ("Employee of the Month", "wf-prov", "20990101000500", "", ""),
+        ])
+        self.assertEqual(progs["wf-prov"]["year"], "2004")
+
+    def test_two_films_only_at_the_shifted_times_are_not_guessed(self):
+        progs = self._programmes([
+            ("Employee of the Month", "wf-sd-a", "20990101000000", "2004", "MV"),
+            ("Employee of the Month", "wf-sd-b", "20990101060000", "2022", "MV"),
+            ("Employee of the Month", "wf-prov", "20990101030000", "", ""),
+        ])
+        self.assertEqual(progs["wf-prov"]["year"], "")
+
+    def test_the_record_check_finds_the_year_across_the_three_hour_shift(self):
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("DELETE FROM guide WHERE channel_id LIKE 'wf-%'")
+        conn.execute("INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category, prog_type, year) "
+                     "VALUES ('Shifted Film','wf-sd','East','20990301000000','20990301020000','','','MV','1995')")
+        conn.commit()
+        conn.close()
+        west = time.mktime(time.strptime("20990301030000", "%Y%m%d%H%M%S")) - time.timezone      # 03:00 UTC
+        found = server._guide_year_for_airing(server._guide_db_path(), "wf-west", "Shifted Film", west)
+        self.assertEqual(found, "1995")
+        none = server._guide_year_for_airing(server._guide_db_path(), "wf-west", "Shifted Film", west + 6 * 3600)
+        self.assertEqual(none, "")

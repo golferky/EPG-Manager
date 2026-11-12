@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261111j"
+VERSION = "v20261112a"
 
 app = Flask(__name__)
 
@@ -1336,7 +1336,9 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
                         p['episode_title'] = ep['et']
                         filled_ep += 1
     # A film's year is on the Schedules Direct listing only.  Give the same film's provider
-    # listings that year too, matching by title and a start time within 15 minutes.
+    # listings that year too, matching by title and a start time within 15 minutes.  A West or
+    # Pacific feed airs the same film three hours after the East listing, so a time shifted by
+    # three hours matches too, but only when nothing matches at the same time.
     title_years = {}
     for p in programmes:
         if p.get('year'):
@@ -1345,9 +1347,12 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
     for p in programmes:
         if p.get('year') or p['title'] not in title_years or p['prog_type'] not in ('MV', ''):
             continue
-        near = [(abs(ts - p['start_ts']), y) for ts, y in title_years[p['title']]
-                if abs(ts - p['start_ts']) <= TOLERANCE]
-        years = {y for _d, y in near}
+        years = set()
+        for shifts in GUIDE_FEED_SHIFTS:
+            years = {y for ts, y in title_years[p['title']]
+                     if any(abs(ts + shift - p['start_ts']) <= TOLERANCE for shift in shifts)}
+            if years:
+                break
         if len(years) == 1:        # two years inside the window would be a guess: leave it blank
             p['year'] = years.pop()
             filled_year += 1
@@ -7223,6 +7228,11 @@ def api_wanted_private():
     return jsonify({'ok': True, 'private': bool(data.get('private'))})
 
 
+# Time shifts to try, in order, when matching one listing of a film to another: the same time,
+# then three hours either way (East, West and Pacific feeds of one channel).
+GUIDE_FEED_SHIFTS = ((0,), (10800, -10800))
+
+
 def _guide_year_for_airing(guide_db, channel_id, title, start_ts):
     """The year the guide gives this airing, or '' if it gives none or is not sure.
 
@@ -7233,13 +7243,20 @@ def _guide_year_for_airing(guide_db, channel_id, title, start_ts):
     """
     try:
         centre = datetime.fromtimestamp(float(start_ts), timezone.utc)
-        lower = (centre - timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
-        upper = (centre + timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
         conn = sqlite3.connect(guide_db, timeout=10)
         try:
-            rows = conn.execute('''SELECT year, channel_id FROM guide
-                                   WHERE lower(title)=lower(?) AND start_utc BETWEEN ? AND ?
-                                     AND year IS NOT NULL AND year != \'\'''', (title, lower, upper)).fetchall()
+            for shifts in GUIDE_FEED_SHIFTS:
+                rows = []
+                for shift in shifts:
+                    middle = centre + timedelta(seconds=shift)
+                    lower = (middle - timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+                    upper = (middle + timedelta(minutes=15)).strftime('%Y%m%d%H%M%S')
+                    rows += conn.execute('''SELECT year, channel_id FROM guide
+                                            WHERE lower(title)=lower(?) AND start_utc BETWEEN ? AND ?
+                                              AND year IS NOT NULL AND year != \'\'''',
+                                         (title, lower, upper)).fetchall()
+                if rows:
+                    break
         finally:
             conn.close()
     except (sqlite3.Error, ValueError, TypeError):
