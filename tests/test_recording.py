@@ -2065,3 +2065,69 @@ class RecordUsesTitleLookupTests(unittest.TestCase):
     def test_a_tv_episode_is_not_looked_up_as_a_film(self):
         _resp, _year, looked = self._record(season_num=1, episode_num=2, episode_title="Pilot")
         looked.assert_not_called()
+
+
+class FilmSignalsTests(unittest.TestCase):
+    def setUp(self):
+        server._film_signals_cache.clear()
+
+    def _get(self, query, search, details=None, tmdb_key="t", calls=None):
+        import io
+
+        def fake(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if calls is not None:
+                calls.append(url)
+            if "/search/movie" in url:
+                return io.BytesIO(json.dumps({"results": search}).encode())
+            if "/movie/" in url:
+                return io.BytesIO(json.dumps(details or {}).encode())
+            raise AssertionError(url)
+        with mock.patch.object(server, "load_config", return_value={"tmdb_key": tmdb_key}), \
+             mock.patch("urllib.request.urlopen", side_effect=fake):
+            return server.app.test_client().get("/epg-web/api/film-signals?" + query)
+
+    SEARCH = [{"id": 5, "title": "Some Film", "release_date": "1998-03-01"},
+              {"id": 6, "title": "Some Film", "release_date": "2010-01-01"}]
+    DETAILS = {"title": "Some Film", "release_date": "1998-03-01", "adult": False,
+               "genres": [{"name": "Thriller"}, {"name": "Drama"}],
+               "release_dates": {"results": [
+                   {"iso_3166_1": "GB", "release_dates": [{"certification": "18"}]},
+                   {"iso_3166_1": "US", "release_dates": [{"certification": ""}, {"certification": "NC-17"}]}]},
+               "keywords": {"keywords": [{"name": "erotic thriller"}, {"name": "softcore"}]}}
+
+    def test_it_returns_the_flag_rating_genres_and_keywords(self):
+        data = self._get("title=Some%20Film&year=1998", self.SEARCH, self.DETAILS).get_json()
+        self.assertTrue(data["found"])
+        self.assertEqual(data["id"], 5)
+        self.assertEqual(data["year"], "1998")
+        self.assertFalse(data["adult"])
+        self.assertEqual(data["certification"], "NC-17")          # the US rating, skipping an empty one
+        self.assertEqual(data["genres"], ["Thriller", "Drama"])
+        self.assertEqual(data["keywords"], ["erotic thriller", "softcore"])
+
+    def test_the_year_picks_between_films_with_one_title(self):
+        data = self._get("title=Some%20Film&year=2010", self.SEARCH, dict(self.DETAILS, release_date="2010-01-01")).get_json()
+        self.assertEqual(data["id"], 6)
+
+    def test_no_match_for_the_year_is_not_found(self):
+        self.assertFalse(self._get("title=Some%20Film&year=1975", self.SEARCH, self.DETAILS).get_json()["found"])
+
+    def test_a_longer_title_is_not_taken(self):
+        search = [{"id": 9, "title": "Some Film Returns", "release_date": "1998-03-01"}]
+        self.assertFalse(self._get("title=Some%20Film", search, self.DETAILS).get_json()["found"])
+
+    def test_the_adult_flag_comes_through(self):
+        data = self._get("title=Some%20Film", self.SEARCH[:1], dict(self.DETAILS, adult=True)).get_json()
+        self.assertTrue(data["adult"])
+
+    def test_an_answer_is_remembered(self):
+        calls = []
+        self._get("title=Some%20Film&year=1998", self.SEARCH, self.DETAILS, calls=calls)
+        n = len(calls)
+        self._get("title=Some%20Film&year=1998", self.SEARCH, self.DETAILS, calls=calls)
+        self.assertEqual(len(calls), n)
+
+    def test_no_key_and_no_title_are_explained(self):
+        self.assertEqual(self._get("title=Some%20Film", [], tmdb_key="").status_code, 503)
+        self.assertEqual(self._get("title=", []).status_code, 400)

@@ -1827,3 +1827,119 @@ class MoveNoYearTests(unittest.TestCase):
             root = self._library(temp)
             self._run(root, ["move noyear", "rename only", "y"])
             self.assertFalse((Path(temp) / "Movies Needing Attention").exists())
+
+
+class AdultSearchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("private_movies_adult", mac / "private_movies.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_scoring(self):
+        sig = self.tool.adult_signals
+        self.assertEqual(sig({"found": True, "adult": True})[0], 3)
+        self.assertEqual(sig({"found": True, "certification": "NC-17"})[0], 3)
+        self.assertEqual(sig({"found": True, "certification": "X"})[1], ["rated X"])
+        self.assertEqual(sig({"found": True, "keywords": ["softcore", "erotica", "nudity"]})[0], 2)
+        self.assertIn("keywords: softcore, erotica", sig({"found": True, "keywords": ["softcore", "erotica"]})[1][0])
+        self.assertEqual(sig({"found": True, "certification": "R", "keywords": ["nudity", "violence"]})[0], 0)   # an ordinary R film
+        self.assertEqual(sig({"found": True, "certification": "Unrated"})[0], 1)          # not enough on its own
+        self.assertEqual(sig({"found": False}), (0, []))
+        self.assertEqual(sig({}), (0, []))
+        total = sig({"found": True, "adult": True, "certification": "NC-17", "keywords": ["softcore"]})
+        self.assertEqual(total[0], 8)
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in ("Heat (1995)", "Adult One (1998)", "Raunchy Two (2003)", "Unknown Film (1990)", "Unrated Only (2001)"):
+            (root / name).mkdir(parents=True)
+            (root / name / "film.mp4").write_bytes(name.encode())
+        return root
+
+    SIGNALS = {
+        "Heat": {"found": True, "certification": "R", "keywords": ["heist"], "adult": False},
+        "Adult One": {"found": True, "adult": True, "certification": "NC-17", "keywords": ["erotic thriller"]},
+        "Raunchy Two": {"found": True, "certification": "R", "keywords": ["softcore", "erotica"]},
+        "Unrated Only": {"found": True, "certification": "NR", "keywords": []},
+    }
+
+    def _run(self, root, answers, cache_path, signals=None, calls=None):
+        signals = self.SIGNALS if signals is None else signals
+        out = []
+
+        def fake_get(server, path, params=None, timeout=20):
+            if calls is not None:
+                calls.append(params["title"])
+            return signals.get(params["title"], {"found": False})
+        with mock.patch.object(self.tool.scan, "get_json", side_effect=fake_get), \
+             mock.patch.object(self.tool.base, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            self.tool.main(["--movies", str(root), "--server", "http://x", "--cache", str(cache_path)])
+        return "\n".join(out)
+
+    def test_adult_lists_likely_films_with_reasons_strongest_first(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = self._run(self._library(temp), ["adult", "q"], Path(temp) / "cache.json")
+            self.assertIn("2 of 5 look adult (1 not found in the database)", out)
+            self.assertIn("1. Adult One (1998)   [adult flag; rated NC-17; keywords: erotic thriller]", out)
+            self.assertIn("2. Raunchy Two (2003)   [keywords: softcore, erotica]", out)
+            self.assertNotIn("Heat (1995)   [", out)
+            self.assertNotIn("Unrated Only (2001)   [", out)
+
+    def test_add_all_and_go_move_the_suggestions_to_the_private_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["adult", "add all", "go"], Path(temp) / "cache.json")
+            private = Path(temp) / "Movies Private"
+            self.assertEqual(sorted(p.name for p in private.iterdir()), ["Adult One (1998)", "Raunchy Two (2003)"])
+            self.assertTrue((root / "Heat (1995)").is_dir())
+            self.assertEqual((private / "Adult One (1998)" / "film.mp4").read_bytes(), b"Adult One (1998)")
+
+    def test_add_by_number_picks_from_the_suggestions_on_screen(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["adult", "add 2", "go"], Path(temp) / "cache.json")
+            self.assertEqual(sorted(p.name for p in (Path(temp) / "Movies Private").iterdir()), ["Raunchy Two (2003)"])
+
+    def test_the_second_scan_only_asks_about_new_films(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, cache = self._library(temp), Path(temp) / "cache.json"
+            calls = []
+            self._run(root, ["adult", "q"], cache, calls=calls)
+            first = len(calls)
+            self.assertGreaterEqual(first, 5)
+            calls.clear()
+            self._run(root, ["adult", "q"], cache, calls=calls)
+            self.assertEqual(calls, ["Unknown Film"])          # not found last time, so asked again; the rest are remembered
+
+    def test_when_nothing_can_be_looked_up_it_says_why(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = self._run(self._library(temp), ["adult", "q"], Path(temp) / "cache.json", signals={})
+            self.assertIn("None of them could be looked up", out)
+
+    def test_adult_is_refused_in_restore_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            private = Path(temp) / "Movies Private" / "Old (2000)"
+            private.mkdir(parents=True)
+            (private / "o.mp4").write_bytes(b"x")
+            out = []
+            with mock.patch.object(self.tool.base, "recorder_copying", return_value=[]), \
+                 mock.patch("builtins.input", side_effect=["adult", "q"]), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+                self.tool.main(["--movies", str(root), "--server", "http://x", "--restore"])
+            self.assertIn("adult works on the Movies library", "\n".join(out))
+
+    def test_a_cache_file_is_written_and_read_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "cache.json"
+            self.tool.save_cache(str(path), {"A (2000)": {"found": True}})
+            self.assertEqual(self.tool.load_cache(str(path)), {"A (2000)": {"found": True}})
+            self.assertEqual(self.tool.load_cache(str(Path(temp) / "missing.json")), {})
+            self.assertEqual(self.tool.default_cache_path("~/EPG-Manager/recording_agent.json").endswith(
+                "EPG-Manager/film_signals_cache.json"), True)
