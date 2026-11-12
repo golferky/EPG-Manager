@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112f"
+VERSION = "v20261112g"
 
 app = Flask(__name__)
 
@@ -5080,6 +5080,52 @@ def api_wanted():
     return jsonify({'error': 'Unknown action'}), 400
 
 
+def _tmdb_wanted_matches(query, item_type, cfg):
+    """Wanted-title choices from TMDb, in the same shape as the OMDb ones.
+
+    Used when OMDb has nothing, is rate-limited, or cannot be reached.  Up to five candidates get
+    a details request (running time, genres, cast, director, IMDb id), the rest the search card.
+    """
+    from urllib import request as urlreq
+    from urllib.parse import quote
+    tmdb_key = cfg.get('tmdb_key', '')
+    if not tmdb_key:
+        return []
+    kind = 'tv' if item_type == 'series' else 'movie'
+    with urlreq.urlopen(f'https://api.themoviedb.org/3/search/{kind}?api_key={tmdb_key}&query={quote(query)}',
+                        timeout=8) as response:
+        results = json.loads(response.read()).get('results', [])
+    matches = []
+    for index, hit in enumerate(results[:8]):
+        detail = {}
+        if index < 5:
+            try:
+                with urlreq.urlopen(f'https://api.themoviedb.org/3/{kind}/{hit["id"]}?api_key={tmdb_key}'
+                                    '&append_to_response=credits,external_ids', timeout=6) as response:
+                    detail = json.loads(response.read())
+            except Exception:
+                detail = {}
+        credits = detail.get('credits') or {}
+        directors = [c.get('name', '') for c in credits.get('crew', []) if c.get('job') == 'Director']
+        creators = [c.get('name', '') for c in detail.get('created_by', [])]
+        runtime = detail.get('runtime') or (detail.get('episode_run_time') or [0])[0]
+        poster = hit.get('poster_path')
+        matches.append({
+            'title': hit.get('title') or hit.get('name') or '',
+            'year': _clean_year((hit.get('release_date') or hit.get('first_air_date') or '')[:4]),
+            'imdb_id': detail.get('imdb_id') or (detail.get('external_ids') or {}).get('imdb_id') or '',
+            'poster': f'https://image.tmdb.org/t/p/w185{poster}' if poster else '',
+            'runtime': f'{runtime} min' if runtime else '',
+            'rated': '',
+            'genre': ', '.join(g.get('name', '') for g in detail.get('genres', [])),
+            'director': ', '.join((directors or creators)[:2]),
+            'actors': ', '.join(c.get('name', '') for c in credits.get('cast', [])[:4]),
+            'plot': hit.get('overview', ''),
+            'imdb_rating': str(round(hit.get('vote_average') or 0, 1)) if hit.get('vote_average') else '',
+        })
+    return [m for m in matches if m['title'] and m['year']]
+
+
 @app.route('/epg-web/api/wanted/movie-matches')
 def api_wanted_movie_matches():
     """Return IMDb/OMDb candidates for a manual Wanted title choice.
@@ -5097,17 +5143,35 @@ def api_wanted_movie_matches():
         return jsonify({'error': 'Wanted titles must be a movie or series.'}), 400
     if not query:
         return jsonify({'error': f'Enter a {item_type} title.'}), 400
-    omdb_key = load_config().get('omdb_key', '')
-    if not omdb_key:
+    cfg = load_config()
+    omdb_key = cfg.get('omdb_key', '')
+    if not omdb_key and not cfg.get('tmdb_key'):
         return jsonify({'error': 'IMDb lookup is not configured on this server.'}), 503
+
+    def from_tmdb(reason):
+        # OMDb has nothing (or is limited, or down): ask TMDb, which has its own generous limits.
+        try:
+            tmdb = _tmdb_wanted_matches(query, item_type, cfg)
+        except Exception as exc:
+            print(f'[wanted TMDb] {exc}')
+            tmdb = []
+        if tmdb:
+            tmdb.sort(key=lambda row: not _metadata_title_matches(query, row['title']))
+            return jsonify({'matches': tmdb, 'type': item_type, 'source': 'tmdb'})
+        return None
+    if not omdb_key:
+        found = from_tmdb('no OMDb key')
+        return found or jsonify({'matches': [], 'message': f'No {item_type} matches found.'})
     try:
         with urlreq.urlopen(
             f'http://www.omdbapi.com/?s={quote(query)}&type={item_type}&apikey={omdb_key}',
             timeout=8,
         ) as response:
             search = json.loads(response.read())
+        _log_omdb_error(search)
         if search.get('Response') != 'True':
-            return jsonify({'matches': [], 'message': search.get('Error', f'No {item_type} matches found.')})
+            found = from_tmdb(search.get('Error', ''))
+            return found or jsonify({'matches': [], 'message': search.get('Error', f'No {item_type} matches found.')})
 
         # OMDb search cards have only a title/year/poster.  Fetch the selected
         # set's details so the chooser has enough context to make a safe pick.
@@ -5146,7 +5210,8 @@ def api_wanted_movie_matches():
         return jsonify({'matches': matches, 'type': item_type})
     except Exception as exc:
         print(f'[wanted IMDb] {exc}')
-        return jsonify({'error': 'Could not reach IMDb details right now.'}), 502
+        found = from_tmdb(str(exc))
+        return found or (jsonify({'error': 'Could not reach IMDb details right now.'}), 502)
 
 @app.route('/epg-web/api/library')
 def api_library():

@@ -2328,3 +2328,79 @@ class SdProgressBarMappingTests(unittest.TestCase):
     def test_program_details_use_their_own_fraction(self):
         self.assertEqual(self._percent("Fetching program details 90/180…"), 60)
         self.assertEqual(self._percent("Fetching program details 180/180…"), 80)
+
+
+class WantedChoicesFallbackTests(unittest.TestCase):
+    def _get(self, query, omdb, tmdb_search=None, tmdb_details=None, cfg=None, omdb_raises=False):
+        import io
+
+        def fake(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            if "omdbapi.com" in url:
+                if omdb_raises:
+                    raise OSError("omdb down")
+                if "?s=" in url:
+                    return io.BytesIO(json.dumps(omdb).encode())
+                return io.BytesIO(json.dumps({"Response": "True", "Title": "From OMDb", "Year": "1999", "imdbID": "ttO"}).encode())
+            if "themoviedb.org/3/search" in url:
+                return io.BytesIO(json.dumps({"results": tmdb_search or []}).encode())
+            if "themoviedb.org/3/" in url:
+                return io.BytesIO(json.dumps(tmdb_details or {}).encode())
+            raise AssertionError(url)
+        cfg = {"omdb_key": "o", "tmdb_key": "t"} if cfg is None else cfg
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch("urllib.request.urlopen", side_effect=fake):
+            return server.app.test_client().get("/epg-web/api/wanted/movie-matches?" + query)
+
+    TOMMY = [{"id": 11, "title": "Tommy", "release_date": "1975-03-19", "poster_path": "/p.jpg",
+              "overview": "A deaf, dumb and blind boy...", "vote_average": 6.6},
+             {"id": 12, "title": "Tommy Boy", "release_date": "1995-03-31", "overview": "x", "vote_average": 6.5}]
+    DETAILS = {"imdb_id": "tt0073891", "runtime": 111, "genres": [{"name": "Drama"}, {"name": "Music"}],
+               "credits": {"cast": [{"name": "Roger Daltrey"}, {"name": "Ann-Margret"}],
+                           "crew": [{"job": "Director", "name": "Ken Russell"}, {"job": "Editor", "name": "X"}]}}
+
+    def test_omdb_not_found_falls_back_to_tmdb(self):
+        data = self._get("q=Tommy&type=movie", {"Response": "False", "Error": "Movie not found!"}, self.TOMMY, self.DETAILS).get_json()
+        self.assertEqual(data["source"], "tmdb")
+        first = data["matches"][0]
+        self.assertEqual((first["title"], first["year"], first["imdb_id"]), ("Tommy", "1975", "tt0073891"))
+        self.assertEqual(first["runtime"], "111 min")
+        self.assertEqual(first["director"], "Ken Russell")
+        self.assertIn("Roger Daltrey", first["actors"])
+        self.assertTrue(first["poster"].endswith("/p.jpg"))
+        self.assertEqual([m["title"] for m in data["matches"]], ["Tommy", "Tommy Boy"])        # the exact title first
+
+    def test_omdb_rate_limit_also_falls_back(self):
+        data = self._get("q=Tommy&type=movie", {"Response": "False", "Error": "Request limit reached!"}, self.TOMMY, self.DETAILS).get_json()
+        self.assertEqual(data["source"], "tmdb")
+
+    def test_omdb_unreachable_falls_back(self):
+        data = self._get("q=Tommy&type=movie", {}, self.TOMMY, self.DETAILS, omdb_raises=True).get_json()
+        self.assertEqual(data["source"], "tmdb")
+
+    def test_omdb_answers_are_still_used_when_it_works(self):
+        omdb = {"Response": "True", "Search": [{"Title": "From OMDb", "Year": "1999", "imdbID": "ttO"}]}
+        data = self._get("q=Tommy&type=movie", omdb, self.TOMMY, self.DETAILS).get_json()
+        self.assertNotEqual(data.get("source"), "tmdb")
+        self.assertEqual(data["matches"][0]["title"], "From OMDb")
+
+    def test_a_series_asks_tmdb_for_tv(self):
+        data = self._get("q=Bewitched&type=series", {"Response": "False", "Error": "Series not found!"},
+                         [{"id": 5, "name": "Bewitched", "first_air_date": "1964-09-17", "overview": "x"}],
+                         {"external_ids": {"imdb_id": "tt0057733"}, "episode_run_time": [30], "genres": [{"name": "Comedy"}],
+                          "created_by": [{"name": "Sol Saks"}]}).get_json()
+        first = data["matches"][0]
+        self.assertEqual((first["title"], first["year"], first["imdb_id"], first["director"]), ("Bewitched", "1964", "tt0057733", "Sol Saks"))
+
+    def test_with_nothing_anywhere_the_old_message_stays(self):
+        data = self._get("q=Zzzz&type=movie", {"Response": "False", "Error": "Movie not found!"}, []).get_json()
+        self.assertEqual(data["matches"], [])
+        self.assertEqual(data["message"], "Movie not found!")
+
+    def test_with_only_a_tmdb_key_it_still_works(self):
+        data = self._get("q=Tommy&type=movie", {}, self.TOMMY, self.DETAILS, cfg={"tmdb_key": "t"}).get_json()
+        self.assertEqual(data["source"], "tmdb")
+
+    def test_with_no_keys_at_all_it_says_so(self):
+        resp = self._get("q=Tommy&type=movie", {}, cfg={})
+        self.assertEqual(resp.status_code, 503)
