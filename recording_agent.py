@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261112a"
+AGENT_VERSION = "v20261112b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -632,6 +632,53 @@ def run_process(api, job, status, cmd, cfg, log_path, file_path='', watchdog=Non
     return process.returncode
 
 
+PROGRESS_LINE = re.compile(r'time=(\d+):(\d+):(\d+(?:\.\d+)?).*?elapsed=(\d+):(\d+):(\d+(?:\.\d+)?)')
+STREAM_ERROR_LINE = re.compile(
+    r'(Server returned \d{3}[^,\]]*|HTTP error \d{3}[^,\]]*|Connection (?:reset|refused|timed out|closed)[^,\]]*'
+    r'|Operation timed out|Connection timed out|End of file|Input/output error|Immediate exit requested'
+    r'|Will reconnect[^\n]*|Error (?:in|while)[^\n]*|Invalid data[^\n]*|Stream ends prematurely[^\n]*)',
+    re.IGNORECASE)
+
+
+def ffmpeg_end_reason(log_path, max_bytes=400000):
+    """A short, plain reason why a live capture stopped, from FFmpeg's own log ('' if unknown).
+
+    Looks for the last error FFmpeg printed (a refused or reset connection, a timeout), then for
+    pauses where no new video arrived, and says so when the stream simply ended with no error.
+    Stream addresses are never included: they hold the provider login.
+    """
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            text = handle.read()
+    except OSError:
+        return ''
+    if not text.strip():
+        return ''
+    last_error = ''
+    longest_pause, run_start, last_time, last_elapsed = 0.0, None, None, 0.0
+    for line in re.split(r'[\r\n]+', text):
+        match = PROGRESS_LINE.search(line)
+        if match:
+            media = (int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3)))
+            elapsed = (int(match.group(4)) * 3600 + int(match.group(5)) * 60 + float(match.group(6)))
+            if media != last_time:
+                run_start, last_time = elapsed, media
+            elif run_start is not None:
+                longest_pause = max(longest_pause, elapsed - run_start)
+            last_elapsed = elapsed
+            continue
+        found = STREAM_ERROR_LINE.search(line)
+        if found:
+            last_error = re.sub(r'\s+', ' ', re.sub(r'\b\w+://\S+', '<address>', found.group(1))).strip(' .')
+    pause = f'; video paused up to {longest_pause:.0f} s before that' if longest_pause >= 8 else ''
+    if last_error:
+        return f'FFmpeg reported "{last_error[:90]}"{pause}'
+    return 'the provider ended the stream with no error' + pause
+
+
 def _log_excerpt(log_path, max_chars=12000):
     """Return the useful tail of FFmpeg's log for the web health report."""
     try:
@@ -1020,6 +1067,10 @@ def process_job(api, job, cfg):
                    f'of {expected_minutes:.0f} min scheduled')
         if missing_seconds:
             message += f' (about {missing_seconds / 60:.0f} min missing)'
+        end_reason = ffmpeg_end_reason(log_path)
+        if end_reason:
+            message += f'; why: {end_reason}'
+            quality['end_reason'] = end_reason
         quality.update({'decision': 'incomplete recording', 'recorded': recorded_probe})
         incomplete_path = None
         try:

@@ -2418,3 +2418,47 @@ class TidyLibraryTests(unittest.TestCase):
             self.assertIn("the loose file is the larger one", recap)
             self.assertIn("no folder with this title found", recap)
             self.assertEqual(self.tool.compare_note({"size": 500, "minutes": 100}, {"size": 505, "minutes": 100}), "unsure")
+
+
+class StreamEndReasonTests(unittest.TestCase):
+    """Why a capture stopped early, read from FFmpeg's log."""
+
+    def _reason(self, text):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "x.ffmpeg.log"
+            path.write_text(text, encoding="utf-8")
+            return recording_agent.ffmpeg_end_reason(str(path))
+
+    def _progress(self, media, elapsed, frame=100):
+        return (f"frame={frame} fps= 31 q=-1.0 size= 1700KiB time={media} bitrate=6821kbits/s "
+                f"speed=1.03x elapsed={elapsed}\n")
+
+    def test_a_refused_connection_is_named(self):
+        text = (self._progress("00:10:00.00", "0:09:50.00")
+                + "[http @ 0x1] HTTP error 403 Forbidden\n"
+                  "[in#0 @ 0x2] Error during demuxing: Server returned 403 Forbidden (access denied)\n")
+        reason = self._reason(text)
+        self.assertIn("403", reason)
+        self.assertTrue(reason.startswith('FFmpeg reported "'))
+
+    def test_the_stream_address_is_never_included(self):
+        text = "[http @ 0x1] Will reconnect at 123 in 0 second(s), error=Connection reset by peer http://host:826/live/user/secret/1.ts\n"
+        reason = self._reason(text)
+        self.assertNotIn("secret", reason)
+        self.assertNotIn("http://", reason)
+
+    def test_a_stream_that_just_ends_is_said_to_end_with_no_error(self):
+        text = self._progress("00:34:11.00", "0:33:09.00") + self._progress("00:34:25.00", "0:33:39.00")
+        self.assertEqual(self._reason(text), "the provider ended the stream with no error")
+
+    def test_a_pause_in_the_video_is_reported(self):
+        text = "".join(self._progress("00:34:11.93", f"0:33:{s:02d}.00") for s in range(9, 21))
+        text += self._progress("00:34:25.00", "0:33:39.00")
+        reason = self._reason(text)
+        self.assertIn("paused up to 11 s", reason)
+        short = "".join(self._progress("00:34:11.93", f"0:33:0{s}.00") for s in range(1, 4))
+        self.assertNotIn("paused", self._reason(short))
+
+    def test_no_log_gives_no_reason(self):
+        self.assertEqual(recording_agent.ffmpeg_end_reason("/no/such/file.log"), "")
+        self.assertEqual(self._reason("   \n"), "")
