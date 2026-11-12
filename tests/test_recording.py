@@ -2236,3 +2236,95 @@ class AmpersandAndLooseTitleTests(unittest.TestCase):
         data = self._signals("title=Dumb%20%26%20Dumber&year=1994", film)
         self.assertTrue(data["found"])
         self.assertEqual(data["match"], "exact")
+
+
+class FetchSdProgressTests(unittest.TestCase):
+    def _wait_until_idle(self):
+        deadline = time.time() + 10
+        while time.time() < deadline and server._sd_status["running"]:
+            time.sleep(0.02)
+
+    def test_the_fetch_reports_its_slow_steps_and_the_loading_progress(self):
+        seen = {}
+
+        def fake_fetch(user, password, db, days=21, log=print):
+            log("Writing to guide.db…")
+            log("Done — 5 new rows inserted (0 superseded rows replaced).")
+            return {"inserted": 5}
+
+        def fake_load(db, tz="America/New_York", progress=None, **kwargs):
+            progress("Reading guide listings", 25000, 100000)
+            seen["during"] = (list(server._sd_status["log"]), dict(server._sd_status["load"]))
+            return 100000
+        cfg = {"sd_user": "u", "sd_pass": "p", "guide_db_path": os.path.join(TEST_DATA_DIR, "guide.db")}
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch("sd_guide.fetch_sd_guide", side_effect=fake_fetch), \
+             mock.patch.object(server, "load_epg_from_db", side_effect=fake_load), \
+             mock.patch.object(server, "_schedule_active_series"):
+            self.assertTrue(server.app.test_client().post("/epg-web/api/fetch-sd", json={"days": 1}).get_json()["ok"])
+            self._wait_until_idle()
+        log, load = seen["during"]
+        self.assertEqual(log[-1], "Loading the guide into memory…")           # the bar can say what is happening
+        self.assertEqual(load, {"label": "Reading guide listings", "done": 25000, "total": 100000})
+        final = server._sd_status
+        self.assertFalse(final["running"])
+        self.assertIsNone(final["load"])
+        self.assertEqual(final["log"][-1], "Checking recurring recordings…")
+        self.assertEqual(final["result"]["total_loaded"], 100000)
+        self.assertIsNone(final["error"])
+
+    def test_the_status_carries_the_load_field(self):
+        self.assertIn("load", server.app.test_client().get("/epg-web/api/fetch-sd/status").get_json())
+
+    def test_an_error_clears_the_loading_progress(self):
+        cfg = {"sd_user": "u", "sd_pass": "p", "guide_db_path": os.path.join(TEST_DATA_DIR, "guide.db")}
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch("sd_guide.fetch_sd_guide", side_effect=RuntimeError("down")):
+            server.app.test_client().post("/epg-web/api/fetch-sd", json={"days": 1})
+            self._wait_until_idle()
+        self.assertEqual(server._sd_status["error"], "down")
+        self.assertIsNone(server._sd_status["load"])
+        self.assertFalse(server._sd_status["running"])
+
+
+class SdProgressBarMappingTests(unittest.TestCase):
+    """The bar's percentage for each real step, run in node (skipped where node is missing)."""
+
+    def _percent(self, log, load=None):
+        import re
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        match = re.search(r"function sdProgressFromLog\(log, load\) \{.*?\n\}\n", server.HTML, re.S)
+        self.assertIsNotNone(match)
+        script = match.group(0) + f"\nconsole.log(sdProgressFromLog({json.dumps(log)}, {json.dumps(load)}));"
+        return int(subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30).stdout.strip())
+
+    def test_each_step_has_its_place_and_the_order_never_goes_backwards(self):
+        steps = ["Authenticating with Schedules Direct…", "Fetching lineups…", "Found 1 lineup(s): ['x']",
+                 "Getting stations for x…", "Total stations: 900", "Fetching schedules batch 3…",
+                 "Unique programs to fetch: 90000", "Fetching program details 1/180…", "Fetching program details 90/180…",
+                 "Fetching program details 180/180…", "Writing to guide.db…",
+                 "Removed 5 superseded Schedule Direct listings.",
+                 "Done — 427068 new rows inserted (427068 superseded rows replaced).",
+                 "Loading the guide into memory…", "Checking recurring recordings…"]
+        values = [self._percent(step) for step in steps]
+        self.assertEqual(values, sorted(values), values)
+        self.assertGreater(len(set(values)), 10)
+
+    def test_the_done_line_is_not_mistaken_for_importing(self):
+        self.assertEqual(self._percent("Done — 427068 new rows inserted (427068 superseded rows replaced)."), 88)
+        self.assertGreater(self._percent("Done — 1 new rows inserted (0 superseded rows replaced)."), 72)
+
+    def test_loading_the_guide_moves_the_bar_as_it_goes(self):
+        self.assertEqual(self._percent("Loading the guide into memory…"), 90)
+        self.assertEqual(self._percent("Loading the guide into memory…", {"done": 0, "total": 100}), 90)
+        self.assertEqual(self._percent("Loading the guide into memory…", {"done": 50, "total": 100}), 93)
+        self.assertEqual(self._percent("Loading the guide into memory…", {"done": 100, "total": 100}), 96)
+        self.assertEqual(self._percent("Checking recurring recordings…"), 97)
+
+    def test_program_details_use_their_own_fraction(self):
+        self.assertEqual(self._percent("Fetching program details 90/180…"), 60)
+        self.assertEqual(self._percent("Fetching program details 180/180…"), 80)

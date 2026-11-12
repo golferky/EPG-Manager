@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112e"
+VERSION = "v20261112f"
 
 app = Flask(__name__)
 
@@ -2580,6 +2580,7 @@ def api_fetch_sd():
     _sd_status['log']     = []
     _sd_status['result']  = None
     _sd_status['error']   = None
+    _sd_status['load']    = None
     def _run():
         try:
             from sd_guide import fetch_sd_guide
@@ -2587,12 +2588,19 @@ def api_fetch_sd():
                 print(f'[SD] {msg}')
                 _sd_status['log'].append(msg)
             result = fetch_sd_guide(sd_user, sd_pass, db_path, days=days, log=log)
-            count = load_epg_from_db(db_path, tz_str)
+            # These two steps take minutes.  Say so, so the progress bar has something true to show.
+            log('Loading the guide into memory…')
+            def loading(label, done, total):
+                _sd_status['load'] = {'label': label, 'done': int(done or 0), 'total': int(total or 0)}
+            count = load_epg_from_db(db_path, tz_str, progress=loading)
+            _sd_status['load'] = None
+            log('Checking recurring recordings…')
             _schedule_active_series(db_path)
             _sd_status['result'] = {**result, 'total_loaded': count}
         except Exception as e:
             _sd_status['error'] = str(e)
         finally:
+            _sd_status['load'] = None
             _sd_status['running'] = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'ok': True, 'message': f'Fetching {days} days from Schedules Direct…'})
@@ -2601,7 +2609,7 @@ def api_fetch_sd():
 def api_fetch_sd_status():
     return jsonify(_sd_status)
 
-_sd_status = {'running': False, 'log': [], 'result': None, 'error': None}
+_sd_status = {'running': False, 'log': [], 'result': None, 'error': None, 'load': None}
 
 @app.route('/epg-web/api/load-guide', methods=['POST'])
 def api_load_guide():
@@ -9074,23 +9082,36 @@ function setSDProgress(pct, text, show=true) {
   document.getElementById('sd-progress-bar').style.width = `${Math.max(0, Math.min(100, pct))}%`;
   document.getElementById('sd-progress-text').textContent = text || '';
 }
-function sdProgressFromLog(log) {
-  const text = log || 'Preparing the Schedule Direct fetch…';
+function sdProgressFromLog(log, load) {
+  // Each real step of the fetch has its own place on the bar, and the long steps move it as they go.
+  const text = String(log || 'Preparing the Schedule Direct fetch…');
   const lower = text.toLowerCase();
-  if (lower.includes('auth')) return 12;
-  if (lower.includes('station') || lower.includes('lineup')) return 28;
-  if (lower.includes('download')) return 48;
-  if (lower.includes('import') || lower.includes('insert')) return 72;
-  if (lower.includes('load') || lower.includes('programme')) return 86;
-  if (lower.includes('series') || lower.includes('schedul')) return 94;
+  const steps = lower.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+  if (lower.startsWith('fetching program details') && steps) return 40 + Math.round(40 * (+steps[1] / Math.max(1, +steps[2])));
+  if (lower.startsWith('loading the guide')) {
+    return (load && load.total) ? 90 + Math.min(6, Math.round(6 * load.done / load.total)) : 90;
+  }
+  if (lower.startsWith('checking recurring')) return 97;
+  if (lower.startsWith('done')) return 88;
+  if (lower.startsWith('removed')) return 85;
+  if (lower.startsWith('writing')) return 82;
+  if (lower.startsWith('unique programs') || lower.startsWith('fetching program details')) return 40;
+  if (lower.startsWith('fetching schedules')) return 30;
+  if (lower.startsWith('total stations') || lower.startsWith('getting stations')) return 22;
+  if (lower.startsWith('found') || lower.startsWith('fetching lineups')) return 14;
+  if (lower.startsWith('authenticating')) return 8;
   return 18;
 }
 function showSDResult(s, btn) {
   const sdEl = document.getElementById('sd-status');
   if (s.running) {
     const last = s.log.length ? s.log[s.log.length - 1] : 'Preparing the Schedule Direct fetch…';
-    sdEl.textContent = '📡 ' + last;
-    setSDProgress(sdProgressFromLog(last), last);
+    let shown = last;
+    if (s.load && s.load.total && last.toLowerCase().startsWith('loading the guide')) {
+      shown = 'Loading the guide into memory: ' + s.load.done.toLocaleString() + ' of ' + s.load.total.toLocaleString() + ' listings';
+    }
+    sdEl.textContent = '📡 ' + shown;
+    setSDProgress(sdProgressFromLog(last, s.load), shown);
     return true;
   }
   if (s.error) {
