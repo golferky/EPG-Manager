@@ -697,6 +697,16 @@ class SlotLimitTests(unittest.TestCase):
     def _rec(title, start, stop, status="queued"):
         return {"title": title, "start_ts": start, "stop_ts": stop, "status": status}
 
+    def test_conflict_items_carry_the_ids_of_the_jobs_in_the_way(self):
+        a = {"title": "Joyride", "channel": "Starz", "start_ts": 20, "stop_ts": 90, "status": "scheduled"}
+        b = {"title": "Head Office", "channel": "HBO", "start_ts": 10, "stop_ts": 90, "status": "recording"}
+        c = {"title": "Elsewhere", "start_ts": 500, "stop_ts": 600, "status": "scheduled"}
+        items = server._slot_conflict_items([("id-a", a), ("id-b", b), ("id-c", c)], [a, b])
+        self.assertEqual([i["id"] for i in items], ["id-b", "id-a"])          # in time order
+        self.assertTrue(items[0]["running"])
+        self.assertFalse(items[1]["running"])
+        self.assertEqual(items[1]["title"], "Joyride")
+
     def test_room_available_returns_no_conflicts(self):
         recs = [self._rec(f"r{i}", 0, 100) for i in range(5)]
         self.assertEqual(server._recording_slot_conflicts(recs, 10, 50, 6), [])
@@ -1154,6 +1164,19 @@ class VersionLabelTests(unittest.TestCase):
     def test_the_header_shows_the_version(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn(server.VERSION, html)
+
+    def test_slot_full_dialog_lets_you_remove_one_and_retries(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("function showSlotFullModal(d, retry)", html)
+        self.assertIn("showSlotFullModal(d, () => quickRecord(key, btnEl))", html)
+        self.assertIn("showSlotFullModal(r, () => recordAiring(airing, title, btn, allowCommercialMovie, year))", html)
+        self.assertIn("/epg-web/api/record/cancel", html)
+
+    def test_the_recordings_window_has_a_refresh_button(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="rec-window-refresh"', html)
+        self.assertIn("onclick=\"refreshRecWindowNow()\"", html)
+        self.assertIn("async function refreshRecWindowNow()", html)
 
 
 class AgentSeenTests(unittest.TestCase):
