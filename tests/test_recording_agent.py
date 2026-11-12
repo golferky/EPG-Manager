@@ -1719,3 +1719,28 @@ class PrivateRecordingFlowTests(unittest.TestCase):
         # (the choice is made in process_job: private applies only when there is no episode and no series)
         private_film = bool(job.get("private")) and not (episode or False)
         self.assertFalse(private_film)
+
+
+class CopyMarkerIsNotAYearTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_copy", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_a_film_named_copy_with_a_year_is_not_junk(self):
+        for name in ("Carbon Copy (1981)", "Copy Cat (1995)", "Perfect Copy (2003)", "Movie-Copy (1999)"):
+            self.assertFalse(self.tool.JUNK_NAME.search(name), name)
+
+    def test_real_copy_markers_still_match(self):
+        for name in ("Movie Copy (1)", "Movie Copy (12)", "Movie-Copy(2)", "Movie - Copy", "Movie-Copy(123)"):
+            self.assertTrue(self.tool.JUNK_NAME.search(name), name)
+
+    def test_a_film_with_copy_and_a_year_is_not_listed_or_moved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Carbon Copy (1981)").mkdir()
+            (Path(temp) / "Carbon Copy (1981)" / "c.mp4").write_bytes(b"x")
+            self.assertEqual(self.tool.junk_folders(temp), [])
+            self.assertEqual(self.tool.yearless_folders(temp), [])

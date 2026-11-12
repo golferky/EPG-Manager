@@ -67,7 +67,8 @@ def yearless_folders(movies_dir):
 
 # A folder name that is a leftover, not a title: a recording stamp ("... 20260205 181000")
 # or a file-manager copy suffix ("...-Copy(1)", "... - Copy", "... Copy(2)").
-JUNK_NAME = re.compile(r'(?:\b\d{8}[ _-]\d{4,6}\b|[-_]\s*copy(?:\s*\(\d+\))?\s*$|\s+copy\s*\(\d+\)\s*$)',
+# A copy number is small: "(1)", "(2)".  "Carbon Copy (1981)" is a film, not a copy.
+JUNK_NAME = re.compile(r'(?:\b\d{8}[ _-]\d{4,6}\b|[-_]\s*copy(?:\s*\(\d{1,3}\))?\s*$|\s+copy\s*\(\d{1,3}\)\s*$)',
                        re.IGNORECASE)
 
 
@@ -83,7 +84,7 @@ def junk_folders(library_dir):
 
 
 _STAMP = re.compile(r'\b\d{8}[ _-]\d{4,6}\b')
-_COPY_SUFFIX = re.compile(r'(?:[-_]\s*copy(?:\s*\(\d+\))?|\s+copy\s*\(\d+\))\s*$', re.IGNORECASE)
+_COPY_SUFFIX = re.compile(r'(?:[-_]\s*copy(?:\s*\(\d{1,3}\))?|\s+copy\s*\(\d{1,3}\))\s*$', re.IGNORECASE)
 _TRAILING_YEAR = re.compile(r'\(\s*((?:19|20)\d{2})\s*\)\s*$')
 
 
