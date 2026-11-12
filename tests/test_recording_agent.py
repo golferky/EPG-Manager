@@ -1842,20 +1842,33 @@ class AdultSearchTests(unittest.TestCase):
     def test_scoring(self):
         sig = self.tool.adult_signals
         self.assertEqual(sig({"found": True, "adult": True})[0], 3)
-        self.assertEqual(sig({"found": True, "certification": "NC-17"})[0], 3)
+        self.assertEqual(sig({"found": True, "keywords": ["softcore"]})[0], 2)
+        self.assertEqual(sig({"found": True, "keywords": ["softcore", "erotica"]})[0], 3)       # two strong ones
+        self.assertEqual(sig({"found": True, "keywords": ["eroticism"]})[0], 1)                 # weak
+        self.assertEqual(sig({"found": True, "certification": "NC-17"})[0], 1)                  # a rating alone is not enough
         self.assertEqual(sig({"found": True, "certification": "X"})[1], ["rated X"])
-        self.assertEqual(sig({"found": True, "keywords": ["softcore", "erotica", "nudity"]})[0], 2)
-        self.assertIn("keywords: softcore, erotica", sig({"found": True, "keywords": ["softcore", "erotica"]})[1][0])
-        self.assertEqual(sig({"found": True, "certification": "R", "keywords": ["nudity", "violence"]})[0], 0)   # an ordinary R film
-        self.assertEqual(sig({"found": True, "certification": "Unrated"})[0], 1)          # not enough on its own
+        self.assertEqual(sig({"found": True, "certification": "Unrated"})[0], 0)
+        self.assertEqual(sig({"found": True, "certification": "R", "keywords": ["nudity", "violence"]})[0], 0)
         self.assertEqual(sig({"found": False}), (0, []))
         self.assertEqual(sig({}), (0, []))
-        total = sig({"found": True, "adult": True, "certification": "NC-17", "keywords": ["softcore"]})
-        self.assertEqual(total[0], 8)
+        self.assertEqual(sig({"found": True, "adult": True, "certification": "NC-17", "keywords": ["softcore"]})[0], 6)
+
+    def test_keywords_are_matched_whole_and_plot_details_are_ignored(self):
+        sig = self.tool.adult_signals
+        self.assertEqual(sig({"found": True, "keywords": ["homoeroticism"]})[0], 0)             # not "eroticism"
+        self.assertEqual(sig({"found": True, "keywords": ["pornography", "pornographic video"]})[0], 0)
+        self.assertEqual(sig({"found": True, "keywords": ["Erotic Thriller"]})[0], 2)           # capitals do not matter
+        self.assertEqual(sig({"found": True, "keywords": ["sexploitation"], "certification": "NC-17"})[0], 3)
+
+    def test_the_tiers(self):
+        self.assertEqual(self.tool.tier(2), "maybe")
+        self.assertEqual(self.tool.tier(3), "likely")
+        self.assertEqual(self.tool.tier(8), "likely")
 
     def _library(self, temp):
         root = Path(temp) / "Movies"
-        for name in ("Heat (1995)", "Adult One (1998)", "Raunchy Two (2003)", "Unknown Film (1990)", "Unrated Only (2001)"):
+        for name in ("Heat (1995)", "Adult One (1998)", "Raunchy Two (2003)", "Unknown Film (1990)", "Unrated Only (2001)",
+                     "Violent Cut (1980)"):
             (root / name).mkdir(parents=True)
             (root / name / "film.mp4").write_bytes(name.encode())
         return root
@@ -1863,7 +1876,8 @@ class AdultSearchTests(unittest.TestCase):
     SIGNALS = {
         "Heat": {"found": True, "certification": "R", "keywords": ["heist"], "adult": False},
         "Adult One": {"found": True, "adult": True, "certification": "NC-17", "keywords": ["erotic thriller"]},
-        "Raunchy Two": {"found": True, "certification": "R", "keywords": ["softcore", "erotica"]},
+        "Raunchy Two": {"found": True, "certification": "R", "keywords": ["erotic thriller"]},
+        "Violent Cut": {"found": True, "certification": "NC-17", "keywords": ["dystopia"]},
         "Unrated Only": {"found": True, "certification": "NR", "keywords": []},
     }
 
@@ -1885,11 +1899,12 @@ class AdultSearchTests(unittest.TestCase):
     def test_adult_lists_likely_films_with_reasons_strongest_first(self):
         with tempfile.TemporaryDirectory() as temp:
             out = self._run(self._library(temp), ["adult", "q"], Path(temp) / "cache.json")
-            self.assertIn("2 of 5 look adult (1 not found in the database)", out)
-            self.assertIn("1. Adult One (1998)   [adult flag; rated NC-17; keywords: erotic thriller]", out)
-            self.assertIn("2. Raunchy Two (2003)   [keywords: softcore, erotica]", out)
-            self.assertNotIn("Heat (1995)   [", out)
-            self.assertNotIn("Unrated Only (2001)   [", out)
+            self.assertIn("2 of 6 may be adult: 1 likely, 1 maybe (1 not found in the database", out)
+            self.assertIn("1. Adult One (1998)   likely: adult flag; keywords: erotic thriller; rated NC-17", out)
+            self.assertIn("2. Raunchy Two (2003)   maybe: keywords: erotic thriller", out)
+            self.assertNotIn("Heat (1995)   ", out)
+            self.assertNotIn("Violent Cut (1980)   ", out)            # an NC-17 rating alone is not listed
+            self.assertNotIn("Unrated Only (2001)   ", out)
 
     def test_add_all_and_go_move_the_suggestions_to_the_private_folder(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1912,7 +1927,7 @@ class AdultSearchTests(unittest.TestCase):
             calls = []
             self._run(root, ["adult", "q"], cache, calls=calls)
             first = len(calls)
-            self.assertGreaterEqual(first, 5)
+            self.assertGreaterEqual(first, 6)
             calls.clear()
             self._run(root, ["adult", "q"], cache, calls=calls)
             self.assertEqual(calls, ["Unknown Film"])          # not found last time, so asked again; the rest are remembered
@@ -1943,3 +1958,47 @@ class AdultSearchTests(unittest.TestCase):
             self.assertEqual(self.tool.load_cache(str(Path(temp) / "missing.json")), {})
             self.assertEqual(self.tool.default_cache_path("~/EPG-Manager/recording_agent.json").endswith(
                 "EPG-Manager/film_signals_cache.json"), True)
+
+
+class NotFoundListTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mac = Path(__file__).resolve().parent.parent / "mac"
+        sys.path.insert(0, str(mac))
+        spec = importlib.util.spec_from_file_location("private_movies_notfound", mac / "private_movies.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _run(self, root, answers, cache_path):
+        out = []
+
+        def fake_get(server, path, params=None, timeout=20):
+            return {"found": True, "certification": "R", "keywords": []} if params["title"] == "Heat" else {"found": False}
+        with mock.patch.object(self.tool.scan, "get_json", side_effect=fake_get), \
+             mock.patch.object(self.tool.base, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            self.tool.main(["--movies", str(root), "--server", "http://x", "--cache", str(cache_path)])
+        return "\n".join(out)
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in ("Heat (1995)", "Obscure Two (1975)", "Obscure One (1972)"):
+            (root / name).mkdir(parents=True)
+            (root / name / "film.mp4").write_bytes(b"x")
+        return root
+
+    def test_notfound_lists_the_unknown_films_and_add_works_on_that_list(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            out = self._run(root, ["adult", "notfound", "add 2", "go"], Path(temp) / "c.json")
+            self.assertIn("2 not found in the database", out)
+            self.assertIn("1. Obscure One (1972)", out)
+            self.assertIn("2. Obscure Two (1975)", out)
+            self.assertEqual(sorted(p.name for p in (Path(temp) / "Movies Private").iterdir()), ["Obscure Two (1975)"])
+
+    def test_notfound_before_a_scan_says_to_run_adult_first(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = self._run(self._library(temp), ["notfound", "q"], Path(temp) / "c.json")
+            self.assertIn("run adult first", out)
