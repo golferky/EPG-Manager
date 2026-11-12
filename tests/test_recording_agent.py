@@ -2249,3 +2249,146 @@ class LooseMatchToolTests(unittest.TestCase):
         exact = self.tool.adult_signals({"found": True, "match": "exact", "title": "Some Film", "keywords": ["softcore"]})
         self.assertEqual(len(exact[1]), 1)
         self.assertEqual(self.tool.adult_signals({"found": True, "match": "loose", "title": "X"}), (0, []))      # nothing to check
+
+
+class TidyLibraryTests(unittest.TestCase):
+    """Loose files into folders, and films that have two folders."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "tidy_library", Path(__file__).resolve().parent.parent / "mac" / "tidy_library.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_file_names_are_cleaned(self):
+        clean = self.tool.clean_file_name
+        self.assertEqual(clean("The_Descendants__2011_.mp4"), ("The Descendants", "2011", False))
+        self.assertEqual(clean("The Count Of Monte Cristo (2002).mp4"), ("The Count Of Monte Cristo", "2002", False))
+        self.assertEqual(clean("Joker-Copy(1).mp4"), ("Joker", "", True))
+        self.assertEqual(clean("FUGITIVE_16X9.mp4"), ("FUGITIVE", "", False))
+        self.assertEqual(clean("2012.mp4"), ("2012", "", False))            # a title that is a year stays a title
+        self.assertEqual(clean("IF.mp4"), ("IF", "", False))
+
+    def test_only_loose_videos_are_listed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp)
+            (movies / "Heat (1995)").mkdir()
+            for name in ("A.mp4", "b.mkv", "notes.txt", ".hidden.mp4"):
+                (movies / name).write_bytes(b"x")
+            self.assertEqual(self.tool.loose_files(str(movies)), ["A.mp4", "b.mkv"])
+
+    def test_year_is_picked_only_when_one_film_fits(self):
+        pick = self.tool.pick_year
+        self.assertEqual(pick([], 100)[0], "")
+        self.assertEqual(pick([{"year": 1987, "runtime": 100}], 101)[0], "1987")
+        both = [{"year": 1960, "runtime": 130}, {"year": 2001, "runtime": 98}]
+        self.assertEqual(pick(both, 99)[0], "2001")                        # the length decides
+        self.assertEqual(pick(both, 0)[0], "")                             # no length: you choose
+        self.assertEqual(pick([{"year": 1987, "runtime": 100}], 150)[0], "")   # does not fit at all
+
+    def test_file_is_filed_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp)
+            (movies / "Cleaner__2025_.MP4").write_bytes(b"x")
+            target = self.tool.file_into_folder(str(movies), "Cleaner__2025_.MP4", "Cleaner", "2025")
+            self.assertEqual(Path(target), movies / "Cleaner (2025)" / "Cleaner.mp4")
+            self.assertTrue(Path(target).exists())
+            (movies / "again.mp4").write_bytes(b"y")
+            with self.assertRaises(FileExistsError):
+                self.tool.file_into_folder(str(movies), "again.mp4", "Cleaner", "2025")
+            self.assertTrue((movies / "again.mp4").exists())
+            with self.assertRaises(ValueError):
+                self.tool.file_into_folder(str(movies), "again.mp4", "Cleaner", "")
+
+    def test_existing_folder_is_not_merged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp)
+            (movies / "Heat (1995)").mkdir()
+            (movies / "Heat_1995.mp4").write_bytes(b"x")
+            (movies / "Alien (1979).mp4").write_bytes(b"x")
+            plan = self.tool.build_loose_plan(str(movies), self.tool.loose_files(str(movies)), "", "ffprobe")
+            states = {r["file"]: r["state"] for r in plan}
+            self.assertEqual(states["Heat_1995.mp4"], "exists")
+            self.assertEqual(states["Alien (1979).mp4"], "ready")
+            recap = self.tool.format_loose_recap(plan)
+            self.assertIn("Alien (1979).mp4  ->  Alien (1979)/Alien.mp4", recap)
+            self.assertIn("already has a folder", recap)
+            self.assertEqual([r["file"] for r in self.tool.loose_to_move(plan)], ["Alien (1979).mp4"])
+
+    def test_commands_change_the_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp)
+            for name in ("Odd.mp4", "Joker-Copy(1).mp4", "Alien (1979).mp4"):
+                (movies / name).write_bytes(b"x")
+            plan = self.tool.build_loose_plan(str(movies), self.tool.loose_files(str(movies)), "", "ffprobe")
+            keys = self.tool.existing_keys(str(movies))
+            number = {r["file"]: r["n"] for r in plan}
+            parse = lambda text: self.tool.parse_loose_command(text, plan, keys, str(movies))
+            self.assertEqual(plan[number["Odd.mp4"] - 1]["state"], "noyear")
+            parse(f"set {number['Odd.mp4']} 1987")
+            self.assertEqual(plan[number["Odd.mp4"] - 1]["state"], "ready")
+            self.assertIn("Odd.mp4", [r["file"] for r in self.tool.loose_to_move(plan)])
+            parse(f"skip {number['Odd.mp4']}")
+            self.assertNotIn("Odd.mp4", [r["file"] for r in self.tool.loose_to_move(plan)])
+            parse(f"out {number['Joker-Copy(1).mp4']}")
+            self.assertEqual([r["file"] for r in self.tool.loose_to_send_out(plan)], ["Joker-Copy(1).mp4"])
+            self.assertIn("not a number", parse("skip 99")[1])
+            self.assertEqual(parse("q")[0], "quit")
+            self.assertEqual(parse("y")[0], "apply")
+
+    def test_duplicate_groups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp)
+            for name in ("Tom & Jerry (2021)", "Tom and Jerry (2021)", "Heat (1995)", "Heat (1996)",
+                         "Alien (1979)", "Alien (1990)", "Solo (2030)", "Solo (1999)", "Empty (2001)", "Empty (2001) 2"):
+                (movies / name).mkdir()
+                if "Empty" not in name:
+                    (movies / name / "a.mp4").write_bytes(b"x")
+            groups = self.tool.find_groups(str(movies), this_year=2026)
+            self.assertIn(["Tom & Jerry (2021)", "Tom and Jerry (2021)"], groups)
+            self.assertIn(["Heat (1995)", "Heat (1996)"], groups)
+            self.assertIn(["Solo (1999)", "Solo (2030)"], groups)           # a future year is plainly wrong
+            self.assertNotIn(["Alien (1979)", "Alien (1990)"], groups)      # 11 years apart: two films
+            self.assertEqual(len(groups), 3)
+
+    def test_keep_suggestion(self):
+        suggest = self.tool.suggest_keep
+        self.assertEqual(suggest([{"size": 900, "minutes": 100}, {"size": 500, "minutes": 100}]), 0)
+        self.assertEqual(suggest([{"size": 500, "minutes": 100}, {"size": 900, "minutes": 99}]), 1)
+        self.assertIsNone(suggest([{"size": 900, "minutes": 60}, {"size": 500, "minutes": 100}]))   # bigger but shorter
+        self.assertIsNone(suggest([{"size": 500, "minutes": 100}, {"size": 505, "minutes": 100}]))  # same size
+
+    def test_duplicate_commands_and_move(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp) / "Movies"
+            for name, size in (("Heat (1995)", 900), ("Heat (1996)", 500)):
+                (movies / name).mkdir(parents=True)
+                (movies / name / "Heat.mp4").write_bytes(b"x" * size)
+            plan = self.tool.build_dupe_plan(str(movies), "no-such-ffprobe")
+            self.assertEqual(plan[0]["suggest"], 0)
+            self.assertIn("<- suggested", self.tool.format_dupe_recap(plan))
+            self.assertEqual(self.tool.parse_dupe_command("keep 1 z", plan)[0], "continue")
+            self.assertIsNone(plan[0]["keep"])
+            self.tool.parse_dupe_command("auto", plan)
+            self.assertEqual(plan[0]["keep"], 0)
+            move_root = Path(temp) / "Movies Needing Attention"
+            args = type("A", (), {"dry_run": False, "yes": True})()
+            self.tool.run_dupes(args, str(movies), "no-such-ffprobe", str(move_root))
+            self.assertTrue((movies / "Heat (1995)" / "Heat.mp4").exists())
+            self.assertFalse((movies / "Heat (1996)").exists())
+            self.assertTrue((move_root / "Duplicates" / "Heat (1996)" / "Heat.mp4").exists())
+
+    def test_dry_run_moves_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp) / "Movies"
+            for name, size in (("Heat (1995)", 900), ("Heat (1996)", 500)):
+                (movies / name).mkdir(parents=True)
+                (movies / name / "Heat.mp4").write_bytes(b"x" * size)
+            args = type("A", (), {"dry_run": True, "yes": True})()
+            self.tool.run_dupes(args, str(movies), "no-such-ffprobe", str(Path(temp) / "out"))
+            self.assertTrue((movies / "Heat (1996)").exists())
+            (movies / "Alien (1979).mp4").write_bytes(b"x")
+            self.tool.run_loose(args, str(movies), "", "no-such-ffprobe", str(Path(temp) / "out"))
+            self.assertTrue((movies / "Alien (1979).mp4").exists())
