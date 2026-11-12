@@ -26,7 +26,8 @@ At the recap prompt:
     fix 32 2008  the same, with a year you give
     fix all      fix every junk-named folder that has a cleaned name and year
     rename only  leave every junk-named folder alone: only the plain renames happen
-    move 32      put a fixed one back to "move out of Plex"
+    move 32      move number 32 out of Plex (a fixed one goes back to "move out")
+    move noyear  move every folder with no year found out of Plex, until you know the year
     set 12 2008  give number 12 (or change its) year
     list         show the recap again
     q            quit without renaming anything
@@ -67,7 +68,8 @@ def yearless_folders(movies_dir):
 
 # A folder name that is a leftover, not a title: a recording stamp ("... 20260205 181000")
 # or a file-manager copy suffix ("...-Copy(1)", "... - Copy", "... Copy(2)").
-JUNK_NAME = re.compile(r'(?:\b\d{8}[ _-]\d{4,6}\b|[-_]\s*copy(?:\s*\(\d+\))?\s*$|\s+copy\s*\(\d+\)\s*$)',
+# A copy number is small: "(1)", "(2)".  "Carbon Copy (1981)" is a film, not a copy.
+JUNK_NAME = re.compile(r'(?:\b\d{8}[ _-]\d{4,6}\b|[-_]\s*copy(?:\s*\(\d{1,3}\))?\s*$|\s+copy\s*\(\d{1,3}\)\s*$)',
                        re.IGNORECASE)
 
 
@@ -83,7 +85,7 @@ def junk_folders(library_dir):
 
 
 _STAMP = re.compile(r'\b\d{8}[ _-]\d{4,6}\b')
-_COPY_SUFFIX = re.compile(r'(?:[-_]\s*copy(?:\s*\(\d+\))?|\s+copy\s*\(\d+\))\s*$', re.IGNORECASE)
+_COPY_SUFFIX = re.compile(r'(?:[-_]\s*copy(?:\s*\(\d{1,3}\))?|\s+copy\s*\(\d{1,3}\))\s*$', re.IGNORECASE)
 _TRAILING_YEAR = re.compile(r'\(\s*((?:19|20)\d{2})\s*\)\s*$')
 
 
@@ -309,7 +311,8 @@ def format_recap(plan, move_root=''):
             elif hint:
                 note = f'junk name; cleaned: "{hint}"  (fix {row["n"]} to rename it in place)'
             else:
-                note = 'junk name: needs a look'
+                note = ('junk name: needs a look' if row.get('clean') or JUNK_NAME.search(row['name'])
+                        else 'no year yet: moved out until you know it')
             lines.append(entry(row, note))
     skipped = [row for row in plan if row['skip']]
     if skipped:
@@ -383,12 +386,26 @@ def parse_command(text, plan, move_root=''):
         row['action'], row['year'], row['skip'] = 'fix', year, False
         return 'continue', f'{row["n"]}. will be renamed to "{row["clean"]} ({year})".'
     if command == 'move':
-        if len(rest) != 1 or not rest[0].isdigit() or int(rest[0]) not in by_number:
-            return 'continue', 'move needs a list number: move 32'
-        row = by_number[int(rest[0])]
-        if row['action'] == 'fix':
-            row['action'], row['year'] = 'move', ''
-        return 'continue', f'{row["n"]}. will be moved out of Plex.'
+        if rest == ['noyear']:
+            count = 0
+            for row in plan:
+                if row['action'] == 'rename' and not row['year'] and not row['skip']:
+                    row['action'] = 'move'
+                    count += 1
+            return 'continue', (f'{count} folder(s) with no year will be moved out of Plex.  '
+                                'Type list to see them, y to go ahead.' if count else
+                                'There are no folders with no year to move.')
+        numbers = []
+        for item in rest:
+            if not item.isdigit() or int(item) not in by_number:
+                return 'continue', f'"{item}" is not a number from the list.'
+            numbers.append(int(item))
+        if not numbers:
+            return 'continue', 'move needs numbers, for example: move 32   or   move noyear'
+        for number in numbers:
+            row = by_number[number]
+            row['action'], row['year'], row['skip'] = 'move', '', False
+        return 'continue', f'{", ".join(str(n) for n in numbers)} will be moved out of Plex.'
     if command == 'set':
         if (len(rest) != 2 or not rest[0].isdigit() or int(rest[0]) not in by_number
                 or not re.fullmatch(r'(19|20)\d{2}', rest[1])):
@@ -498,6 +515,7 @@ def main(argv=None):
               + ('  fix 32       rename junk-named number 32 in place to its cleaned name (fix all = every one)\n'
                  '  rename only  leave every junk-named folder alone, just do the plain renames\n'
                  if any(row['action'] != 'rename' for row in plan) else '')
+              + '  move noyear  move every folder with no year out of Plex, until you know the year\n'
               + '  list         show the list again\n'
               '  q            quit without changing anything')
         while True:

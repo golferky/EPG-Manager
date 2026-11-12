@@ -1719,3 +1719,111 @@ class PrivateRecordingFlowTests(unittest.TestCase):
         # (the choice is made in process_job: private applies only when there is no episode and no series)
         private_film = bool(job.get("private")) and not (episode or False)
         self.assertFalse(private_film)
+
+
+class CopyMarkerIsNotAYearTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_copy", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_a_film_named_copy_with_a_year_is_not_junk(self):
+        for name in ("Carbon Copy (1981)", "Copy Cat (1995)", "Perfect Copy (2003)", "Movie-Copy (1999)"):
+            self.assertFalse(self.tool.JUNK_NAME.search(name), name)
+
+    def test_real_copy_markers_still_match(self):
+        for name in ("Movie Copy (1)", "Movie Copy (12)", "Movie-Copy(2)", "Movie - Copy", "Movie-Copy(123)"):
+            self.assertTrue(self.tool.JUNK_NAME.search(name), name)
+
+    def test_a_film_with_copy_and_a_year_is_not_listed_or_moved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "Carbon Copy (1981)").mkdir()
+            (Path(temp) / "Carbon Copy (1981)" / "c.mp4").write_bytes(b"x")
+            self.assertEqual(self.tool.junk_folders(temp), [])
+            self.assertEqual(self.tool.yearless_folders(temp), [])
+
+
+class MoveNoYearTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "plex_movie_years_noyear", Path(__file__).resolve().parent.parent / "mac" / "plex_movie_years.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    JUNK = "Caddyshack 20260124 073500-Copy(1)"
+
+    def _library(self, temp):
+        root = Path(temp) / "Movies"
+        for name in ("Reefer Madness", "Hellboy Blood and Iron", "Mad Max 3 Beyond Thunderdome", self.JUNK):
+            (root / name).mkdir(parents=True)
+            (root / name / "film.mp4").write_bytes(name.encode())
+        return root
+
+    def _run(self, root, answers):
+        years = {"Reefer Madness": "1936"}
+        out = []
+        with mock.patch.object(self.tool, "suggest_year", side_effect=lambda s, n, k="": years.get(n, "")), \
+             mock.patch.object(self.tool, "recorder_copying", return_value=[]), \
+             mock.patch("builtins.input", side_effect=list(answers)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            self.tool.main(["--movies", str(root), "--server", "http://x"])
+        return "\n".join(out)
+
+    def _names(self, path):
+        return sorted(p.name for p in Path(path).iterdir()) if Path(path).exists() else []
+
+    def test_move_noyear_sends_every_folder_with_no_year_out_of_plex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            out = self._run(root, ["move noyear", "y"])
+            attention = Path(temp) / "Movies Needing Attention"
+            self.assertEqual(self._names(attention), sorted(["Hellboy Blood and Iron", "Mad Max 3 Beyond Thunderdome", self.JUNK]))
+            self.assertEqual((attention / "Hellboy Blood and Iron" / "film.mp4").read_bytes(), b"Hellboy Blood and Iron")
+            self.assertIn("Reefer Madness (1936)", self._names(root))      # the one with a year is renamed in place
+            self.assertIn("Nothing was deleted", out)
+
+    def test_move_by_number_moves_just_those(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            # alphabetical: 1 Caddyshack..., 2 Hellboy, 3 Mad Max, 4 Reefer Madness
+            self._run(root, ["move 2", "y"])
+            attention = Path(temp) / "Movies Needing Attention"
+            self.assertIn("Hellboy Blood and Iron", self._names(attention))
+            self.assertIn("Mad Max 3 Beyond Thunderdome", self._names(root))
+
+    def test_a_given_year_keeps_a_folder_in_plex_with_move_noyear(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["set 3 1985", "move noyear", "y"])
+            self.assertIn("Mad Max 3 Beyond Thunderdome (1985)", self._names(root))
+            self.assertNotIn("Mad Max 3 Beyond Thunderdome", self._names(Path(temp) / "Movies Needing Attention"))
+
+    def test_skip_after_move_noyear_leaves_a_folder_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["move noyear", "skip 2", "y"])
+            self.assertIn("Hellboy Blood and Iron", self._names(root))
+
+    def test_the_recap_says_why_they_are_moved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            out = self._run(root, ["move noyear", "list", "q"])
+            self.assertIn("no year yet: moved out until you know it", out)
+            self.assertIn("folder(s) with no year will be moved out of Plex", out)
+
+    def test_move_with_bad_input_is_explained(self):
+        plan = self.tool.build_plan(["A"], {})
+        self.assertIn("is not a number", self.tool.parse_command("move 9", plan)[1])
+        self.assertIn("move needs numbers", self.tool.parse_command("move", plan)[1])
+        self.assertIn("no folders with no year", self.tool.parse_command("move noyear", self.tool.build_plan(["A"], {"A": "2000"}))[1])
+
+    def test_rename_only_still_leaves_moved_folders_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._library(temp)
+            self._run(root, ["move noyear", "rename only", "y"])
+            self.assertFalse((Path(temp) / "Movies Needing Attention").exists())

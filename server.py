@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112a"
+VERSION = "v20261112b"
 
 app = Flask(__name__)
 
@@ -7228,6 +7228,100 @@ def api_wanted_private():
     return jsonify({'ok': True, 'private': bool(data.get('private'))})
 
 
+_film_year_cache = {}          # (folded title, length bucket) -> (year, looked up at)
+FILM_YEAR_CACHE_SECONDS = 7 * 86400
+FILM_YEAR_RETRY_SECONDS = 3600     # a lookup that found nothing is not repeated for an hour
+
+
+def _film_candidates(title, cfg):
+    """[(year, runtime minutes or 0, id)] of the films that have exactly this title.
+
+    TMDb first (generous limits), OMDb if TMDb gave nothing.  Only an exact title counts, so
+    a longer title that merely contains it is never taken.
+    """
+    from urllib import request as urlreq
+    from urllib.parse import quote
+    wanted = fold_title(title)
+    found = []
+    tmdb_key = cfg.get('tmdb_key', '')
+    if tmdb_key:
+        try:
+            with urlreq.urlopen(f'https://api.themoviedb.org/3/search/movie?api_key={tmdb_key}'
+                                f'&query={quote(title)}', timeout=5) as resp:
+                results = json.loads(resp.read()).get('results', [])
+            for item in results:
+                if wanted in (fold_title(item.get('title')), fold_title(item.get('original_title'))):
+                    year = _clean_year((item.get('release_date') or '')[:4])
+                    if year:
+                        found.append((year, 0, ('tmdb', item.get('id'))))
+        except Exception as exc:
+            print(f'[year-lookup] TMDb: {exc}')
+    omdb_key = cfg.get('omdb_key', '')
+    if not found and omdb_key:
+        try:
+            with urlreq.urlopen(f'http://www.omdbapi.com/?s={quote(title)}&type=movie&apikey={omdb_key}', timeout=5) as resp:
+                answer = json.loads(resp.read())
+            _log_omdb_error(answer)
+            for item in answer.get('Search', []) or []:
+                if fold_title(item.get('Title')) == wanted:
+                    year = _clean_year(item.get('Year'))
+                    if year:
+                        found.append((year, 0, ('omdb', item.get('imdbID'))))
+        except Exception as exc:
+            print(f'[year-lookup] OMDb: {exc}')
+    return found
+
+
+def _candidate_runtime(candidate_id, cfg):
+    """Running time in minutes of one candidate film, or 0 if it cannot be found."""
+    from urllib import request as urlreq
+    source, ident = candidate_id
+    try:
+        if source == 'tmdb':
+            with urlreq.urlopen(f'https://api.themoviedb.org/3/movie/{ident}?api_key={cfg.get("tmdb_key", "")}', timeout=5) as resp:
+                return _metadata_runtime_minutes(json.loads(resp.read()).get('runtime'))
+        with urlreq.urlopen(f'http://www.omdbapi.com/?i={ident}&apikey={cfg.get("omdb_key", "")}', timeout=5) as resp:
+            answer = json.loads(resp.read())
+        _log_omdb_error(answer)
+        return _metadata_runtime_minutes(answer.get('Runtime'))
+    except Exception as exc:
+        print(f'[year-lookup] runtime: {exc}')
+        return 0
+
+
+def _film_year_by_title(title, minutes=0):
+    """The year of a film found by its title alone, or '' when that is not certain.
+
+    One film has the title (one year among the exact matches): that year.  Several films
+    share it (a remake): only if exactly one of them has about the airing's running time,
+    otherwise blank.  A year is never guessed: it decides which copy in Plex is "the same".
+    """
+    key = (fold_title(title), int(float(minutes or 0) // 10))
+    cached = _film_year_cache.get(key)
+    if cached and time.time() - cached[1] < (FILM_YEAR_CACHE_SECONDS if cached[0] else FILM_YEAR_RETRY_SECONDS):
+        return cached[0]
+    cfg = load_config()
+    year = ''
+    try:
+        candidates = _film_candidates(title, cfg)
+        years = {c[0] for c in candidates}
+        if len(years) == 1:
+            year = years.pop()
+        elif len(years) > 1 and minutes:
+            tolerance = max(8.0, float(minutes) * 0.12)
+            close = {}
+            for candidate_year, _runtime, ident in candidates[:6]:
+                runtime = _candidate_runtime(ident, cfg)
+                if runtime and abs(runtime - float(minutes)) <= tolerance:
+                    close[candidate_year] = runtime
+            if len(close) == 1:
+                year = next(iter(close))
+    except Exception as exc:
+        print(f'[year-lookup] {exc}')
+    _film_year_cache[key] = (year, time.time())
+    return year
+
+
 # Time shifts to try, in order, when matching one listing of a film to another: the same time,
 # then three hours either way (East, West and Pacific feeds of one channel).
 GUIDE_FEED_SHIFTS = ((0,), (10800, -10800))
@@ -7410,7 +7504,13 @@ def api_record():
     # A film can be recorded privately (straight into the private folder, never into Plex):
     # because this recording was asked to be, or because the Wanted film is marked private.
     # Only films: TV episodes always go to the TV library.
-    film_year = requested_year or guide_year
+    # No year from the caller or the guide (a provider channel with no Schedules Direct
+    # listing): look the film up by title, but only if that gives one certain answer.
+    lookup_year = ''
+    if (not requested_year and not guide_year and not is_series_request and not is_sports_request
+            and (stop_ts - start_ts) >= 60 * 60):
+        lookup_year = _film_year_by_title(title, (stop_ts - start_ts) / 60)
+    film_year = requested_year or guide_year or lookup_year
     wants_private = bool(data.get('private')) or (bool(film_year) and _is_private_title(title, film_year))
     guide_stop_ts = stop_ts
     overtime_cushion_seconds = SPORTS_OVERTIME_CUSHION_SECONDS if is_sports_request else 0
@@ -7458,7 +7558,7 @@ def api_record():
         'episode_num': episode_num,
         'is_series': is_series_request,
         'auto_upgrade': bool(data.get('auto_upgrade', False)),
-        'year': requested_year or guide_year or (_wanted_series_year(title) if is_series_request else ''),
+        'year': film_year or (_wanted_series_year(title) if is_series_request else ''),
         'private': bool(wants_private and not is_series_request),
     }
     _url, stream_error, stream_debug = _resolve_recording_source(
