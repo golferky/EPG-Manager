@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261112c"
+AGENT_VERSION = "v20261113a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -58,6 +58,10 @@ def load_config(path):
     cfg.setdefault('incomplete_recordings_path', '')
     cfg.setdefault('ffmpeg', 'ffmpeg')
     cfg.setdefault('ffprobe', 'ffprobe')
+    # Decode every finished recording once and count the errors: a stream stall can leave a
+    # file the right length that is corrupt in places (green or blocky video).
+    cfg.setdefault('check_video_after_recording', True)
+    cfg.setdefault('damaged_error_lines', DAMAGED_ERROR_LINES)
     cfg.setdefault('transfer_retry_seconds', 30)
     cfg.setdefault('transfer_wait_timeout', 86400)
     # A small cushion keeps a provider's slightly-late final scene/credits from
@@ -755,7 +759,35 @@ def incomplete_recordings_root(cfg):
     return Path(cfg['plex_path']).parent / 'Incomplete Recordings'
 
 
-def preserve_incomplete_recording(source, cfg, title, start_ts, progress_callback=None):
+DAMAGED_ERROR_LINES = 50
+
+
+def count_decode_errors(api, job, cfg, media_path):
+    """Decode a finished recording from start to end and count FFmpeg's error lines.
+
+    Returns the number of error lines (0 for a clean file), or None if the check could not run
+    or the job was cancelled.  A recording that is the right length can still be corrupt where
+    the stream stalled, and only decoding it shows that.
+    """
+    check_log = Path(str(media_path) + '.check.log')
+    cmd = [cfg['ffmpeg'], '-v', 'error', '-i', str(media_path), '-f', 'null', '-']
+    try:
+        rc = run_process(api, job, 'converting', cmd, cfg, check_log, str(media_path))
+        if rc is None:
+            return None
+        lines = [ln for ln in check_log.read_text(encoding='utf-8', errors='replace').splitlines() if ln.strip()]
+        return len(lines)
+    except OSError as exc:
+        print(f'[check] could not check {job["title"]}: {exc}', file=sys.stderr, flush=True)
+        return None
+    finally:
+        try:
+            check_log.unlink()
+        except OSError:
+            pass
+
+
+def preserve_incomplete_recording(source, cfg, title, start_ts, progress_callback=None, label='INCOMPLETE'):
     """Copy a partial MP4 to the QNAP, keeping it out of Plex libraries."""
     destination_root = incomplete_recordings_root(cfg)
     # Verify the actual QNAP share, not the destination folder (which may not
@@ -763,7 +795,7 @@ def preserve_incomplete_recording(source, cfg, title, start_ts, progress_callbac
     if not plex_mount_available(destination_root.parent, cfg.get('plex_mount_marker', '')):
         raise RuntimeError('QNAP recording share is not available')
     stamp = time.strftime('%Y-%m-%d_%H%M', time.localtime(start_ts))
-    filename = f'{safe_filename(title)} - INCOMPLETE - {stamp}.mp4'
+    filename = f'{safe_filename(title)} - {label} - {stamp}.mp4'
     return _verified_copy(source, destination_root / filename, progress_callback)
 
 
@@ -1145,6 +1177,35 @@ def process_job(api, job, cfg):
             discard_failed_media(ts_path, mp4_path)
         print(f'[incomplete] {job["title"]}: {message}', flush=True)
         return
+    # The right length is not enough: decode the file to see whether the video is intact.
+    if cfg.get('check_video_after_recording', True):
+        api.patient_heartbeat(job['id'], 'converting', file=str(mp4_path),
+                              quality_decision='checking the video for damage')
+        damage = count_decode_errors(api, job, cfg, mp4_path)
+        if damage is not None:
+            quality['decode_errors'] = damage
+            limit = int(cfg.get('damaged_error_lines') or DAMAGED_ERROR_LINES)
+            if damage >= limit:
+                message = (f'Video is damaged: {damage} decode errors (the limit is {limit}); '
+                           'not added to Plex')
+                try:
+                    saved = preserve_incomplete_recording(mp4_path, cfg, job['title'], job['start_ts'],
+                                                          label='DAMAGED')
+                    quality['incomplete_path'] = str(saved)
+                    message += f'; saved to QNAP: {saved.name}'
+                except Exception as exc:
+                    quality['incomplete_save_error'] = str(exc)
+                    message += '; kept on Mac because QNAP save failed'
+                    saved = None
+                archive_terminal_result(api, job, 'failed', log_path, message=message,
+                                        file=str(saved or mp4_path), quality_decision='damaged video',
+                                        result=quality)
+                if saved:
+                    discard_failed_media(ts_path, mp4_path)
+                print(f'[damaged] {job["title"]}: {message}', flush=True)
+                return
+            if damage:
+                decision = f'{decision}; {damage} minor video errors'
     final_incomplete_copy = bool(final_existing_probe and incomplete_for_scheduled_window(
         final_existing_probe, job['start_ts'], job['stop_ts']
     ))

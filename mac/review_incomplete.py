@@ -24,7 +24,7 @@ import plex_movie_years as base  # noqa: E402
 import tidy_library as tidy  # noqa: E402
 import wanted_from_empty as scan  # noqa: E402
 
-INCOMPLETE_NAME = re.compile(r'^(?P<title>.+?) - INCOMPLETE - (?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{4})\.(?P<ext>\w+)$')
+INCOMPLETE_NAME = re.compile(r'^(?P<title>.+?) - (?:INCOMPLETE|DAMAGED) - (?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{4})\.(?P<ext>\w+)$')
 TITLE_YEAR = re.compile(r'^(.*?)\s*\(((?:19|20)\d{2})\)\s*$')
 
 
