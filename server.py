@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261112j"
+VERSION = "v20261113a"
 
 app = Flask(__name__)
 
@@ -4861,6 +4861,14 @@ def api_recommendations():
         if wanted_year_now and not is_series_wanted:
             # An airing the guide says is another film (a remake) is not this film's airing.
             candidates = [a for a in candidates if not a.get('year') or a.get('year') == wanted_year_now]
+        # A wanted film is offered only from a commercial-free English channel (HBO, Starz,
+        # Showtime and the like): an ad-supported channel such as AMC is not suggested.  A series
+        # is different: TV shows normally air on channels with ads.
+        ad_supported_only = False
+        if not is_series_wanted:
+            clean_candidates = [a for a in candidates if _is_rerecord_channel(a.get('channel'))]
+            ad_supported_only = bool(candidates) and not clean_candidates
+            candidates = clean_candidates
         airing = next(iter(candidates), None)
         title_key = _norm_plex_show(w['title'])
         wanted_year = str(w['year'] or '').strip()
@@ -4892,6 +4900,7 @@ def api_recommendations():
             'imdb_id':    w['imdb_id'],
             'updated_at': w['updated_at'],
             'next_airing': airing,
+            'ad_supported_only': ad_supported_only,
             'in_plex': in_movies or in_shows,
             'private': (title_key, wanted_year) in private_set,
             'plex_year_unknown': year_unknown,
@@ -11669,7 +11678,7 @@ async function loadRecs() {
           ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
           <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
         </td>
-        <td class="ch-cell">${a ? esc(a.channel) : '<span style="color:#333">Not in guide</span>'}</td>
+        <td class="ch-cell">${a ? esc(a.channel) : (r.ad_supported_only ? '<span style="color:#64748b" title="It airs only on channels with ads, which are not offered">Only on channels with ads</span>' : '<span style="color:#333">Not in guide</span>')}</td>
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
         <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button></td>
       </tr>`;

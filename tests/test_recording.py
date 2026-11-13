@@ -1536,7 +1536,7 @@ class RecommendationAiringYearTests(unittest.TestCase):
                    "imdb_id": "", "updated_at": ""}]
         far = time.time() + 86400
         progs = [dict(title="Employee of the Month", channel_id="c", stop_ts=far + 7200, start_ts=far + shift,
-                      channel="Chan", start_fmt="", **extra) for shift, extra in airings]
+                      channel="HBO", start_fmt="", **extra) for shift, extra in airings]
         index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
                  "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
         with mock.patch.object(server, "db_rows", return_value=wanted), \
@@ -1874,9 +1874,43 @@ class RerecordChannelTests(unittest.TestCase):
     def test_a_film_we_have_gets_no_offer_when_only_ad_supported_airings_exist(self):
         self.assertIsNone(self._recs(True, [(0, "ANTENNA TV"), (60, "Paramount Network HD")]))
 
-    def test_a_film_we_do_not_have_is_still_offered_from_any_airing(self):
-        airing = self._recs(False, [(0, "ANTENNA TV"), (120, "HBO")])
-        self.assertEqual(airing["channel"], "ANTENNA TV")
+    def test_a_film_we_do_not_have_is_offered_only_from_a_commercial_free_channel_too(self):
+        airing = self._recs(False, [(0, "AMC"), (60, "ANTENNA TV"), (120, "HBO")])
+        self.assertEqual(airing["channel"], "HBO")
+        self.assertIsNone(self._recs(False, [(0, "AMC"), (60, "ANTENNA TV")]))
+
+    def test_a_film_that_airs_only_with_ads_says_so(self):
+        wanted = [{"id": 1, "title": "The Green Mile", "normalized_title": "the green mile", "year": "1999",
+                   "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""},
+                  {"id": 2, "title": "Not Aired", "normalized_title": "not aired", "year": "1999",
+                   "type": "movie", "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        far = time.time() + 86400
+        progs = [dict(title="The Green Mile", channel_id="c", channel="AMC", stop_ts=far + 7200,
+                      start_ts=far, start_fmt="")]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": progs}):
+            recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        self.assertIsNone(recs[0]["next_airing"])
+        self.assertTrue(recs[0]["ad_supported_only"])
+        self.assertFalse(recs[1]["ad_supported_only"])
+        self.assertIn("Only on channels with ads", server.HTML)
+
+    def test_a_series_is_still_offered_from_any_channel(self):
+        wanted = [{"id": 1, "title": "Doug", "normalized_title": "doug", "year": "1991", "type": "series",
+                   "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        far = time.time() + 86400
+        progs = [dict(title="Doug", channel_id="c", channel="Nickelodeon", stop_ts=far + 1800,
+                      start_ts=far, start_fmt="")]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": progs}):
+            recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        self.assertEqual(recs[0]["next_airing"]["channel"], "Nickelodeon")
 
     def test_the_page_only_shows_check_upgrade_when_there_is_an_airing(self):
         self.assertIn('(a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing', server.HTML)
