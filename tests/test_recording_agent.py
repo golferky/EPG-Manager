@@ -2868,3 +2868,142 @@ class CheckLibraryTests(unittest.TestCase):
         self.assertIn("-sseof", seen[0])
         self.assertIn("-600", seen[0])
         self.assertNotIn("-sseof", seen[1])
+
+
+class FixDamagedTests(unittest.TestCase):
+    """Move the damaged films out of Plex and put them on Wanted."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "fix_damaged", Path(__file__).resolve().parent.parent / "mac" / "fix_damaged.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _setup(self, temp, results):
+        """A library of films, and a saved scan: results is {folder name: errors}."""
+        root = Path(temp)
+        movies = root / "Movies"
+        cache = {}
+        for name, errors in results.items():
+            (movies / name).mkdir(parents=True)
+            video = movies / name / "film.mp4"
+            video.write_bytes(b"x" * 100)
+            cache[str(video)] = dict(errors=errors, mode="quick", **self.tool.library_check.fingerprint(str(video)))
+        (root / "recording_agent.json").write_text(json.dumps({"plex_path": str(movies), "server_url": "http://x.test"}))
+        self.tool.library_check.save_cache(str(root / "library_check_cache.json"), cache)
+        return movies, cache
+
+    def test_only_damaged_unchanged_films_in_the_library_are_listed_worst_first(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies, cache = self._setup(temp, {"A (2000)": 400, "B (2001)": 9000, "C (2002)": 3, "Nameless": 70, "D (2003)": 0})
+            (movies / "A (2000)" / "film.mp4").write_bytes(b"y" * 200)          # changed since it was checked
+            films = self.tool.damaged_films(str(movies), cache, 50)
+            self.assertEqual([f["folder"] for f in films], ["B (2001)", "Nameless"])
+            self.assertEqual(films[0]["year"], "2001")
+            self.assertEqual(films[0]["title"], "B")
+            self.assertTrue(films[0]["wanted"])
+            self.assertFalse(films[1]["wanted"])                                   # no year: cannot go on Wanted
+            self.assertEqual([f["n"] for f in films], [1, 2])
+
+    def test_the_recap_and_commands(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies, cache = self._setup(temp, {"B (2001)": 9000, "Nameless": 70, "E (2004)": 80})
+            films = self.tool.damaged_films(str(movies), cache, 50)
+            recap = self.tool.format_recap(films)
+            self.assertIn("B (2001): 9000 errors, last 10 minutes  ->  and added to Wanted", recap)
+            self.assertIn("moved only (no year in the name)", recap)
+            self.assertEqual(self.tool.parse_command("skip 2", films)[0], "continue")
+            self.assertTrue(films[1]["skip"])
+            self.tool.parse_command("nowanted 1", films)
+            self.assertFalse(films[0]["wanted"])
+            self.assertIn("not a number", self.tool.parse_command("skip 9", films)[1])
+            self.assertEqual(self.tool.parse_command("y", films)[0], "apply")
+            self.assertEqual(self.tool.parse_command("q", films)[0], "quit")
+            self.assertIn("Left alone by you (1)", self.tool.format_recap(films))
+
+    def test_apply_moves_folders_adds_to_wanted_and_never_overwrites(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            movies, cache = self._setup(temp, {"B (2001)": 9000, "Nameless": 70, "F (2005)": 500, "G (2006)": 800})
+            damaged_root = Path(temp) / "Movies Needing Attention" / "Damaged"
+            (damaged_root / "F (2005)").mkdir(parents=True)                           # already there: must not be overwritten
+            films = self.tool.damaged_films(str(movies), cache, 50)
+            next(f for f in films if f["folder"] == "G (2006)")["skip"] = True
+            added = []
+            def fake_add(server, row):
+                added.append((row["title"], row["year"]))
+                return ""
+            with contextlib.redirect_stdout(io.StringIO()):
+                moved, wanted, problems = self.tool.apply_plan(films, str(movies), str(damaged_root), "http://x", add=fake_add)
+            self.assertEqual((moved, wanted), (2, 1))
+            self.assertEqual(added, [("B", "2001")])
+            self.assertTrue((damaged_root / "B (2001)" / "film.mp4").exists())
+            self.assertTrue((damaged_root / "Nameless").exists())
+            self.assertTrue((movies / "F (2005)" / "film.mp4").exists())             # left in Plex: the target existed
+            self.assertTrue((movies / "G (2006)").exists())                           # skipped
+            self.assertEqual(len(problems), 1)
+            self.assertIn("F (2005)", problems[0])
+
+    def test_a_failed_wanted_add_is_reported_but_the_move_stands(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            movies, cache = self._setup(temp, {"B (2001)": 9000})
+            films = self.tool.damaged_films(str(movies), cache, 50)
+            damaged_root = Path(temp) / "Movies Needing Attention" / "Damaged"
+            with contextlib.redirect_stdout(io.StringIO()):
+                moved, wanted, problems = self.tool.apply_plan(films, str(movies), str(damaged_root), "http://x",
+                                                               add=lambda s, r: "dashboard unreachable")
+            self.assertEqual((moved, wanted), (1, 0))
+            self.assertIn("not added to Wanted", problems[0])
+            self.assertTrue((damaged_root / "B (2001)").exists())
+
+    def test_a_dry_run_changes_nothing_and_refusal_while_copying(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            movies, _cache = self._setup(temp, {"B (2001)": 9000})
+            config = str(Path(temp) / "recording_agent.json")
+            out = io.StringIO()
+            with mock.patch.object(self.tool.base, "recorder_copying", return_value=["Some Film"]), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(self.tool.main(["--config", config]), 1)
+            self.assertIn("recorder is copying", out.getvalue())
+            self.assertTrue((movies / "B (2001)").exists())
+            out = io.StringIO()
+            with mock.patch.object(self.tool.base, "recorder_copying", return_value=["Some Film"]), \
+                 mock.patch.object(self.tool.scan, "add_to_wanted") as add, contextlib.redirect_stdout(out):
+                self.assertEqual(self.tool.main(["--config", config, "--dry-run"]), 0)
+            add.assert_not_called()
+            self.assertIn("would move \"B (2001)\" and add it to Wanted", out.getvalue())
+            self.assertTrue((movies / "B (2001)").exists())
+
+    def test_yes_does_it_all_from_the_command_line(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            movies, _cache = self._setup(temp, {"B (2001)": 9000})
+            config = str(Path(temp) / "recording_agent.json")
+            with mock.patch.object(self.tool.base, "recorder_copying", return_value=[]), \
+                 mock.patch.object(self.tool.scan, "add_to_wanted", return_value="") as add, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.tool.main(["--config", config, "--yes"]), 0)
+            add.assert_called_once()
+            self.assertFalse((movies / "B (2001)").exists())
+            self.assertTrue((Path(temp) / "Movies Needing Attention" / "Damaged" / "B (2001)" / "film.mp4").exists())
+
+    def test_no_saved_scan_says_so(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp) / "Movies"
+            movies.mkdir()
+            config = Path(temp) / "recording_agent.json"
+            config.write_text(json.dumps({"plex_path": str(movies), "server_url": "http://x.test"}))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.tool.main(["--config", str(config)]), 1)
+            self.assertIn("Run check_library.py first", out.getvalue())
