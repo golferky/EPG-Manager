@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """EPG Manager Web — Guide · Recommendations · Channels · Schedule · Conversions"""
+import functools
+import html as _html
 import unicodedata
 import faulthandler, hmac, json, os, re, shutil, signal, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
@@ -28,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261113d"
+VERSION = "v20261113e"
 
 app = Flask(__name__)
 
@@ -5205,7 +5207,7 @@ def api_wanted_movie_matches():
             if detail.get('Response') == 'False':
                 detail = hit
             poster = detail.get('Poster', '')
-            matches.append({
+            matches.append(_decode_info({
                 'title': detail.get('Title') or hit.get('Title', ''),
                 'year': detail.get('Year') or hit.get('Year', ''),
                 'imdb_id': detail.get('imdbID') or imdb_id,
@@ -5217,7 +5219,7 @@ def api_wanted_movie_matches():
                 'actors': detail.get('Actors', ''),
                 'plot': detail.get('Plot', ''),
                 'imdb_rating': detail.get('imdbRating', ''),
-            })
+            }))
         # Exact title results first, while retaining alternate spellings and
         # similarly named films for a conscious user choice.
         matches.sort(key=lambda row: not _metadata_title_matches(query, row['title']))
@@ -5947,7 +5949,32 @@ def api_conv_cancel():
 
 # ── Programme Info (OMDB/TMDB enrichment) ────────────────────────────────────
 
+def _decode_entities(value):
+    """OMDb returns some names with HTML entities (D&apos;Onofrio): turn them back into characters."""
+    return _html.unescape(value) if isinstance(value, str) and '&' in value else value
+
+
+def _decode_info(info):
+    return {key: _decode_entities(value) for key, value in info.items()}
+
+
+def _decode_response_text(view):
+    """Route decorator: clean HTML entities out of the text fields of a JSON object answer."""
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        result = view(*args, **kwargs)
+        response, status = (result[0], result[1] if len(result) > 1 else None) if isinstance(result, tuple) else (result, None)
+        data = response.get_json(silent=True) if hasattr(response, 'get_json') else None
+        if not isinstance(data, dict):
+            return result
+        fixed = jsonify(_decode_info(data))
+        fixed.status_code = status if isinstance(status, int) else response.status_code
+        return fixed
+    return wrapper
+
+
 @app.route('/epg-web/api/prog-info')
+@_decode_response_text
 def api_prog_info():
     from urllib import request as urlreq
     from urllib.parse import quote
