@@ -1250,6 +1250,11 @@ class ActiveRecordingsPanelTests(unittest.TestCase):
                        "r.stream_info"):
             self.assertIn(needle, html)
 
+    def test_the_panel_starts_when_the_page_opens(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("setInterval(refreshRecBadge, 30000);\nrefreshRecBadge();", html)
+        self.assertRegex(html, r"refreshRecBadge\(\);\n(?://[^\n]*\n)+startRecPoll\(\);")
+
     def test_the_stream_text_is_formatted(self):
         import re
         import shutil
