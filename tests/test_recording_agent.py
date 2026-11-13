@@ -2651,3 +2651,33 @@ class VideoDamageCheckTests(unittest.TestCase):
                 return len([ln for ln in result.stderr.splitlines() if ln.strip()])
             self.assertEqual(run(good), 0)
             self.assertGreater(run(bad), 0)
+
+
+class StreamInfoHeartbeatTests(unittest.TestCase):
+    """The recorder tells the dashboard what the incoming stream looks like."""
+
+    def _api(self):
+        api = recording_agent.AgentAPI({"server_url": "http://x.test", "agent_token": "t", "agent_id": "a",
+                                        "epg_url": "", "epg_user": "", "epg_pass": "", "lease_seconds": 90})
+        sent = []
+        api._request = lambda method, path, payload=None, timeout=30: sent.append(payload) or {}
+        return api, sent
+
+    def test_heartbeats_carry_the_stream_info_once_it_is_known(self):
+        api, sent = self._api()
+        api.heartbeat("j1", "preflight")
+        api.note_stream_info("j1", {"width": 1920, "height": 1080, "fps": 29.97, "video_codec": "h264",
+                                    "audio_codec": "aac", "audio_channels": 2, "total_bitrate": 6821000,
+                                    "duration": 99, "size": 1, "video_profile": "High"})
+        api.heartbeat("j1", "recording")
+        api.heartbeat("other", "recording")
+        self.assertNotIn("stream_info", sent[0])
+        self.assertEqual(sent[1]["stream_info"], {"width": 1920, "height": 1080, "fps": 29.97, "video_codec": "h264",
+                                                  "audio_codec": "aac", "audio_channels": 2, "total_bitrate": 6821000})
+        self.assertNotIn("stream_info", sent[2])
+
+    def test_an_empty_probe_sends_nothing(self):
+        api, sent = self._api()
+        api.note_stream_info("j1", {"width": 0, "fps": 0})
+        api.heartbeat("j1", "recording")
+        self.assertNotIn("stream_info", sent[0])

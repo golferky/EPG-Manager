@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261113a"
+AGENT_VERSION = "v20261113b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -110,6 +110,13 @@ class AgentAPI:
             'claim_ahead_seconds': int(claim_ahead_seconds),
         }).get('job')
 
+    def note_stream_info(self, job_id, probe):
+        """Remember what the incoming stream looks like, so every heartbeat can report it."""
+        keep = ('width', 'height', 'fps', 'video_codec', 'audio_codec', 'audio_channels', 'total_bitrate')
+        if not hasattr(self, '_stream_info'):
+            self._stream_info = {}
+        self._stream_info[job_id] = {key: probe.get(key) for key in keep if probe.get(key)}
+
     def heartbeat(self, job_id, status, **fields):
         payload = {
             'agent_id': self.agent_id,
@@ -118,6 +125,9 @@ class AgentAPI:
             'status': status,
             **fields,
         }
+        info = getattr(self, '_stream_info', {}).get(job_id)
+        if info and 'stream_info' not in payload:
+            payload['stream_info'] = info
         return self._request(
             'POST', f'/epg-web/api/agent/jobs/{job_id}/heartbeat', payload
         )
@@ -1044,6 +1054,7 @@ def process_job(api, job, cfg):
         return
     if incoming_probe is None:        # cancelled while waiting to try again
         return
+    api.note_stream_info(job['id'], incoming_probe)
 
     incomplete_copy = bool(existing_probe and incomplete_for_scheduled_window(
         existing_probe, job['start_ts'], job['stop_ts']
