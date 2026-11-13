@@ -3,6 +3,7 @@ import sys
 import time
 import shutil
 import subprocess
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -2743,3 +2744,127 @@ class StreamInfoHeartbeatTests(unittest.TestCase):
         api.note_stream_info("j1", {"width": 0, "fps": 0})
         api.heartbeat("j1", "recording")
         self.assertNotIn("stream_info", sent[0])
+
+
+class CheckLibraryTests(unittest.TestCase):
+    """The library-wide damage scan."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "check_library", Path(__file__).resolve().parent.parent / "mac" / "check_library.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _library(self, root, names):
+        movies = Path(root) / "Movies"
+        for name in names:
+            (movies / name).mkdir(parents=True)
+            (movies / name / "film.mp4").write_bytes(b"x" * 100)
+            (movies / name / "extra.mp4").write_bytes(b"x")
+        (movies / "_hidden").mkdir()
+        (movies / "_hidden" / "film.mp4").write_bytes(b"x")
+        (movies / "Empty (2000)").mkdir()
+        (movies / "loose.mp4").write_bytes(b"x")
+        return movies
+
+    def test_only_movie_folders_with_a_video_are_scanned(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp, ["Heat (1995)", "Alien (1979)"])
+            found = self.tool.movie_files(str(movies))
+            self.assertEqual([n for n, _v in found], ["Alien (1979)", "Heat (1995)"])
+            self.assertTrue(all(v.endswith("film.mp4") for _n, v in found))        # the largest file is the film
+            self.assertEqual([n for n, _v in self.tool.movie_files(str(movies), "heat")], ["Heat (1995)"])
+
+    def test_results_are_classified(self):
+        classify = self.tool.classify
+        self.assertEqual(classify(0), "clean")
+        self.assertEqual(classify(2), "minor")
+        self.assertEqual(classify(49), "minor")
+        self.assertEqual(classify(50), "damaged")
+        self.assertEqual(classify(None), "unreadable")
+
+    def test_a_saved_result_is_reused_only_while_the_file_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            video = Path(temp) / "film.mp4"
+            video.write_bytes(b"x" * 10)
+            entry = dict(errors=0, mode="full", **self.tool.fingerprint(str(video)))
+            cache = {str(video): entry}
+            self.assertIsNotNone(self.tool.cached_result(cache, str(video), False))
+            self.assertIsNotNone(self.tool.cached_result(cache, str(video), True))     # a full result serves a quick request
+            cache[str(video)] = dict(entry, mode="quick")
+            self.assertIsNone(self.tool.cached_result(cache, str(video), False))       # but a quick one does not serve a full one
+            self.assertIsNotNone(self.tool.cached_result(cache, str(video), True))
+            video.write_bytes(b"x" * 20)                                                 # changed since it was checked
+            self.assertIsNone(self.tool.cached_result(cache, str(video), True))
+            self.assertIsNone(self.tool.cached_result({str(video): dict(entry, errors=None)}, str(video), False))
+
+    def test_the_report_lists_the_worst_first(self):
+        report = self.tool.format_report([
+            {"name": "A (2000)", "errors": 0, "mode": "full"}, {"name": "B (2001)", "errors": 3, "mode": "full"},
+            {"name": "C (2002)", "errors": 400, "mode": "full"}, {"name": "D (2003)", "errors": 70000, "mode": "quick"},
+            {"name": "E (2004)", "errors": None, "mode": "full"}])
+        self.assertIn("Checked 5 film(s): 1 clean, 1 with minor errors, 2 damaged, 1 could not be read.", report)
+        self.assertLess(report.index("D (2003): 70000"), report.index("C (2002): 400"))
+        self.assertIn("(last 10 minutes only)", report)
+        self.assertIn("E (2004)", report)
+
+    def test_a_scan_saves_as_it_goes_and_a_second_run_skips_what_is_done(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp, ["Heat (1995)", "Alien (1979)"])
+            config = Path(temp) / "recording_agent.json"
+            config.write_text(json.dumps({"plex_path": str(movies), "server_url": "http://x.test"}))
+            counts = {"Heat (1995)": 400000, "Alien (1979)": 0}
+            calls = []
+            def fake(path, ffmpeg="ffmpeg", tail_seconds=None):
+                calls.append((Path(path).parent.name, tail_seconds))
+                return counts[Path(path).parent.name]
+            out = io.StringIO()
+            with mock.patch.object(self.tool.review, "count_decode_errors", fake), contextlib.redirect_stdout(out):
+                self.tool.main(["--config", str(config), "--workers", "1"])
+            self.assertEqual(sorted(c[0] for c in calls), ["Alien (1979)", "Heat (1995)"])
+            self.assertIn("Heat (1995): 400000 errors", out.getvalue())
+            self.assertIn("1 damaged", out.getvalue())
+            self.assertTrue((Path(temp) / "library_check_cache.json").exists())
+            calls.clear()
+            out = io.StringIO()
+            with mock.patch.object(self.tool.review, "count_decode_errors", fake), contextlib.redirect_stdout(out):
+                self.tool.main(["--config", str(config), "--workers", "1"])
+            self.assertEqual(calls, [])                                          # nothing re-decoded
+            self.assertIn("2 already checked and unchanged, 0 to check", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.tool.main(["--config", str(config), "--report"])
+            self.assertIn("Heat (1995): 400000 errors", out.getvalue())
+
+    def test_quick_mode_decodes_only_the_tail(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            movies = self._library(temp, ["Heat (1995)"])
+            config = Path(temp) / "recording_agent.json"
+            config.write_text(json.dumps({"plex_path": str(movies), "server_url": "http://x.test"}))
+            calls = []
+            def fake(path, ffmpeg="ffmpeg", tail_seconds=None):
+                calls.append(tail_seconds)
+                return 0
+            with mock.patch.object(self.tool.review, "count_decode_errors", fake), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.tool.main(["--config", str(config), "--quick"])
+            self.assertEqual(calls, [600])
+
+    def test_the_review_counter_can_decode_just_the_tail(self):
+        review = self.tool.review
+        seen = []
+        def fake_run(cmd, **kw):
+            seen.append(cmd)
+            return mock.Mock(stderr="")
+        with mock.patch.object(review.subprocess, "run", fake_run):
+            review.count_decode_errors("/x/film.mp4", "ffmpeg", 600)
+            review.count_decode_errors("/x/film.mp4", "ffmpeg")
+        self.assertIn("-sseof", seen[0])
+        self.assertIn("-600", seen[0])
+        self.assertNotIn("-sseof", seen[1])
