@@ -2,6 +2,7 @@ import json
 import sys
 import time
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -2593,12 +2594,73 @@ class ReviewIncompleteTests(unittest.TestCase):
                  mock.patch.object(self.tool.years, "file_minutes",
                                    side_effect=lambda folder, ffprobe="ffprobe":
                                    next((v for k, v in lengths.items() if (Path(folder) / k).exists()), 0.0)):
-                rows = self.tool.review(str(incomplete), str(movies), str(tv), "ffprobe")
+                rows = self.tool.review(str(incomplete), str(movies), str(tv), "ffprobe", check_decode=False)
             verdicts = {r["title"]: r["verdict"] for r in rows}
             self.assertEqual(verdicts, {"Heat": "covered", "Alien": "shorter", "Jeannie": "tv", "Solo": "not_in_plex"})
             report = self.tool.format_report(rows)
             self.assertIn("Plex already has an equal or longer copy", report)
             self.assertEqual(len(list(incomplete.iterdir())), 4)          # nothing moved or deleted
+
+    def _decode_review(self, errors):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            incomplete, movies = root / "Incomplete Recordings", root / "Movies"
+            incomplete.mkdir()
+            movies.mkdir()
+            (incomplete / "Heat - INCOMPLETE - 2026-11-01_1000.mp4").write_bytes(b"x" * 100)
+            (movies / "Heat (1995)").mkdir()
+            (movies / "Heat (1995)" / "Heat.mp4").write_bytes(b"x" * 50)
+            (movies / "Heat (1995)" / "extra.mp4").write_bytes(b"x")
+            seen = []
+            def fake_count(path, ffmpeg="ffmpeg"):
+                seen.append(Path(path).name)
+                return errors
+            with mock.patch.object(self.tool.tidy, "video_minutes", return_value=100.0), \
+                 mock.patch.object(self.tool.years, "file_minutes", return_value=170.0), \
+                 mock.patch.object(self.tool, "count_decode_errors", fake_count):
+                rows = self.tool.review(str(incomplete), str(movies), "", "ffprobe")
+            return rows[0], seen
+
+    def test_a_clean_plex_copy_counts_as_covering_the_partial(self):
+        row, seen = self._decode_review(0)
+        self.assertEqual(seen, ["Heat.mp4"])                           # the largest file is the film
+        self.assertEqual(row["verdict"], "covered")
+        self.assertIn("decodes cleanly", row["text"])
+
+    def test_a_few_errors_still_cover_it_with_a_note(self):
+        row, _ = self._decode_review(3)
+        self.assertEqual(row["verdict"], "covered")
+        self.assertIn("3 minor decode errors", row["text"])
+
+    def test_a_damaged_plex_copy_does_not_cover_the_partial(self):
+        row, _ = self._decode_review(69768)
+        self.assertEqual(row["verdict"], "damaged")
+        self.assertIn("69768 decode errors", row["text"])
+        report = self.tool.format_report([row])
+        self.assertIn("keep the partial until it is replaced", report)
+
+    def test_a_check_that_cannot_run_is_said_so(self):
+        row, _ = self._decode_review(None)
+        self.assertEqual(row["verdict"], "covered")
+        self.assertIn("video not checked", row["text"])
+
+    def test_the_error_counter_really_counts(self):
+        import shutil
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is not installed")
+        with tempfile.TemporaryDirectory() as temp:
+            good = Path(temp) / "good.ts"
+            subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=25",
+                            "-c:v", "libx264", "-f", "mpegts", str(good)], check=True)
+            data = bytearray(good.read_bytes())
+            for i in range(len(data) // 3, len(data) // 3 * 2, 7):
+                data[i] ^= 0xFF
+            bad = Path(temp) / "bad.ts"
+            bad.write_bytes(bytes(data))
+            self.assertEqual(self.tool.count_decode_errors(str(good), ffmpeg), 0)
+            self.assertGreater(self.tool.count_decode_errors(str(bad), ffmpeg), 0)
+            self.assertIsNone(self.tool.count_decode_errors(str(good), "/no/such/ffmpeg"))
 
 
 class VideoDamageCheckTests(unittest.TestCase):
