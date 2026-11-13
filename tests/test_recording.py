@@ -1215,6 +1215,58 @@ class AgentSeenTests(unittest.TestCase):
         self.assertAlmostEqual(data["agent"]["seconds_ago"], 12, delta=3)
 
 
+class ActiveRecordingsPanelTests(unittest.TestCase):
+    """The Active Recordings panel shows when, where and what the stream looks like."""
+
+    def setUp(self):
+        server._init_recordings_table()
+
+    def test_stream_info_keeps_only_the_expected_clean_fields(self):
+        clean = server._clean_stream_info({
+            "width": 1920, "height": "1080", "fps": 29.97003, "video_codec": "h264<script>", "audio_codec": "aac",
+            "audio_channels": 2, "total_bitrate": 6821000, "login": "secret", "width_x": 5})
+        self.assertEqual(clean, {"width": 1920, "height": 1080, "fps": 29.97, "video_codec": "h264script",
+                                 "audio_codec": "aac", "audio_channels": 2, "total_bitrate": 6821000})
+        self.assertEqual(server._clean_stream_info("nope"), {})
+        self.assertEqual(server._clean_stream_info({"width": "abc", "fps": "x"}), {})
+
+    def test_a_heartbeat_carries_the_stream_info_to_the_panel(self):
+        rec = {"title": "Info Test", "channel": "HBO", "channel_id": "hbo", "stream_id": "1",
+               "start_ts": time.time() - 60, "stop_ts": time.time() + 3600, "status": "queued",
+               "backend": "agent", "file": ""}
+        server._db_upsert_rec("infojob", rec)
+        with mock.patch.object(server, "_agent_authorized", return_value=True):
+            resp = server.app.test_client().post(
+                "/epg-web/api/agent/jobs/infojob/heartbeat",
+                json={"agent_id": "a", "status": "recording",
+                      "stream_info": {"width": 1920, "height": 1080, "fps": 29.97, "video_codec": "h264"}})
+        self.assertEqual(resp.status_code, 200)
+        data = server.app.test_client().get("/epg-web/api/record/status").get_json()
+        self.assertEqual(data["recordings"]["infojob"]["stream_info"]["height"], 1080)
+
+    def test_the_panel_script_shows_time_countdown_and_stream_details(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        for needle in ("function _recStreamText(s)", "starts in ", " left'", "_recDay(r.start_ts, now)",
+                       "r.stream_info"):
+            self.assertIn(needle, html)
+
+    def test_the_stream_text_is_formatted(self):
+        import re
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        source = re.search(r"function _recStreamText\(s\) \{.*?\n\}\n", server.HTML, re.S).group(0)
+        script = source + ("console.log(_recStreamText({width:1920,height:1080,fps:29.97,video_codec:'h264',"
+                           "audio_codec:'aac',audio_channels:2,total_bitrate:6821000}));"
+                           "console.log(_recStreamText({fps:30}));console.log('['+_recStreamText(null)+']');")
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30).stdout.split("\n")
+        self.assertEqual(out[0], "1920\u00d71080 \u00b7 29.97 fps \u00b7 H264 \u00b7 AAC 2ch \u00b7 6.8 Mbps")
+        self.assertEqual(out[1], "30 fps")
+        self.assertEqual(out[2], "[]")
+
+
 class MarkFinishedTests(unittest.TestCase):
     def setUp(self):
         server._init_recordings_table()

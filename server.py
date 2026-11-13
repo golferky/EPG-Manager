@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261113b"
+VERSION = "v20261113c"
 
 app = Flask(__name__)
 
@@ -8142,6 +8142,30 @@ def api_agent_claim():
                     'auto_upgrade': bool(row['auto_upgrade'])})
     return jsonify({'ok': True, 'job': job, 'server_time': now})
 
+def _clean_stream_info(value):
+    """The recorder's description of the incoming stream, with only the expected fields kept."""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for key in ('width', 'height', 'audio_channels', 'total_bitrate'):
+        try:
+            number = int(value.get(key) or 0)
+        except (TypeError, ValueError):
+            number = 0
+        if number > 0:
+            clean[key] = number
+    try:
+        fps = round(float(value.get('fps') or 0), 3)
+    except (TypeError, ValueError):
+        fps = 0.0
+    if fps > 0:
+        clean['fps'] = fps
+    for key in ('video_codec', 'audio_codec'):
+        text = re.sub(r'[^A-Za-z0-9_.-]', '', str(value.get(key) or ''))[:20]
+        if text:
+            clean[key] = text
+    return clean
+
 @app.route('/epg-web/api/agent/jobs/<rec_id>/heartbeat', methods=['POST'])
 def api_agent_heartbeat(rec_id):
     if not _agent_authorized():
@@ -8196,11 +8220,14 @@ def api_agent_heartbeat(rec_id):
                 print(f'[auto-retry] No future airing found for {row["title"]!r}, added to Wanted')
         except Exception as _e:
             print(f'[auto-retry] Error during auto-retry for {row["title"]!r}: {_e}')
+    stream_info = _clean_stream_info(data.get('stream_info'))
     with _rec_lock:
         rec = _recs.setdefault(rec_id, {})
         rec.update({'status': status, 'file': file_path or None,
                     'progress': data.get('progress', rec.get('progress', 0)),
                     'backend': 'agent'})
+        if stream_info:
+            rec['stream_info'] = stream_info
         if failure_reason:
             rec.setdefault('log', []).append(failure_reason)
     return jsonify({'ok': True, 'cancel_requested': False, 'status': status,
@@ -11381,6 +11408,16 @@ function _recIn(seconds) {
   const h = Math.floor(m / 60);
   return h + ' h' + (m % 60 ? ' ' + (m % 60) + ' min' : '');
 }
+function _recStreamText(s) {
+  if (!s) return '';
+  const parts = [];
+  if (s.width && s.height) parts.push(s.width + '×' + s.height);
+  if (s.fps) parts.push(String(Math.round(s.fps * 100) / 100) + ' fps');
+  if (s.video_codec) parts.push(String(s.video_codec).toUpperCase());
+  if (s.audio_codec) parts.push(String(s.audio_codec).toUpperCase() + (s.audio_channels ? ' ' + s.audio_channels + 'ch' : ''));
+  if (s.total_bitrate) parts.push((s.total_bitrate / 1000000).toFixed(1) + ' Mbps');
+  return parts.join(' · ');
+}
 function _recBadge(provider) {
   return provider === 'eaglecast'
     ? '<span style="color:#fbbf24;font-size:11px;">🦅 EC</span>'
@@ -11516,16 +11553,44 @@ async function updateRecPanel() {
     done:'✅', done_ts:'✅', skipped_existing_better:'⏭️',
     error:'❌', failed:'❌', cancelled:'🚫'
   };
+  const now = Date.now() / 1000;
+  const activeStates = ['queued','scheduled','agent_claimed','preflight','waiting',
+                        'recording','awaiting_transfer','transferring','copying'];
+  const startStates = ['queued','scheduled','agent_claimed','preflight','waiting'];
+  const baseOf = r => (r.status||'').split('(')[0].trim();
+  recs.sort((x, y) => {
+    const ax = activeStates.includes(baseOf(x[1])) ? 0 : 1, ay = activeStates.includes(baseOf(y[1])) ? 0 : 1;
+    if (ax !== ay) return ax - ay;
+    return (x[1].start_ts || 0) - (y[1].start_ts || 0);
+  });
   document.getElementById('rec-list').innerHTML = recs.map(([id, r]) => {
-    const baseStatus = (r.status||'').split('(')[0].trim();
+    const baseStatus = baseOf(r);
     const icon = statusIcons[baseStatus] || '•';
-    const active = ['queued','scheduled','agent_claimed','preflight','waiting',
-                    'recording','awaiting_transfer','transferring','copying'].includes(baseStatus);
-    return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1e1e1e;font-size:13px;">
-      <span style="font-size:16px;">${icon}</span>
-      <span style="flex:1;color:#c7d2e7;">${esc(r.title)}</span>
-      <span style="color:#64748b;font-size:11px;">${r.status}</span>
-      ${active ? `<button class="btn btn-danger btn-sm" onclick="cancelRec('${id}')">■</button>` : ''}
+    const active = activeStates.includes(baseStatus);
+    const ep = (r.season_num != null && r.episode_num != null)
+      ? ' · S' + String(r.season_num).padStart(2, '0') + 'E' + String(r.episode_num).padStart(2, '0') + (r.episode_title ? ' ' + r.episode_title : '')
+      : (r.episode_title ? ' · ' + r.episode_title : '');
+    const bits = [];
+    if (r.channel) bits.push(esc(r.channel));
+    bits.push(_recBadge(r.stream_provider));
+    if (r.start_ts && r.stop_ts) {
+      bits.push(esc(_recDay(r.start_ts, now) + ' ' + _recClock(r.start_ts) + ' – ' + _recClock(r.stop_ts)));
+      if (startStates.includes(baseStatus) && r.start_ts > now) bits.push('starts in ' + esc(_recIn(r.start_ts - now)));
+      if (baseStatus === 'recording' && r.stop_ts > now) bits.push(esc(_recIn(r.stop_ts - now)) + ' left');
+    }
+    const stream = _recStreamText(r.stream_info);
+    const pct = (baseStatus === 'recording' && r.start_ts && r.stop_ts && r.stop_ts > r.start_ts)
+      ? Math.max(0, Math.min(100, (now - r.start_ts) / (r.stop_ts - r.start_ts) * 100)) : null;
+    return `<div style="padding:7px 0;border-bottom:1px solid #1e1e1e;font-size:13px;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:16px;">${icon}</span>
+        <span style="flex:1;color:#c7d2e7;">${esc(r.title)}<span style="color:#94a3b8;">${esc(ep)}</span></span>
+        <span style="color:#64748b;font-size:11px;">${esc(r.status)}</span>
+        ${active ? `<button class="btn btn-danger btn-sm" onclick="cancelRec('${id}')">■</button>` : ''}
+      </div>
+      <div style="margin:3px 0 0 26px;color:#64748b;font-size:11px;">${bits.join(' · ')}</div>
+      ${stream ? `<div style="margin:2px 0 0 26px;color:#475569;font-size:11px;font-family:monospace;">${esc(stream)}</div>` : ''}
+      ${pct !== null ? `<div style="margin:5px 0 0 26px;height:3px;background:#1e293b;border-radius:2px;"><div style="width:${pct.toFixed(1)}%;height:3px;background:#ef4444;border-radius:2px;"></div></div>` : ''}
     </div>`;
   }).join('');
   // Stop polling when nothing active
