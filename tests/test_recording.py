@@ -1215,6 +1215,35 @@ class AgentSeenTests(unittest.TestCase):
         self.assertAlmostEqual(data["agent"]["seconds_ago"], 12, delta=3)
 
 
+class HtmlEntityTextTests(unittest.TestCase):
+    """OMDb sometimes returns names such as D&apos;Onofrio: show them as plain text."""
+
+    def test_entities_become_characters(self):
+        self.assertEqual(server._decode_entities("Vincent D&apos;Onofrio, Tom &amp; Jerry &quot;Hi&quot;"),
+                         "Vincent D'Onofrio, Tom & Jerry \"Hi\"")
+        self.assertEqual(server._decode_entities("Plain text"), "Plain text")
+        self.assertEqual(server._decode_entities(2023), 2023)
+        self.assertEqual(server._decode_info({"actors": "D&apos;Onofrio", "year": "2023", "n": 5}),
+                         {"actors": "D'Onofrio", "year": "2023", "n": 5})
+
+    def test_the_decorator_cleans_a_json_answer_and_keeps_the_status(self):
+        @server._decode_response_text
+        def view():
+            return server.jsonify({"actors": "Vincent D&apos;Onofrio", "error": "x &amp; y"}), 502
+
+        @server._decode_response_text
+        def plain():
+            return server.jsonify({"ok": True})
+        with server.app.test_request_context("/"):
+            response, status = view(), None
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.get_json(), {"actors": "Vincent D'Onofrio", "error": "x & y"})
+            self.assertEqual(plain().status_code, 200)
+
+    def test_programme_info_answers_go_through_the_decorator(self):
+        self.assertTrue(hasattr(server.api_prog_info, "__wrapped__"))
+
+
 class ActiveRecordingsPanelTests(unittest.TestCase):
     """The Active Recordings panel shows when, where and what the stream looks like."""
 
