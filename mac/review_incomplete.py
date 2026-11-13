@@ -10,11 +10,17 @@ title (and a year within one) in the Plex Movies folder, and compares lengths:
     Plex copy is shorter              the incomplete file is the longer one: look at both
     not in Plex                       nothing replaces it: keep it, or record the film again
     TV show                           a series episode: check by hand
+A Plex copy that is longer can still be damaged (a stream stall leaves green or blocky video), so
+each one is also decoded from start to end and its errors counted.  A copy with 50 or more errors is
+listed as damaged, and its partial should be kept.  This takes a few minutes per film; --no-decode
+skips it.
+
 This only reads.  It never moves or deletes anything.
 """
 import argparse
 import os
 import re
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,6 +70,33 @@ def folders_for(library, title, year):
     return found
 
 
+DAMAGED_ERROR_LINES = 50
+
+
+def main_video(folder):
+    """The largest video file in a movie folder (the film itself), or '' if there is none."""
+    best, best_size = '', -1
+    for root, _dirs, files in os.walk(folder):
+        for name in files:
+            if name.startswith('.') or os.path.splitext(name)[1].lower() not in scan.VIDEO_EXTENSIONS:
+                continue
+            path = os.path.join(root, name)
+            size = os.path.getsize(path)
+            if size > best_size:
+                best, best_size = path, size
+    return best
+
+
+def count_decode_errors(path, ffmpeg='ffmpeg'):
+    """Decode a video from start to end and count FFmpeg's error lines; None if it could not run."""
+    try:
+        result = subprocess.run([ffmpeg, '-v', 'error', '-i', path, '-f', 'null', '-'],
+                                capture_output=True, text=True, timeout=4 * 3600)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return len([line for line in result.stderr.splitlines() if line.strip()])
+
+
 def judge(minutes, plex_minutes):
     """(verdict, text): how a Plex copy compares with the incomplete file."""
     if not plex_minutes:
@@ -73,7 +106,8 @@ def judge(minutes, plex_minutes):
     return 'shorter', f'Plex has only {plex_minutes:.0f} min (this file {minutes:.0f} min)'
 
 
-def review(folder, movies_dir, tv_dir, ffprobe, workers=4):
+def review(folder, movies_dir, tv_dir, ffprobe, workers=4, check_decode=True, ffmpeg='ffmpeg',
+           limit=DAMAGED_ERROR_LINES):
     def one(name):
         title, year, date = parse_name(name)
         path = os.path.join(folder, name)
@@ -81,8 +115,21 @@ def review(folder, movies_dir, tv_dir, ffprobe, workers=4):
         minutes = tidy.video_minutes(path, ffprobe)
         movies = folders_for(movies_dir, title, year) if movies_dir else []
         if movies:
-            best = max(years.file_minutes(os.path.join(movies_dir, m), ffprobe) for m in movies)
-            verdict, text = judge(minutes, best)
+            lengths = {m: years.file_minutes(os.path.join(movies_dir, m), ffprobe) for m in movies}
+            best_folder = max(lengths, key=lengths.get)
+            verdict, text = judge(minutes, lengths[best_folder])
+            if verdict == 'covered' and check_decode:
+                video = main_video(os.path.join(movies_dir, best_folder))
+                errors = count_decode_errors(video, ffmpeg) if video else None
+                if errors is None:
+                    text += ' (video not checked)'
+                elif errors >= limit:
+                    verdict = 'damaged'
+                    text = f'Plex has {lengths[best_folder]:.0f} min but its video is damaged ({errors} decode errors)'
+                elif errors:
+                    text += f', {errors} minor decode errors'
+                else:
+                    text += ', decodes cleanly'
         elif tv_dir and folders_for(tv_dir, title, ''):
             verdict, text = 'tv', 'TV show: check by hand'
         else:
@@ -94,7 +141,8 @@ def review(folder, movies_dir, tv_dir, ffprobe, workers=4):
 
 
 GROUPS = [
-    ('covered', 'Plex already has an equal or longer copy: the incomplete file adds nothing'),
+    ('covered', 'Plex already has an equal or longer copy that decodes well: the incomplete file adds nothing'),
+    ('damaged', 'Plex has a longer copy but its video is damaged: keep the partial until it is replaced'),
     ('shorter', 'Plex has a shorter copy: the incomplete file is the longer one, so look at both'),
     ('not_in_plex', 'Not in Plex: nothing replaces these'),
     ('tv', 'TV episodes: check by hand'),
@@ -119,6 +167,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', default='~/EPG-Manager/recording_agent.json')
     parser.add_argument('--folder', help='Incomplete Recordings folder (default: next to the Movies folder)')
+    parser.add_argument('--no-decode', action='store_true',
+                        help='do not decode the Plex copies to check them for damage (much faster)')
     args = parser.parse_args(argv)
     movies_dir, _server = base.load_defaults(args.config)
     tv_dir, _server = base.load_defaults(args.config, tv=True)
@@ -128,9 +178,14 @@ def main(argv=None):
         print(f'Cannot open the Incomplete Recordings folder ({folder or "not set"}). Is the Plex share mounted?')
         return 1
     ffprobe = base.load_config_value(args.config, 'ffprobe') or 'ffprobe'
-    print(f'Measuring the files in {folder} ...\n')
+    ffmpeg = base.load_config_value(args.config, 'ffmpeg') or 'ffmpeg'
+    print(f'Measuring the files in {folder} ...')
+    if not args.no_decode:
+        print('Plex copies that cover a partial are also decoded to check for damage: a few minutes per film.')
+    print()
     print(format_report(review(folder, movies_dir if movies_dir and os.path.isdir(movies_dir) else '',
-                               tv_dir if tv_dir and os.path.isdir(tv_dir) else '', ffprobe)))
+                               tv_dir if tv_dir and os.path.isdir(tv_dir) else '', ffprobe,
+                               check_decode=not args.no_decode, ffmpeg=ffmpeg)))
     print('\nNothing was moved or deleted.')
     return 0
 
