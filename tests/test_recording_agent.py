@@ -530,7 +530,7 @@ class AgentVersionPayloadTests(unittest.TestCase):
 class ShortRecordingFlowTests(unittest.TestCase):
     """A recording a few minutes short goes to Incomplete Recordings, not Plex."""
 
-    def _run(self, recorded_minutes):
+    def _run(self, recorded_minutes, damage=None):
         now = time.time()
         job = {"id": "j1", "title": "Short Movie", "stream_id": "1", "start_ts": now - 3600,
                "stop_ts": now - 3600 + 137 * 60, "stream_provider": "primestreams",
@@ -552,6 +552,7 @@ class ShortRecordingFlowTests(unittest.TestCase):
                  mock.patch.object(recording_agent, "discard_failed_media"), \
                  mock.patch.object(recording_agent, "preserve_incomplete_recording",
                                    return_value=Path(temp) / "x - INCOMPLETE.mp4") as preserve, \
+                 mock.patch.object(recording_agent, "count_decode_errors", return_value=damage), \
                  mock.patch.object(recording_agent, "verified_transfer",
                                    return_value=Path(temp) / "x.mp4"):
                 recording_agent.process_job(api, job, cfg)
@@ -567,6 +568,24 @@ class ShortRecordingFlowTests(unittest.TestCase):
     def test_a_complete_recording_is_not_saved_as_incomplete(self):
         _archive, preserve = self._run(138)
         preserve.assert_not_called()
+
+    def test_a_damaged_recording_is_kept_out_of_plex(self):
+        archive, preserve = self._run(138, damage=80)
+        preserve.assert_called_once()
+        self.assertEqual(preserve.call_args.kwargs["label"], "DAMAGED")
+        self.assertEqual(archive.call_args.args[2], "failed")
+        self.assertIn("damaged: 80 decode errors", archive.call_args.kwargs["message"])
+
+    def test_a_few_errors_do_not_stop_the_recording_reaching_plex(self):
+        archive, preserve = self._run(138, damage=3)
+        preserve.assert_not_called()
+        self.assertEqual(archive.call_args.args[2], "done")
+        self.assertIn("3 minor video errors", archive.call_args.kwargs["quality_decision"])
+
+    def test_a_clean_file_reaches_plex(self):
+        archive, preserve = self._run(138, damage=0)
+        preserve.assert_not_called()
+        self.assertEqual(archive.call_args.args[2], "done")
 
 
 class SameTitleDifferentYearTests(unittest.TestCase):
@@ -2527,3 +2546,108 @@ class IncomingProbeTests(unittest.TestCase):
                 None, {"title": "Film", "id": "j1"}, {"ffprobe": "ffprobe"}, "http://x",
                 sleep=lambda *a, **k: False)
         self.assertIsNone(result)
+
+
+class ReviewIncompleteTests(unittest.TestCase):
+    """Which incomplete recordings Plex already covers."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "review_incomplete", Path(__file__).resolve().parent.parent / "mac" / "review_incomplete.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_names_are_read(self):
+        parse = self.tool.parse_name
+        self.assertEqual(parse("Ocean's Thirteen - INCOMPLETE - 2026-11-11_1334.mp4"),
+                         ("Ocean's Thirteen", "", "2026-11-11"))
+        self.assertEqual(parse("Minions (2015) - INCOMPLETE - 2026-11-08_1125.mp4"),
+                         ("Minions", "2015", "2026-11-08"))
+        self.assertIsNone(parse("Heat (1995).mp4"))
+
+    def test_lengths_are_compared(self):
+        judge = self.tool.judge
+        self.assertEqual(judge(34, 123)[0], "covered")
+        self.assertEqual(judge(100, 100)[0], "covered")
+        self.assertEqual(judge(100, 60)[0], "shorter")
+        self.assertEqual(judge(100, 0)[0], "not_in_plex")
+
+    def test_the_review_groups_files_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            incomplete, movies, tv = root / "Incomplete Recordings", root / "Movies", root / "TV Shows"
+            for folder in (incomplete, movies, tv):
+                folder.mkdir()
+            for name in ("Heat - INCOMPLETE - 2026-11-01_1000.mp4", "Alien - INCOMPLETE - 2026-11-02_1000.mp4",
+                         "Jeannie - INCOMPLETE - 2026-11-03_1000.mp4", "Solo - INCOMPLETE - 2026-11-04_1000.mp4"):
+                (incomplete / name).write_bytes(b"x" * 100)
+            (movies / "Heat (1995)").mkdir()
+            (movies / "Heat (1995)" / "Heat.mp4").write_bytes(b"x")
+            (movies / "Alien (1979)").mkdir()
+            (movies / "Alien (1979)" / "Alien.mp4").write_bytes(b"x")
+            (tv / "Jeannie (1965)").mkdir()
+            lengths = {"Heat.mp4": 170.0, "Alien.mp4": 40.0}
+            with mock.patch.object(self.tool.tidy, "video_minutes", return_value=100.0), \
+                 mock.patch.object(self.tool.years, "file_minutes",
+                                   side_effect=lambda folder, ffprobe="ffprobe":
+                                   next((v for k, v in lengths.items() if (Path(folder) / k).exists()), 0.0)):
+                rows = self.tool.review(str(incomplete), str(movies), str(tv), "ffprobe")
+            verdicts = {r["title"]: r["verdict"] for r in rows}
+            self.assertEqual(verdicts, {"Heat": "covered", "Alien": "shorter", "Jeannie": "tv", "Solo": "not_in_plex"})
+            report = self.tool.format_report(rows)
+            self.assertIn("Plex already has an equal or longer copy", report)
+            self.assertEqual(len(list(incomplete.iterdir())), 4)          # nothing moved or deleted
+
+
+class VideoDamageCheckTests(unittest.TestCase):
+    """Decode a finished recording and count FFmpeg's errors."""
+
+    def _count(self, stderr_text, rc=0):
+        """Run count_decode_errors with run_process faked to write ``stderr_text`` to the check log."""
+        def fake_run(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None):
+            Path(log_path).write_text(stderr_text, encoding="utf-8")
+            return rc
+        with tempfile.TemporaryDirectory() as temp:
+            media = Path(temp) / "x.mp4"
+            media.write_bytes(b"x")
+            with mock.patch.object(recording_agent, "run_process", fake_run):
+                count = recording_agent.count_decode_errors(None, {"title": "Film", "id": "j"},
+                                                            {"ffmpeg": "ffmpeg"}, media)
+            self.assertFalse(Path(str(media) + ".check.log").exists())      # no stray file left behind
+            return count
+
+    def test_a_clean_file_has_no_errors(self):
+        self.assertEqual(self._count(""), 0)
+
+    def test_error_lines_are_counted(self):
+        self.assertEqual(self._count("[h264 @ 0x1] no frame!\n\n[h264 @ 0x1] cabac_init_idc 4 overflow\n"), 2)
+
+    def test_a_cancelled_job_gives_none(self):
+        self.assertIsNone(self._count("", rc=None))
+
+    def test_the_limit_is_a_setting_with_a_default(self):
+        self.assertEqual(recording_agent.DAMAGED_ERROR_LINES, 50)
+
+    def test_the_check_really_catches_a_corrupted_video(self):
+        import shutil
+        import subprocess
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is not installed")
+        with tempfile.TemporaryDirectory() as temp:
+            good = Path(temp) / "good.ts"
+            subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=25",
+                            "-c:v", "libx264", "-f", "mpegts", str(good)], check=True)
+            data = bytearray(good.read_bytes())
+            for i in range(len(data) // 3, len(data) // 3 * 2, 7):          # damage the middle third
+                data[i] ^= 0xFF
+            bad = Path(temp) / "bad.ts"
+            bad.write_bytes(bytes(data))
+            def run(path):
+                result = subprocess.run([ffmpeg, "-v", "error", "-i", str(path), "-f", "null", "-"],
+                                        capture_output=True, text=True)
+                return len([ln for ln in result.stderr.splitlines() if ln.strip()])
+            self.assertEqual(run(good), 0)
+            self.assertGreater(run(bad), 0)
