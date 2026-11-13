@@ -28,7 +28,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261113a"
+VERSION = "v20261113b"
 
 app = Flask(__name__)
 
@@ -294,9 +294,14 @@ def _is_premium_channel(name):
     return normalized.startswith(premium_prefixes)
 
 
+# Commercial-free channels that are not "premium" in the Favorites sense: Flix and The Movie
+# Channel (Showtime's sister networks), TCM, and Crave's premium channels.
+_COMMERCIAL_FREE_EXTRA_PREFIXES = ('flix', 'themoviechannel', 'tmc', 'tcm', 'turnerclassicmovies', 'crave')
+
+
 def _is_commercial_free_channel(name):
     """Channels we can reliably treat as commercial-free for movie recording."""
-    return _is_premium_channel(name)
+    return _is_premium_channel(name) or _channel_match_base(name).startswith(_COMMERCIAL_FREE_EXTRA_PREFIXES)
 
 
 def _is_rerecord_channel(name):

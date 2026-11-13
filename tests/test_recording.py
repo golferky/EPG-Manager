@@ -1844,6 +1844,12 @@ class RerecordChannelTests(unittest.TestCase):
         self.assertTrue(ok("HBO"))
         self.assertTrue(ok("Showtime East HD"))
         self.assertTrue(ok("MGM+ Hits HD"))
+        for name in ("Flix", "FLIX HD", "TCM (SD)", "The Movie Channel East", "TMC Xtra", "Crave1",
+                     "SHO 2 HD", "SKY CINEMA FAMILY | VIP", "Starz Kids & Family HD",
+                     "CINEMAX CLASSICS", "Hollywood Suite 70s"):
+            self.assertTrue(ok(name), name)
+        for name in ("AMC", "Hallmark Movies", "FXM", "Freeform", "Showcase"):
+            self.assertFalse(ok(name), name)
         self.assertFalse(ok("ANTENNA TV"))                 # ad-supported
         self.assertFalse(ok("Paramount Network HD"))       # ad-supported
         self.assertFalse(ok("HBO Latino"))                 # premium, but a Spanish feed
