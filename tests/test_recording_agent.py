@@ -2527,3 +2527,56 @@ class IncomingProbeTests(unittest.TestCase):
                 None, {"title": "Film", "id": "j1"}, {"ffprobe": "ffprobe"}, "http://x",
                 sleep=lambda *a, **k: False)
         self.assertIsNone(result)
+
+
+class ReviewIncompleteTests(unittest.TestCase):
+    """Which incomplete recordings Plex already covers."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "review_incomplete", Path(__file__).resolve().parent.parent / "mac" / "review_incomplete.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_names_are_read(self):
+        parse = self.tool.parse_name
+        self.assertEqual(parse("Ocean's Thirteen - INCOMPLETE - 2026-11-11_1334.mp4"),
+                         ("Ocean's Thirteen", "", "2026-11-11"))
+        self.assertEqual(parse("Minions (2015) - INCOMPLETE - 2026-11-08_1125.mp4"),
+                         ("Minions", "2015", "2026-11-08"))
+        self.assertIsNone(parse("Heat (1995).mp4"))
+
+    def test_lengths_are_compared(self):
+        judge = self.tool.judge
+        self.assertEqual(judge(34, 123)[0], "covered")
+        self.assertEqual(judge(100, 100)[0], "covered")
+        self.assertEqual(judge(100, 60)[0], "shorter")
+        self.assertEqual(judge(100, 0)[0], "not_in_plex")
+
+    def test_the_review_groups_files_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            incomplete, movies, tv = root / "Incomplete Recordings", root / "Movies", root / "TV Shows"
+            for folder in (incomplete, movies, tv):
+                folder.mkdir()
+            for name in ("Heat - INCOMPLETE - 2026-11-01_1000.mp4", "Alien - INCOMPLETE - 2026-11-02_1000.mp4",
+                         "Jeannie - INCOMPLETE - 2026-11-03_1000.mp4", "Solo - INCOMPLETE - 2026-11-04_1000.mp4"):
+                (incomplete / name).write_bytes(b"x" * 100)
+            (movies / "Heat (1995)").mkdir()
+            (movies / "Heat (1995)" / "Heat.mp4").write_bytes(b"x")
+            (movies / "Alien (1979)").mkdir()
+            (movies / "Alien (1979)" / "Alien.mp4").write_bytes(b"x")
+            (tv / "Jeannie (1965)").mkdir()
+            lengths = {"Heat.mp4": 170.0, "Alien.mp4": 40.0}
+            with mock.patch.object(self.tool.tidy, "video_minutes", return_value=100.0), \
+                 mock.patch.object(self.tool.years, "file_minutes",
+                                   side_effect=lambda folder, ffprobe="ffprobe":
+                                   next((v for k, v in lengths.items() if (Path(folder) / k).exists()), 0.0)):
+                rows = self.tool.review(str(incomplete), str(movies), str(tv), "ffprobe")
+            verdicts = {r["title"]: r["verdict"] for r in rows}
+            self.assertEqual(verdicts, {"Heat": "covered", "Alien": "shorter", "Jeannie": "tv", "Solo": "not_in_plex"})
+            report = self.tool.format_report(rows)
+            self.assertIn("Plex already has an equal or longer copy", report)
+            self.assertEqual(len(list(incomplete.iterdir())), 4)          # nothing moved or deleted
