@@ -2734,6 +2734,58 @@ class AutoRecordWantedTests(unittest.TestCase):
         self.assertEqual(self._recorded_titles(), [])
         self.assertEqual(resolve.call_count, 1)
 
+    def _channel_outcome(self, rec_id, channel_id, status, reason=""):
+        self.conn.execute("INSERT OR REPLACE INTO recordings(rec_id, title, channel, channel_id, start_ts, stop_ts, status, failure_reason) "
+                          "VALUES (?,?,?,?,?,?,?,?)", (rec_id, "T", channel_id, channel_id, time.time() - 3600, time.time(), status, reason))
+        self.conn.commit()
+
+    def test_a_damaged_recording_counts_double_against_its_channel(self):
+        self._channel_outcome("o1", "aw-good", "done")
+        self._channel_outcome("o2", "aw-damaged", "failed", "Video is damaged: 9000 decode errors")
+        self._channel_outcome("o3", "aw-plain", "failed", "Recording ended early")
+        stats = server._channel_recording_reliability()
+        self.assertEqual(stats["aw-damaged"]["failed"], 2)
+        self.assertEqual(stats["aw-plain"]["failed"], 1)
+        self.assertEqual(stats["aw-good"]["level"], "reliable")
+        self._channel_outcome("o4", "aw-damaged", "failed", "Video is damaged: 400 decode errors")
+        self.assertEqual(server._channel_recording_reliability()["aw-damaged"]["level"], "suspect")    # two damaged: suspect
+
+    def test_the_bad_channel_list_matches_names_and_ids(self):
+        cfg = {"bad_channels": ["Flix", "aw-HBO-0"]}
+        self.assertTrue(server._is_bad_channel(cfg, "x", "FLIX"))
+        self.assertTrue(server._is_bad_channel(cfg, "aw-HBO-0", "Other"))
+        self.assertFalse(server._is_bad_channel(cfg, "y", "Starz"))
+        self.assertFalse(server._is_bad_channel({}, "y", "Flix"))
+        self.assertTrue(server._is_bad_channel({"bad_channels": "Flix"}, "y", "Flix"))
+
+    def test_a_bad_channel_is_never_used_automatically(self):
+        self._airing("Bad Film", "2004", "Flix", shift=0)
+        self._airing("Bad Film", "2004", "Starz", shift=3600)
+        self._run([self._wanted("Bad Film", "2004")], config={"bad_channels": ["Flix"]})
+        self.assertEqual([r["channel"] for r in server._recs.values()], ["Starz"])
+
+    def test_a_channel_with_a_good_record_is_preferred_within_a_week(self):
+        self._airing("Choice Film", "2004", "HBO", shift=0, channel_id="aw-new")
+        self._airing("Choice Film", "2004", "Starz", shift=3 * 86400, channel_id="aw-proven")
+        self._channel_outcome("p1", "aw-proven", "done")
+        self._run([self._wanted("Choice Film", "2004")])
+        self.assertEqual([r["channel"] for r in server._recs.values()], ["Starz"])
+
+    def test_a_better_channel_more_than_a_week_later_is_not_waited_for(self):
+        self._airing("Late Film", "2004", "HBO", shift=0, channel_id="aw-new2")
+        self._airing("Late Film", "2004", "Starz", shift=9 * 86400, channel_id="aw-proven2")
+        self._channel_outcome("p2", "aw-proven2", "done")
+        self._run([self._wanted("Late Film", "2004")])
+        self.assertEqual([r["channel"] for r in server._recs.values()], ["HBO"])
+
+    def test_a_channel_with_failures_is_the_last_choice(self):
+        self._airing("Rank Film", "2004", "HBO", shift=0, channel_id="aw-shaky")
+        self._airing("Rank Film", "2004", "Starz", shift=3600, channel_id="aw-unknown")
+        self._channel_outcome("s1", "aw-shaky", "done")
+        self._channel_outcome("s2", "aw-shaky", "failed", "Recording ended early")
+        self._run([self._wanted("Rank Film", "2004")])
+        self.assertEqual([r["channel"] for r in server._recs.values()], ["Starz"])
+
     def test_the_passes_are_wired_in(self):
         import inspect
         source = inspect.getsource(server)

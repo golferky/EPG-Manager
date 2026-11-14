@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261113b"
+AGENT_VERSION = "v20261114a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -797,6 +797,38 @@ def count_decode_errors(api, job, cfg, media_path):
             pass
 
 
+DAMAGED_TAIL_SECONDS = 600
+
+
+def tail_decode_errors(path, cfg, seconds=DAMAGED_TAIL_SECONDS):
+    """Decode the last ``seconds`` of a video and count FFmpeg's error lines; None if it cannot run."""
+    cmd = [cfg.get('ffmpeg', 'ffmpeg'), '-nostdin', '-v', 'error', '-sseof', f'-{int(seconds)}',
+           '-i', str(path), '-f', 'null', '-']
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
+                                stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return len([line for line in result.stderr.splitlines() if line.strip()])
+
+
+def replace_if_existing_is_damaged(should_replace, decision, existing_path, cfg):
+    """A damaged Plex copy must never block its own replacement.
+
+    The quality comparison looks at resolution, frame rate and bitrate, so a damaged copy of a
+    higher-quality recording can look "better" and make the recorder skip the good one.  When the
+    comparison says to keep the existing copy, decode its last ten minutes: with the damage limit
+    or more errors it is replaced after all.  Returns (should_replace, decision).
+    """
+    if should_replace or not existing_path or not cfg.get('check_video_after_recording', True):
+        return should_replace, decision
+    errors = tail_decode_errors(existing_path, cfg)
+    limit = int(cfg.get('damaged_error_lines') or DAMAGED_ERROR_LINES)
+    if errors is not None and errors >= limit:
+        return True, f'replacing damaged Plex copy ({errors} decode errors in its last 10 minutes)'
+    return should_replace, decision
+
+
 def preserve_incomplete_recording(source, cfg, title, start_ts, progress_callback=None, label='INCOMPLETE'):
     """Copy a partial MP4 to the QNAP, keeping it out of Plex libraries."""
     destination_root = incomplete_recordings_root(cfg)
@@ -1066,6 +1098,7 @@ def process_job(api, job, cfg):
         )
     elif existing_probe:
         should_record, decision = quality_decision(existing_probe, incoming_probe)
+        should_record, decision = replace_if_existing_is_damaged(should_record, decision, existing_path, cfg)
     else:
         should_record, decision = True, 'recording because Plex has no copy'
     quality = {
@@ -1235,6 +1268,9 @@ def process_job(api, job, cfg):
     elif final_existing_probe:
         should_transfer, final_decision = quality_decision(
             final_existing_probe, recorded_probe
+        )
+        should_transfer, final_decision = replace_if_existing_is_damaged(
+            should_transfer, final_decision, final_existing_path, cfg
         )
         quality.update({
             'decision': final_decision,

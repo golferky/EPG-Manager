@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261114b"
+VERSION = "v20261114c"
 
 app = Flask(__name__)
 
@@ -390,6 +390,19 @@ def _is_automatic_recording_quarantined_channel(name):
     """
     normalized = re.sub(r'[^a-z0-9]+', '', (name or '').lower())
     return normalized.startswith('tastemade')
+
+
+def _is_bad_channel(cfg, channel_id, channel_name):
+    """Is this channel on the owner's "do not record automatically from here" list?
+
+    ``"bad_channels": ["Channel name or id", ...]`` in the dashboard config.  It only affects
+    unattended recording (Wanted films and quality upgrades); a Record you press yourself still works.
+    """
+    listed = cfg.get('bad_channels') or []
+    if isinstance(listed, str):
+        listed = [listed]
+    wanted = {fold_title(str(item)) for item in listed if str(item).strip()}
+    return bool(wanted) and (fold_title(channel_name or '') in wanted or fold_title(channel_id or '') in wanted)
 
 
 def _is_quality_variant_channel_name(name):
@@ -1859,7 +1872,7 @@ def _channel_recording_reliability(days=30):
         conn = sqlite3.connect(_guide_db_path(), timeout=1)
         conn.execute('PRAGMA busy_timeout=1000')
         conn.row_factory = sqlite3.Row
-        rows = conn.execute('''SELECT channel_id,status FROM recordings
+        rows = conn.execute('''SELECT channel_id,status,failure_reason FROM recordings
                                WHERE start_ts >= ? AND channel_id IS NOT NULL
                                  AND TRIM(channel_id) != '' ''', (since,)).fetchall()
         conn.close()
@@ -1872,7 +1885,10 @@ def _channel_recording_reliability(days=30):
             outcomes.setdefault(key, {'ok': 0, 'failed': 0})['ok'] += 1
         elif status in {'failed', 'error', 'done_ts', 'stale', 'missed'}:
             key = row['channel_id']
-            outcomes.setdefault(key, {'ok': 0, 'failed': 0})['failed'] += 1
+            # A recording whose video came out damaged counts double: two of them make a channel
+            # suspect, so unattended recording stops using a source that keeps corrupting video.
+            weight = 2 if 'damaged' in str(row['failure_reason'] or '').lower() else 1
+            outcomes.setdefault(key, {'ok': 0, 'failed': 0})['failed'] += weight
     for stats in outcomes.values():
         total = stats['ok'] + stats['failed']
         rate = stats['failed'] / total if total else 0
@@ -4746,6 +4762,7 @@ def _auto_schedule_movie_upgrades():
             row_year = _clean_year(row['year'])
             if (_upgrade_matches_plex(plex_index, title_key, row_year)
                     and _is_rerecord_channel(row['channel_name'])
+                    and not _is_bad_channel(cfg, row['channel_id'], row['channel_name'])
                     and not _is_automatic_recording_quarantined_channel(row['channel_name'])
                     and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
                     and not _recent_same_source_failure(row['title'], row['channel_id'])):
@@ -4823,6 +4840,7 @@ def _auto_schedule_movie_upgrades():
 _AUTO_WANTED_FAILED = {}          # (folded title, airing start) -> when a source last refused it
 AUTO_WANTED_HORIZON_DAYS = 14
 AUTO_WANTED_MIN_LEAD_SECONDS = 180
+AUTO_WANTED_CHANNEL_CHOICE_DAYS = 7
 AUTO_WANTED_RETRY_SECONDS = 6 * 3600
 _auto_wanted_lock = threading.Lock()
 
@@ -4870,6 +4888,7 @@ def _auto_record_wanted_movies(max_new=60):
         with _rec_lock:
             busy = {fold_title(r.get('title', '')) for r in _recs.values() if _rec_is_active(r)}
         options = []
+        rank_of = lambda channel_id: {'reliable': 0, 'warning': 2}.get(reliability.get(channel_id, {}).get('level'), 1)
         for w in wanted:
             key = fold_title(w['title'])
             year = _clean_year(w['year'])
@@ -4880,6 +4899,7 @@ def _auto_record_wanted_movies(max_new=60):
             if owned or key in busy:
                 summary['skipped'] += 1
                 continue
+            usable = []
             for row in by_title.get(key, []):
                 row_year = _clean_year(row['year'])
                 if year and row_year and abs(int(year) - int(row_year)) > 1:
@@ -4887,13 +4907,24 @@ def _auto_record_wanted_movies(max_new=60):
                 if not _is_rerecord_channel(row['channel_name']):
                     continue
                 if (_is_automatic_recording_quarantined_channel(row['channel_name'])
+                        or _is_bad_channel(cfg, row['channel_id'], row['channel_name'])
                         or reliability.get(row['channel_id'], {}).get('level') == 'suspect'
                         or _recent_same_source_failure(row['title'], row['channel_id'])):
                     continue
                 if now - _AUTO_WANTED_FAILED.get((key, row['start_utc']), 0) < AUTO_WANTED_RETRY_SECONDS:
                     continue
-                options.append((row['start_utc'], w, row, year or row_year, key))
-                break                        # the earliest usable airing of this film
+                usable.append(row)
+            if not usable:
+                continue
+            # Pick the channel as well as the time: among the airings in the first week of what is
+            # available, take the one on the channel with the best recent record (proven reliable,
+            # then no history, then some failures), and the earliest of those.
+            first = min(row['start_utc'] for row in usable)
+            horizon = (datetime.strptime(first, '%Y%m%d%H%M%S')
+                       + timedelta(days=AUTO_WANTED_CHANNEL_CHOICE_DAYS)).strftime('%Y%m%d%H%M%S')
+            row = min((r for r in usable if r['start_utc'] <= horizon),
+                      key=lambda r: (rank_of(r['channel_id']), r['start_utc']))
+            options.append((row['start_utc'], w, row, year or _clean_year(row['year']), key))
         options.sort(key=lambda item: item[0])
         for start_key, w, row, year, key in options[:max_new]:
             start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
