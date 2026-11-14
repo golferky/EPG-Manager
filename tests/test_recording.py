@@ -2556,6 +2556,38 @@ class WantedChoicesFallbackTests(unittest.TestCase):
         data = self._get("q=Tommy&type=movie", {}, self.TOMMY, self.DETAILS, cfg={"tmdb_key": "t"}).get_json()
         self.assertEqual(data["source"], "tmdb")
 
+    def test_a_year_in_the_title_is_not_searched_for_and_that_year_comes_first(self):
+        import io
+        seen = []
+        omdb = {"Response": "True", "Search": [{"Title": "Bohemian Rhapsody", "Year": "1975", "imdbID": "tt1"},
+                                              {"Title": "Bohemian Rhapsody", "Year": "2018", "imdbID": "tt2"}]}
+
+        def fake(url, timeout=0):
+            url = url if isinstance(url, str) else url.full_url
+            seen.append(url)
+            if "?s=" in url:
+                return io.BytesIO(json.dumps(omdb).encode())
+            return io.BytesIO(json.dumps({"Response": "True", "Title": "Bohemian Rhapsody",
+                                          "Year": "2018" if "tt2" in url else "1975", "imdbID": "tt2" if "tt2" in url else "tt1"}).encode())
+        with mock.patch.object(server, "load_config", return_value={"omdb_key": "o", "tmdb_key": "t"}), \
+             mock.patch("urllib.request.urlopen", side_effect=fake):
+            data = server.app.test_client().get(
+                "/epg-web/api/wanted/movie-matches?q=Bohemian%20Rhapsody%20(2018)&type=movie").get_json()
+        search = [u for u in seen if "?s=" in u][0]
+        self.assertIn("s=Bohemian%20Rhapsody&", search)
+        self.assertNotIn("2018", search)
+        self.assertEqual([m["year"] for m in data["matches"]], ["2018", "1975"])
+
+    def test_a_year_in_the_title_also_works_through_tmdb(self):
+        data = self._get("q=Tommy%20(1975)&type=movie", {"Response": "False", "Error": "Movie not found!"},
+                         self.TOMMY, self.DETAILS).get_json()
+        self.assertEqual(data["source"], "tmdb")
+        self.assertEqual(data["matches"][0]["year"], "1975")
+
+    def test_a_title_that_is_only_a_year_is_left_alone(self):
+        data = self._get("q=%282012%29&type=movie", {"Response": "False", "Error": "Movie not found!"}, []).get_json()
+        self.assertEqual(data["matches"], [])
+
     def test_with_no_keys_at_all_it_says_so(self):
         resp = self._get("q=Tommy&type=movie", {}, cfg={})
         self.assertEqual(resp.status_code, 503)
