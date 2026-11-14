@@ -92,12 +92,15 @@ def count_decode_errors(path, ffmpeg='ffmpeg', tail_seconds=None):
 
     With ``tail_seconds`` only the last that-many seconds are decoded (a quick check).
     """
-    cmd = [ffmpeg, '-v', 'error']
+    # -nostdin and a closed stdin: FFmpeg otherwise reads the keyboard ("press q to stop"), which can
+    # leave the Terminal window in a raw mode where Enter shows as ^M.
+    cmd = [ffmpeg, '-nostdin', '-v', 'error']
     if tail_seconds:
         cmd += ['-sseof', f'-{int(tail_seconds)}']
     cmd += ['-i', path, '-f', 'null', '-']
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=4 * 3600,
+                                stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     return len([line for line in result.stderr.splitlines() if line.strip()])
