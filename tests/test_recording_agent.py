@@ -2859,8 +2859,10 @@ class CheckLibraryTests(unittest.TestCase):
     def test_the_review_counter_can_decode_just_the_tail(self):
         review = self.tool.review
         seen = []
+        kwargs = []
         def fake_run(cmd, **kw):
             seen.append(cmd)
+            kwargs.append(kw)
             return mock.Mock(stderr="")
         with mock.patch.object(review.subprocess, "run", fake_run):
             review.count_decode_errors("/x/film.mp4", "ffmpeg", 600)
@@ -2868,6 +2870,9 @@ class CheckLibraryTests(unittest.TestCase):
         self.assertIn("-sseof", seen[0])
         self.assertIn("-600", seen[0])
         self.assertNotIn("-sseof", seen[1])
+        for cmd, kw in zip(seen, kwargs):                       # FFmpeg must never read the keyboard
+            self.assertIn("-nostdin", cmd)
+            self.assertIs(kw["stdin"], review.subprocess.DEVNULL)
 
 
 class FixDamagedTests(unittest.TestCase):
