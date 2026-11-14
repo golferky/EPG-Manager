@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261113e"
+VERSION = "v20261114a"
 
 app = Flask(__name__)
 
@@ -2635,6 +2635,8 @@ def api_load_guide():
                          name='epg-auto-upgrades', daemon=True).start()
         threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
                          name='epg-abandoned-transfer-retries', daemon=True).start()
+        threading.Thread(target=_auto_record_wanted_movies,
+                         name='epg-auto-wanted', daemon=True).start()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows, 'loaded': _epg['loaded']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2657,6 +2659,8 @@ def api_refresh_downloaded_guide():
                          name='epg-auto-upgrades', daemon=True).start()
         threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
                          name='epg-abandoned-transfer-retries', daemon=True).start()
+        threading.Thread(target=_auto_record_wanted_movies,
+                         name='epg-auto-wanted', daemon=True).start()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows,
                         'source': 'saved XML'})
     except Exception as exc:
@@ -2761,6 +2765,8 @@ def api_fetch_guide():
                          name='epg-auto-upgrades', daemon=True).start()
         threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
                          name='epg-abandoned-transfer-retries', daemon=True).start()
+        threading.Thread(target=_auto_record_wanted_movies,
+                         name='epg-auto-wanted', daemon=True).start()
         threading.Thread(target=_refresh_stream_quality_cache,
                          name='epg-stream-quality', daemon=True).start()
         print(f'[fetch-guide] Visible guide ready: {count} programmes, {new_rows} XML rows, '
@@ -4814,6 +4820,119 @@ def _auto_schedule_movie_upgrades():
     except Exception as exc:
         print(f'[auto-upgrade] Error: {exc}')
 
+_AUTO_WANTED_FAILED = {}          # (folded title, airing start) -> when a source last refused it
+AUTO_WANTED_HORIZON_DAYS = 14
+AUTO_WANTED_MIN_LEAD_SECONDS = 180
+AUTO_WANTED_RETRY_SECONDS = 6 * 3600
+_auto_wanted_lock = threading.Lock()
+
+
+def _auto_record_wanted_movies(max_new=60):
+    """Schedule the next commercial-free airing of every Wanted film that is not in Plex.
+
+    A Wanted film should simply be recorded, with no Record button to press.  Only airings on
+    commercial-free English channels are used (the same rule the Wanted list shows), only films
+    that Plex does not already hold (the right year), and never a title that already has an active
+    recording.  Soonest airings are placed first; one that does not fit the recording slots, or
+    whose stream cannot be found, is left for the next pass.  Turn it off with
+    ``"auto_record_wanted": false`` in the dashboard config.  Returns a small summary dict.
+    """
+    summary = {'scheduled': [], 'skipped': 0, 'disabled': False}
+    if not _auto_wanted_lock.acquire(blocking=False):
+        return summary                      # a pass is already running
+    try:
+        cfg = load_config()
+        if cfg.get('auto_record_wanted', True) is False:
+            summary['disabled'] = True
+            return summary
+        movie_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
+        if not os.path.isdir(movie_root):
+            print('[auto-wanted] Plex Movies is not mounted; skipping')
+            return summary
+        wanted = [w for w in db_rows('SELECT * FROM wanted_titles') if w['type'] != 'series']
+        if not wanted:
+            return summary
+        plex = _plex_wanted_title_index()
+        guide_db = _guide_db_path()
+        now = time.time()
+        now_key = datetime.fromtimestamp(now + AUTO_WANTED_MIN_LEAD_SECONDS, timezone.utc).strftime('%Y%m%d%H%M%S')
+        until_key = datetime.fromtimestamp(now + AUTO_WANTED_HORIZON_DAYS * 86400, timezone.utc).strftime('%Y%m%d%H%M%S')
+        conn = sqlite3.connect(guide_db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc, COALESCE(year, '') AS year
+                               FROM guide WHERE prog_type='MV' AND start_utc>? AND start_utc<?
+                               ORDER BY start_utc''', (now_key, until_key)).fetchall()
+        conn.close()
+        by_title = {}
+        for row in rows:
+            by_title.setdefault(fold_title(row['title']), []).append(row)
+        reliability = _channel_recording_reliability()
+        with _rec_lock:
+            busy = {fold_title(r.get('title', '')) for r in _recs.values() if _rec_is_active(r)}
+        options = []
+        for w in wanted:
+            key = fold_title(w['title'])
+            year = _clean_year(w['year'])
+            title_key = _norm_plex_show(w['title'])
+            owned = ((title_key in plex['movies']) if not year
+                     else ((title_key, year) in plex.get('movie_versions', set())
+                           or title_key in plex.get('unyearred_movies', set())))
+            if owned or key in busy:
+                summary['skipped'] += 1
+                continue
+            for row in by_title.get(key, []):
+                row_year = _clean_year(row['year'])
+                if year and row_year and abs(int(year) - int(row_year)) > 1:
+                    continue
+                if not _is_rerecord_channel(row['channel_name']):
+                    continue
+                if (_is_automatic_recording_quarantined_channel(row['channel_name'])
+                        or reliability.get(row['channel_id'], {}).get('level') == 'suspect'
+                        or _recent_same_source_failure(row['title'], row['channel_id'])):
+                    continue
+                if now - _AUTO_WANTED_FAILED.get((key, row['start_utc']), 0) < AUTO_WANTED_RETRY_SECONDS:
+                    continue
+                options.append((row['start_utc'], w, row, year or row_year, key))
+                break                        # the earliest usable airing of this film
+        options.sort(key=lambda item: item[0])
+        for start_key, w, row, year, key in options[:max_new]:
+            start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            stop = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            try:
+                with app.test_request_context('/epg-web/api/record', method='POST', json={
+                        'title': row['title'], 'channel_id': row['channel_id'],
+                        'channel_name': row['channel_name'], 'start_ts': start.timestamp(),
+                        'stop_ts': stop.timestamp(), 'year': year}):
+                    answer = api_record()
+                response = answer[0] if isinstance(answer, tuple) else answer
+                result = response.get_json() or {}
+            except Exception as exc:
+                result = {'ok': False, 'error': str(exc)}
+            if result.get('ok') and not result.get('dup'):
+                summary['scheduled'].append(f"{row['title']} ({year}) on {row['channel_name']}")
+                print(f"[auto-wanted] Scheduled {row['title']} ({year}) on {row['channel_name']} at {row['start_utc']}")
+            elif not result.get('ok') and not result.get('slot_full'):
+                _AUTO_WANTED_FAILED[(key, row['start_utc'])] = now
+                print(f"[auto-wanted] Could not schedule {row['title']}: {result.get('error', 'refused')}")
+        return summary
+    except Exception as exc:
+        print(f'[auto-wanted] Error: {exc}')
+        return summary
+    finally:
+        _auto_wanted_lock.release()
+
+
+def _auto_record_wanted_loop():
+    """Look for new Wanted airings every half hour, so a film added to Wanted is picked up soon."""
+    time.sleep(90)
+    while True:
+        try:
+            _auto_record_wanted_movies()
+        except Exception as exc:
+            print(f'[auto-wanted] loop error: {exc}')
+        time.sleep(1800)
+
+
 @app.route('/epg-web/api/upgrade-opportunities')
 def api_upgrade_opportunities():
     """Return the latest non-scheduled Plex resolution upgrades for review."""
@@ -5085,6 +5204,8 @@ def api_wanted():
                   VALUES (?,?,?,?,?,?,?,datetime("now"),datetime("now"))''',
                (title, norm, year, imdb_id, item_type,
                 'imdb' if imdb_id else 'manual', 'wanted'))
+        threading.Thread(target=_auto_record_wanted_movies,
+                         name='epg-auto-wanted', daemon=True).start()
         return jsonify({'ok': True})
     if action == 'remove':
         db_run('DELETE FROM wanted_titles WHERE id=?', (data.get('id'),))
@@ -13000,6 +13121,7 @@ if __name__ == '__main__':
     import webbrowser
     _load_pending_recs()
     threading.Thread(target=_daily_guide_loop, name='epg-daily-guide', daemon=True).start()
+    threading.Thread(target=_auto_record_wanted_loop, name='epg-auto-wanted-loop', daemon=True).start()
     print(f'\n  EPG Manager Web {VERSION}')
     print(  '  ──────────────────────')
     print(  '  Open: http://localhost:5001/epg-web\n')
