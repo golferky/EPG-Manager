@@ -2559,3 +2559,151 @@ class WantedChoicesFallbackTests(unittest.TestCase):
     def test_with_no_keys_at_all_it_says_so(self):
         resp = self._get("q=Tommy&type=movie", {}, cfg={})
         self.assertEqual(resp.status_code, 503)
+
+
+class AutoRecordWantedTests(unittest.TestCase):
+    """A Wanted film is recorded without anyone pressing Record."""
+
+    def setUp(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._rec_cancel_events.clear()
+        server._AUTO_WANTED_FAILED.clear()
+        server._init_recordings_table()
+        self.conn = sqlite3.connect(server._guide_db_path())
+        self.conn.execute("DELETE FROM guide WHERE channel_id LIKE 'aw-%'")
+        self.conn.execute("DELETE FROM recordings")
+        self.conn.commit()
+        self.base = time.time() + 7200
+        self.tmp = tempfile.TemporaryDirectory()
+        self.movies = self.tmp.name
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _airing(self, title, year, channel="HBO", shift=0, channel_id=None):
+        start = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.base + shift))
+        end = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.base + shift + 6000))
+        self.conn.execute("INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category, prog_type, year) "
+                          "VALUES (?,?,?,?,?,?,?,?,?)",
+                          (title, channel_id or f"aw-{channel}-{shift}", channel, start, end, "", "", "MV", year))
+        self.conn.commit()
+
+    def _wanted(self, title, year, kind="movie"):
+        return {"id": 1, "title": title, "normalized_title": title.lower(), "year": year, "type": kind,
+                "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}
+
+    def _run(self, wanted, plex_titles=(), config=None):
+        key = lambda t: server._norm_plex_show(t[0])
+        index = {"movies": {key(t) for t in plex_titles}, "movie_versions": {(key(t), t[1]) for t in plex_titles},
+                 "unyearred_movies": set(), "shows": set(), "movie_counts": {}, "show_versions": set(),
+                 "unyearred_shows": set()}
+        cfg = {"plex_path": self.movies}
+        cfg.update(config or {})
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source",
+                               return_value=("http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"})):
+            return server._auto_record_wanted_movies()
+
+    def _recorded_titles(self):
+        return sorted(r["title"] for r in server._recs.values())
+
+    def test_a_wanted_film_with_a_commercial_free_airing_is_scheduled(self):
+        self._airing("Auto Film", "2004", "HBO")
+        summary = self._run([self._wanted("Auto Film", "2004")])
+        self.assertEqual(self._recorded_titles(), ["Auto Film"])
+        self.assertIn("Auto Film (2004) on HBO", summary["scheduled"][0])
+
+    def test_a_film_already_in_plex_is_not_recorded_again(self):
+        self._airing("Owned Film", "2004", "HBO")
+        self._run([self._wanted("Owned Film", "2004")], plex_titles=[("Owned Film", "2004")])
+        self.assertEqual(self._recorded_titles(), [])
+
+    def test_a_copy_in_plex_for_another_year_does_not_block_it(self):
+        self._airing("Remake Film", "2022", "HBO")
+        self._run([self._wanted("Remake Film", "2022")], plex_titles=[("Remake Film", "2004")])
+        self.assertEqual(self._recorded_titles(), ["Remake Film"])
+
+    def test_ad_supported_channels_are_never_used(self):
+        self._airing("Ads Film", "2004", "AMC")
+        self._run([self._wanted("Ads Film", "2004")])
+        self.assertEqual(self._recorded_titles(), [])
+
+    def test_the_commercial_free_airing_is_chosen_over_an_earlier_ad_supported_one(self):
+        self._airing("Pick Film", "2004", "AMC", shift=0)
+        self._airing("Pick Film", "2004", "Flix", shift=3600)
+        self._run([self._wanted("Pick Film", "2004")])
+        self.assertEqual([r["channel"] for r in server._recs.values()], ["Flix"])
+
+    def test_an_airing_of_another_year_is_not_recorded(self):
+        self._airing("Year Film", "2022", "HBO")
+        self._run([self._wanted("Year Film", "2004")])
+        self.assertEqual(self._recorded_titles(), [])
+        self._airing("Year Film", "2005", "HBO", shift=900)               # one year apart is the same film
+        self._run([self._wanted("Year Film", "2004")])
+        self.assertEqual(self._recorded_titles(), ["Year Film"])
+
+    def test_a_film_that_already_has_an_active_recording_is_not_scheduled_twice(self):
+        self._airing("Twice Film", "2004", "HBO", shift=0)
+        self._airing("Twice Film", "2004", "Starz", shift=86400)
+        wanted = [self._wanted("Twice Film", "2004")]
+        self._run(wanted)
+        self._run(wanted)
+        self.assertEqual(self._recorded_titles(), ["Twice Film"])
+
+    def test_a_series_on_wanted_is_left_to_the_series_scheduler(self):
+        self._airing("Some Show", "1991", "HBO")
+        self._run([self._wanted("Some Show", "1991", kind="series")])
+        self.assertEqual(self._recorded_titles(), [])
+
+    def test_a_full_slot_set_skips_one_film_but_not_the_rest(self):
+        self._airing("Early Film", "2001", "HBO", shift=0)
+        self._airing("Late Film", "2002", "Starz", shift=100000)
+        wanted = [self._wanted("Early Film", "2001"), self._wanted("Late Film", "2002")]
+        real = server._recording_slot_conflicts
+        def fake(recs, start_ts, stop_ts, limit):
+            return [{"title": "Busy"}] * 6 if start_ts < self.base + 50000 else real(recs, start_ts, stop_ts, limit)
+        with mock.patch.object(server, "_recording_slot_conflicts", fake):
+            self._run(wanted)
+        self.assertEqual(self._recorded_titles(), ["Late Film"])
+
+    def test_it_can_be_turned_off(self):
+        self._airing("Off Film", "2004", "HBO")
+        summary = self._run([self._wanted("Off Film", "2004")], config={"auto_record_wanted": False})
+        self.assertTrue(summary["disabled"])
+        self.assertEqual(self._recorded_titles(), [])
+
+    def test_nothing_is_scheduled_when_plex_is_not_mounted(self):
+        self._airing("Unmounted Film", "2004", "HBO")
+        self._run([self._wanted("Unmounted Film", "2004")], config={"plex_path": "/no/such/plex"})
+        self.assertEqual(self._recorded_titles(), [])
+
+    def test_an_airing_that_starts_too_soon_is_not_scheduled(self):
+        self.base = time.time() + 60
+        self._airing("Soon Film", "2004", "HBO")
+        self._run([self._wanted("Soon Film", "2004")])
+        self.assertEqual(self._recorded_titles(), [])
+
+    def test_a_refused_airing_is_not_retried_straight_away(self):
+        self._airing("Refused Film", "2004", "HBO")
+        wanted = [self._wanted("Refused Film", "2004")]
+        with mock.patch.object(server, "load_config", return_value={"plex_path": self.movies}), \
+             mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index",
+                               return_value={"movies": set(), "movie_versions": set(), "unyearred_movies": set()}), \
+             mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source", return_value=(None, "no stream", {})) as resolve:
+            server._auto_record_wanted_movies()
+            server._auto_record_wanted_movies()
+        self.assertEqual(self._recorded_titles(), [])
+        self.assertEqual(resolve.call_count, 1)
+
+    def test_the_passes_are_wired_in(self):
+        import inspect
+        source = inspect.getsource(server)
+        self.assertGreaterEqual(source.count("target=_auto_record_wanted_movies"), 4)     # 3 guide refreshes + adding a title
+        self.assertIn("target=_auto_record_wanted_loop", source)
