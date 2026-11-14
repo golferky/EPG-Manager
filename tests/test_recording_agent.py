@@ -532,7 +532,7 @@ class AgentVersionPayloadTests(unittest.TestCase):
 class ShortRecordingFlowTests(unittest.TestCase):
     """A recording a few minutes short goes to Incomplete Recordings, not Plex."""
 
-    def _run(self, recorded_minutes, damage=None):
+    def _run(self, recorded_minutes, damage=None, existing_errors=None):
         now = time.time()
         job = {"id": "j1", "title": "Short Movie", "stream_id": "1", "start_ts": now - 3600,
                "stop_ts": now - 3600 + 137 * 60, "stream_provider": "primestreams",
@@ -543,8 +543,14 @@ class ShortRecordingFlowTests(unittest.TestCase):
                    "epg_url": "http://x.test", "epg_user": "u", "epg_pass": "p", "heartbeat_seconds": 1,
                    "transfer_wait_timeout": 5, "transfer_retry_seconds": 1}
             api = mock.Mock()
+            self.api = api
             probe = {"duration": recorded_minutes * 60, "height": 480}
-            with mock.patch.object(recording_agent, "find_plex_candidates", return_value=[]), \
+            existing = ([Path(temp) / "Movies" / "Short Movie (2001)" / "x.mp4"] if existing_errors is not None else [])
+            better = {"width": 1920, "height": 1080, "duration": 7000, "fps": 25.0}
+            with mock.patch.object(recording_agent, "find_plex_candidates", return_value=existing), \
+                 mock.patch.object(recording_agent, "best_existing_copy",
+                                   return_value=((existing[0], better) if existing else (None, None))), \
+                 mock.patch.object(recording_agent, "tail_decode_errors", return_value=existing_errors), \
                  mock.patch.object(recording_agent, "probe_media", return_value=probe), \
                  mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
                  mock.patch.object(recording_agent, "record_with_resume", return_value=0), \
@@ -583,6 +589,16 @@ class ShortRecordingFlowTests(unittest.TestCase):
         preserve.assert_not_called()
         self.assertEqual(archive.call_args.args[2], "done")
         self.assertIn("3 minor video errors", archive.call_args.kwargs["quality_decision"])
+
+    def test_a_damaged_better_looking_plex_copy_does_not_block_the_new_recording(self):
+        archive, _preserve = self._run(138, damage=0, existing_errors=5000)
+        self.assertEqual(archive.call_args.args[2], "done")
+        self.assertIn("replacing damaged Plex copy", archive.call_args.kwargs["quality_decision"])
+
+    def test_a_clean_better_looking_plex_copy_still_wins(self):
+        archive, _preserve = self._run(138, damage=0, existing_errors=1)
+        self.assertIsNone(archive.call_args)                                  # nothing recorded or filed
+        self.assertEqual(self.api.patient_heartbeat.call_args.args[1], "skipped_existing_better")
 
     def test_a_clean_file_reaches_plex(self):
         archive, preserve = self._run(138, damage=0)
@@ -3012,3 +3028,59 @@ class FixDamagedTests(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 self.assertEqual(self.tool.main(["--config", str(config)]), 1)
             self.assertIn("Run check_library.py first", out.getvalue())
+
+
+class DamagedExistingCopyTests(unittest.TestCase):
+    """A damaged Plex copy must never block its own replacement."""
+
+    CFG = {"ffmpeg": "ffmpeg", "check_video_after_recording": True}
+
+    def test_a_copy_that_is_already_being_replaced_is_left_alone(self):
+        with mock.patch.object(recording_agent, "tail_decode_errors") as decode:
+            self.assertEqual(recording_agent.replace_if_existing_is_damaged(True, "upgrade", "/p/x.mp4", self.CFG),
+                             (True, "upgrade"))
+        decode.assert_not_called()
+
+    def test_a_damaged_existing_copy_is_replaced_even_when_it_looks_better(self):
+        with mock.patch.object(recording_agent, "tail_decode_errors", return_value=400):
+            should, decision = recording_agent.replace_if_existing_is_damaged(
+                False, "Plex is 1080p; incoming is 720p", "/p/x.mp4", self.CFG)
+        self.assertTrue(should)
+        self.assertIn("replacing damaged Plex copy (400 decode errors", decision)
+
+    def test_a_clean_or_minor_existing_copy_is_kept(self):
+        for errors in (0, 3, 49):
+            with mock.patch.object(recording_agent, "tail_decode_errors", return_value=errors):
+                self.assertEqual(recording_agent.replace_if_existing_is_damaged(False, "keep", "/p/x.mp4", self.CFG),
+                                 (False, "keep"))
+
+    def test_when_the_check_cannot_run_or_is_off_or_there_is_no_copy_nothing_changes(self):
+        with mock.patch.object(recording_agent, "tail_decode_errors", return_value=None):
+            self.assertEqual(recording_agent.replace_if_existing_is_damaged(False, "keep", "/p/x.mp4", self.CFG),
+                             (False, "keep"))
+        with mock.patch.object(recording_agent, "tail_decode_errors", return_value=9999) as decode:
+            self.assertEqual(recording_agent.replace_if_existing_is_damaged(
+                False, "keep", "/p/x.mp4", dict(self.CFG, check_video_after_recording=False)), (False, "keep"))
+            self.assertEqual(recording_agent.replace_if_existing_is_damaged(False, "keep", None, self.CFG), (False, "keep"))
+        decode.assert_not_called()
+
+    def test_the_limit_is_the_configured_one(self):
+        with mock.patch.object(recording_agent, "tail_decode_errors", return_value=120):
+            self.assertTrue(recording_agent.replace_if_existing_is_damaged(
+                False, "keep", "/p/x.mp4", dict(self.CFG, damaged_error_lines=100))[0])
+            self.assertFalse(recording_agent.replace_if_existing_is_damaged(
+                False, "keep", "/p/x.mp4", dict(self.CFG, damaged_error_lines=200))[0])
+
+    def test_the_tail_check_decodes_only_the_last_ten_minutes_and_never_reads_the_keyboard(self):
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+            return mock.Mock(stderr="a\n\nb\n")
+        with mock.patch.object(recording_agent.subprocess, "run", fake_run):
+            self.assertEqual(recording_agent.tail_decode_errors("/p/x.mp4", self.CFG), 2)
+        self.assertIn("-nostdin", seen["cmd"])
+        self.assertIn("-sseof", seen["cmd"])
+        self.assertIn("-600", seen["cmd"])
+        self.assertIs(seen["kw"]["stdin"], recording_agent.subprocess.DEVNULL)
+        with mock.patch.object(recording_agent.subprocess, "run", side_effect=OSError("no ffmpeg")):
+            self.assertIsNone(recording_agent.tail_decode_errors("/p/x.mp4", self.CFG))
