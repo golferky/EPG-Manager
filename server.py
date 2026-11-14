@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261114a"
+VERSION = "v20261114b"
 
 app = Flask(__name__)
 
@@ -5280,6 +5280,17 @@ def api_wanted_movie_matches():
         return jsonify({'error': 'Wanted titles must be a movie or series.'}), 400
     if not query:
         return jsonify({'error': f'Enter a {item_type} title.'}), 400
+    # Some guide listings carry the year in the title ("Bohemian Rhapsody (2018)").  Search for the
+    # plain title, and list the matches for that year first.
+    year_hint = ''
+    with_year = re.match(r'^(.*?)\s*\(((?:19|20)\d{2})\)\s*$', query)
+    if with_year and with_year.group(1).strip():
+        query, year_hint = with_year.group(1).strip(), with_year.group(2)
+
+    def order_matches(rows):
+        rows.sort(key=lambda row: (not _metadata_title_matches(query, row['title']),
+                                   bool(year_hint) and str(row.get('year', ''))[:4] != year_hint))
+        return rows
     cfg = load_config()
     omdb_key = cfg.get('omdb_key', '')
     if not omdb_key and not cfg.get('tmdb_key'):
@@ -5293,7 +5304,7 @@ def api_wanted_movie_matches():
             print(f'[wanted TMDb] {exc}')
             tmdb = []
         if tmdb:
-            tmdb.sort(key=lambda row: not _metadata_title_matches(query, row['title']))
+            order_matches(tmdb)
             return jsonify({'matches': tmdb, 'type': item_type, 'source': 'tmdb'})
         return None
     if not omdb_key:
@@ -5343,7 +5354,7 @@ def api_wanted_movie_matches():
             }))
         # Exact title results first, while retaining alternate spellings and
         # similarly named films for a conscious user choice.
-        matches.sort(key=lambda row: not _metadata_title_matches(query, row['title']))
+        order_matches(matches)
         return jsonify({'matches': matches, 'type': item_type})
     except Exception as exc:
         print(f'[wanted IMDb] {exc}')
