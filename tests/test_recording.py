@@ -3069,3 +3069,112 @@ class WantedSeriesAndStatusTests(unittest.TestCase):
         self.assertIn("if (!r.auto_record) {", html)
         self.assertIn(": wantedAutoStatus(r, a, airingArg, titleArg, yearArg);", html)
         self.assertIn("<th>Recording</th>", html)
+
+
+class ReplaceWeakerScheduledRecordingTests(unittest.TestCase):
+    """A queued recording on an ad-supported or poor channel gives way to a better airing."""
+
+    def setUp(self):
+        self.case = AutoRecordWantedTests("test_it_can_be_turned_off")
+        self.case.setUp()
+        self.now = time.time()
+
+    def tearDown(self):
+        with server._rec_lock:
+            server._recs.clear()
+        self.case.tearDown()
+
+    def _queue(self, rec_id, title, channel, channel_id, start_in, status="queued"):
+        with server._rec_lock:
+            server._recs[rec_id] = {"title": title, "channel": channel, "channel_id": channel_id,
+                                    "start_ts": self.now + start_in, "stop_ts": self.now + start_in + 6000,
+                                    "status": status, "backend": "agent"}
+
+    def _airing(self, title, year, channel, channel_id, start_in):
+        self.case.base = self.now + start_in
+        self.case._airing(title, year, channel, shift=0, channel_id=channel_id)
+
+    def _go(self, title="Swap Film", year="2004", config=None):
+        return self.case._run([self.case._wanted(title, year)], config=config)
+
+    def _status(self, rec_id):
+        return server._rec_status_base(server._recs[rec_id]["status"])
+
+    def test_an_ad_supported_recording_is_replaced_by_an_earlier_commercial_free_airing(self):
+        self._queue("old", "Swap Film", "AMC", "aw-amc", 6 * 86400)
+        self._airing("Swap Film", "2004", "Starz", "aw-starz", 2 * 86400)
+        summary = self._go()
+        self.assertEqual(self._status("old"), "cancelled")
+        others = [r for rid, r in server._recs.items() if rid != "old"]
+        self.assertEqual([r["channel"] for r in others], ["Starz"])
+        self.assertIn("AMC replaced by Starz", summary["replaced"][0])
+
+    def test_a_better_airing_more_than_three_days_later_does_not_replace_it(self):
+        self._queue("old", "Swap Film", "AMC", "aw-amc", 1 * 86400)
+        self._airing("Swap Film", "2004", "Starz", "aw-starz", 6 * 86400)
+        self._go()
+        self.assertEqual(self._status("old"), "queued")
+        self.assertEqual(len(server._recs), 1)
+
+    def test_a_recording_that_has_started_or_is_about_to_is_never_touched(self):
+        self._airing("Swap Film", "2004", "Starz", "aw-starz", 86400)
+        self._queue("old", "Swap Film", "AMC", "aw-amc", 300)                      # starts in 5 minutes
+        self._go()
+        self.assertEqual(self._status("old"), "queued")
+        self._queue("old", "Swap Film", "AMC", "aw-amc", -600, status="recording")   # already recording
+        self._go()
+        self.assertEqual(self._status("old"), "recording")
+        self.assertEqual(len(server._recs), 1)
+
+    def test_a_recording_on_a_good_commercial_free_channel_is_left_alone(self):
+        self._queue("old", "Swap Film", "HBO", "aw-hbo", 5 * 86400)
+        self._airing("Swap Film", "2004", "Starz", "aw-starz", 2 * 86400)
+        self._go()
+        self.assertEqual(self._status("old"), "queued")
+        self.assertEqual(len(server._recs), 1)
+
+    def test_a_recording_on_a_poor_channel_is_replaced(self):
+        for n, (status, reason) in enumerate((("done", ""), ("failed", "Recording ended early"), ("failed", "Video is damaged: 9000 decode errors"))):
+            self.case.conn.execute("INSERT OR REPLACE INTO recordings(rec_id, title, channel, channel_id, start_ts, stop_ts, status, failure_reason) "
+                                   "VALUES (?,?,?,?,?,?,?,?)", (f"h{n}", "T", "aw-poor", "aw-poor", time.time() - 3600, time.time(), status, reason))
+        self.case.conn.commit()
+        self._queue("old", "Swap Film", "Showtime", "aw-poor", 4 * 86400)
+        self._airing("Swap Film", "2004", "Starz", "aw-starz", 2 * 86400)
+        self._go()
+        self.assertEqual(self._status("old"), "cancelled")
+        self.assertEqual(len(server._recs), 2)
+
+    def test_if_the_better_airing_cannot_be_queued_the_old_recording_stays(self):
+        self._queue("old", "Swap Film", "AMC", "aw-amc", 6 * 86400)
+        self._airing("Swap Film", "2004", "Starz", "aw-starz", 2 * 86400)
+        with mock.patch.object(server, "_recording_slot_conflicts", return_value=[{"title": "Busy"}] * 6):
+            self._go()
+        self.assertEqual(self._status("old"), "queued")
+
+    def test_a_sky_style_listing_with_the_year_in_its_title_is_matched(self):
+        self._airing("Swap Film (2004)", "", "SKY CINEMA DRAMA | VIP", "aw-sky", 2 * 86400)
+        summary = self._go()
+        self.assertEqual(len(summary["scheduled"]), 1)
+        self.assertIn("Swap Film (2004)", [r["title"] for r in server._recs.values()])
+
+    def test_a_scheduled_summary_says_whether_the_channel_has_ads(self):
+        recs = [{"title": "Ad Film", "channel": "AMC", "start_ts": self.now + 100, "status": "queued"}]
+        self.assertFalse(server._wanted_scheduled_summary(recs, "Ad Film")["commercial_free"])
+        recs[0]["channel"] = "HBO"
+        self.assertTrue(server._wanted_scheduled_summary(recs, "Ad Film")["commercial_free"])
+
+    def test_the_wanted_list_lists_sky_style_airings_and_warns_about_ads(self):
+        wanted = [{"id": 1, "title": "Sky Film", "normalized_title": "sky film", "year": "2018", "type": "movie",
+                   "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        far = time.time() + 86400
+        progs = [dict(title="Sky Film (2018)", channel_id="c", channel="SKY CINEMA DRAMA | VIP", stop_ts=far + 7000, start_ts=far, start_fmt="")]
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": progs}):
+            recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        self.assertEqual(recs[0]["next_airing"]["channel"], "SKY CINEMA DRAMA | VIP")
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("⚠ ads", html)
+        self.assertIn("r.scheduled.commercial_free === false", html)
