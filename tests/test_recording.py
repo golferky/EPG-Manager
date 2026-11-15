@@ -3242,7 +3242,7 @@ class AutoRecordReasonsTests(unittest.TestCase):
              mock.patch.object(server, "_recording_backend", return_value="agent"), \
              mock.patch.object(server, "_resolve_recording_source", return_value=(None, "no stream", {})):
             server._auto_record_wanted_movies()
-        self.assertIn("no recording stream is mapped for HBO", self._reason())
+        self.assertIn("HBO cannot be recorded then: no stream", self._reason())
 
     def test_a_scheduled_film_has_no_reason_and_an_old_reason_is_not_shown(self):
         self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
@@ -3286,7 +3286,7 @@ class AutoRecordReasonsTests(unittest.TestCase):
              mock.patch.object(server, "_resolve_recording_source", return_value=(None, "no stream", {})):
             server._auto_record_wanted_movies()
         self.assertEqual(len(server._recs), 0)
-        self.assertIn("no recording stream is mapped for STARZ 1", self._reason())
+        self.assertIn("STARZ 1 cannot be recorded then: no stream", self._reason())
         self.assertIn("the next pass tries again", self._reason())
 
     def test_the_list_carries_the_reason_and_the_page_shows_it(self):
