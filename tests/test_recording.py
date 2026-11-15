@@ -3178,3 +3178,92 @@ class ReplaceWeakerScheduledRecordingTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("⚠ ads", html)
         self.assertIn("r.scheduled.commercial_free === false", html)
+
+
+class AutoRecordReasonsTests(unittest.TestCase):
+    """The Wanted list says why a film with an airing has not been scheduled."""
+
+    def setUp(self):
+        self.case = AutoRecordWantedTests("test_it_can_be_turned_off")
+        self.case.setUp()
+        server._AUTO_WANTED_REASONS.clear()
+        self.key = server.fold_title("Reason Film")
+
+    def tearDown(self):
+        server._AUTO_WANTED_REASONS.clear()
+        with server._rec_lock:
+            server._recs.clear()
+        self.case.tearDown()
+
+    def _go(self, config=None):
+        return self.case._run([self.case._wanted("Reason Film", "2004")], config=config)
+
+    def _reason(self):
+        return (server._AUTO_WANTED_REASONS.get(self.key) or {}).get("reason")
+
+    def _history(self, rec_id, channel_id, status, reason="", title="T", start_ago=3600):
+        self.case.conn.execute("INSERT OR REPLACE INTO recordings(rec_id, title, channel, channel_id, start_ts, stop_ts, status, failure_reason) "
+                               "VALUES (?,?,?,?,?,?,?,?)", (rec_id, title, channel_id, channel_id, time.time() - start_ago, time.time(), status, reason))
+        self.case.conn.commit()
+
+    def test_a_poor_channel_is_named_with_its_counts(self):
+        self.case._airing("Reason Film", "2004", "Starz", channel_id="aw-poor")
+        for n, status in enumerate(("done", "failed", "failed")):
+            self._history(f"p{n}", "aw-poor", status, "Recording ended early")
+        self._go()
+        self.assertEqual(len(server._recs), 0)
+        self.assertIn("Starz has a poor recording record (2 of 3 recent recordings went wrong)", self._reason())
+
+    def test_the_bad_channel_list_is_named(self):
+        self.case._airing("Reason Film", "2004", "Flix", channel_id="aw-flix")
+        self._go(config={"bad_channels": ["Flix"]})
+        self.assertEqual(self._reason(), "Flix is on your bad-channels list")
+
+    def test_a_recent_failure_of_this_film_on_this_channel_is_named(self):
+        self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
+        self._history("f1", "aw-hbo", "failed", "Recording ended early", title="Reason Film", start_ago=86400)
+        self._go()
+        self.assertEqual(self._reason(), "a recording of this film from HBO failed in the last 14 days")
+
+    def test_full_recording_slots_are_named(self):
+        self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
+        with mock.patch.object(server, "_recording_slot_conflicts", return_value=[{"title": "Busy"}] * 6):
+            self._go()
+        self.assertIn("all recording slots are busy when it airs on HBO", self._reason())
+
+    def test_a_refusal_is_named(self):
+        self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
+        wanted = [self.case._wanted("Reason Film", "2004")]
+        with mock.patch.object(server, "load_config", return_value={"plex_path": self.case.movies}), \
+             mock.patch.object(server, "_auto_wanted_lock", threading.Lock()), \
+             mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index",
+                               return_value={"movies": set(), "movie_versions": set(), "unyearred_movies": set()}), \
+             mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source", return_value=(None, "no stream", {})):
+            server._auto_record_wanted_movies()
+        self.assertIn("the dashboard refused it", self._reason())
+
+    def test_a_scheduled_film_has_no_reason_and_an_old_reason_is_not_shown(self):
+        self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
+        self._go()
+        self.assertEqual(len(server._recs), 1)
+        self.assertIsNone(self._reason())
+        server._AUTO_WANTED_REASONS[self.key] = {"reason": "was blocked", "at": time.time()}
+        self.assertEqual(server._wanted_auto_reason("Reason Film"), "was blocked")
+        server._AUTO_WANTED_REASONS[self.key] = {"reason": "was blocked", "at": time.time() - 4 * 3600}
+        self.assertIsNone(server._wanted_auto_reason("Reason Film"))
+
+    def test_the_list_carries_the_reason_and_the_page_shows_it(self):
+        server._AUTO_WANTED_REASONS[self.key] = {"reason": "Starz has a poor recording record", "at": time.time()}
+        wanted = [self.case._wanted("Reason Film", "2004")]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.dict(server._epg, {"programmes": []}):
+            recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        self.assertEqual(recs[0]["auto_reason"], "Starz has a poor recording record")
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("if (a && r.auto_reason)", html)
+        self.assertIn("Waiting: ' + esc(r.auto_reason)", html)
