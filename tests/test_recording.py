@@ -3242,7 +3242,7 @@ class AutoRecordReasonsTests(unittest.TestCase):
              mock.patch.object(server, "_recording_backend", return_value="agent"), \
              mock.patch.object(server, "_resolve_recording_source", return_value=(None, "no stream", {})):
             server._auto_record_wanted_movies()
-        self.assertIn("the dashboard refused it", self._reason())
+        self.assertIn("no recording stream is mapped for HBO", self._reason())
 
     def test_a_scheduled_film_has_no_reason_and_an_old_reason_is_not_shown(self):
         self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
@@ -3253,6 +3253,41 @@ class AutoRecordReasonsTests(unittest.TestCase):
         self.assertEqual(server._wanted_auto_reason("Reason Film"), "was blocked")
         server._AUTO_WANTED_REASONS[self.key] = {"reason": "was blocked", "at": time.time() - 4 * 3600}
         self.assertIsNone(server._wanted_auto_reason("Reason Film"))
+
+    def test_the_next_airing_is_tried_when_the_first_has_no_mapped_stream(self):
+        self.case._airing("Reason Film", "2004", "STARZ 1", channel_id="aw-unmapped", shift=0)
+        self.case._airing("Reason Film", "2004", "Showtime", channel_id="aw-mapped", shift=3600)
+        wanted = [self.case._wanted("Reason Film", "2004")]
+        def resolve(channel_id, start_ts, stop_ts, exclude_rec_id="", preferred_provider=None):
+            if channel_id == "aw-unmapped":
+                return None, "no stream", {}
+            return "http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"}
+        with mock.patch.object(server, "load_config", return_value={"plex_path": self.case.movies}), \
+             mock.patch.object(server, "_auto_wanted_lock", threading.Lock()), \
+             mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index",
+                               return_value={"movies": set(), "movie_versions": set(), "unyearred_movies": set()}), \
+             mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source", resolve):
+            server._auto_record_wanted_movies()
+        self.assertEqual([r["channel"] for r in server._recs.values()], ["Showtime"])
+        self.assertIsNone(self._reason())                                       # it did get scheduled
+
+    def test_when_every_airing_is_unmapped_the_reason_says_so_and_the_next_pass_retries(self):
+        self.case._airing("Reason Film", "2004", "STARZ 1", channel_id="aw-un1", shift=0)
+        self.case._airing("Reason Film", "2004", "STARZ 2", channel_id="aw-un2", shift=3600)
+        wanted = [self.case._wanted("Reason Film", "2004")]
+        with mock.patch.object(server, "load_config", return_value={"plex_path": self.case.movies}), \
+             mock.patch.object(server, "_auto_wanted_lock", threading.Lock()), \
+             mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index",
+                               return_value={"movies": set(), "movie_versions": set(), "unyearred_movies": set()}), \
+             mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source", return_value=(None, "no stream", {})):
+            server._auto_record_wanted_movies()
+        self.assertEqual(len(server._recs), 0)
+        self.assertIn("no recording stream is mapped for STARZ 1", self._reason())
+        self.assertIn("the next pass tries again", self._reason())
 
     def test_the_list_carries_the_reason_and_the_page_shows_it(self):
         server._AUTO_WANTED_REASONS[self.key] = {"reason": "Starz has a poor recording record", "at": time.time()}

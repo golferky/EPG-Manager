@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115g"
+VERSION = "v20261115h"
 
 app = Flask(__name__)
 
@@ -4910,6 +4910,7 @@ AUTO_WANTED_MIN_LEAD_SECONDS = 180
 AUTO_WANTED_CHANNEL_CHOICE_DAYS = 7
 AUTO_WANTED_REPLACE_WINDOW_DAYS = 3      # a better airing may start up to this long after the queued one
 AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS = 600
+AUTO_WANTED_MAX_TRIES = 5              # airings of one film tried in a single pass
 AUTO_WANTED_RETRY_SECONDS = 6 * 3600
 _auto_wanted_lock = threading.Lock()
 
@@ -5019,48 +5020,64 @@ def _auto_record_wanted_movies(max_new=60):
             first = min(row['start_utc'] for row in usable)
             horizon = (datetime.strptime(first, '%Y%m%d%H%M%S')
                        + timedelta(days=AUTO_WANTED_CHANNEL_CHOICE_DAYS)).strftime('%Y%m%d%H%M%S')
-            row = min((r for r in usable if r['start_utc'] <= horizon),
-                      key=lambda r: (rank_of(r['channel_id']), r['start_utc']))
+            ordered = sorted((r for r in usable if r['start_utc'] <= horizon),
+                             key=lambda r: (rank_of(r['channel_id']), r['start_utc']))
+            ordered += sorted((r for r in usable if r['start_utc'] > horizon), key=lambda r: r['start_utc'])
             replace_id = None
             if key in replaceable:
                 old_id, old_rec = replaceable[key]
-                row_ts = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
-                if row_ts > float(old_rec.get('start_ts') or 0) + AUTO_WANTED_REPLACE_WINDOW_DAYS * 86400:
-                    continue                  # the better airing is much later: keep the queued one
+                limit_ts = float(old_rec.get('start_ts') or 0) + AUTO_WANTED_REPLACE_WINDOW_DAYS * 86400
+                ordered = [r for r in ordered if datetime.strptime(r['start_utc'], '%Y%m%d%H%M%S')
+                           .replace(tzinfo=timezone.utc).timestamp() <= limit_ts]
+                if not ordered:
+                    continue                  # the better airings are much later: keep the queued one
                 replace_id = old_id
-            options.append((row['start_utc'], w, row, year or _clean_year(row['year']), key, replace_id))
+            options.append((ordered[0]['start_utc'], w, ordered, year or _clean_year(ordered[0]['year']), key, replace_id))
         options.sort(key=lambda item: item[0])
-        for start_key, w, row, year, key, replace_id in options[:max_new]:
-            start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
-            stop = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
-            try:
-                with app.test_request_context('/epg-web/api/record', method='POST', json={
-                        'title': row['title'], 'channel_id': row['channel_id'],
-                        'channel_name': row['channel_name'], 'start_ts': start.timestamp(),
-                        'stop_ts': stop.timestamp(), 'year': year}):
-                    answer = api_record()
-                response = answer[0] if isinstance(answer, tuple) else answer
-                result = response.get_json() or {}
-            except Exception as exc:
-                result = {'ok': False, 'error': str(exc)}
-            if result.get('ok') and not result.get('dup'):
-                summary['scheduled'].append(f"{row['title']} ({year}) on {row['channel_name']}")
-                print(f"[auto-wanted] Scheduled {row['title']} ({year}) on {row['channel_name']} at {row['start_utc']}")
-                if replace_id:
-                    # The better airing is queued, so the one on the weaker channel can go.
-                    try:
-                        with app.test_request_context('/epg-web/api/record/cancel', method='POST', json={'id': replace_id}):
-                            api_rec_cancel()
-                        summary['replaced'].append(f"{row['title']} ({year}): {replaceable[key][1].get('channel')} replaced by {row['channel_name']}")
-                        print(f"[auto-wanted] Replaced the {replaceable[key][1].get('channel')} recording of {row['title']} with {row['channel_name']}")
-                    except Exception as exc:
-                        print(f"[auto-wanted] Could not cancel the earlier recording of {row['title']}: {exc}")
-            elif not result.get('ok') and not result.get('slot_full'):
-                _AUTO_WANTED_FAILED[(key, row['start_utc'])] = now
-                reasons[key] = f"the dashboard refused it: {result.get('error', 'refused')}"
-                print(f"[auto-wanted] Could not schedule {row['title']}: {result.get('error', 'refused')}")
-            elif result.get('slot_full'):
-                reasons[key] = f"all recording slots are busy when it airs on {row['channel_name']} (tried again every pass)"
+        for start_key, w, candidates, year, key, replace_id in options[:max_new]:
+            # Try the film's airings in order of preference until one can be queued: a channel with
+            # no recording stream mapped, or one with no free slot, should not stop the next airing.
+            first_problem = None
+            for row in candidates[:AUTO_WANTED_MAX_TRIES]:
+                start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                stop = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+                try:
+                    with app.test_request_context('/epg-web/api/record', method='POST', json={
+                            'title': row['title'], 'channel_id': row['channel_id'],
+                            'channel_name': row['channel_name'], 'start_ts': start.timestamp(),
+                            'stop_ts': stop.timestamp(), 'year': year}):
+                        answer = api_record()
+                    response = answer[0] if isinstance(answer, tuple) else answer
+                    result = response.get_json() or {}
+                except Exception as exc:
+                    result = {'ok': False, 'error': str(exc)}
+                if result.get('ok'):
+                    first_problem = None
+                    if result.get('dup'):
+                        break
+                    summary['scheduled'].append(f"{row['title']} ({year}) on {row['channel_name']}")
+                    print(f"[auto-wanted] Scheduled {row['title']} ({year}) on {row['channel_name']} at {row['start_utc']}")
+                    if replace_id:
+                        # The better airing is queued, so the one on the weaker channel can go.
+                        try:
+                            with app.test_request_context('/epg-web/api/record/cancel', method='POST', json={'id': replace_id}):
+                                api_rec_cancel()
+                            summary['replaced'].append(f"{row['title']} ({year}): {replaceable[key][1].get('channel')} replaced by {row['channel_name']}")
+                            print(f"[auto-wanted] Replaced the {replaceable[key][1].get('channel')} recording of {row['title']} with {row['channel_name']}")
+                        except Exception as exc:
+                            print(f"[auto-wanted] Could not cancel the earlier recording of {row['title']}: {exc}")
+                    break
+                if result.get('slot_full'):
+                    problem = f"all recording slots are busy when it airs on {row['channel_name']}"
+                else:
+                    _AUTO_WANTED_FAILED[(key, row['start_utc'])] = now
+                    error = str(result.get('error', 'refused'))
+                    problem = (f"no recording stream is mapped for {row['channel_name']}, so that airing cannot be recorded"
+                               if 'not airing on any mapped provider channel' in error else f'the dashboard refused it: {error}')
+                    print(f"[auto-wanted] Could not schedule {row['title']} on {row['channel_name']}: {error}")
+                first_problem = first_problem or problem
+            if first_problem:
+                reasons[key] = first_problem + (' (the next pass tries again)' if len(candidates) > 1 else '')
         _AUTO_WANTED_REASONS.clear()
         _AUTO_WANTED_REASONS.update({k: {'reason': v, 'at': now} for k, v in reasons.items()})
         return summary
