@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115b"
+VERSION = "v20261115c"
 
 app = Flask(__name__)
 
@@ -1882,13 +1882,15 @@ def _channel_recording_reliability(days=30):
         status = _rec_status_base(row['status'])
         if status == 'done':
             key = row['channel_id']
-            outcomes.setdefault(key, {'ok': 0, 'failed': 0})['ok'] += 1
+            outcomes.setdefault(key, {'ok': 0, 'failed': 0, 'damaged': 0})['ok'] += 1
         elif status in {'failed', 'error', 'done_ts', 'stale', 'missed'}:
             key = row['channel_id']
             # A recording whose video came out damaged counts double: two of them make a channel
             # suspect, so unattended recording stops using a source that keeps corrupting video.
-            weight = 2 if 'damaged' in str(row['failure_reason'] or '').lower() else 1
-            outcomes.setdefault(key, {'ok': 0, 'failed': 0})['failed'] += weight
+            damaged = 'damaged' in str(row['failure_reason'] or '').lower()
+            stats = outcomes.setdefault(key, {'ok': 0, 'failed': 0, 'damaged': 0})
+            stats['failed'] += 2 if damaged else 1
+            stats['damaged'] += 1 if damaged else 0
     for stats in outcomes.values():
         total = stats['ok'] + stats['failed']
         rate = stats['failed'] / total if total else 0
@@ -1900,6 +1902,67 @@ def _channel_recording_reliability(days=30):
             level, label = 'reliable', 'Reliable'
         stats.update({'total': total, 'rate': rate, 'level': level, 'label': label})
     return outcomes
+
+def _channel_history_warning(channel_id, reliability=None):
+    """Stats to show before a recording from a channel with a poor recent record, or None.
+
+    "Poor" is a suspect channel, or two or more bad recordings making up a quarter or more of its
+    recent ones.  The counts are real recordings over the last 30 days (a damaged one is counted
+    double in the reliability score, so it is taken back to one here).
+    """
+    stats = (reliability if reliability is not None else _channel_recording_reliability()).get(channel_id)
+    if not stats:
+        return None
+    damaged = stats.get('damaged', 0)
+    plain = stats['failed'] - 2 * damaged
+    problems = plain + damaged
+    total = stats['ok'] + problems
+    if not (stats.get('level') == 'suspect' or (problems >= 2 and total and problems / total >= 0.25)):
+        return None
+    parts = []
+    if plain:
+        parts.append(f'{plain} failed or ended early')
+    if damaged:
+        parts.append(f'{damaged} came out with damaged video')
+    return {'ok': stats['ok'], 'problems': problems, 'total': total, 'damaged': damaged,
+            'level': stats.get('level', ''),
+            'text': f'{problems} of {total} recent recordings from this channel went wrong ('
+                    + ', '.join(parts) + ') in the last 30 days.'}
+
+
+def _better_channel_airings(title, year, channel_id, limit=5):
+    """Other upcoming airings of a film or show on commercial-free channels with a better record."""
+    out = []
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        conn.row_factory = sqlite3.Row
+        now = datetime.now(timezone.utc)
+        rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, COALESCE(year, '') AS year
+                               FROM guide WHERE start_utc>? AND start_utc<? ORDER BY start_utc''',
+                            (now.strftime('%Y%m%d%H%M%S'),
+                             (now + timedelta(days=14)).strftime('%Y%m%d%H%M%S'))).fetchall()
+        conn.close()
+        key, wanted_year = fold_title(title), _clean_year(year)
+        reliability = _channel_recording_reliability()
+        for row in rows:
+            if row['channel_id'] == channel_id or fold_title(row['title']) != key:
+                continue
+            row_year = _clean_year(row['year'])
+            if wanted_year and row_year and abs(int(wanted_year) - int(row_year)) > 1:
+                continue
+            if not _is_rerecord_channel(row['channel_name']) or _channel_history_warning(row['channel_id'], reliability):
+                continue
+            stats = reliability.get(row['channel_id'])
+            when = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+            out.append({'channel': row['channel_name'], 'start_ts': when.timestamp(),
+                        'record': (f"{stats['ok']} recent recording(s) came out fine" if stats and stats.get('ok')
+                                   else 'no recent recordings from this channel')})
+            if len(out) >= limit:
+                break
+    except Exception:
+        pass
+    return out
+
 
 def _recent_same_source_failure(title, channel_id, days=14):
     """Avoid automatic retry loops for one title from one proven-bad source."""
@@ -7924,6 +7987,18 @@ def api_record():
         if _find_duplicate_recording(_recs.items(), title, start_ts, channel_id):
             return jsonify({'ok': True, 'id': 'dup', 'dup': True})
 
+    # A Record pressed in the browser asks first when the channel has a poor recent record, and shows
+    # the stats and any better-channel airings, so the owner can wait for one.  Unattended scheduling
+    # does not send ``ask_channel`` and is never held up here.
+    if data.get('ask_channel') and not data.get('confirm_channel'):
+        warning = _channel_history_warning(channel_id)
+        if warning:
+            return jsonify({
+                'ok': False, 'channel_warning': True, 'channel': channel_name, 'title': title,
+                'stats': warning, 'error': f'{channel_name} has a poor recent recording record.',
+                'alternatives': _better_channel_airings(title, data.get('year'), channel_id),
+            }), 409
+
     # Refuse a recording when every recorder slot is already taken for that time.
     try:
         slot_limit = int(cfg2.get('max_concurrent_recordings') or DEFAULT_MAX_CONCURRENT_RECORDINGS)
@@ -9842,6 +9917,29 @@ async function refreshGuideRecMap() {
 
 let _progMap = {};
 
+function showChannelWarningModal(d, proceed) {
+  const old = document.getElementById('channel-warning-modal');
+  if (old) old.remove();
+  const o = document.createElement('div');
+  o.id = 'channel-warning-modal';
+  o.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;padding:16px;';
+  const when = ts => new Date(ts * 1000).toLocaleString([], {weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'});
+  const alts = (d.alternatives || []).map(a => '<div style="padding:6px 0;border-bottom:1px solid #1e293b;"><div>' + esc(a.channel) + ' · ' + esc(when(a.start_ts)) + '</div>'
+    + '<div style="font-size:12px;color:#94a3b8;">' + esc(a.record) + '</div></div>').join('');
+  o.innerHTML = '<div style="background:#111827;border:1px solid #334155;border-radius:12px;max-width:480px;width:100%;padding:22px;color:#e2e8f0;">'
+    + '<h3 style="margin:0 0 10px;color:#fcd34d;">' + esc(d.channel || 'This channel') + ' has a poor recording record</h3>'
+    + '<p style="margin:0 0 10px;">' + esc((d.stats && d.stats.text) || d.error || '') + '</p>'
+    + '<p style="margin:0 0 6px;color:#94a3b8;">' + esc(d.title || 'This programme') + (alts ? ' also airs on these channels with a better record:' : ': no other upcoming airing on a commercial-free channel was found.') + '</p>'
+    + (alts ? '<div style="margin:0 0 14px;">' + alts + '</div>' : '<div style="margin:0 0 14px;"></div>')
+    + '<div style="display:flex;gap:10px;justify-content:flex-end;">'
+    + '<button class="btn btn-ghost" id="cw-wait" style="margin:0;">Wait for a better channel</button>'
+    + '<button class="btn btn-primary" id="cw-go" style="margin:0;">Record anyway</button></div></div>';
+  o.querySelector('#cw-wait').onclick = () => o.remove();
+  o.querySelector('#cw-go').onclick = () => { o.remove(); if (typeof proceed === 'function') proceed(); };
+  o.onclick = e => { if (e.target === o) o.remove(); };
+  document.body.appendChild(o);
+}
+
 function showSlotFullModal(d, retry) {
   const old = document.getElementById('slot-full-modal');
   if (old) old.remove();
@@ -9884,7 +9982,7 @@ function showSlotFullModal(d, retry) {
   document.body.appendChild(o);
 }
 
-async function quickRecord(key, btnEl) {
+async function quickRecord(key, btnEl, confirmChannel=false) {
   const p = _progMap[key];
   if (!p) return;
   btnEl.textContent = '⏱';
@@ -9897,6 +9995,7 @@ async function quickRecord(key, btnEl) {
                             start_ts: p.start_ts, stop_ts: p.stop_ts,
                             episode_title: p.episode_title || '',
                             season_num: p.season_num, episode_num: p.episode_num,
+                            ask_channel: true, confirm_channel: confirmChannel || undefined,
                             year: String(p.year || '').slice(0, 4)})
     });
     const d = await r.json();
@@ -9908,6 +10007,7 @@ async function quickRecord(key, btnEl) {
       btnEl.className = 'rec-btn';
       btnEl.onclick = e => { e.stopPropagation(); quickRecord(key, btnEl); };
       if (d.slot_full) showSlotFullModal(d, () => quickRecord(key, btnEl));
+      else if (d.channel_warning) showChannelWarningModal(d, () => quickRecord(key, btnEl, true));
       else if (d.error) alert(d.error);
     }
   } catch(e) {
@@ -11526,7 +11626,7 @@ async function togglePrivateWanted(title, year, makePrivate) {
   if (!r.ok) { alert(r.error || 'Could not change it'); return; }
   loadRecs();
 }
-async function recordAiring(airing, title, button, allowCommercialMovie=false, year='') {
+async function recordAiring(airing, title, button, allowCommercialMovie=false, year='', confirmChannel=false) {
   const modalGeneration = _modalGeneration;
   const btn = button || event.target;
   btn.disabled = true; btn.textContent = '…';
@@ -11543,6 +11643,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
     episode_num: airing.episode_num,
     sports_event: !!(airing.sports_event || (_currentProg && _currentProg.sports_event)),
     allow_commercial_movie: allowCommercialMovie,
+    ask_channel: true, confirm_channel: confirmChannel || undefined,
     // Private is asked for only while the window shows THIS film.  A Wanted film marked private
     // is private anyway: the server knows.
     private: ((_currentProg && _currentProg.title === title && (document.getElementById('pm-private') || {}).checked) ? true : undefined),
@@ -11566,6 +11667,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
   } else {
     btn.disabled = false; btn.textContent = allowCommercialMovie ? '● Record remaining' : '⏱ Record';
     if (r.slot_full) showSlotFullModal(r, () => recordAiring(airing, title, btn, allowCommercialMovie, year));
+    else if (r.channel_warning) showChannelWarningModal(r, () => recordAiring(airing, title, btn, allowCommercialMovie, year, true));
     // Shown in the programme window and in the Wanted list's status line: a Record pressed in the
     // Wanted list has no programme window open, so a message only there would be invisible.
     reportRecordResult('❌ ' + (r.error || 'Failed'), 'err');
