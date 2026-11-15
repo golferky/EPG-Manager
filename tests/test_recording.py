@@ -1284,6 +1284,14 @@ class ActiveRecordingsPanelTests(unittest.TestCase):
         self.assertIn("setInterval(refreshRecBadge, 30000);\nrefreshRecBadge();", html)
         self.assertRegex(html, r"refreshRecBadge\(\);\n(?://[^\n]*\n)+startRecPoll\(\);")
 
+    def test_a_record_that_fails_is_reported_where_the_wanted_list_can_show_it(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("function reportRecordResult(text, cls)", html)
+        self.assertIn("['pm-status', 'rec-status'].forEach", html)
+        self.assertIn("reportRecordResult('❌ ' + (r.error || 'Failed'), 'err');", html)
+        self.assertIn("is already scheduled", html)
+        self.assertIn("Could not reach the dashboard: ", html)
+
     def test_the_stream_text_is_formatted(self):
         import re
         import shutil
@@ -1989,6 +1997,24 @@ class RerecordChannelTests(unittest.TestCase):
         self.assertTrue(recs[0]["ad_supported_only"])
         self.assertFalse(recs[1]["ad_supported_only"])
         self.assertIn("Only on channels with ads", server.HTML)
+
+    def test_the_wanted_list_says_when_the_guide_is_still_loading(self):
+        wanted = [{"id": 1, "title": "Later Film", "normalized_title": "later film", "year": "2000", "type": "movie",
+                   "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        for loading, flag in (({"loading": False, "background_loading": True}, True),
+                              ({"loading": True, "background_loading": False}, True),
+                              ({"loading": False, "background_loading": False}, False)):
+            with mock.patch.object(server, "db_rows", return_value=wanted), \
+                 mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+                 mock.patch.dict(server._epg, {"programmes": []}), \
+                 mock.patch.dict(server._startup_status, loading):
+                data = server.app.test_client().get("/epg-web/api/recommendations").get_json()
+            self.assertEqual(data["guide_loading"], flag)
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("Guide still loading…", html)
+        self.assertIn("window._wantedReloadTimer", html)
 
     def test_a_series_is_still_offered_from_any_channel(self):
         wanted = [{"id": 1, "title": "Doug", "normalized_title": "doug", "year": "1991", "type": "series",
@@ -2791,3 +2817,116 @@ class AutoRecordWantedTests(unittest.TestCase):
         source = inspect.getsource(server)
         self.assertGreaterEqual(source.count("target=_auto_record_wanted_movies"), 4)     # 3 guide refreshes + adding a title
         self.assertIn("target=_auto_record_wanted_loop", source)
+
+
+class ChannelWarningTests(unittest.TestCase):
+    """Before a manual Record on a channel with a poor record, show the stats and the alternatives."""
+
+    POOR = "cw-poor"
+
+    def setUp(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._rec_cancel_events.clear()
+        server._init_recordings_table()
+        self.conn = sqlite3.connect(server._guide_db_path())
+        self.conn.execute("DELETE FROM guide WHERE channel_id LIKE 'cw-%'")
+        self.conn.execute("DELETE FROM recordings")
+        self.conn.commit()
+        self.start = time.time() + 7200
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _history(self, rec_id, channel_id, status, reason=""):
+        self.conn.execute("INSERT OR REPLACE INTO recordings(rec_id, title, channel, channel_id, start_ts, stop_ts, status, failure_reason) "
+                          "VALUES (?,?,?,?,?,?,?,?)", (rec_id, "T", channel_id, channel_id, time.time() - 3600, time.time(), status, reason))
+        self.conn.commit()
+
+    def _make_poor(self):
+        self._history("a1", self.POOR, "done")
+        self._history("a2", self.POOR, "failed", "Recording ended early")
+        self._history("a3", self.POOR, "failed", "Video is damaged: 9000 decode errors")
+
+    def _airing(self, title, year, channel, channel_id, shift=0):
+        key = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.start + shift))
+        end = time.strftime("%Y%m%d%H%M%S", time.gmtime(self.start + shift + 6000))
+        self.conn.execute("INSERT INTO guide(title, channel_id, channel_name, start_utc, end_utc, desc, category, prog_type, year) "
+                          "VALUES (?,?,?,?,?,?,?,?,?)", (title, channel_id, channel, key, end, "", "", "MV", year))
+        self.conn.commit()
+
+    def _record(self, **extra):
+        body = {"title": "Warn Film", "channel_id": self.POOR, "channel_name": "Poor Channel",
+                "start_ts": self.start, "stop_ts": self.start + 6000, "year": "2004"}
+        body.update(extra)
+        with mock.patch.object(server, "_recording_backend", return_value="agent"), \
+             mock.patch.object(server, "_resolve_recording_source",
+                               return_value=("http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"})):
+            return server.app.test_client().post("/epg-web/api/record", json=body)
+
+    def test_a_channel_with_no_trouble_gives_no_warning(self):
+        self.assertIsNone(server._channel_history_warning("nowhere"))
+        self._history("g1", "cw-fine", "done")
+        self._history("g2", "cw-fine", "done")
+        self._history("g3", "cw-fine", "done")
+        self._history("g4", "cw-fine", "failed", "Recording ended early")
+        self.assertIsNone(server._channel_history_warning("cw-fine"))             # one in four is not enough
+
+    def test_the_warning_has_real_counts(self):
+        self._make_poor()
+        warning = server._channel_history_warning(self.POOR)
+        self.assertEqual((warning["problems"], warning["total"], warning["damaged"]), (2, 3, 1))
+        self.assertIn("2 of 3 recent recordings", warning["text"])
+        self.assertIn("1 failed or ended early", warning["text"])
+        self.assertIn("1 came out with damaged video", warning["text"])
+
+    def test_a_manual_record_asks_first_and_records_nothing(self):
+        self._make_poor()
+        resp = self._record(ask_channel=True)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.get_json()
+        self.assertTrue(data["channel_warning"])
+        self.assertIn("2 of 3", data["stats"]["text"])
+        self.assertEqual(len(server._recs), 0)
+
+    def test_confirming_records_it(self):
+        self._make_poor()
+        self.assertEqual(self._record(ask_channel=True, confirm_channel=True).status_code, 200)
+        self.assertEqual(len(server._recs), 1)
+
+    def test_automatic_scheduling_is_never_held_up(self):
+        self._make_poor()
+        self.assertEqual(self._record().status_code, 200)                           # no ask_channel
+
+    def test_a_good_channel_records_without_asking(self):
+        self._history("g1", self.POOR, "done")
+        self.assertEqual(self._record(ask_channel=True).status_code, 200)
+
+    def test_better_channels_are_offered_as_alternatives(self):
+        self._make_poor()
+        self._airing("Warn Film", "2004", "HBO", "cw-good", shift=86400)
+        self._history("g1", "cw-good", "done")
+        self._airing("Warn Film", "2004", "Showtime", "cw-new", shift=2 * 86400)
+        self._airing("Warn Film", "2004", "AMC", "cw-ads", shift=3600)               # ad-supported: not offered
+        self._airing("Warn Film", "2022", "Starz", "cw-remake", shift=3600)          # another film
+        self._airing("Warn Film", "2004", "Poor Channel", self.POOR, shift=7200)      # the same channel
+        self._airing("Other Film", "2004", "Starz", "cw-other", shift=3600)           # another title
+        self._airing("Warn Film", "2004", "Cinemax", "cw-bad", shift=3600)
+        for n, status in enumerate(("failed", "failed", "failed")):
+            self._history(f"b{n}", "cw-bad", status, "Recording ended early")       # a poor channel too: not offered
+        data = self._record(ask_channel=True).get_json()
+        channels = [a["channel"] for a in data["alternatives"]]
+        self.assertEqual(sorted(channels), ["HBO", "Showtime"])
+        hbo = next(a for a in data["alternatives"] if a["channel"] == "HBO")
+        self.assertIn("1 recent recording(s) came out fine", hbo["record"])
+        showtime = next(a for a in data["alternatives"] if a["channel"] == "Showtime")
+        self.assertIn("no recent recordings", showtime["record"])
+
+    def test_the_page_asks_and_can_go_ahead(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("function showChannelWarningModal(d, proceed)", html)
+        self.assertIn("Wait for a better channel", html)
+        self.assertIn("Record anyway", html)
+        self.assertIn("ask_channel: true, confirm_channel: confirmChannel || undefined", html)
+        self.assertIn("showChannelWarningModal(r, () => recordAiring(airing, title, btn, allowCommercialMovie, year, true))", html)
+        self.assertIn("showChannelWarningModal(d, () => quickRecord(key, btnEl, true))", html)
