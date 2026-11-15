@@ -3302,3 +3302,28 @@ class AutoRecordReasonsTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("if (a && r.auto_reason)", html)
         self.assertIn("Waiting: ' + esc(r.auto_reason)", html)
+
+
+class StarzAndHboHitsStreamMapTests(unittest.TestCase):
+    def _guide(self, temp, rows):
+        guide_db = os.path.join(temp, "guide.db")
+        server.ensure_guide_db(guide_db)
+        conn = sqlite3.connect(guide_db)
+        conn.executemany("INSERT INTO guide_channels(channel_id,channel_name) VALUES (?,?)", rows)
+        conn.commit()
+        conn.close()
+        return guide_db
+
+    def test_starz_channels_use_the_eaglecast_streams(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._guide(temp, [("14947", "STARZ 1"), ("24804", "STARZ 2")])
+            self.assertEqual(server._eaglecast_verified_override("14947", guide_db)[0], "176929")
+            self.assertEqual(server._eaglecast_verified_override("24804", guide_db)[0], "176930")
+
+    def test_hbo_hits_uses_the_primestreams_hbo_hits_feed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._guide(temp, [("10241", "HBO Hits"), ("59355", "HBO Hits (West)")])
+            with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+                self.assertEqual(server._primestream_verified_override("10241")[0], "95926")
+                self.assertEqual(server._primestream_verified_override("59355")[0], "110774")
+                self.assertIsNone(server._primestream_verified_override("99999"))
