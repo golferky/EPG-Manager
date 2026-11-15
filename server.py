@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115j"
+VERSION = "v20261115k"
 
 app = Flask(__name__)
 
@@ -660,6 +660,11 @@ EAGLECAST_VERIFIED_STREAM_OVERRIDES = {
     # from a generic ABC name; the provider feed explicitly identifies KABC.
     'kabc': ('172930', 'US| ABC 7 LOS ANGELES CA (KABC)', 'ts'),
     'kabcdt': ('172930', 'US| ABC 7 LOS ANGELES CA (KABC)', 'ts'),
+    # PrimeStreams does not carry STARZ 1/2; Eaglecast lists them by name.
+    # Added 2026-11-15 so Wanted films airing there can be scheduled; confirm
+    # with the dashboard's live play that the picture is the right channel.
+    'starz1': ('176929', 'CA| STARZ 1 HD', 'ts'),
+    'starz2': ('176930', 'CA| STARZ 2 HD', 'ts'),
 }
 
 def _eaglecast_verified_override(channel_id, guide_db_path=None):
@@ -785,7 +790,27 @@ def _primestream_verified_override(channel_id):
     overrides = {
         'hollywoodsuite2000.ca': ('114268', 'HOLLYWOOD SUITE 00S'),
     }
-    return overrides.get(str(channel_id or ''))
+    found = overrides.get(str(channel_id or ''))
+    if found:
+        return found
+    # HBO 2 is now branded HBO Hits; the provider carries it under that name
+    # but the guide ID does not match, so map it by the guide channel name.
+    by_name = {
+        'hbohits': ('95926', 'HBO HITS'),
+        'hbohitswest': ('110774', 'HBO HITS (WEST)'),
+    }
+    try:
+        conn = sqlite3.connect(_guide_db_path())
+        names = [r[0] for r in conn.execute(
+            'SELECT channel_name FROM guide_channels WHERE channel_id=?', (channel_id,)).fetchall()]
+        conn.close()
+    except Exception:
+        names = []
+    for name in names:
+        hit = by_name.get(_channel_match_base(name))
+        if hit:
+            return hit
+    return None
 
 def _eaglecast_stream_url(stream_id, extension='ts'):
     """Build an internal-only Eaglecast stream URL for probes/local playback."""
