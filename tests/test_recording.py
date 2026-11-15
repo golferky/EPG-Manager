@@ -13,6 +13,8 @@ os.environ["EPG_BASE_DIR"] = TEST_DATA_DIR
 
 import server  # noqa: E402
 
+server._AUTO_WANTED_BACKGROUND = False       # no background Wanted pass may run in the middle of a test
+
 
 class RecordingTests(unittest.TestCase):
     def setUp(self):
@@ -2660,6 +2662,7 @@ class AutoRecordWantedTests(unittest.TestCase):
         cfg = {"plex_path": self.movies}
         cfg.update(config or {})
         with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(server, "_auto_wanted_lock", threading.Lock()), \
              mock.patch.object(server, "db_rows", return_value=wanted), \
              mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
              mock.patch.object(server, "_recording_backend", return_value="agent"), \
@@ -2815,7 +2818,8 @@ class AutoRecordWantedTests(unittest.TestCase):
     def test_the_passes_are_wired_in(self):
         import inspect
         source = inspect.getsource(server)
-        self.assertGreaterEqual(source.count("target=_auto_record_wanted_movies"), 4)     # 3 guide refreshes + adding a title
+        self.assertGreaterEqual(source.count("_start_auto_wanted_pass()"), 4)     # 3 guide refreshes + adding a title
+        self.assertIn("target=_auto_record_wanted,", source)
         self.assertIn("target=_auto_record_wanted_loop", source)
 
 
@@ -2976,3 +2980,92 @@ class ChannelWarningTests(unittest.TestCase):
         self.assertIn("ask_channel: true, confirm_channel: confirmChannel || undefined", html)
         self.assertIn("showChannelWarningModal(r, () => recordAiring(airing, title, btn, allowCommercialMovie, year, true))", html)
         self.assertIn("showChannelWarningModal(d, () => quickRecord(key, btnEl, true))", html)
+
+
+class WantedSeriesAndStatusTests(unittest.TestCase):
+    """Wanted shows record themselves too, and the list says what is happening."""
+
+    def _wanted(self, title, kind, year="2000"):
+        return {"id": 1, "title": title, "normalized_title": title.lower(), "year": year, "type": kind,
+                "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}
+
+    def test_every_wanted_series_has_its_missing_episodes_scheduled(self):
+        rows = [self._wanted("Show One", "series"), self._wanted("Show Two", "series")]
+        calls = []
+        def fake(title, guide_db, movies_db, tz):
+            calls.append(title)
+            return 2
+        with mock.patch.object(server, "load_config", return_value={}), \
+             mock.patch.object(server, "_auto_wanted_series_lock", threading.Lock()), \
+             mock.patch.object(server, "db_rows", return_value=rows), \
+             mock.patch.object(server, "_schedule_series_airings", fake):
+            self.assertEqual(server._auto_record_wanted_series(), 4)
+        self.assertEqual(calls, ["Show One", "Show Two"])
+
+    def test_wanted_series_are_left_alone_when_automatic_recording_is_off(self):
+        with mock.patch.object(server, "load_config", return_value={"auto_record_wanted": False}), \
+             mock.patch.object(server, "_auto_wanted_series_lock", threading.Lock()), \
+             mock.patch.object(server, "db_rows", return_value=[self._wanted("Show One", "series")]), \
+             mock.patch.object(server, "_schedule_series_airings") as schedule:
+            self.assertEqual(server._auto_record_wanted_series(), 0)
+        schedule.assert_not_called()
+
+    def test_one_pass_does_films_then_series(self):
+        with mock.patch.object(server, "_auto_record_wanted_movies", return_value={"scheduled": []}) as films, \
+             mock.patch.object(server, "_auto_record_wanted_series", return_value=3) as series:
+            result = server._auto_record_wanted()
+        films.assert_called_once()
+        series.assert_called_once()
+        self.assertEqual(result["series"], 3)
+
+    def test_the_list_reports_what_is_scheduled(self):
+        wanted = [self._wanted("Sched Film", "movie", "2004"), self._wanted("Idle Film", "movie", "2005"),
+                  self._wanted("Sched Show", "series", "1999")]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        soon = time.time() + 86400
+        with server._rec_lock:
+            server._recs.clear()
+            server._recs["r1"] = {"title": "Sched Film (2004)", "channel": "HBO", "channel_id": "hbo", "start_ts": soon,
+                                  "stop_ts": soon + 7200, "status": "queued"}
+            server._recs["r2"] = {"title": "Sched Show", "channel": "TCM", "channel_id": "tcm", "start_ts": soon + 100,
+                                  "stop_ts": soon + 3700, "status": "scheduled"}
+            server._recs["r3"] = {"title": "Sched Show", "channel": "TCM", "channel_id": "tcm", "start_ts": soon + 9000,
+                                  "stop_ts": soon + 12600, "status": "queued"}
+            server._recs["r4"] = {"title": "Idle Film", "channel": "HBO", "channel_id": "hbo", "start_ts": soon,
+                                  "stop_ts": soon + 7200, "status": "done"}
+        try:
+            with mock.patch.object(server, "db_rows", return_value=wanted), \
+                 mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+                 mock.patch.object(server, "load_config", return_value={}), \
+                 mock.patch.dict(server._epg, {"programmes": []}):
+                recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        finally:
+            with server._rec_lock:
+                server._recs.clear()
+        by_title = {r["title"]: r for r in recs}
+        self.assertEqual(by_title["Sched Film"]["scheduled"]["channel"], "HBO")
+        self.assertEqual(by_title["Sched Film"]["scheduled"]["count"], 1)
+        self.assertIsNone(by_title["Idle Film"]["scheduled"])                       # a finished recording is not scheduled
+        self.assertEqual(by_title["Sched Show"]["scheduled"]["count"], 2)
+        self.assertTrue(all(r["auto_record"] for r in recs))
+
+    def test_the_automatic_flag_follows_the_config(self):
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        with mock.patch.object(server, "db_rows", return_value=[self._wanted("Any Film", "movie", "2004")]), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+             mock.patch.object(server, "load_config", return_value={"auto_record_wanted": False}), \
+             mock.patch.dict(server._epg, {"programmes": []}):
+            recs = server.app.test_client().get("/epg-web/api/recommendations").get_json()["recommendations"]
+        self.assertFalse(recs[0]["auto_record"])
+
+    def test_the_page_shows_status_not_a_record_button_unless_automatic_recording_is_off(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("function wantedAutoStatus(r, a, airingArg, titleArg, yearArg)", html)
+        self.assertIn("⏱ Scheduled</span>", html)
+        self.assertIn("Will record automatically", html)
+        self.assertIn("Waiting for a better channel", html)
+        self.assertIn("if (!r.auto_record) {", html)
+        self.assertIn(": wantedAutoStatus(r, a, airingArg, titleArg, yearArg);", html)
+        self.assertIn("<th>Recording</th>", html)

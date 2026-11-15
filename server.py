@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115d"
+VERSION = "v20261115e"
 
 app = Flask(__name__)
 
@@ -2720,8 +2720,7 @@ def api_load_guide():
                          name='epg-auto-upgrades', daemon=True).start()
         threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
                          name='epg-abandoned-transfer-retries', daemon=True).start()
-        threading.Thread(target=_auto_record_wanted_movies,
-                         name='epg-auto-wanted', daemon=True).start()
+        _start_auto_wanted_pass()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows, 'loaded': _epg['loaded']})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2744,8 +2743,7 @@ def api_refresh_downloaded_guide():
                          name='epg-auto-upgrades', daemon=True).start()
         threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
                          name='epg-abandoned-transfer-retries', daemon=True).start()
-        threading.Thread(target=_auto_record_wanted_movies,
-                         name='epg-auto-wanted', daemon=True).start()
+        _start_auto_wanted_pass()
         return jsonify({'ok': True, 'count': count, 'new_rows': new_rows,
                         'source': 'saved XML'})
     except Exception as exc:
@@ -2850,8 +2848,7 @@ def api_fetch_guide():
                          name='epg-auto-upgrades', daemon=True).start()
         threading.Thread(target=_auto_schedule_abandoned_transfer_wanted,
                          name='epg-abandoned-transfer-retries', daemon=True).start()
-        threading.Thread(target=_auto_record_wanted_movies,
-                         name='epg-auto-wanted', daemon=True).start()
+        _start_auto_wanted_pass()
         threading.Thread(target=_refresh_stream_quality_cache,
                          name='epg-stream-quality', daemon=True).start()
         print(f'[fetch-guide] Visible guide ready: {count} programmes, {new_rows} XML rows, '
@@ -5023,12 +5020,58 @@ def _auto_record_wanted_movies(max_new=60):
         _auto_wanted_lock.release()
 
 
+_auto_wanted_series_lock = threading.Lock()
+
+
+def _auto_record_wanted_series():
+    """Queue the missing episodes of every Wanted series, as an active series rule would.
+
+    For each Wanted series this schedules the upcoming airings of episodes Plex does not already
+    have (the same logic as a "Record series" rule), so a series on Wanted records itself.
+    Returns how many airings were queued.
+    """
+    if not _auto_wanted_series_lock.acquire(blocking=False):
+        return 0
+    try:
+        cfg = load_config()
+        if cfg.get('auto_record_wanted', True) is False:
+            return 0
+        titles = [w['title'] for w in db_rows("SELECT title FROM wanted_titles WHERE type='series'")]
+        total = 0
+        for title in titles:
+            total += _schedule_series_airings(
+                title, _guide_db_path(), cfg.get('db_path', '/Volumes/EPG/Movies.db'),
+                cfg.get('timezone', 'America/New_York'))
+        if total:
+            print(f'[auto-wanted] queued {total} airing(s) for Wanted series')
+        return total
+    except Exception as exc:
+        print(f'[auto-wanted] series error: {exc}')
+        return 0
+    finally:
+        _auto_wanted_series_lock.release()
+
+
+def _auto_record_wanted():
+    """One pass over everything on Wanted: films first, then series."""
+    return {'movies': _auto_record_wanted_movies(), 'series': _auto_record_wanted_series()}
+
+
+_AUTO_WANTED_BACKGROUND = True        # the tests turn this off so no stray pass runs during them
+
+
+def _start_auto_wanted_pass():
+    """Run one pass over Wanted in the background (after a guide refresh, or when a title is added)."""
+    if _AUTO_WANTED_BACKGROUND:
+        threading.Thread(target=_auto_record_wanted, name='epg-auto-wanted', daemon=True).start()
+
+
 def _auto_record_wanted_loop():
     """Look for new Wanted airings every half hour, so a film added to Wanted is picked up soon."""
     time.sleep(90)
     while True:
         try:
-            _auto_record_wanted_movies()
+            _auto_record_wanted()
         except Exception as exc:
             print(f'[auto-wanted] loop error: {exc}')
         time.sleep(1800)
@@ -5055,6 +5098,18 @@ def api_upgrade_opportunities():
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
+def _wanted_scheduled_summary(active_recs, plain_title):
+    """The soonest active recording of a Wanted title, and how many there are: what the list shows."""
+    key = fold_title(plain_title)
+    matches = sorted((r for r in active_recs if fold_title(re.sub(r'\s*\(\d{4}\)\s*$', '', r.get('title', '') or '')) == key),
+                     key=lambda r: r['start_ts'])
+    if not matches:
+        return None
+    first = matches[0]
+    return {'count': len(matches), 'channel': first.get('channel') or first.get('channel_id') or '',
+            'start_ts': first['start_ts'], 'status': _rec_status_base(first.get('status'))}
+
+
 @app.route('/epg-web/api/recommendations')
 def api_recommendations():
     # Wanted titles from DB cross-referenced with guide
@@ -5074,7 +5129,11 @@ def api_recommendations():
 
     plex_titles = _plex_wanted_title_index()
     private_set = _private_titles()
+    auto_record = load_config().get('auto_record_wanted', True) is not False
+    reliability = _channel_recording_reliability()
+    strip_year = lambda text: re.sub(r'\s*\(\d{4}\)\s*$', '', text or '').strip()
     with _rec_lock:
+        active_recs = [r for r in _recs.values() if _rec_is_active(r) and r.get('start_ts') is not None]
         active_upgrade_titles = {
             _norm_plex_show(r.get('title', '')) for r in _recs.values()
             if _rec_is_active(r)
@@ -5127,6 +5186,9 @@ def api_recommendations():
             'imdb_id':    w['imdb_id'],
             'updated_at': w['updated_at'],
             'next_airing': airing,
+            'auto_record': auto_record,
+            'channel_poor': bool(airing and _channel_history_warning(airing.get('channel_id'), reliability)),
+            'scheduled': _wanted_scheduled_summary(active_recs, strip_year(w['title'])),
             'ad_supported_only': ad_supported_only,
             'in_plex': in_movies or in_shows,
             'private': (title_key, wanted_year) in private_set,
@@ -5306,8 +5368,7 @@ def api_wanted():
                   VALUES (?,?,?,?,?,?,?,datetime("now"),datetime("now"))''',
                (title, norm, year, imdb_id, item_type,
                 'imdb' if imdb_id else 'manual', 'wanted'))
-        threading.Thread(target=_auto_record_wanted_movies,
-                         name='epg-auto-wanted', daemon=True).start()
+        _start_auto_wanted_pass()
         return jsonify({'ok': True})
     if action == 'remove':
         db_run('DELETE FROM wanted_titles WHERE id=?', (data.get('id'),))
@@ -8980,7 +9041,7 @@ tr:hover td{background:#141414;}
     <div id="rec-status" class="status-msg"></div>
     <div style="overflow-x:auto;">
       <table><thead><tr>
-        <th>Title</th><th>Next Airing on Guide</th><th>Status</th><th>Actions</th>
+        <th>Title</th><th>Next Airing on Guide</th><th>Airs</th><th>Recording</th>
       </tr></thead><tbody id="rec-body"></tbody></table>
     </div>
   </div>
@@ -12041,6 +12102,20 @@ async function recordUpgradeOpportunity(button, airing, title) {
   await recordAiring(airing, title, button);
   await loadUpgradeOpportunities();
 }
+function wantedAutoStatus(r, a, airingArg, titleArg, yearArg) {
+  // A Wanted film records itself.  The list says what is happening instead of offering a Record button
+  // (the button comes back only if automatic recording is turned off).
+  if (!r.auto_record) {
+    return a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg},undefined,false,${yearArg})">⏱ Record</button>` : '';
+  }
+  if (r.scheduled) {
+    const when = r.scheduled.start_ts ? new Date(r.scheduled.start_ts * 1000).toLocaleString([], {weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'}) : '';
+    return '<span class="badge badge-record" title="' + esc('Scheduled on ' + (r.scheduled.channel || '') + (when ? ', ' + when : '')) + '">⏱ Scheduled</span>';
+  }
+  if (a && r.channel_poor) return '<span style="color:#fbbf24;font-size:12px;" title="This channel has a poor recording record. It will record from a channel with a better one.">Waiting for a better channel</span>';
+  if (a) return '<span style="color:#94a3b8;font-size:12px;" title="Wanted films are scheduled automatically (checked every 30 minutes)">Will record automatically</span>';
+  return '';
+}
 async function loadRecs() {
   loadUpgradeOpportunities();
   document.getElementById('rec-status').textContent = 'Loading…';
@@ -12062,12 +12137,13 @@ async function loadRecs() {
       const airingArg = a ? JSON.stringify(a).replace(/"/g,'&quot;') : '';
       const yearArg = JSON.stringify(r.year || '').replace(/"/g,'&quot;');
       const action = isSeries
-        ? (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
+        ? (r.scheduled ? `<span class="badge badge-record" title="Missing episodes are recorded automatically. Next: ${esc(r.scheduled.channel)}">⏱ ${r.scheduled.count} scheduled</span> ` : (r.auto_record ? '<span style="color:#94a3b8;font-size:12px;" title="Missing episodes are recorded automatically when they air">Auto-recording</span> ' : ''))
+          + (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
         : r.in_plex
           ? (r.upgrade_scheduled
               ? `<span class="badge badge-record" title="A better commercial-free airing was found and scheduled automatically">✓ Upgrade scheduled</span>`
               : (a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing: ${esc(a.channel || '')}" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>` : ''))
-          : (a ? `<button class="btn btn-success btn-sm" onclick="recordAiring(${airingArg},${titleArg},undefined,false,${yearArg})">⏱ Record</button>` : '');
+          : wantedAutoStatus(r, a, airingArg, titleArg, yearArg);
       return `<tr>
         <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
           ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
