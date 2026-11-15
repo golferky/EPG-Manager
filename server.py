@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115l"
+VERSION = "v20261115m"
 
 app = Flask(__name__)
 
@@ -2344,6 +2344,21 @@ def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
         return None, (f'Eaglecast is already scheduled for overlapping "{title}", '
                       'and PrimeStreams has no usable stream for this channel.'), {}
     return _stream_url(channel_id, 'primestreams')
+
+def _play_blocked_note(error):
+    """Plain-words reason a live airing cannot be played or recorded right now."""
+    error = str(error or '')
+    if not error:
+        return ''
+    if 'already scheduled for overlapping' in error:
+        parts = error.split('"')
+        title = parts[1] if len(parts) >= 3 else 'another recording'
+        return f'Eaglecast has one connection and it is busy with "{title}"'
+    if 'quarantined' in error:
+        return 'this Eaglecast feed is blocked after it delivered the wrong programme'
+    if 'No stream_id found' in error:
+        return 'no recording stream is mapped for this channel'
+    return re.sub(r'https?://\S+', '<address>', error)[:160]
 
 def _saved_stream_quality(channel_id):
     """Read a safe cached channel-quality record from guide.db."""
@@ -6876,6 +6891,7 @@ def api_airings():
                 'reliability': reliability_by_channel.get(r['channel_id'], {}),
                 'commercial_free': _is_commercial_free_channel(r['channel_name']),
                 'stream_channel': stream_debug.get('matched_guide_channel') or '',
+                'play_note':    _play_blocked_note(stream_error),
                 'on_now':       su.timestamp() <= now_ts < eu.timestamp(),
                 'prog_type':    r['prog_type'] or '',
                 'category':     r['category'] or '',
@@ -11246,6 +11262,16 @@ async function openProg(p) {
         } else {
           rBtn.style.display = 'none';
         }
+        document.getElementById('pm-next-wrap').style.display = 'block';
+      }
+
+      // The airing that was opened is live but cannot be played: say why
+      // instead of leaving the Play button silently missing.
+      if (selectedAiring && selectedAiring.on_now && !selectedAiring.can_play && selectedAiring.play_note) {
+        const whyLbl = document.getElementById('pm-play-busy');
+        document.getElementById('pm-play-btn').style.display = 'none';
+        whyLbl.textContent = '▶ Play unavailable: ' + selectedAiring.play_note;
+        whyLbl.style.display = '';
         document.getElementById('pm-next-wrap').style.display = 'block';
       }
 
