@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115f"
+VERSION = "v20261115g"
 
 app = Flask(__name__)
 
@@ -4904,6 +4904,7 @@ def _auto_schedule_movie_upgrades():
         print(f'[auto-upgrade] Error: {exc}')
 
 _AUTO_WANTED_FAILED = {}          # (folded title, airing start) -> when a source last refused it
+_AUTO_WANTED_REASONS = {}         # folded title -> {'reason', 'at'}: why the last pass did not schedule it
 AUTO_WANTED_HORIZON_DAYS = 14
 AUTO_WANTED_MIN_LEAD_SECONDS = 180
 AUTO_WANTED_CHANNEL_CHOICE_DAYS = 7
@@ -4970,6 +4971,7 @@ def _auto_record_wanted_movies(max_new=60):
                          or _channel_history_warning(r.get('channel_id'), reliability))):
                 replaceable.setdefault(fold_title(plain(r.get('title', ''))), (rec_id, r))
         options = []
+        reasons = {}
         rank_of = lambda channel_id: {'reliable': 0, 'warning': 2}.get(reliability.get(channel_id, {}).get('level'), 1)
         for w in wanted:
             key = fold_title(plain(w['title']))
@@ -4982,22 +4984,34 @@ def _auto_record_wanted_movies(max_new=60):
                 summary['skipped'] += 1
                 continue
             usable = []
+            rejected = []                    # (airing start, plain-words reason) for airings we would have used
             for row in by_title.get(key, []):
                 row_year = _clean_year(row['year'])
                 if year and row_year and abs(int(year) - int(row_year)) > 1:
                     continue
                 if not _is_rerecord_channel(row['channel_name']):
                     continue
-                if (_is_automatic_recording_quarantined_channel(row['channel_name'])
-                        or _is_bad_channel(cfg, row['channel_id'], row['channel_name'])
-                        or reliability.get(row['channel_id'], {}).get('level') == 'suspect'
-                        or _channel_history_warning(row['channel_id'], reliability)
-                        or _recent_same_source_failure(row['title'], row['channel_id'])):
-                    continue
-                if now - _AUTO_WANTED_FAILED.get((key, row['start_utc']), 0) < AUTO_WANTED_RETRY_SECONDS:
+                channel = row['channel_name']
+                warning = _channel_history_warning(row['channel_id'], reliability)
+                why = None
+                if _is_automatic_recording_quarantined_channel(channel):
+                    why = f'{channel} is excluded from automatic recording'
+                elif _is_bad_channel(cfg, row['channel_id'], channel):
+                    why = f'{channel} is on your bad-channels list'
+                elif reliability.get(row['channel_id'], {}).get('level') == 'suspect' or warning:
+                    why = (f"{channel} has a poor recording record ({warning['problems']} of {warning['total']} recent recordings went wrong)"
+                           if warning else f'{channel} has a poor recording record')
+                elif _recent_same_source_failure(row['title'], row['channel_id']):
+                    why = f'a recording of this film from {channel} failed in the last 14 days'
+                elif now - _AUTO_WANTED_FAILED.get((key, row['start_utc']), 0) < AUTO_WANTED_RETRY_SECONDS:
+                    why = f'the last attempt from {channel} was refused (it is tried again later)'
+                if why:
+                    rejected.append((row['start_utc'], why))
                     continue
                 usable.append(row)
             if not usable:
+                if rejected:
+                    reasons[key] = min(rejected)[1]
                 continue
             # Pick the channel as well as the time: among the airings in the first week of what is
             # available, take the one on the channel with the best recent record (proven reliable,
@@ -5043,7 +5057,12 @@ def _auto_record_wanted_movies(max_new=60):
                         print(f"[auto-wanted] Could not cancel the earlier recording of {row['title']}: {exc}")
             elif not result.get('ok') and not result.get('slot_full'):
                 _AUTO_WANTED_FAILED[(key, row['start_utc'])] = now
+                reasons[key] = f"the dashboard refused it: {result.get('error', 'refused')}"
                 print(f"[auto-wanted] Could not schedule {row['title']}: {result.get('error', 'refused')}")
+            elif result.get('slot_full'):
+                reasons[key] = f"all recording slots are busy when it airs on {row['channel_name']} (tried again every pass)"
+        _AUTO_WANTED_REASONS.clear()
+        _AUTO_WANTED_REASONS.update({k: {'reason': v, 'at': now} for k, v in reasons.items()})
         return summary
     except Exception as exc:
         print(f'[auto-wanted] Error: {exc}')
@@ -5129,6 +5148,12 @@ def api_upgrade_opportunities():
         return jsonify({'opportunities': items})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+
+def _wanted_auto_reason(plain_title):
+    """Why the last automatic pass did not schedule this Wanted film (only a recent answer counts)."""
+    entry = _AUTO_WANTED_REASONS.get(fold_title(plain_title))
+    return entry['reason'] if entry and time.time() - entry['at'] < 3 * 3600 else None
+
 
 def _wanted_scheduled_summary(active_recs, plain_title):
     """The soonest active recording of a Wanted title, and how many there are: what the list shows."""
@@ -5225,6 +5250,7 @@ def api_recommendations():
             'auto_record': auto_record,
             'channel_poor': bool(airing and _channel_history_warning(airing.get('channel_id'), reliability)),
             'scheduled': _wanted_scheduled_summary(active_recs, strip_year(w['title'])),
+            'auto_reason': _wanted_auto_reason(strip_year(w['title'])),
             'ad_supported_only': ad_supported_only,
             'in_plex': in_movies or in_shows,
             'private': (title_key, wanted_year) in private_set,
@@ -12150,6 +12176,7 @@ function wantedAutoStatus(r, a, airingArg, titleArg, yearArg) {
       + '<span style="color:#94a3b8;font-size:11px;">' + esc((r.scheduled.channel || '') + (when ? ' · ' + when : '')) + '</span>'
       + (r.scheduled.commercial_free === false ? ' <span style="color:#fbbf24;font-size:11px;" title="This airing has commercials. A commercial-free airing on a good channel replaces it automatically when one is found.">⚠ ads</span>' : '');
   }
+  if (a && r.auto_reason) return '<span style="color:#fbbf24;font-size:12px;" title="' + esc('Not scheduled: ' + r.auto_reason) + '">Waiting: ' + esc(r.auto_reason) + '</span>';
   if (a && r.channel_poor) return '<span style="color:#fbbf24;font-size:12px;" title="This channel has a poor recording record. It will record from a channel with a better one.">Waiting for a better channel</span>';
   if (a) return '<span style="color:#94a3b8;font-size:12px;" title="Wanted films are scheduled automatically (checked every 30 minutes)">Will record automatically</span>';
   return '';
