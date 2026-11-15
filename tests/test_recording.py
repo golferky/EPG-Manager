@@ -3327,3 +3327,20 @@ class StarzAndHboHitsStreamMapTests(unittest.TestCase):
                 self.assertEqual(server._primestream_verified_override("10241")[0], "95926")
                 self.assertEqual(server._primestream_verified_override("59355")[0], "110774")
                 self.assertIsNone(server._primestream_verified_override("99999"))
+
+
+class ShowtimeWestRebrandMapTests(unittest.TestCase):
+    def test_paramount_showtime_pacific_uses_the_showtime_west_eaglecast_stream(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            conn = sqlite3.connect(guide_db)
+            conn.executemany(
+                "INSERT INTO provider_streams(provider,channel_id,stream_id,provider_channel_name,"
+                "stream_extension,guide_channel_name,mapped_at) VALUES ('eaglecast',?,?,?,?,?,0)",
+                [("22532", "92020", "US| SHOWTIME WEST HD", "ts", "Paramount+ with Showtime HD (Pacific)"),
+                 ("11115", "45503", "US| SHOWTIME HD", "ts", "Paramount+ with Showtime HD (Eastern)")])
+            conn.commit(); conn.close()
+            with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+                self.assertEqual(server._eaglecast_stream_for_channel("22532")[0], "92020")
+                self.assertIn("22532", server.get_eaglecast_channel_ids(guide_db))
