@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115h"
+VERSION = "v20261115i"
 
 app = Flask(__name__)
 
@@ -5072,8 +5072,12 @@ def _auto_record_wanted_movies(max_new=60):
                 else:
                     _AUTO_WANTED_FAILED[(key, row['start_utc'])] = now
                     error = str(result.get('error', 'refused'))
-                    problem = (f"no recording stream is mapped for {row['channel_name']}, so that airing cannot be recorded"
-                               if 'not airing on any mapped provider channel' in error else f'the dashboard refused it: {error}')
+                    detail = str(result.get('detail', '') or '')
+                    if 'not airing on any mapped provider channel' in error:
+                        problem = (f"{row['channel_name']} cannot be recorded then: {detail}" if detail else
+                                   f"no recording stream is mapped for {row['channel_name']}, so that airing cannot be recorded")
+                    else:
+                        problem = f'the dashboard refused it: {error}'
                     print(f"[auto-wanted] Could not schedule {row['title']} on {row['channel_name']}: {error}")
                 first_problem = first_problem or problem
             if first_problem:
@@ -8042,7 +8046,9 @@ def api_record():
             stop_ts      = ps_stop_ts
             print(f'[record] Remapped "{title}" → available channel {channel_id} at {start_ts}')
         else:
-            return jsonify({'ok': False, 'error': f'"{title}" is not airing on any mapped provider channel soon'}), 200
+            return jsonify({'ok': False,
+                            'error': f'"{title}" is not airing on any mapped provider channel soon',
+                            'detail': str(requested_error or '')}), 200
     else:
         # Resolve the label for this exact airing.  A bare ``LIMIT 1`` by
         # channel id can pick a stale/unrelated guide row (for example,
