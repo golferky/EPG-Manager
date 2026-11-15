@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115e"
+VERSION = "v20261116a"
 
 app = Flask(__name__)
 
@@ -4907,6 +4907,8 @@ _AUTO_WANTED_FAILED = {}          # (folded title, airing start) -> when a sourc
 AUTO_WANTED_HORIZON_DAYS = 14
 AUTO_WANTED_MIN_LEAD_SECONDS = 180
 AUTO_WANTED_CHANNEL_CHOICE_DAYS = 7
+AUTO_WANTED_REPLACE_WINDOW_DAYS = 3      # a better airing may start up to this long after the queued one
+AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS = 600
 AUTO_WANTED_RETRY_SECONDS = 6 * 3600
 _auto_wanted_lock = threading.Lock()
 
@@ -4918,10 +4920,13 @@ def _auto_record_wanted_movies(max_new=60):
     commercial-free English channels are used (the same rule the Wanted list shows), only films
     that Plex does not already hold (the right year), and never a title that already has an active
     recording.  Soonest airings are placed first; one that does not fit the recording slots, or
-    whose stream cannot be found, is left for the next pass.  Turn it off with
+    whose stream cannot be found, is left for the next pass.  A recording still waiting to start
+    on a channel the recorder would not choose today (ads, or a poor record) is replaced when a
+    commercial-free airing on a good channel starts no more than three days after it; one already
+    started, or starting within ten minutes, is never touched.  Turn it off with
     ``"auto_record_wanted": false`` in the dashboard config.  Returns a small summary dict.
     """
-    summary = {'scheduled': [], 'skipped': 0, 'disabled': False}
+    summary = {'scheduled': [], 'replaced': [], 'skipped': 0, 'disabled': False}
     if not _auto_wanted_lock.acquire(blocking=False):
         return summary                      # a pass is already running
     try:
@@ -4947,22 +4952,33 @@ def _auto_record_wanted_movies(max_new=60):
                                FROM guide WHERE prog_type='MV' AND start_utc>? AND start_utc<?
                                ORDER BY start_utc''', (now_key, until_key)).fetchall()
         conn.close()
+        plain = lambda text: re.sub(r'\s*\(\d{4}\)\s*$', '', text or '').strip()      # Sky listings end "(2018)"
         by_title = {}
         for row in rows:
-            by_title.setdefault(fold_title(row['title']), []).append(row)
+            by_title.setdefault(fold_title(plain(row['title'])), []).append(row)
         reliability = _channel_recording_reliability()
         with _rec_lock:
-            busy = {fold_title(r.get('title', '')) for r in _recs.values() if _rec_is_active(r)}
+            active = [(rec_id, r) for rec_id, r in _recs.items() if _rec_is_active(r)]
+        busy = {fold_title(plain(r.get('title', ''))) for _rec_id, r in active}
+        # Queued recordings, not yet started, on a channel the recorder would not choose today.
+        replaceable = {}
+        for rec_id, r in active:
+            if (_rec_status_base(r.get('status')) in ('queued', 'scheduled')
+                    and float(r.get('start_ts') or 0) > now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS
+                    and (not _is_rerecord_channel(r.get('channel'))
+                         or _is_bad_channel(cfg, r.get('channel_id'), r.get('channel'))
+                         or _channel_history_warning(r.get('channel_id'), reliability))):
+                replaceable.setdefault(fold_title(plain(r.get('title', ''))), (rec_id, r))
         options = []
         rank_of = lambda channel_id: {'reliable': 0, 'warning': 2}.get(reliability.get(channel_id, {}).get('level'), 1)
         for w in wanted:
-            key = fold_title(w['title'])
+            key = fold_title(plain(w['title']))
             year = _clean_year(w['year'])
             title_key = _norm_plex_show(w['title'])
             owned = ((title_key in plex['movies']) if not year
                      else ((title_key, year) in plex.get('movie_versions', set())
                            or title_key in plex.get('unyearred_movies', set())))
-            if owned or key in busy:
+            if owned or (key in busy and key not in replaceable):
                 summary['skipped'] += 1
                 continue
             usable = []
@@ -4991,9 +5007,16 @@ def _auto_record_wanted_movies(max_new=60):
                        + timedelta(days=AUTO_WANTED_CHANNEL_CHOICE_DAYS)).strftime('%Y%m%d%H%M%S')
             row = min((r for r in usable if r['start_utc'] <= horizon),
                       key=lambda r: (rank_of(r['channel_id']), r['start_utc']))
-            options.append((row['start_utc'], w, row, year or _clean_year(row['year']), key))
+            replace_id = None
+            if key in replaceable:
+                old_id, old_rec = replaceable[key]
+                row_ts = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
+                if row_ts > float(old_rec.get('start_ts') or 0) + AUTO_WANTED_REPLACE_WINDOW_DAYS * 86400:
+                    continue                  # the better airing is much later: keep the queued one
+                replace_id = old_id
+            options.append((row['start_utc'], w, row, year or _clean_year(row['year']), key, replace_id))
         options.sort(key=lambda item: item[0])
-        for start_key, w, row, year, key in options[:max_new]:
+        for start_key, w, row, year, key, replace_id in options[:max_new]:
             start = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             stop = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             try:
@@ -5009,6 +5032,15 @@ def _auto_record_wanted_movies(max_new=60):
             if result.get('ok') and not result.get('dup'):
                 summary['scheduled'].append(f"{row['title']} ({year}) on {row['channel_name']}")
                 print(f"[auto-wanted] Scheduled {row['title']} ({year}) on {row['channel_name']} at {row['start_utc']}")
+                if replace_id:
+                    # The better airing is queued, so the one on the weaker channel can go.
+                    try:
+                        with app.test_request_context('/epg-web/api/record/cancel', method='POST', json={'id': replace_id}):
+                            api_rec_cancel()
+                        summary['replaced'].append(f"{row['title']} ({year}): {replaceable[key][1].get('channel')} replaced by {row['channel_name']}")
+                        print(f"[auto-wanted] Replaced the {replaceable[key][1].get('channel')} recording of {row['title']} with {row['channel_name']}")
+                    except Exception as exc:
+                        print(f"[auto-wanted] Could not cancel the earlier recording of {row['title']}: {exc}")
             elif not result.get('ok') and not result.get('slot_full'):
                 _AUTO_WANTED_FAILED[(key, row['start_utc'])] = now
                 print(f"[auto-wanted] Could not schedule {row['title']}: {result.get('error', 'refused')}")
@@ -5107,7 +5139,8 @@ def _wanted_scheduled_summary(active_recs, plain_title):
         return None
     first = matches[0]
     return {'count': len(matches), 'channel': first.get('channel') or first.get('channel_id') or '',
-            'start_ts': first['start_ts'], 'status': _rec_status_base(first.get('status'))}
+            'start_ts': first['start_ts'], 'status': _rec_status_base(first.get('status')),
+            'commercial_free': bool(_is_rerecord_channel(first.get('channel')))}
 
 
 @app.route('/epg-web/api/recommendations')
@@ -5126,6 +5159,9 @@ def api_recommendations():
                 continue
             t = p['title'].lower()
             future_airings.setdefault(t, []).append(p)
+            bare = re.sub(r'\s*\(\d{4}\)\s*$', '', t).strip()
+            if bare and bare != t:
+                future_airings.setdefault(bare, []).append(p)       # "Bohemian Rhapsody (2018)" also counts as "Bohemian Rhapsody"
 
     plex_titles = _plex_wanted_title_index()
     private_set = _private_titles()
@@ -12110,7 +12146,9 @@ function wantedAutoStatus(r, a, airingArg, titleArg, yearArg) {
   }
   if (r.scheduled) {
     const when = r.scheduled.start_ts ? new Date(r.scheduled.start_ts * 1000).toLocaleString([], {weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'}) : '';
-    return '<span class="badge badge-record" title="' + esc('Scheduled on ' + (r.scheduled.channel || '') + (when ? ', ' + when : '')) + '">⏱ Scheduled</span>';
+    return '<span class="badge badge-record" title="' + esc('Scheduled on ' + (r.scheduled.channel || '') + (when ? ', ' + when : '')) + '">⏱ Scheduled</span> '
+      + '<span style="color:#94a3b8;font-size:11px;">' + esc((r.scheduled.channel || '') + (when ? ' · ' + when : '')) + '</span>'
+      + (r.scheduled.commercial_free === false ? ' <span style="color:#fbbf24;font-size:11px;" title="This airing has commercials. A commercial-free airing on a good channel replaces it automatically when one is found.">⚠ ads</span>' : '');
   }
   if (a && r.channel_poor) return '<span style="color:#fbbf24;font-size:12px;" title="This channel has a poor recording record. It will record from a channel with a better one.">Waiting for a better channel</span>';
   if (a) return '<span style="color:#94a3b8;font-size:12px;" title="Wanted films are scheduled automatically (checked every 30 minutes)">Will record automatically</span>';
