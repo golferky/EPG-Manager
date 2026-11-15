@@ -3344,3 +3344,19 @@ class ShowtimeWestRebrandMapTests(unittest.TestCase):
             with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
                 self.assertEqual(server._eaglecast_stream_for_channel("22532")[0], "92020")
                 self.assertIn("22532", server.get_eaglecast_channel_ids(guide_db))
+
+
+class PlayBlockedNoteTests(unittest.TestCase):
+    def test_overlap_error_names_the_recording_in_plain_words(self):
+        err = ('Eaglecast is already scheduled for overlapping "Rawhide", '
+               'and PrimeStreams has no usable stream for this channel.')
+        self.assertEqual(server._play_blocked_note(err),
+                         'Eaglecast has one connection and it is busy with "Rawhide"')
+
+    def test_no_error_gives_no_note_and_addresses_are_hidden(self):
+        self.assertEqual(server._play_blocked_note(''), '')
+        self.assertNotIn("http", server._play_blocked_note("failed http://host/live/user/pw/1.ts"))
+
+    def test_page_shows_the_play_note(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("'▶ Play unavailable: ' + selectedAiring.play_note", html)
