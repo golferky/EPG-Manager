@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115k"
+VERSION = "v20261115l"
 
 app = Flask(__name__)
 
@@ -713,7 +713,7 @@ def get_eaglecast_channel_ids(guide_db_path=None):
         conn.close()
         verified.update(
             row[0] for row in rows
-            if (_channel_match_base(row[1]) == _channel_match_base(row[2])
+            if (_same_linear_channel_name(row[1], row[2])
                 and not _is_quarantined_eaglecast_stream(row[3]))
         )
     except Exception:
@@ -749,7 +749,7 @@ def _eaglecast_stream_for_channel(channel_id):
         # ID.  Do not trust an old/over-broad match when the two canonical
         # names differ.  This specifically blocks the stale "SHOWTIME HD"
         # map that delivered V for Vendetta for a MobLand recording.
-        if _channel_match_base(row[1]) != _channel_match_base(row[3]):
+        if not _same_linear_channel_name(row[1], row[3]):
             return _eaglecast_verified_override(channel_id)
         return row[:3]
     except Exception:
