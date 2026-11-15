@@ -1284,6 +1284,14 @@ class ActiveRecordingsPanelTests(unittest.TestCase):
         self.assertIn("setInterval(refreshRecBadge, 30000);\nrefreshRecBadge();", html)
         self.assertRegex(html, r"refreshRecBadge\(\);\n(?://[^\n]*\n)+startRecPoll\(\);")
 
+    def test_a_record_that_fails_is_reported_where_the_wanted_list_can_show_it(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("function reportRecordResult(text, cls)", html)
+        self.assertIn("['pm-status', 'rec-status'].forEach", html)
+        self.assertIn("reportRecordResult('❌ ' + (r.error || 'Failed'), 'err');", html)
+        self.assertIn("is already scheduled", html)
+        self.assertIn("Could not reach the dashboard: ", html)
+
     def test_the_stream_text_is_formatted(self):
         import re
         import shutil

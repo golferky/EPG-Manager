@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261114c"
+VERSION = "v20261115a"
 
 app = Flask(__name__)
 
@@ -11529,7 +11529,8 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
   const modalGeneration = _modalGeneration;
   const btn = button || event.target;
   btn.disabled = true; btn.textContent = '…';
-  const r = await post('/epg-web/api/record', {
+  let r;
+  try { r = await post('/epg-web/api/record', {
     title:      title,
     channel_id: airing.channel_id,
     channel_name: airing.channel_name || airing.channel || airing.channel_id,
@@ -11547,7 +11548,7 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
     // The year must belong to THIS title: the programme window's year only counts while
     // that window shows the same title (it can be left over from a different film).
     year: String(year || airing.year || ((_currentProg && _currentProg.title === title) ? _currentInfoYear : '') || '').slice(0, 4),
-  });
+  }); } catch (e) { r = {ok: false, error: 'Could not reach the dashboard: ' + e.message}; }
   if (r.ok) {
     btn.textContent = '✅ Scheduled';
     btn.style.background = '#166534';
@@ -11556,20 +11557,24 @@ async function recordAiring(airing, title, button, allowCommercialMovie=false, y
       : 'on PrimeStreams';
     if (modalGeneration === _modalGeneration) {
       const overtime = Number(r.overtime_cushion_minutes || 0);
-      document.getElementById('pm-status').textContent = `✅ "${title}" queued ${sourceText}` +
-        (overtime ? ` — includes ${overtime} minutes for overtime` : '');
-      document.getElementById('pm-status').className = 'status-msg ok';
+      reportRecordResult(r.dup ? `✅ "${title}" is already scheduled`
+        : `✅ "${title}" queued ${sourceText}` + (overtime ? ` — includes ${overtime} minutes for overtime` : ''), 'ok');
     }
     startRecPoll();
     refreshGuideRecMap().then(() => renderGuide());
   } else {
     btn.disabled = false; btn.textContent = allowCommercialMovie ? '● Record remaining' : '⏱ Record';
     if (r.slot_full) showSlotFullModal(r, () => recordAiring(airing, title, btn, allowCommercialMovie, year));
-    if (modalGeneration === _modalGeneration) {
-      document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
-      document.getElementById('pm-status').className = 'status-msg err';
-    }
+    // Shown in the programme window and in the Wanted list's status line: a Record pressed in the
+    // Wanted list has no programme window open, so a message only there would be invisible.
+    reportRecordResult('❌ ' + (r.error || 'Failed'), 'err');
   }
+}
+function reportRecordResult(text, cls) {
+  ['pm-status', 'rec-status'].forEach(id => {
+    const e = document.getElementById(id);
+    if (e) { e.textContent = text; e.className = 'status-msg ' + cls; }
+  });
 }
 
 // ── Recordings panel ──────────────────────────────────────────────────────────
