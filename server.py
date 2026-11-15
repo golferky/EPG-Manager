@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115i"
+VERSION = "v20261115j"
 
 app = Flask(__name__)
 
@@ -5078,7 +5078,7 @@ def _auto_record_wanted_movies(max_new=60):
                                    f"no recording stream is mapped for {row['channel_name']}, so that airing cannot be recorded")
                     else:
                         problem = f'the dashboard refused it: {error}'
-                    print(f"[auto-wanted] Could not schedule {row['title']} on {row['channel_name']}: {error}")
+                    print(f"[auto-wanted] Could not schedule {row['title']} on {row['channel_name']}: {error}" + (f" -- {detail}" if detail else ""))
                 first_problem = first_problem or problem
             if first_problem:
                 reasons[key] = first_problem + (' (the next pass tries again)' if len(candidates) > 1 else '')
