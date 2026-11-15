@@ -1998,6 +1998,24 @@ class RerecordChannelTests(unittest.TestCase):
         self.assertFalse(recs[1]["ad_supported_only"])
         self.assertIn("Only on channels with ads", server.HTML)
 
+    def test_the_wanted_list_says_when_the_guide_is_still_loading(self):
+        wanted = [{"id": 1, "title": "Later Film", "normalized_title": "later film", "year": "2000", "type": "movie",
+                   "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]
+        index = {"movies": set(), "movie_versions": set(), "unyearred_movies": set(), "shows": set(),
+                 "movie_counts": {}, "show_versions": set(), "unyearred_shows": set()}
+        for loading, flag in (({"loading": False, "background_loading": True}, True),
+                              ({"loading": True, "background_loading": False}, True),
+                              ({"loading": False, "background_loading": False}, False)):
+            with mock.patch.object(server, "db_rows", return_value=wanted), \
+                 mock.patch.object(server, "_plex_wanted_title_index", return_value=index), \
+                 mock.patch.dict(server._epg, {"programmes": []}), \
+                 mock.patch.dict(server._startup_status, loading):
+                data = server.app.test_client().get("/epg-web/api/recommendations").get_json()
+            self.assertEqual(data["guide_loading"], flag)
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("Guide still loading…", html)
+        self.assertIn("window._wantedReloadTimer", html)
+
     def test_a_series_is_still_offered_from_any_channel(self):
         wanted = [{"id": 1, "title": "Doug", "normalized_title": "doug", "year": "1991", "type": "series",
                    "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "", "updated_at": ""}]

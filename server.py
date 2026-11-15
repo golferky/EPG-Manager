@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115a"
+VERSION = "v20261115b"
 
 app = Flask(__name__)
 
@@ -5064,7 +5064,8 @@ def api_recommendations():
             'upgrade_scheduled': bool(in_movies and title_key in active_upgrade_titles),
             'plex_kind': ('Movie' if in_movies else '') + (' & TV' if in_movies and in_shows else 'TV' if in_shows else ''),
         })
-    return jsonify({'recommendations': result})
+    return jsonify({'recommendations': result,
+                    'guide_loading': bool(_startup_status['loading'] or _startup_status['background_loading'])})
 
 
 @app.route('/epg-web/api/recommendations/movie-upgrade')
@@ -11924,7 +11925,12 @@ async function loadRecs() {
     const d = await (await fetch('/epg-web/api/recommendations')).json();
     if (d.error) { setEl('rec-status',d.error,'err'); return; }
     const recs = d.recommendations || [];
-    setEl('rec-status', recs.length + ' wanted titles','');
+    setEl('rec-status', recs.length + ' wanted titles' + (d.guide_loading ? ' — the guide is still loading, so airings are not all shown yet' : ''),'');
+    // While the complete guide loads after a restart, look again every 20 seconds.
+    if (d.guide_loading && !window._wantedReloadTimer) {
+      window._wantedReloadTimer = setTimeout(() => { window._wantedReloadTimer = null; loadRecs(); }, 20000);
+    }
+    window._wantedGuideLoading = !!d.guide_loading;
     const tbody = document.getElementById('rec-body');
     const renderRow = r => {
       const a = r.next_airing;
@@ -11946,7 +11952,7 @@ async function loadRecs() {
           ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
           <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
         </td>
-        <td class="ch-cell">${a ? esc(a.channel) : (r.ad_supported_only ? '<span style="color:#64748b" title="It airs only on channels with ads, which are not offered">Only on channels with ads</span>' : '<span style="color:#333">Not in guide</span>')}</td>
+        <td class="ch-cell">${a ? esc(a.channel) : (r.ad_supported_only ? '<span style="color:#64748b" title="It airs only on channels with ads, which are not offered">Only on channels with ads</span>' : (window._wantedGuideLoading ? '<span style="color:#fbbf24">Guide still loading…</span>' : '<span style="color:#333">Not in guide</span>'))}</td>
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
         <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button></td>
       </tr>`;
