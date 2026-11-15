@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115c"
+VERSION = "v20261115d"
 
 app = Flask(__name__)
 
@@ -1937,15 +1937,21 @@ def _better_channel_airings(title, year, channel_id, limit=5):
         conn = sqlite3.connect(_guide_db_path(), timeout=5)
         conn.row_factory = sqlite3.Row
         now = datetime.now(timezone.utc)
+        # Narrow in SQL to titles that contain this one: folding every programme in the guide in
+        # Python made the Record button wait for seconds.  (Sky listings carry "(2018)" after the
+        # title, so the match is "contains", and the exact comparison follows.)
+        plain = re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip()
+        like = '%' + plain.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
         rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, COALESCE(year, '') AS year
-                               FROM guide WHERE start_utc>? AND start_utc<? ORDER BY start_utc''',
+                               FROM guide WHERE start_utc>? AND start_utc<? AND title LIKE ? ESCAPE '\\'
+                               ORDER BY start_utc''',
                             (now.strftime('%Y%m%d%H%M%S'),
-                             (now + timedelta(days=14)).strftime('%Y%m%d%H%M%S'))).fetchall()
+                             (now + timedelta(days=14)).strftime('%Y%m%d%H%M%S'), like)).fetchall()
         conn.close()
-        key, wanted_year = fold_title(title), _clean_year(year)
+        wanted_year = _clean_year(year)
         reliability = _channel_recording_reliability()
         for row in rows:
-            if row['channel_id'] == channel_id or fold_title(row['title']) != key:
+            if row['channel_id'] == channel_id or fold_title(re.sub(r'\s*\(\d{4}\)\s*$', '', row['title'])) != fold_title(plain):
                 continue
             row_year = _clean_year(row['year'])
             if wanted_year and row_year and abs(int(wanted_year) - int(row_year)) > 1:
@@ -4972,6 +4978,7 @@ def _auto_record_wanted_movies(max_new=60):
                 if (_is_automatic_recording_quarantined_channel(row['channel_name'])
                         or _is_bad_channel(cfg, row['channel_id'], row['channel_name'])
                         or reliability.get(row['channel_id'], {}).get('level') == 'suspect'
+                        or _channel_history_warning(row['channel_id'], reliability)
                         or _recent_same_source_failure(row['title'], row['channel_id'])):
                     continue
                 if now - _AUTO_WANTED_FAILED.get((key, row['start_utc']), 0) < AUTO_WANTED_RETRY_SECONDS:
@@ -7996,7 +8003,11 @@ def api_record():
             return jsonify({
                 'ok': False, 'channel_warning': True, 'channel': channel_name, 'title': title,
                 'stats': warning, 'error': f'{channel_name} has a poor recent recording record.',
-                'alternatives': _better_channel_airings(title, data.get('year'), channel_id),
+                'alternatives': _better_channel_airings(title, film_year, channel_id),
+                # "Wait for a better channel" puts a film on Wanted, which then records from a good one.
+                'year': film_year or '',
+                'wanted_title': re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip(),
+                'can_wait_in_wanted': bool(film_year) and not is_series_request,
             }), 409
 
     # Refuse a recording when every recorder slot is already taken for that time.
@@ -9932,9 +9943,19 @@ function showChannelWarningModal(d, proceed) {
     + '<p style="margin:0 0 6px;color:#94a3b8;">' + esc(d.title || 'This programme') + (alts ? ' also airs on these channels with a better record:' : ': no other upcoming airing on a commercial-free channel was found.') + '</p>'
     + (alts ? '<div style="margin:0 0 14px;">' + alts + '</div>' : '<div style="margin:0 0 14px;"></div>')
     + '<div style="display:flex;gap:10px;justify-content:flex-end;">'
-    + '<button class="btn btn-ghost" id="cw-wait" style="margin:0;">Wait for a better channel</button>'
+    + '<button class="btn btn-ghost" id="cw-wait" style="margin:0;">' + (d.can_wait_in_wanted ? 'Wait for a better channel (add to Wanted)' : 'Wait for a better channel') + '</button>'
     + '<button class="btn btn-primary" id="cw-go" style="margin:0;">Record anyway</button></div></div>';
-  o.querySelector('#cw-wait').onclick = () => o.remove();
+  o.querySelector('#cw-wait').onclick = async () => {
+    o.remove();
+    if (!d.can_wait_in_wanted) return;
+    // Waiting for a better channel means putting the film on Wanted: it records itself later, from
+    // a channel with a good record.
+    try {
+      const r = await post('/epg-web/api/wanted', {action: 'add', title: d.wanted_title || d.title, year: d.year, type: 'movie'});
+      if (r && !r.error) reportRecordResult('⭐ "' + (d.wanted_title || d.title) + '" is on Wanted. It will record from a channel with a good record.', 'ok');
+      else reportRecordResult('❌ ' + ((r && r.error) || 'Could not add it to Wanted'), 'err');
+    } catch (e) { reportRecordResult('❌ Could not add it to Wanted: ' + e.message, 'err'); }
+  };
   o.querySelector('#cw-go').onclick = () => { o.remove(); if (typeof proceed === 'function') proceed(); };
   o.onclick = e => { if (e.target === o) o.remove(); };
   document.body.appendChild(o);

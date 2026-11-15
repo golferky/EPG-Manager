@@ -2922,6 +2922,52 @@ class ChannelWarningTests(unittest.TestCase):
         showtime = next(a for a in data["alternatives"] if a["channel"] == "Showtime")
         self.assertIn("no recent recordings", showtime["record"])
 
+    def test_the_warning_says_whether_waiting_can_put_the_film_on_wanted(self):
+        self._make_poor()
+        data = self._record(ask_channel=True).get_json()
+        self.assertTrue(data["can_wait_in_wanted"])
+        self.assertEqual((data["year"], data["wanted_title"]), ("2004", "Warn Film"))
+        self._airing("Warn Film (2004)", "", "Showtime", "cw-new", shift=86400)
+        data = self._record(ask_channel=True, title="Warn Film (2004)", year="").get_json()
+        self.assertEqual(data["wanted_title"], "Warn Film")                       # a year in the title is dropped
+        no_year = self._record(ask_channel=True, title="Nameless Film", year="").get_json()
+        self.assertFalse(no_year["can_wait_in_wanted"])                           # Wanted needs a year
+        series = self._record(ask_channel=True, is_series=True).get_json()
+        self.assertFalse(series["can_wait_in_wanted"])                            # a series is not a Wanted film
+
+    def test_finding_alternatives_does_not_fold_every_programme_in_the_guide(self):
+        self._make_poor()
+        self._airing("Warn Film (2004)", "", "HBO", "cw-good", shift=86400)
+        self._history("g1", "cw-good", "done")
+        for n in range(1500):
+            self._airing(f"Unrelated Programme {n}", "", "HBO", f"cw-x{n % 7}", shift=3600 + n)
+        calls = []
+        real = server.fold_title
+        def counting(value):
+            calls.append(value)
+            return real(value)
+        with mock.patch.object(server, "fold_title", counting):
+            found = server._better_channel_airings("Warn Film", "2004", self.POOR)
+        self.assertEqual([a["channel"] for a in found], ["HBO"])                    # the "(2004)" listing is found
+        self.assertLess(len(calls), 20)
+
+    def test_a_poor_channel_is_not_used_for_a_wanted_film_either(self):
+        self._make_poor()
+        self._airing("Wait Film", "2004", "Poor Channel", self.POOR, shift=3600)
+        auto = AutoRecordWantedTests("test_the_passes_are_wired_in")
+        auto.setUp()
+        try:
+            auto._run([auto._wanted("Wait Film", "2004")])
+            self.assertEqual(len(server._recs), 0)
+        finally:
+            auto.tearDown()
+
+    def test_waiting_for_a_better_channel_puts_the_film_on_wanted(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("(add to Wanted)", html)
+        self.assertIn("post('/epg-web/api/wanted', {action: 'add', title: d.wanted_title || d.title, year: d.year, type: 'movie'})", html)
+        self.assertIn("is on Wanted. It will record from a channel with a good record.", html)
+
     def test_the_page_asks_and_can_go_ahead(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("function showChannelWarningModal(d, proceed)", html)
