@@ -30,5 +30,12 @@ Read this first. It records how the owner's machines are set up and how changes 
 - **Never put a partial or damaged movie into Plex**, even one that is only missing opening credits or a few minutes. Only complete, clean recordings go in `Movies`. Partials stay in `Incomplete Recordings` (or are deleted on request) and the film stays on Wanted so it is re-recorded.
 - Tests: `python3 -m unittest discover -s tests` (needs `pip install flask`).
 
+## Eaglecast on/off (subscription may lapse or be renewed)
+- Status / switch off / switch on: `curl -s http://192.168.1.176:5001/epg-web/api/eaglecast`, and `-X POST -H 'Content-Type: application/json' -d '{"enabled": false}'` (or `true`) to the same URL. Off means new recordings use PrimeStreams only; the setting is `eaglecast_enabled` in the dashboard config. Turning it back on needs no other change.
+- Report what could move, then move it: POST `{}` then `{"apply": true}` to `/epg-web/api/eaglecast/move-to-primestreams`. It only switches the stored source of queued bookings PrimeStreams can carry; the rest are listed and left alone.
+- Read-only cost report: `/epg-web/api/eaglecast-dependency`.
+- End dates: set the Eaglecast date with POST `{"expires": "YYYY-MM-DD"}` to `/epg-web/api/eaglecast` (the dashboard also asks the provider account for it when it can, and that wins). Airings that run past it use PrimeStreams, and bookings past it move to PrimeStreams automatically every half hour where PrimeStreams carries the channel. Renewing: send the new date.
+- Reminders: the dashboard shows a banner when Schedules Direct is within 30 days of its end date (Eaglecast within 7). Set the date with POST `{"key": "schedules_direct", "expires": "YYYY-MM-DD"}` to `/epg-web/api/reminders`. Schedules Direct currently ends 2027-05-05. PrimeStreams is deliberately not tracked: the owner renews it monthly.
+
 ## Stop-hook note
 The "N unpushed commits" stop-hook warning is stale after a squash merge. Check `git ls-remote origin <branch>` against `git rev-parse HEAD`; if they match, nothing needs pushing.

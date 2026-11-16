@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116d"
+VERSION = "v20261116g"
 
 app = Flask(__name__)
 
@@ -689,6 +689,8 @@ def _eaglecast_verified_override(channel_id, guide_db_path=None):
 
 def get_eaglecast_channel_ids(guide_db_path=None):
     """Guide channel ids with a locally verified Eaglecast live-stream map."""
+    if not _eaglecast_enabled():
+        return set()
     db_path = guide_db_path or _guide_db_path()
     try:
         conn = sqlite3.connect(db_path, timeout=3)
@@ -734,7 +736,65 @@ def _query_in_chunks(conn, select_prefix, ids, extra_params=(), chunk_size=500):
         rows.extend(conn.execute(f"{select_prefix} ({ph})", list(extra_params) + chunk).fetchall())
     return rows
 
+_eaglecast_panel_expiry_cache = {'at': 0.0, 'ts': None, 'known': False}
+
+
+def _eaglecast_panel_expiry():
+    """The account's own expiry (epoch seconds) from the provider panel, when it reports one; cached 6 hours."""
+    cache = _eaglecast_panel_expiry_cache
+    if time.time() - cache['at'] < 6 * 3600:
+        return cache['ts'] if cache['known'] else None
+    ts, known = None, False
+    try:
+        cfg = _load_eaglecast_test_config()
+        if all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+            from urllib import request as urlreq
+            from urllib.parse import quote
+            url = (f"{cfg['server_url'].rstrip('/')}/player_api.php?username={quote(str(cfg['username']), safe='')}"
+                   f"&password={quote(str(cfg['password']), safe='')}")
+            with urlreq.urlopen(url, timeout=8) as response:
+                info = (json.loads(response.read()) or {}).get('user_info') or {}
+            raw = info.get('exp_date')
+            if raw not in (None, '', 'null'):
+                ts, known = float(raw), True
+    except Exception:
+        ts, known = None, False        # never log the address: it carries the login
+    cache.update({'at': time.time(), 'ts': ts, 'known': known})
+    return ts
+
+
+def _eaglecast_expiry():
+    """(epoch seconds, where it came from) for the Eaglecast subscription end, or (None, '')."""
+    panel = _eaglecast_panel_expiry()
+    if panel:
+        return panel, 'the provider account'
+    try:
+        cfg = load_config()
+        text = str(cfg.get('eaglecast_expires', '') or '').strip()
+        if text:
+            from zoneinfo import ZoneInfo
+            day = datetime.strptime(text, '%Y-%m-%d')
+            end = day.replace(hour=23, minute=59, second=59, tzinfo=ZoneInfo(cfg.get('timezone', 'America/New_York')))
+            return end.timestamp(), 'the date you entered'
+    except Exception:
+        pass
+    return None, ''
+
+
+def _eaglecast_enabled():
+    """False once the owner has switched Eaglecast off, or its subscription has run out."""
+    try:
+        if load_config().get('eaglecast_enabled', True) is False:
+            return False
+        expiry, _source = _eaglecast_expiry()
+        return not (expiry and expiry < time.time())
+    except Exception:
+        return True
+
+
 def _eaglecast_stream_for_channel(channel_id):
+    if not _eaglecast_enabled():
+        return None
     try:
         conn = sqlite3.connect(_guide_db_path())
         row = conn.execute('''SELECT stream_id, provider_channel_name, stream_extension,
@@ -2329,7 +2389,9 @@ def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
     if eaglecast_exists:
         quarantined = _is_quarantined_eaglecast_stream(eaglecast_stream)
         conflict = _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id)
-        if not quarantined and not conflict:
+        expiry, _source = _eaglecast_expiry()
+        lapsed = bool(expiry and stop_ts and float(stop_ts) > expiry)    # the subscription ends before this airing does
+        if not quarantined and not conflict and not lapsed:
             url, error, debug = _stream_url(channel_id, 'eaglecast')
             if not error:
                 return url, None, debug
@@ -2338,7 +2400,10 @@ def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
         # PrimeStreams becomes the safe fallback for this recording window.
         url, error, debug = _stream_url(channel_id, 'primestreams')
         if not error:
-            if quarantined:
+            if lapsed:
+                debug['fallback_reason'] = ('The Eaglecast subscription ends before this airing. '
+                                            'Using PrimeStreams instead; quality may be lower.')
+            elif quarantined:
                 debug['fallback_reason'] = (
                     'Eaglecast stream mapping was quarantined after a verified '
                     'wrong-program capture. Using PrimeStreams instead; quality may be lower.'
@@ -2350,6 +2415,10 @@ def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
                     'Using PrimeStreams instead; quality may be lower.'
                 )
             return url, None, debug
+        if lapsed:
+            when = _local_dt(expiry).strftime('%b %-d')
+            return None, (f'The Eaglecast subscription ends {when}, before this airing, '
+                          'and PrimeStreams has no usable stream for this channel.'), {}
         if quarantined:
             return None, ('Eaglecast mapping is quarantined after a verified wrong-program '
                           'capture, and PrimeStreams has no usable stream for this channel.'), {}
@@ -2367,6 +2436,8 @@ def _play_blocked_note(error):
         parts = error.split('"')
         title = parts[1] if len(parts) >= 3 else 'another recording'
         return f'Eaglecast has one connection and it is busy with "{title}"'
+    if 'subscription ends' in error:
+        return error.split(', and')[0]
     if 'quarantined' in error:
         return 'this Eaglecast feed is blocked after it delivered the wrong programme'
     if 'No stream_id found' in error:
@@ -2913,6 +2984,187 @@ def api_fetch_guide():
     except Exception as e:
         print(f'[fetch-guide] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+def _local_dt(ts):
+    """A timestamp as a datetime in the dashboard's own timezone (not the server machine's)."""
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(load_config().get('timezone', 'America/New_York'))
+    except Exception:
+        tz = ZoneInfo('America/New_York')
+    return datetime.fromtimestamp(ts, tz)
+
+
+def _expiry_text(expiry):
+    return _local_dt(expiry).strftime('%Y-%m-%d') if expiry else ''
+
+
+@app.route('/epg-web/api/eaglecast', methods=['GET', 'POST'])
+def api_eaglecast_switch():
+    """Read or set the Eaglecast switch and its subscription end date.
+
+    POST {"enabled": false} switches it off; {"expires": "2026-11-22"} records when the subscription ends
+    ("" clears it).  The dashboard then stops choosing Eaglecast for airings that run past that date and moves
+    later bookings to PrimeStreams where it carries the channel.  Renew and send the new date (or let the
+    provider account report it) and everything resumes.
+    """
+    if request.method == 'POST':
+        body = request.json or {}
+        cfg = load_config()
+        if 'enabled' in body:
+            if not isinstance(body['enabled'], bool):
+                return jsonify({'error': 'send {"enabled": true} or {"enabled": false}'}), 400
+            cfg['eaglecast_enabled'] = body['enabled']
+        if 'expires' in body:
+            text = str(body['expires'] or '').strip()
+            if text:
+                try:
+                    datetime.strptime(text, '%Y-%m-%d')
+                except ValueError:
+                    return jsonify({'error': 'send the date as YYYY-MM-DD, for example 2026-11-22'}), 400
+            cfg['eaglecast_expires'] = text
+        save_config(cfg)
+    expiry, source = _eaglecast_expiry()
+    return jsonify({'enabled': _eaglecast_enabled(), 'expires': _expiry_text(expiry), 'expiry_from': source,
+                    'days_left': round((expiry - time.time()) / 86400, 1) if expiry else None})
+
+
+# How many days before an account ends the dashboard starts reminding.  Schedules Direct opens renewal
+# 45 days ahead and does not bill by itself, so 30 days leaves time; Eaglecast is a short subscription.
+REMINDER_WINDOWS = {'schedules_direct': ('Schedules Direct', 30), 'eaglecast': ('Eaglecast', 7)}
+
+
+def _reminder_items():
+    """The accounts whose end date is known: [{key, label, expires, days_left, due, message}]."""
+    cfg = load_config()
+    today = _local_dt(time.time()).date()
+    dates = {}
+    eaglecast_end, _source = _eaglecast_expiry()
+    if eaglecast_end:
+        dates['eaglecast'] = _local_dt(eaglecast_end).date()
+    text = str(cfg.get('sd_expires', '') or '').strip()
+    if text:
+        try:
+            dates['schedules_direct'] = datetime.strptime(text, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+    items = []
+    for key, (label, window) in REMINDER_WINDOWS.items():
+        end = dates.get(key)
+        if not end:
+            continue
+        days = (end - today).days
+        if days < 0:
+            message = f'{label} ran out on {end.strftime("%b")} {end.day}'
+        elif days == 0:
+            message = f'{label} runs out today'
+        else:
+            message = f'{label} runs out in {days} day{"s" if days != 1 else ""} ({end.strftime("%b")} {end.day})'
+        items.append({'key': key, 'label': label, 'expires': end.isoformat(), 'days_left': days,
+                      'due': days <= window, 'message': message})
+    return items
+
+
+@app.route('/epg-web/api/reminders', methods=['GET', 'POST'])
+def api_reminders():
+    """Account end dates and which of them are close enough to show a reminder.
+
+    POST {"key": "schedules_direct", "expires": "2027-05-05"} records a date ("" clears it).
+    """
+    if request.method == 'POST':
+        body = request.json or {}
+        key = str(body.get('key', ''))
+        if key not in REMINDER_WINDOWS:
+            return jsonify({'error': 'key must be schedules_direct or eaglecast'}), 400
+        text = str(body.get('expires', '') or '').strip()
+        if text:
+            try:
+                datetime.strptime(text, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'send the date as YYYY-MM-DD, for example 2027-05-05'}), 400
+        cfg = load_config()
+        cfg['sd_expires' if key == 'schedules_direct' else 'eaglecast_expires'] = text
+        save_config(cfg)
+    return jsonify({'reminders': _reminder_items()})
+
+
+def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
+    """Move queued Eaglecast bookings to PrimeStreams where it carries the same channel.
+
+    A booking keeps its title, channel and times: only its stored source changes.  A booking PrimeStreams
+    cannot carry is left exactly as it is.  With ``after_expiry_only`` only bookings that run past the
+    subscription end are considered.  Returns the lists and how many were moved (0 unless ``apply_it``).
+    """
+    now = time.time()
+    expiry, _source = _eaglecast_expiry()
+    if after_expiry_only and not expiry:
+        return {'error': 'No Eaglecast end date is known. Set one first.'}
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        rows = conn.execute(
+            "SELECT rec_id, title, channel, channel_id, start_ts, stop_ts FROM recordings "
+            "WHERE status IN ('queued','scheduled') AND stream_provider='eaglecast' AND start_ts>? "
+            "ORDER BY start_ts", (now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS,)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return {'error': str(exc)}
+    movable, stuck = [], []
+    for rec_id, title, channel, channel_id, start_ts, stop_ts in rows:
+        if after_expiry_only and not (stop_ts and float(stop_ts) > expiry):
+            continue
+        url, error, debug = _stream_url(channel_id, 'primestreams')
+        entry = {'id': rec_id, 'title': title, 'channel': channel, 'start_ts': start_ts}
+        if url and not error:
+            entry['stream_id'] = str(debug.get('stream_id') or '')
+            entry['stream_extension'] = str(debug.get('stream_extension') or 'ts')
+            movable.append(entry)
+        else:
+            stuck.append(entry)
+    moved = 0
+    if apply_it and movable:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.execute('PRAGMA busy_timeout=10000')
+        for entry in movable:
+            if not entry['stream_id']:
+                continue
+            conn.execute("UPDATE recordings SET stream_provider='primestreams', stream_id=?, stream_extension=? "
+                         "WHERE rec_id=? AND status IN ('queued','scheduled')",
+                         (entry['stream_id'], entry['stream_extension'], entry['id']))
+            moved += 1
+        conn.commit()
+        conn.close()
+        with _rec_lock:
+            for entry in movable:
+                rec = _recs.get(entry['id'])
+                if rec and entry['stream_id']:
+                    rec.update({'stream_provider': 'primestreams', 'stream_id': entry['stream_id'],
+                                'stream_extension': entry['stream_extension']})
+    keep = ('id', 'title', 'channel', 'start_ts')
+    strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
+    return {'applied': bool(apply_it), 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)}
+
+
+@app.route('/epg-web/api/eaglecast/move-to-primestreams', methods=['POST'])
+def api_eaglecast_move_to_primestreams():
+    """Report, or with {"apply": true} perform, the move.  {"after_expiry_only": true} limits it to bookings past the end date."""
+    body = request.json or {}
+    result = _move_eaglecast_bookings(body.get('apply') is True, body.get('after_expiry_only') is True)
+    return jsonify(result), (400 if 'error' in result else 200)
+
+
+def _move_bookings_past_expiry():
+    """Automatic: once an end date is known, move the bookings that would run past it (where PrimeStreams can)."""
+    try:
+        expiry, _source = _eaglecast_expiry()
+        if not expiry:
+            return
+        result = _move_eaglecast_bookings(True, True)
+        if result.get('moved') or result.get('cannot_move'):
+            print(f"[eaglecast] subscription ends {_expiry_text(expiry)}: moved {result.get('moved', 0)} booking(s) to "
+                  f"PrimeStreams, {len(result.get('cannot_move', []))} cannot move")
+    except Exception as exc:
+        print(f'[eaglecast] expiry check failed: {exc}')
+
 
 @app.route('/epg-web/api/eaglecast-dependency')
 def api_eaglecast_dependency():
@@ -5303,6 +5555,7 @@ def _auto_record_wanted_loop():
     """Look for new Wanted airings every half hour, so a film added to Wanted is picked up soon."""
     time.sleep(90)
     while True:
+        _move_bookings_past_expiry()
         try:
             _auto_record_wanted()
         except Exception as exc:
@@ -9063,6 +9316,10 @@ tr:hover td{background:#141414;}
   <button class="btn btn-ghost btn-sm" id="player-pref-btn" onclick="togglePlayerPref()" title="Where Play opens videos on this device">Player: VLC</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
+<div id="reminder-bar" style="display:none;background:#78350f;color:#fde68a;padding:6px 16px;font-size:13px;border-bottom:1px solid #b45309;">
+  <span id="reminder-text"></span>
+  <button class="btn btn-ghost btn-sm" style="margin-left:12px;" onclick="dismissReminders()">Dismiss for today</button>
+</div>
 
 <nav>
   <div class="tab active" onclick="switchTab('guide')">📺 Guide</div>
@@ -10429,6 +10686,25 @@ async function openInVlc(params) {
   } catch (e) { alert('Could not open VLC: ' + e.message); }
 }
 document.addEventListener('DOMContentLoaded', updatePlayerPrefBtn);
+
+// Account end-date reminder (Schedules Direct, Eaglecast): shown only when one is close, hidden for the rest of the day once dismissed.
+async function loadReminders() {
+  try {
+    const d = await (await fetch('/epg-web/api/reminders')).json();
+    const due = (d.reminders || []).filter(r => r.due);
+    const bar = document.getElementById('reminder-bar');
+    const today = new Date().toISOString().slice(0, 10);
+    if (!due.length || localStorage.getItem('epg_reminder_dismissed') === today) { bar.style.display = 'none'; return; }
+    document.getElementById('reminder-text').textContent = '⏰ ' + due.map(r => r.message).join('  ·  ') + '. Renew soon.';
+    bar.style.display = '';
+  } catch (e) { /* a reminder is never worth an error */ }
+}
+function dismissReminders() {
+  localStorage.setItem('epg_reminder_dismissed', new Date().toISOString().slice(0, 10));
+  document.getElementById('reminder-bar').style.display = 'none';
+}
+document.addEventListener('DOMContentLoaded', loadReminders);
+setInterval(loadReminders, 30 * 60 * 1000);
 updatePlayerPrefBtn();
 
 // In-browser player overlay: plays on whichever device the browser is on.
