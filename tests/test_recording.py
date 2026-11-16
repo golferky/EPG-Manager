@@ -3649,3 +3649,84 @@ class AccountRemindersTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn('id="reminder-bar"', html)
         self.assertIn("async function loadReminders()", html)
+
+
+class SameAiringElsewhereTests(unittest.TestCase):
+    def _setup(self, temp):
+        guide_db = os.path.join(temp, "guide.db")
+        server.ensure_guide_db(guide_db)
+        with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+            server._init_recordings_table()
+        self.now = time.time()
+        self.start = int(self.now) + 7200
+        conn = sqlite3.connect(guide_db)
+        conn.execute("INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,guide_stop_ts,status,stream_provider,stream_id) "
+                     "VALUES ('mob','MobLand','Paramount+ with Showtime HD (Pacific)','hd22532',?,?,?,'queued','eaglecast','92020')",
+                     (self.start, self.start + 3700, self.start + 3600))
+        self.alt_start = self.start + 120                  # the other channel's row starts two minutes later
+        stamp = lambda ts: time.strftime("%Y%m%d%H%M%S", time.gmtime(ts))
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,category) VALUES (?,?,?,?,?,?,?)",
+                     ("MobLand", "plain", "Paramount+ with Showtime (Pacific)", stamp(self.alt_start), stamp(self.alt_start + 3600), "", ""))
+        conn.commit(); conn.close()
+        return guide_db
+
+    @staticmethod
+    def _stream(channel_id, preferred=None):
+        if channel_id == "plain":
+            return "secret-url", None, {"stream_id": "39223", "stream_extension": "ts"}
+        return None, "No stream_id found for channel", {}
+
+    def _row(self, guide_db):
+        conn = sqlite3.connect(guide_db)
+        row = conn.execute("SELECT channel_id, channel, start_ts, stop_ts, guide_stop_ts, stream_provider, stream_id "
+                           "FROM recordings WHERE rec_id='mob'").fetchone()
+        conn.close()
+        return row
+
+    def _run(self, guide_db, apply_it, cfg=None):
+        with mock.patch.object(server, "_guide_db_path", return_value=guide_db), \
+                mock.patch.object(server, "_stream_url", self._stream), \
+                mock.patch.object(server, "load_config", lambda: cfg or {}), \
+                mock.patch.object(server, "_eaglecast_expiry", return_value=(None, "")):
+            return server._move_eaglecast_bookings(apply_it)
+
+    def test_a_dry_run_names_the_other_channel_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._setup(temp)
+            data = self._run(guide_db, False)
+            self.assertEqual(data["cannot_move"], [])
+            self.assertEqual(data["can_move"][0]["via"], "Paramount+ with Showtime (Pacific)")
+            self.assertEqual(self._row(guide_db)[0], "hd22532")
+            self.assertNotIn("secret", str(data))
+
+    def test_apply_switches_channel_source_and_times_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._setup(temp)
+            data = self._run(guide_db, True)
+            self.assertEqual(data["moved"], 1)
+            channel_id, channel, start, stop, guide_stop, provider, stream_id = self._row(guide_db)
+            self.assertEqual((channel_id, channel, provider, stream_id),
+                             ("plain", "Paramount+ with Showtime (Pacific)", "primestreams", "39223"))
+            self.assertEqual(int(start), self.alt_start)
+            self.assertEqual(int(stop), self.start + 3700 + 120)            # padding kept, shifted with the start
+            self.assertEqual(int(guide_stop), self.start + 3600 + 120)
+
+    def test_an_airing_already_booked_elsewhere_is_not_booked_twice(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._setup(temp)
+            conn = sqlite3.connect(guide_db)
+            conn.execute("INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider) "
+                         "VALUES ('twin','MobLand','Paramount+ with Showtime (Pacific)','plain',?,?,'queued','primestreams')",
+                         (self.alt_start, self.alt_start + 3600))
+            conn.commit(); conn.close()
+            data = self._run(guide_db, True)
+            self.assertEqual(data["moved"], 0)
+            self.assertEqual([e["id"] for e in data["cannot_move"]], ["mob"])
+            self.assertEqual(self._row(guide_db)[0], "hd22532")
+
+    def test_a_bad_channel_is_never_chosen(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._setup(temp)
+            data = self._run(guide_db, True, cfg={"bad_channels": ["Paramount+ with Showtime (Pacific)"]})
+            self.assertEqual(data["moved"], 0)
+            self.assertEqual([e["id"] for e in data["cannot_move"]], ["mob"])
