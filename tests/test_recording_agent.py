@@ -157,9 +157,15 @@ class QualityDecisionTests(unittest.TestCase):
             destination = recording_agent.verified_unidentified_episode_transfer(
                 source, root / "TV Shows", "I Dream of Jeannie", 1_786_719_600,
             )
-            self.assertIn("TV Shows/_Needs Episode Info/I Dream of Jeannie/",
+            self.assertIn("TV Needing Episode Info/I Dream of Jeannie/",
                           destination.as_posix())
             self.assertEqual(destination.read_bytes(), b"episode-data")
+
+    def test_the_holding_folder_is_outside_the_plex_tv_tree_and_can_be_configured(self):
+        cfg = {"plex_tv_path": "/Volumes/Plex/TV Shows"}
+        self.assertEqual(recording_agent.needs_episode_root(cfg), Path("/Volumes/Plex/TV Needing Episode Info"))
+        cfg["needs_episode_path"] = "/Volumes/Plex/Waiting TV"
+        self.assertEqual(recording_agent.needs_episode_root(cfg), Path("/Volumes/Plex/Waiting TV"))
 
     def test_title_normalization_ignores_punctuation_and_year(self):
         self.assertEqual(
@@ -778,7 +784,7 @@ class SeriesYearFolderTests(unittest.TestCase):
             source.write_bytes(b"ep")
             dest = recording_agent.verified_unidentified_episode_transfer(source, root, "Perry Mason", 0, year="2020")
             self.assertEqual(dest.parent.name, "Perry Mason (2020)")
-            self.assertEqual(dest.parent.parent.name, "_Needs Episode Info")
+            self.assertEqual(dest.parent.parent.name, "TV Needing Episode Info")
 
 
 class PlexTvYearsToolTests(unittest.TestCase):
