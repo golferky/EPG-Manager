@@ -30,5 +30,10 @@ Read this first. It records how the owner's machines are set up and how changes 
 - **Never put a partial or damaged movie into Plex**, even one that is only missing opening credits or a few minutes. Only complete, clean recordings go in `Movies`. Partials stay in `Incomplete Recordings` (or are deleted on request) and the film stays on Wanted so it is re-recorded.
 - Tests: `python3 -m unittest discover -s tests` (needs `pip install flask`).
 
+## Eaglecast on/off (subscription may lapse or be renewed)
+- Status / switch off / switch on: `curl -s http://192.168.1.176:5001/epg-web/api/eaglecast`, and `-X POST -H 'Content-Type: application/json' -d '{"enabled": false}'` (or `true`) to the same URL. Off means new recordings use PrimeStreams only; the setting is `eaglecast_enabled` in the dashboard config. Turning it back on needs no other change.
+- Report what could move, then move it: POST `{}` then `{"apply": true}` to `/epg-web/api/eaglecast/move-to-primestreams`. It only switches the stored source of queued bookings PrimeStreams can carry; the rest are listed and left alone.
+- Read-only cost report: `/epg-web/api/eaglecast-dependency`.
+
 ## Stop-hook note
 The "N unpushed commits" stop-hook warning is stale after a squash merge. Check `git ls-remote origin <branch>` against `git rev-parse HEAD`; if they match, nothing needs pushing.

@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116d"
+VERSION = "v20261116e"
 
 app = Flask(__name__)
 
@@ -689,6 +689,8 @@ def _eaglecast_verified_override(channel_id, guide_db_path=None):
 
 def get_eaglecast_channel_ids(guide_db_path=None):
     """Guide channel ids with a locally verified Eaglecast live-stream map."""
+    if not _eaglecast_enabled():
+        return set()
     db_path = guide_db_path or _guide_db_path()
     try:
         conn = sqlite3.connect(db_path, timeout=3)
@@ -734,7 +736,17 @@ def _query_in_chunks(conn, select_prefix, ids, extra_params=(), chunk_size=500):
         rows.extend(conn.execute(f"{select_prefix} ({ph})", list(extra_params) + chunk).fetchall())
     return rows
 
+def _eaglecast_enabled():
+    """False once the owner has switched Eaglecast off (for example when the subscription lapses)."""
+    try:
+        return load_config().get('eaglecast_enabled', True) is not False
+    except Exception:
+        return True
+
+
 def _eaglecast_stream_for_channel(channel_id):
+    if not _eaglecast_enabled():
+        return None
     try:
         conn = sqlite3.connect(_guide_db_path())
         row = conn.execute('''SELECT stream_id, provider_channel_name, stream_extension,
@@ -2913,6 +2925,71 @@ def api_fetch_guide():
     except Exception as e:
         print(f'[fetch-guide] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/eaglecast', methods=['GET', 'POST'])
+def api_eaglecast_switch():
+    """Read or set the Eaglecast on/off switch.  Off means every new recording uses PrimeStreams only."""
+    if request.method == 'POST':
+        enabled = (request.json or {}).get('enabled')
+        if not isinstance(enabled, bool):
+            return jsonify({'error': 'send {"enabled": true} or {"enabled": false}'}), 400
+        cfg = load_config()
+        cfg['eaglecast_enabled'] = enabled
+        save_config(cfg)
+    return jsonify({'enabled': _eaglecast_enabled()})
+
+
+@app.route('/epg-web/api/eaglecast/move-to-primestreams', methods=['POST'])
+def api_eaglecast_move_to_primestreams():
+    """Move queued Eaglecast bookings to PrimeStreams where it carries the same channel.
+
+    Nothing changes unless the request says {"apply": true}; without it this only reports.  A booking
+    keeps its title, channel and times: only the stored source is switched.  A booking PrimeStreams
+    cannot carry is left exactly as it is and listed.
+    """
+    apply_it = (request.json or {}).get('apply') is True
+    now = time.time()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        rows = conn.execute(
+            "SELECT rec_id, title, channel, channel_id, start_ts FROM recordings "
+            "WHERE status IN ('queued','scheduled') AND stream_provider='eaglecast' AND start_ts>? "
+            "ORDER BY start_ts", (now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS,)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'error': str(exc)}), 500
+    movable, stuck = [], []
+    for rec_id, title, channel, channel_id, start_ts in rows:
+        url, error, debug = _stream_url(channel_id, 'primestreams')
+        entry = {'id': rec_id, 'title': title, 'channel': channel, 'start_ts': start_ts}
+        if url and not error:
+            entry['stream_id'] = str(debug.get('stream_id') or '')
+            entry['stream_extension'] = str(debug.get('stream_extension') or 'ts')
+            movable.append(entry)
+        else:
+            stuck.append(entry)
+    moved = 0
+    if apply_it and movable:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.execute('PRAGMA busy_timeout=10000')
+        for entry in movable:
+            if not entry['stream_id']:
+                continue
+            conn.execute("UPDATE recordings SET stream_provider='primestreams', stream_id=?, stream_extension=? "
+                         "WHERE rec_id=? AND status IN ('queued','scheduled')",
+                         (entry['stream_id'], entry['stream_extension'], entry['id']))
+            moved += 1
+        conn.commit()
+        conn.close()
+        with _rec_lock:
+            for entry in movable:
+                rec = _recs.get(entry['id'])
+                if rec and entry['stream_id']:
+                    rec.update({'stream_provider': 'primestreams', 'stream_id': entry['stream_id'],
+                                'stream_extension': entry['stream_extension']})
+    strip = lambda items: [{k: v for k, v in e.items() if k in ('id', 'title', 'channel', 'start_ts')} for e in items]
+    return jsonify({'applied': apply_it, 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)})
+
 
 @app.route('/epg-web/api/eaglecast-dependency')
 def api_eaglecast_dependency():

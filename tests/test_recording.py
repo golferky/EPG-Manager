@@ -3419,3 +3419,90 @@ class EaglecastDependencyReportTests(unittest.TestCase):
                          {"Film A": True, "Film B": False})
         self.assertEqual(data["recent_channels"][0]["recordings"], 1)
         self.assertNotIn("secret", str(data))
+
+
+class EaglecastSwitchAndMoveTests(unittest.TestCase):
+    def _db(self, temp):
+        guide_db = os.path.join(temp, "guide.db")
+        server.ensure_guide_db(guide_db)
+        with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+            server._init_recordings_table()
+        conn = sqlite3.connect(guide_db)
+        now = time.time()
+        rows = [("covered", "Film A", "HBO", "hbo", now + 7200, "queued", "eaglecast", "111"),
+                ("uncovered", "Film B", "STARZ 1", "starz1", now + 7200, "queued", "eaglecast", "176929"),
+                ("too_soon", "Film C", "HBO", "hbo", now + 60, "queued", "eaglecast", "111"),
+                ("on_ps", "Film D", "HBO", "hbo", now + 7200, "queued", "primestreams", "222")]
+        conn.executemany(
+            "INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,stream_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", [(r[0], r[1], r[2], r[3], r[4], r[4] + 3600, r[5], r[6], r[7]) for r in rows])
+        conn.commit(); conn.close()
+        return guide_db
+
+    @staticmethod
+    def _fake_stream(channel_id, preferred=None):
+        assert preferred == "primestreams"
+        if channel_id == "hbo":
+            return "url-with-secret", None, {"stream_id": "95926", "stream_extension": "ts"}
+        return None, "No stream_id found for channel", {}
+
+    def _status(self, guide_db, rec_id):
+        conn = sqlite3.connect(guide_db)
+        row = conn.execute("SELECT stream_provider, stream_id FROM recordings WHERE rec_id=?", (rec_id,)).fetchone()
+        conn.close()
+        return row
+
+    def test_without_apply_it_only_reports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._db(temp)
+            with mock.patch.object(server, "_guide_db_path", return_value=guide_db), \
+                    mock.patch.object(server, "_stream_url", self._fake_stream):
+                data = server.app.test_client().post("/epg-web/api/eaglecast/move-to-primestreams", json={}).get_json()
+            self.assertFalse(data["applied"])
+            self.assertEqual(data["moved"], 0)
+            self.assertEqual([e["id"] for e in data["can_move"]], ["covered"])
+            self.assertEqual([e["id"] for e in data["cannot_move"]], ["uncovered"])
+            self.assertEqual(self._status(guide_db, "covered"), ("eaglecast", "111"))
+            self.assertNotIn("secret", str(data))
+
+    def test_apply_moves_only_what_primestreams_can_carry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = self._db(temp)
+            with server._rec_lock:
+                server._recs["covered"] = {"stream_provider": "eaglecast", "stream_id": "111"}
+            try:
+                with mock.patch.object(server, "_guide_db_path", return_value=guide_db), \
+                        mock.patch.object(server, "_stream_url", self._fake_stream):
+                    data = server.app.test_client().post("/epg-web/api/eaglecast/move-to-primestreams",
+                                                         json={"apply": True}).get_json()
+                self.assertEqual(data["moved"], 1)
+                self.assertEqual(self._status(guide_db, "covered"), ("primestreams", "95926"))
+                self.assertEqual(self._status(guide_db, "uncovered"), ("eaglecast", "176929"))   # left alone
+                self.assertEqual(self._status(guide_db, "too_soon"), ("eaglecast", "111"))       # starts too soon
+                self.assertEqual(server._recs["covered"]["stream_provider"], "primestreams")
+            finally:
+                with server._rec_lock:
+                    server._recs.pop("covered", None)
+
+    def test_switching_eaglecast_off_removes_it_from_source_choice_and_back_on_restores_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            conn = sqlite3.connect(guide_db)
+            conn.execute("INSERT INTO provider_streams(provider,channel_id,stream_id,provider_channel_name,stream_extension,"
+                         "guide_channel_name,mapped_at) VALUES ('eaglecast','x1','5','US| HBO','ts','HBO',0)")
+            conn.commit(); conn.close()
+            cfg = {}
+            with mock.patch.object(server, "load_config", lambda: cfg), \
+                    mock.patch.object(server, "save_config", lambda c: cfg.update(c)), \
+                    mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+                self.assertIn("x1", server.get_eaglecast_channel_ids(guide_db))
+                self.assertIsNotNone(server._eaglecast_stream_for_channel("x1"))
+                reply = server.app.test_client().post("/epg-web/api/eaglecast", json={"enabled": False})
+                self.assertEqual(reply.get_json(), {"enabled": False})
+                self.assertEqual(server.get_eaglecast_channel_ids(guide_db), set())
+                self.assertIsNone(server._eaglecast_stream_for_channel("x1"))
+                server.app.test_client().post("/epg-web/api/eaglecast", json={"enabled": True})
+                self.assertIn("x1", server.get_eaglecast_channel_ids(guide_db))
+                bad = server.app.test_client().post("/epg-web/api/eaglecast", json={"enabled": "no"})
+                self.assertEqual(bad.status_code, 400)
