@@ -3499,10 +3499,153 @@ class EaglecastSwitchAndMoveTests(unittest.TestCase):
                 self.assertIn("x1", server.get_eaglecast_channel_ids(guide_db))
                 self.assertIsNotNone(server._eaglecast_stream_for_channel("x1"))
                 reply = server.app.test_client().post("/epg-web/api/eaglecast", json={"enabled": False})
-                self.assertEqual(reply.get_json(), {"enabled": False})
+                self.assertFalse(reply.get_json()["enabled"])
                 self.assertEqual(server.get_eaglecast_channel_ids(guide_db), set())
                 self.assertIsNone(server._eaglecast_stream_for_channel("x1"))
                 server.app.test_client().post("/epg-web/api/eaglecast", json={"enabled": True})
                 self.assertIn("x1", server.get_eaglecast_channel_ids(guide_db))
                 bad = server.app.test_client().post("/epg-web/api/eaglecast", json={"enabled": "no"})
                 self.assertEqual(bad.status_code, 400)
+
+
+class EaglecastExpiryTests(unittest.TestCase):
+
+    def test_a_typed_end_date_is_used_when_the_panel_gives_none(self):
+        cfg = {"eaglecast_expires": "2026-11-22", "timezone": "America/New_York"}
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "_eaglecast_panel_expiry", return_value=None):
+            ts, source = server._eaglecast_expiry()
+        from datetime import datetime as _dt, timezone as _tz
+        self.assertEqual(_dt.fromtimestamp(ts, _tz.utc).strftime("%Y-%m-%d %H"), "2026-11-23 04")  # 23:59 Eastern
+        self.assertEqual(source, "the date you entered")
+
+    def test_the_provider_account_date_wins_over_a_typed_one(self):
+        cfg = {"eaglecast_expires": "2026-11-22"}
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "_eaglecast_panel_expiry", return_value=1_800_000_000.0):
+            self.assertEqual(server._eaglecast_expiry(), (1_800_000_000.0, "the provider account"))
+
+    def test_the_switch_reports_and_saves_the_end_date_and_refuses_a_bad_one(self):
+        cfg = {"timezone": "America/New_York"}
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "save_config", lambda c: cfg.update(c)), \
+                mock.patch.object(server, "_eaglecast_panel_expiry", return_value=None):
+            client = server.app.test_client()
+            data = client.post("/epg-web/api/eaglecast", json={"expires": "2999-01-01"}).get_json()
+            self.assertEqual(data["expires"], "2999-01-01")
+            self.assertTrue(data["enabled"])
+            self.assertEqual(client.post("/epg-web/api/eaglecast", json={"expires": "22/11"}).status_code, 400)
+            self.assertEqual(client.post("/epg-web/api/eaglecast", json={"expires": ""}).get_json()["expires"], "")
+
+    def test_a_subscription_that_has_run_out_switches_eaglecast_off(self):
+        cfg = {"eaglecast_expires": "2000-01-01"}
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "_eaglecast_panel_expiry", return_value=None):
+            self.assertFalse(server._eaglecast_enabled())
+
+    def test_an_airing_past_the_end_date_uses_primestreams_or_is_refused(self):
+        expiry = time.time() + 86400
+        covered = ("ps-url", None, {"provider": "primestreams", "stream_id": "9"})
+        with mock.patch.object(server, "_eaglecast_stream_for_channel", return_value=("5", "US| HBO", "ts")), \
+                mock.patch.object(server, "_eaglecast_expiry", return_value=(expiry, "the date you entered")), \
+                mock.patch.object(server, "_eaglecast_overlap", return_value=None), \
+                mock.patch.object(server, "_is_quarantined_eaglecast_stream", return_value=False):
+            with mock.patch.object(server, "_stream_url", lambda cid, pref=None: covered if pref == "primestreams"
+                                   else ("ec-url", None, {"provider": "eaglecast"})):
+                before = server._resolve_recording_source("x", time.time() + 100, time.time() + 3000)
+                after = server._resolve_recording_source("x", expiry + 100, expiry + 3000)
+            self.assertEqual(before[2]["provider"], "eaglecast")
+            self.assertEqual(after[2]["provider"], "primestreams")
+            with mock.patch.object(server, "_stream_url", lambda cid, pref=None: (None, "No stream_id found for channel", {})
+                                   if pref == "primestreams" else ("ec-url", None, {"provider": "eaglecast"})):
+                url, error, _debug = server._resolve_recording_source("x", expiry + 100, expiry + 3000)
+        self.assertIsNone(url)
+        self.assertIn("subscription ends", error)
+        self.assertEqual(server._play_blocked_note(error).startswith("The Eaglecast subscription ends"), True)
+
+    def test_only_bookings_past_the_end_date_are_moved_automatically(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+                server._init_recordings_table()
+            now = time.time()
+            expiry = now + 86400
+            conn = sqlite3.connect(guide_db)
+            conn.executemany(
+                "INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,stream_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                [("before", "Film A", "HBO", "hbo", now + 7200, now + 10800, "queued", "eaglecast", "111"),
+                 ("after", "Film B", "HBO", "hbo", expiry + 7200, expiry + 10800, "queued", "eaglecast", "111"),
+                 ("after_stuck", "Film C", "STARZ 1", "starz1", expiry + 9000, expiry + 12000, "queued", "eaglecast", "7")])
+            conn.commit(); conn.close()
+
+            def fake(cid, pref=None):
+                return (("u", None, {"stream_id": "95926", "stream_extension": "ts"}) if cid == "hbo"
+                        else (None, "No stream_id found for channel", {}))
+            with mock.patch.object(server, "_guide_db_path", return_value=guide_db), \
+                    mock.patch.object(server, "_stream_url", fake), \
+                    mock.patch.object(server, "_eaglecast_expiry", return_value=(expiry, "the date you entered")):
+                result = server._move_eaglecast_bookings(True, after_expiry_only=True)
+            conn = sqlite3.connect(guide_db)
+            state = dict(conn.execute("SELECT rec_id, stream_provider FROM recordings").fetchall())
+            conn.close()
+        self.assertEqual(result["moved"], 1)
+        self.assertEqual(state, {"before": "eaglecast", "after": "primestreams", "after_stuck": "eaglecast"})
+        self.assertEqual([e["id"] for e in result["cannot_move"]], ["after_stuck"])
+
+    def test_without_an_end_date_the_after_expiry_move_refuses(self):
+        with mock.patch.object(server, "_eaglecast_expiry", return_value=(None, "")):
+            self.assertIn("error", server._move_eaglecast_bookings(True, after_expiry_only=True))
+
+
+class AccountRemindersTests(unittest.TestCase):
+    def _cfg(self, **extra):
+        cfg = {"timezone": "America/New_York"}
+        cfg.update(extra)
+        return cfg
+
+    @staticmethod
+    def _in_days(days):
+        from datetime import datetime as _dt, timedelta as _td
+        return (server._local_dt(time.time()) + _td(days=days)).strftime("%Y-%m-%d")
+
+    def test_a_date_within_the_window_is_due_and_a_far_one_is_not(self):
+        cfg = self._cfg(sd_expires=self._in_days(20))
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "_eaglecast_expiry", return_value=(None, "")):
+            items = {i["key"]: i for i in server._reminder_items()}
+            self.assertTrue(items["schedules_direct"]["due"])          # inside 30 days
+            self.assertIn("runs out in 20 days", items["schedules_direct"]["message"])
+            cfg["sd_expires"] = self._in_days(200)
+            self.assertFalse({i["key"]: i for i in server._reminder_items()}["schedules_direct"]["due"])
+            self.assertNotIn("eaglecast", {i["key"] for i in server._reminder_items()})   # no date known
+
+    def test_eaglecast_reminds_inside_a_week_and_an_expired_account_says_so(self):
+        cfg = self._cfg(sd_expires=self._in_days(-2))
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "_eaglecast_expiry", return_value=(time.time() + 5 * 86400, "x")):
+            items = {i["key"]: i for i in server._reminder_items()}
+        self.assertTrue(items["eaglecast"]["due"])
+        self.assertTrue(items["schedules_direct"]["due"])
+        self.assertTrue(items["schedules_direct"]["message"].startswith("Schedules Direct ran out on"))
+
+    def test_primestreams_is_never_tracked(self):
+        self.assertNotIn("primestreams", server.REMINDER_WINDOWS)
+
+    def test_the_endpoint_saves_a_date_and_refuses_bad_input(self):
+        cfg = self._cfg()
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "save_config", lambda c: cfg.update(c)), \
+                mock.patch.object(server, "_eaglecast_expiry", return_value=(None, "")):
+            client = server.app.test_client()
+            reply = client.post("/epg-web/api/reminders", json={"key": "schedules_direct", "expires": "2027-05-05"})
+            self.assertEqual(cfg["sd_expires"], "2027-05-05")
+            self.assertEqual(reply.get_json()["reminders"][0]["expires"], "2027-05-05")
+            self.assertEqual(client.post("/epg-web/api/reminders", json={"key": "nope", "expires": "2027-05-05"}).status_code, 400)
+            self.assertEqual(client.post("/epg-web/api/reminders", json={"key": "schedules_direct", "expires": "05/05/27"}).status_code, 400)
+
+    def test_the_page_has_the_reminder_bar(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="reminder-bar"', html)
+        self.assertIn("async function loadReminders()", html)
