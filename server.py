@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261115m"
+VERSION = "v20261116a"
 
 app = Flask(__name__)
 
@@ -2900,6 +2900,31 @@ def api_fetch_guide():
     except Exception as e:
         print(f'[fetch-guide] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/guide-descriptions')
+def api_guide_descriptions():
+    """Plot lines the guide holds for one title, so an episode can be identified by its summary."""
+    title = str(request.args.get('title', '') or '').strip()
+    if not title:
+        return jsonify({'error': 'title is required'}), 400
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=3)
+        rows = conn.execute(
+            'SELECT start_utc, channel_name, desc FROM guide WHERE lower(title)=lower(?) '
+            'AND desc IS NOT NULL AND desc != ? ORDER BY start_utc',
+            (title, '')).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'error': str(exc)}), 500
+    airings = []
+    for start_utc, channel, desc in rows:
+        try:
+            ts = datetime.strptime(start_utc, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        airings.append({'start_ts': ts, 'channel': channel, 'desc': desc})
+    return jsonify({'title': title, 'airings': airings})
+
 
 @app.route('/epg-web/api/guide')
 def api_guide():
