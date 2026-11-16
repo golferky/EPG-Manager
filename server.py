@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116c"
+VERSION = "v20261116d"
 
 app = Flask(__name__)
 
@@ -2008,6 +2008,19 @@ def _recent_same_source_failure(title, channel_id, days=14):
         return bool(row)
     except Exception:
         return False
+
+def _user_cancelled_airings():
+    """Airings (channel id, start second) the owner cancelled by hand, so automation does not book them again."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        rows = conn.execute("""SELECT channel_id, start_ts FROM recordings
+                               WHERE status='cancelled' AND failure_reason='Cancelled by user'
+                                 AND start_ts>?""", (time.time() - 3600,)).fetchall()
+        conn.close()
+        return {(str(cid), int(ts)) for cid, ts in rows if ts is not None}
+    except Exception:
+        return set()
+
 
 def _reconcile_stale_recordings():
     """Mark jobs that could not have survived a prior server stop."""
@@ -5103,6 +5116,7 @@ def _auto_record_wanted_movies(max_new=60):
         for row in rows:
             by_title.setdefault(fold_title(plain(row['title'])), []).append(row)
         reliability = _channel_recording_reliability()
+        user_cancelled = _user_cancelled_airings()
         with _rec_lock:
             active = [(rec_id, r) for rec_id, r in _recs.items() if _rec_is_active(r)]
         busy = {fold_title(plain(r.get('title', ''))) for _rec_id, r in active}
@@ -5139,7 +5153,10 @@ def _auto_record_wanted_movies(max_new=60):
                 channel = row['channel_name']
                 warning = _channel_history_warning(row['channel_id'], reliability)
                 why = None
-                if _is_automatic_recording_quarantined_channel(channel):
+                aired_ts = datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
+                if (str(row['channel_id']), int(aired_ts)) in user_cancelled:
+                    why = f'you cancelled the recording of this airing on {channel}'
+                elif _is_automatic_recording_quarantined_channel(channel):
                     why = f'{channel} is excluded from automatic recording'
                 elif _is_bad_channel(cfg, row['channel_id'], channel):
                     why = f'{channel} is on your bad-channels list'
@@ -7501,8 +7518,13 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         db_existing = conn.execute('''SELECT channel_id, start_ts FROM recordings
             WHERE status NOT IN ('done','done_ts','cancelled','failed','error',
                                  'skipped_existing_better','skipped_too_short')''').fetchall()
+        # An airing the owner cancelled by hand is not booked again.
+        db_cancelled = conn.execute("""SELECT channel_id, start_ts FROM recordings
+            WHERE status='cancelled' AND failure_reason='Cancelled by user'
+              AND start_ts>?""", (time.time() - 3600,)).fetchall()
         conn.close()
         existing_keys.update((row[0], row[1]) for row in db_existing)
+        existing_keys.update((row[0], row[1]) for row in db_cancelled)
     except Exception as exc:
         print(f'[series] queue dedupe lookup failed: {exc}')
     for r in best_rows:

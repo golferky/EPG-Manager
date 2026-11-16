@@ -3225,6 +3225,35 @@ class AutoRecordReasonsTests(unittest.TestCase):
         self._go()
         self.assertEqual(self._reason(), "a recording of this film from HBO failed in the last 14 days")
 
+    def _cancel_by_hand(self, rec_id, channel_id, shift=0):
+        self.case.conn.execute("INSERT INTO recordings(rec_id, title, channel, channel_id, start_ts, stop_ts, status, failure_reason) "
+                               "VALUES (?,?,?,?,?,?,?,?)",
+                               (rec_id, "Reason Film", "HBO", channel_id, self.case.base + shift,
+                                self.case.base + shift + 6000, "cancelled", "Cancelled by user"))
+        self.case.conn.commit()
+
+    def test_an_airing_the_owner_cancelled_is_not_booked_again(self):
+        self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
+        self._cancel_by_hand("c1", "aw-hbo")
+        self._go()
+        self.assertEqual(len(server._recs), 0)
+        self.assertEqual(self._reason(), "you cancelled the recording of this airing on HBO")
+
+    def test_another_airing_is_still_booked_after_a_cancel(self):
+        self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
+        self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo", shift=86400)
+        self._cancel_by_hand("c1", "aw-hbo")
+        self._go()
+        self.assertEqual([round(r["start_ts"]) for r in server._recs.values()], [round(self.case.base + 86400)])
+
+    def test_cancelled_by_user_airings_are_listed_but_other_cancels_are_not(self):
+        self._cancel_by_hand("c1", "aw-hbo")
+        self.case.conn.execute("UPDATE recordings SET failure_reason='Replaced' WHERE rec_id='c1'")
+        self.case.conn.commit()
+        self.assertEqual(server._user_cancelled_airings(), set())
+        self._cancel_by_hand("c2", "aw-hbo")
+        self.assertEqual(server._user_cancelled_airings(), {("aw-hbo", int(self.case.base))})
+
     def test_full_recording_slots_are_named(self):
         self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo")
         with mock.patch.object(server, "_recording_slot_conflicts", return_value=[{"title": "Busy"}] * 6):
