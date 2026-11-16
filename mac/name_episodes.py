@@ -20,9 +20,9 @@ What it will NOT move:
 Without --apply it only reads.  Nothing is deleted.
 """
 import argparse
-import difflib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -37,8 +37,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 NAME_TIME = re.compile(r' - (\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})\.\w+$')
 STOP_WORDS = set('a an and the of to in on at for with his her their he she it is are was be by as that this '
                  'from but or who when while after before into out up down over'.split())
-CONFIDENT_SCORE = 0.55      # how alike the plot lines must read
-CONFIDENT_MARGIN = 0.08     # how much better than the second-best episode
+CONFIDENT_SCORE = 0.5       # share of the plot line's telling words found in the episode summary
+CONFIDENT_MARGIN = 0.15     # how much better than the second-best episode
 PARTIAL_RATIO = 0.85        # smaller than this share of the typical file size = a partial
 
 
@@ -51,32 +51,54 @@ def clean_summary(text):
     return html.unescape(re.sub(r'<[^>]+>', ' ', str(text or ''))).strip()
 
 
-def similarity(guide_text, summary):
-    """0 to 1: how much a short guide plot line reads like an episode summary."""
+_IDF_CACHE = {}
+
+
+def word_weights(episodes):
+    """How telling each word is: one that is in every summary ("Tony", "Jeannie") counts for little."""
+    key = id(episodes)
+    if key in _IDF_CACHE and _IDF_CACHE[key][0] is episodes:
+        return _IDF_CACHE[key][1]
+    docs = [set(words(clean_summary(ep.get('summary')))) for ep in episodes]
+    total = len(docs) or 1
+    frequency = {}
+    for doc in docs:
+        for word in doc:
+            frequency[word] = frequency.get(word, 0) + 1
+    weights = {word: math.log((total + 1) / (count + 1)) + 0.1 for word, count in frequency.items()}
+    _IDF_CACHE[key] = (episodes, weights)
+    return weights
+
+
+def similarity(guide_text, summary, weights=None):
+    """0 to 1: how much of a short guide plot line is found in an episode summary, rare words counting most."""
     guide_words, summary_words = set(words(guide_text)), set(words(summary))
     if not guide_words or not summary_words:
         return 0.0
-    overlap = len(guide_words & summary_words) / len(guide_words)
-    guide_clean = ' '.join(words(guide_text))
-    head = ' '.join(words(summary))[:len(guide_clean) + 40]
-    ratio = difflib.SequenceMatcher(None, guide_clean, head).ratio()
-    return max(overlap * 0.9, ratio)
+    weights = weights or {}
+    unseen = max(weights.values()) if weights else 1.0       # a word no summary has can only be unmatched
+    def weight(word):
+        return weights.get(word, unseen)
+    return sum(weight(w) for w in guide_words & summary_words) / sum(weight(w) for w in guide_words)
 
 
 def rank_episodes(guide_text, episodes):
     """[(score, episode)] best first."""
-    scored = [(similarity(guide_text, clean_summary(ep.get('summary'))), ep) for ep in episodes]
+    weights = word_weights(episodes)
+    scored = [(similarity(guide_text, clean_summary(ep.get('summary')), weights), ep) for ep in episodes]
     return sorted(scored, key=lambda pair: pair[0], reverse=True)
 
 
-def pick(guide_text, episodes):
+def pick(guide_text, episodes, min_score=None, margin=None):
     """(episode, score, confident) for a plot line."""
+    min_score = CONFIDENT_SCORE if min_score is None else min_score
+    margin = CONFIDENT_MARGIN if margin is None else margin
     ranked = rank_episodes(guide_text, episodes)
     if not ranked or ranked[0][0] <= 0:
         return None, 0.0, False
     best_score, best = ranked[0]
     second = ranked[1][0] if len(ranked) > 1 else 0.0
-    return best, best_score, (best_score >= CONFIDENT_SCORE and best_score - second >= CONFIDENT_MARGIN)
+    return best, best_score, (best_score >= min_score and best_score - second >= margin)
 
 
 def file_start_ts(filename):
@@ -104,12 +126,19 @@ def load_tvmaze(show):
     return str(data.get('premiered') or '')[:4], episodes
 
 
+def load_tmdb(server, show):
+    """Episodes from TMDb, fetched by the dashboard (it holds the key)."""
+    data = fetch_json(server.rstrip('/') + '/epg-web/api/tmdb-episodes?title=' + urllib.parse.quote(show))
+    episodes = [ep for ep in data.get('episodes', []) if ep.get('season') and ep.get('number')]
+    return str(data.get('premiered') or '')[:4], episodes
+
+
 def load_guide(server, show):
     data = fetch_json(server.rstrip('/') + '/epg-web/api/guide-descriptions?title=' + urllib.parse.quote(show))
     return data.get('airings', [])
 
 
-def plan(files, airings, episodes):
+def plan(files, airings, episodes, min_score=None, margin=None):
     """Decide each file.  files: [(name, size)].  Returns a list of dicts."""
     sizes = [size for _name, size in files]
     typical = statistics.median(sizes) if sizes else 0
@@ -127,7 +156,7 @@ def plan(files, airings, episodes):
                 row['status'] = 'no guide plot line for that air time'
             else:
                 row['plot'] = airing['desc']
-                episode, score, confident = pick(airing['desc'], episodes)
+                episode, score, confident = pick(airing['desc'], episodes, min_score, margin)
                 row['episode'], row['score'] = episode, score
                 row['status'] = 'ok' if confident else 'unsure'
         rows.append(row)
@@ -142,6 +171,21 @@ def plan(files, airings, episodes):
     return rows
 
 
+def agree(rows_a, rows_b):
+    """Keep a match only where both sources are confident and name the same episode."""
+    by_name = {row['name']: row for row in rows_b}
+    for row in rows_a:
+        other = by_name.get(row['name'])
+        if row['status'] != 'ok':
+            continue
+        same = (other and other['status'] == 'ok' and other['episode']
+                and (row['episode']['season'], row['episode']['number']) ==
+                    (other['episode']['season'], other['episode']['number']))
+        if not same:
+            row['status'] = 'unsure'
+    return rows_a
+
+
 def target_name(show, episode):
     from recording_agent import safe_filename
     title = safe_filename(episode.get('name') or '')
@@ -154,6 +198,10 @@ def main():
     parser.add_argument('--show', required=True, help='the show, as named in _Needs Episode Info')
     parser.add_argument('--server', default='http://192.168.1.176:5001', help='the dashboard on the QNAP')
     parser.add_argument('--config', default='~/EPG-Manager/recording_agent.json')
+    parser.add_argument('--source', choices=('tmdb', 'tvmaze', 'both'), default='tmdb',
+                        help='where the episode summaries come from; both = only moves files the two agree on')
+    parser.add_argument('--min-score', type=float, default=CONFIDENT_SCORE, help='how well a plot line must match')
+    parser.add_argument('--margin', type=float, default=CONFIDENT_MARGIN, help='how far ahead of the runner-up')
     parser.add_argument('--apply', action='store_true', help='move the confident matches into Plex')
     args = parser.parse_args()
 
@@ -171,10 +219,20 @@ def main():
              if n.lower().endswith(('.mp4', '.mkv', '.m4v')) and not n.startswith('.')]
     print(f'{len(files)} file(s) in {folder}')
 
-    year, episodes = load_tvmaze(args.show)
     airings = load_guide(args.server, args.show)
-    print(f'{len(episodes)} episodes known to TVMaze, {len(airings)} guide plot lines.\n')
-    rows = plan(files, airings, episodes)
+    year = ''
+    sets = []
+    if args.source in ('tmdb', 'both'):
+        year, episodes = load_tmdb(args.server, args.show)
+        sets.append(('TMDb', episodes))
+    if args.source in ('tvmaze', 'both'):
+        tv_year, episodes = load_tvmaze(args.show)
+        year = year or tv_year
+        sets.append(('TVMaze', episodes))
+    print(f'{len(airings)} guide plot lines; ' + ', '.join(f'{len(e)} episodes from {n}' for n, e in sets) + '.\n')
+    rows = plan(files, airings, sets[0][1], args.min_score, args.margin)
+    if len(sets) == 2:
+        rows = agree(rows, plan(files, airings, sets[1][1], args.min_score, args.margin))
 
     for row in rows:
         ep = row['episode']
@@ -183,7 +241,7 @@ def main():
         if row['plot'] and row['status'] in ('ok', 'unsure'):
             print(f"           guide: {row['plot'][:100]}")
             if ep:
-                print(f"           tvmaze: {clean_summary(ep.get('summary'))[:100]}")
+                print(f"           episode: {clean_summary(ep.get('summary'))[:100]}")
     ready = [r for r in rows if r['status'] == 'ok']
     print(f'\n{len(ready)} confident, {sum(r["status"] == "unsure" for r in rows)} unsure, '
           f'{sum(r["status"].startswith(("partial", "duplicate", "no ")) for r in rows)} left alone.')

@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116a"
+VERSION = "v20261116b"
 
 app = Flask(__name__)
 
@@ -2900,6 +2900,52 @@ def api_fetch_guide():
     except Exception as e:
         print(f'[fetch-guide] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+_tmdb_episode_cache = {}
+
+
+@app.route('/epg-web/api/tmdb-episodes')
+def api_tmdb_episodes():
+    """Every episode of a series (season, number, name, overview) from TMDb, using the server's key."""
+    from urllib import request as urlreq
+    from urllib.parse import quote
+    title = str(request.args.get('title', '') or '').strip()
+    if not title:
+        return jsonify({'error': 'title is required'}), 400
+    tmdb_key = load_config().get('tmdb_key', '')
+    if not tmdb_key:
+        return jsonify({'error': 'No TMDb key is configured on the dashboard.'}), 503
+    clean_title, _year = _plex_title_and_year(title)
+    cache_key = _norm_plex_show(clean_title)
+    cached = _tmdb_episode_cache.get(cache_key)
+    if cached and time.time() - cached['at'] < 86400:
+        return jsonify(cached['data'])
+
+    def get(url):
+        with urlreq.urlopen(url, timeout=10) as response:
+            return json.loads(response.read())
+    try:
+        results = get(f'https://api.themoviedb.org/3/search/tv?api_key={tmdb_key}&query={quote(clean_title)}').get('results', [])
+        exact = next((item for item in results if _norm_plex_show(item.get('name', '')) == cache_key), None)
+        if not exact or not exact.get('id'):
+            return jsonify({'error': f'TMDb has no series named "{clean_title}".'}), 404
+        details = get(f'https://api.themoviedb.org/3/tv/{exact["id"]}?api_key={tmdb_key}')
+        episodes = []
+        for season in details.get('seasons', []):
+            number = int(season.get('season_number') or 0)
+            if number <= 0:
+                continue
+            data = get(f'https://api.themoviedb.org/3/tv/{exact["id"]}/season/{number}?api_key={tmdb_key}')
+            for episode in data.get('episodes', []):
+                episodes.append({'season': number, 'number': episode.get('episode_number'),
+                                 'name': episode.get('name') or '', 'summary': episode.get('overview') or ''})
+    except Exception as exc:
+        # The URL carries the key, so report only the kind of failure.
+        return jsonify({'error': f'TMDb lookup failed ({type(exc).__name__}).'}), 502
+    data = {'title': clean_title, 'premiered': str(details.get('first_air_date') or '')[:4], 'episodes': episodes}
+    _tmdb_episode_cache[cache_key] = {'at': time.time(), 'data': data}
+    return jsonify(data)
+
 
 @app.route('/epg-web/api/guide-descriptions')
 def api_guide_descriptions():

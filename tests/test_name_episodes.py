@@ -48,6 +48,16 @@ class MatchingTests(unittest.TestCase):
                          "I Dream of Jeannie - S02E09 - The Birds and the Bees.mp4")
 
 
+class AgreementTests(unittest.TestCase):
+    def _row(self, status, season, number):
+        return {"name": "f.mp4", "status": status, "episode": {"season": season, "number": number}}
+
+    def test_two_sources_must_name_the_same_episode(self):
+        self.assertEqual(ne.agree([self._row("ok", 2, 9)], [self._row("ok", 2, 9)])[0]["status"], "ok")
+        self.assertEqual(ne.agree([self._row("ok", 2, 9)], [self._row("ok", 3, 1)])[0]["status"], "unsure")
+        self.assertEqual(ne.agree([self._row("ok", 2, 9)], [self._row("unsure", 2, 9)])[0]["status"], "unsure")
+
+
 class PlanTests(unittest.TestCase):
     def setUp(self):
         self.airings = [
@@ -98,7 +108,7 @@ class ApplyTests(unittest.TestCase):
             cfg = {"plex_tv_path": tv}
             argv = ["name_episodes.py", "--show", "I Dream of Jeannie", "--apply"]
             with mock.patch("recording_agent.load_config", return_value=cfg), \
-                    mock.patch.object(ne, "load_tvmaze", return_value=("1965", EPISODES)), \
+                    mock.patch.object(ne, "load_tmdb", return_value=("1965", EPISODES)), \
                     mock.patch.object(ne, "load_guide", return_value=airings), \
                     mock.patch.object(sys, "argv", argv):
                 self.assertEqual(ne.main(), 0)
@@ -107,6 +117,51 @@ class ApplyTests(unittest.TestCase):
             self.assertTrue(os.path.exists(moved))
             self.assertFalse(os.path.exists(os.path.join(holding, good)))
             self.assertTrue(os.path.exists(os.path.join(holding, vague)))   # unsure: left in place
+
+
+class TmdbEpisodesEndpointTests(unittest.TestCase):
+    def test_endpoint_returns_episodes_without_exposing_the_key(self):
+        import json as _json
+        import server
+
+        class Reply:
+            def __init__(self, data):
+                self.data = data
+            def read(self):
+                return _json.dumps(self.data).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(url, timeout=0):
+            if "/search/tv" in url:
+                return Reply({"results": [{"id": 7, "name": "Test Show"}]})
+            if "/season/1" in url:
+                return Reply({"episodes": [{"episode_number": 1, "name": "Pilot", "overview": "A plot."}]})
+            return Reply({"first_air_date": "1965-09-18", "seasons": [{"season_number": 0}, {"season_number": 1}]})
+
+        server._tmdb_episode_cache.clear()
+        with mock.patch.object(server, "load_config", return_value={"tmdb_key": "SECRETKEY"}), \
+                mock.patch("urllib.request.urlopen", fake_urlopen):
+            data = server.app.test_client().get("/epg-web/api/tmdb-episodes?title=Test+Show").get_json()
+        self.assertEqual(data["premiered"], "1965")
+        self.assertEqual(data["episodes"], [{"season": 1, "number": 1, "name": "Pilot", "summary": "A plot."}])
+        self.assertNotIn("SECRETKEY", _json.dumps(data))
+
+    def test_failure_does_not_leak_the_key(self):
+        import json as _json
+        import server
+
+        def boom(url, timeout=0):
+            raise OSError("failed for " + url)
+
+        server._tmdb_episode_cache.clear()
+        with mock.patch.object(server, "load_config", return_value={"tmdb_key": "SECRETKEY"}), \
+                mock.patch("urllib.request.urlopen", boom):
+            reply = server.app.test_client().get("/epg-web/api/tmdb-episodes?title=Other+Show")
+        self.assertEqual(reply.status_code, 502)
+        self.assertNotIn("SECRETKEY", _json.dumps(reply.get_json()))
 
 
 class GuideDescriptionsEndpointTests(unittest.TestCase):
