@@ -138,6 +138,50 @@ def load_guide(server, show):
     return data.get('airings', [])
 
 
+def mark_duplicates(rows):
+    """Two files that are both going to the same episode are held back, so one can be chosen by hand."""
+    taken = {}
+    for row in rows:
+        if row['status'] == 'ok':
+            taken.setdefault((row['episode']['season'], row['episode']['number']), []).append(row)
+    for group in taken.values():
+        if len(group) > 1:
+            for row in group:
+                row['status'] = 'duplicate: another file matches the same episode'
+
+
+def parse_accept(text):
+    """"2026-08-14_1130=S02E15,2026-08-15_2100=S02E31" -> {"2026-08-14_1130": (2, 15), ...}"""
+    accepted = {}
+    for part in str(text or '').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}_\d{4})=S(\d{1,2})E(\d{1,3})', part, flags=re.I)
+        if not match:
+            raise ValueError(f'Cannot read "{part}": use 2026-08-14_1130=S02E15')
+        accepted[match.group(1)] = (int(match.group(2)), int(match.group(3)))
+    return accepted
+
+
+def apply_accepted(rows, accepted, episodes):
+    """Mark files the owner has checked by eye as matched to the episode named.  Returns messages."""
+    messages = []
+    by_number = {(ep['season'], ep['number']): ep for ep in episodes}
+    for stamp, key in accepted.items():
+        row = next((r for r in rows if f' - {stamp}.' in r['name']), None)
+        if row is None:
+            messages.append(f'No file for {stamp}')
+        elif row['status'].startswith('partial'):
+            messages.append(f'{row["name"]}: a partial episode is never accepted')
+        elif key not in by_number:
+            messages.append(f'{row["name"]}: S{key[0]:02d}E{key[1]:02d} is not an episode of this show')
+        else:
+            row['episode'], row['status'], row['score'] = by_number[key], 'ok', 1.0
+    mark_duplicates(rows)
+    return messages
+
+
 def plan(files, airings, episodes, min_score=None, margin=None):
     """Decide each file.  files: [(name, size)].  Returns a list of dicts."""
     sizes = [size for _name, size in files]
@@ -160,14 +204,7 @@ def plan(files, airings, episodes, min_score=None, margin=None):
                 row['episode'], row['score'] = episode, score
                 row['status'] = 'ok' if confident else 'unsure'
         rows.append(row)
-    taken = {}
-    for row in rows:
-        if row['status'] == 'ok':
-            taken.setdefault((row['episode']['season'], row['episode']['number']), []).append(row)
-    for group in taken.values():
-        if len(group) > 1:
-            for row in group:
-                row['status'] = 'duplicate: another file matches the same episode'
+    mark_duplicates(rows)
     return rows
 
 
@@ -202,6 +239,8 @@ def main():
                         help='where the episode summaries come from; both = only moves files the two agree on')
     parser.add_argument('--min-score', type=float, default=CONFIDENT_SCORE, help='how well a plot line must match')
     parser.add_argument('--margin', type=float, default=CONFIDENT_MARGIN, help='how far ahead of the runner-up')
+    parser.add_argument('--accept', default='', help='matches you checked by eye and want moved even though the tool was '
+                        'unsure, e.g. 2026-08-14_1130=S02E15,2026-08-15_2100=S02E31')
     parser.add_argument('--apply', action='store_true', help='move the confident matches into Plex')
     args = parser.parse_args()
 
@@ -234,6 +273,10 @@ def main():
     if len(sets) == 2:
         rows = agree(rows, plan(files, airings, sets[1][1], args.min_score, args.margin))
 
+    accepted = parse_accept(args.accept)
+    if accepted:
+        for message in apply_accepted(rows, accepted, sets[0][1]):
+            print('NOTE:', message)
     for row in rows:
         ep = row['episode']
         label = f"S{ep['season']:02d}E{ep['number']:02d} {ep.get('name', '')}" if ep else ''
