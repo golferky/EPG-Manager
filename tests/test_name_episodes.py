@@ -58,6 +58,15 @@ class AgreementTests(unittest.TestCase):
         self.assertEqual(ne.agree([self._row("ok", 2, 9)], [self._row("unsure", 2, 9)])[0]["status"], "unsure")
 
 
+class TopCandidatesTests(unittest.TestCase):
+    def test_lists_the_closest_episodes_best_first(self):
+        top = ne.top_candidates("When Jeannie's nightmare comes true, Tony shrinks to six inches tall.", EPISODES, 2)
+        self.assertEqual(len(top), 2)
+        self.assertEqual((top[0][1]["season"], top[0][1]["number"]), (2, 9))
+        self.assertGreaterEqual(top[0][0], top[1][0])
+        self.assertEqual(ne.top_candidates("x", EPISODES, 0), [])
+
+
 class AcceptTests(unittest.TestCase):
     def test_accept_text_is_parsed_and_bad_text_is_refused(self):
         self.assertEqual(ne.parse_accept("2026-08-14_1130=S02E15, 2026-08-15_2100=s1e3"),

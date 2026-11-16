@@ -101,6 +101,11 @@ def pick(guide_text, episodes, min_score=None, margin=None):
     return best, best_score, (best_score >= min_score and best_score - second >= margin)
 
 
+def top_candidates(plot, episodes, count=3):
+    """The closest few episodes to a plot line: [(score, episode)], best first."""
+    return rank_episodes(plot, episodes)[:max(0, count)]
+
+
 def file_start_ts(filename):
     match = NAME_TIME.search(filename)
     if not match:
@@ -240,6 +245,8 @@ def main():
                         help='where the episode summaries come from; both = only moves files the two agree on')
     parser.add_argument('--min-score', type=float, default=CONFIDENT_SCORE, help='how well a plot line must match')
     parser.add_argument('--margin', type=float, default=CONFIDENT_MARGIN, help='how far ahead of the runner-up')
+    parser.add_argument('--top', type=int, default=0, metavar='N',
+                        help='for each unsure file, also list its N closest episodes so you can pick one by eye')
     parser.add_argument('--accept', default='', help='matches you checked by eye and want moved even though the tool was '
                         'unsure, e.g. 2026-08-14_1130=S02E15,2026-08-15_2100=S02E31')
     parser.add_argument('--apply', action='store_true', help='move the confident matches into Plex')
@@ -290,6 +297,10 @@ def main():
             print(f"           guide: {row['plot'][:100]}")
             if ep:
                 print(f"           episode: {clean_summary(ep.get('summary'))[:100]}")
+            if args.top and row['status'] == 'unsure':
+                for score, cand in top_candidates(row['plot'], sets[0][1], args.top):
+                    print(f"             - S{int(cand['season']):02d}E{int(cand['number']):02d} {cand.get('name', '')} ({score:.2f}): "
+                          f"{clean_summary(cand.get('summary'))[:90]}")
     ready = [r for r in rows if r['status'] == 'ok']
     print(f'\n{len(ready)} confident, {sum(r["status"] == "unsure" for r in rows)} unsure, '
           f'{sum(r["status"].startswith(("partial", "duplicate", "no ")) for r in rows)} left alone.')
