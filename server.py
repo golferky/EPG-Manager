@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116b"
+VERSION = "v20261116c"
 
 app = Flask(__name__)
 
@@ -2900,6 +2900,39 @@ def api_fetch_guide():
     except Exception as e:
         print(f'[fetch-guide] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/eaglecast-dependency')
+def api_eaglecast_dependency():
+    """Read-only: which recordings would still have a stream if Eaglecast were cancelled."""
+    now = time.time()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=3)
+        upcoming = conn.execute(
+            "SELECT title, channel, channel_id FROM recordings WHERE status IN ('queued','scheduled') "
+            "AND stop_ts>? AND stream_provider='eaglecast' ORDER BY start_ts", (now,)).fetchall()
+        recent = conn.execute(
+            "SELECT channel, channel_id, COUNT(*) FROM recordings WHERE status IN ('done','done_ts') "
+            "AND start_ts>? AND stream_provider='eaglecast' GROUP BY channel_id ORDER BY COUNT(*) DESC",
+            (now - 60 * 86400,)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'error': str(exc)}), 500
+    covered = {}
+
+    def has_primestreams(channel_id):
+        if channel_id not in covered:
+            url, error, _debug = _stream_url(channel_id, 'primestreams')
+            covered[channel_id] = bool(url) and not error
+        return covered[channel_id]
+    result = {
+        'upcoming': [{'title': t, 'channel': c, 'primestreams_has_it': has_primestreams(cid)}
+                     for t, c, cid in upcoming],
+        'recent_channels': [{'channel': c, 'recordings': n, 'primestreams_has_it': has_primestreams(cid)}
+                            for c, cid, n in recent],
+    }
+    result['upcoming_would_break'] = sum(1 for r in result['upcoming'] if not r['primestreams_has_it'])
+    return jsonify(result)
+
 
 _tmdb_episode_cache = {}
 
