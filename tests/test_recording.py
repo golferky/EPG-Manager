@@ -3360,3 +3360,33 @@ class PlayBlockedNoteTests(unittest.TestCase):
     def test_page_shows_the_play_note(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("'▶ Play unavailable: ' + selectedAiring.play_note", html)
+
+
+class EaglecastDependencyReportTests(unittest.TestCase):
+    def test_report_says_which_recordings_primestreams_could_not_cover(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+                server._init_recordings_table()
+            conn = sqlite3.connect(guide_db)
+            now = time.time()
+            conn.executemany(
+                "INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                [("a", "Film A", "HBO", "hbo", now + 3600, now + 7200, "queued", "eaglecast"),
+                 ("b", "Film B", "STARZ 1", "starz1", now + 3600, now + 7200, "queued", "eaglecast"),
+                 ("c", "Film C", "HBO", "hbo", now - 86400, now - 80000, "done", "eaglecast")])
+            conn.commit(); conn.close()
+
+            def fake_stream(channel_id, preferred=None):
+                self.assertEqual(preferred, "primestreams")
+                return ("url-with-secret", None, {}) if channel_id == "hbo" else (None, "No stream_id found for channel", {})
+            with mock.patch.object(server, "_guide_db_path", return_value=guide_db), \
+                    mock.patch.object(server, "_stream_url", fake_stream):
+                data = server.app.test_client().get("/epg-web/api/eaglecast-dependency").get_json()
+        self.assertEqual(data["upcoming_would_break"], 1)
+        self.assertEqual({r["title"]: r["primestreams_has_it"] for r in data["upcoming"]},
+                         {"Film A": True, "Film B": False})
+        self.assertEqual(data["recent_channels"][0]["recordings"], 1)
+        self.assertNotIn("secret", str(data))

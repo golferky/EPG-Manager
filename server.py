@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116a"
+VERSION = "v20261116c"
 
 app = Flask(__name__)
 
@@ -2900,6 +2900,85 @@ def api_fetch_guide():
     except Exception as e:
         print(f'[fetch-guide] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+@app.route('/epg-web/api/eaglecast-dependency')
+def api_eaglecast_dependency():
+    """Read-only: which recordings would still have a stream if Eaglecast were cancelled."""
+    now = time.time()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=3)
+        upcoming = conn.execute(
+            "SELECT title, channel, channel_id FROM recordings WHERE status IN ('queued','scheduled') "
+            "AND stop_ts>? AND stream_provider='eaglecast' ORDER BY start_ts", (now,)).fetchall()
+        recent = conn.execute(
+            "SELECT channel, channel_id, COUNT(*) FROM recordings WHERE status IN ('done','done_ts') "
+            "AND start_ts>? AND stream_provider='eaglecast' GROUP BY channel_id ORDER BY COUNT(*) DESC",
+            (now - 60 * 86400,)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'error': str(exc)}), 500
+    covered = {}
+
+    def has_primestreams(channel_id):
+        if channel_id not in covered:
+            url, error, _debug = _stream_url(channel_id, 'primestreams')
+            covered[channel_id] = bool(url) and not error
+        return covered[channel_id]
+    result = {
+        'upcoming': [{'title': t, 'channel': c, 'primestreams_has_it': has_primestreams(cid)}
+                     for t, c, cid in upcoming],
+        'recent_channels': [{'channel': c, 'recordings': n, 'primestreams_has_it': has_primestreams(cid)}
+                            for c, cid, n in recent],
+    }
+    result['upcoming_would_break'] = sum(1 for r in result['upcoming'] if not r['primestreams_has_it'])
+    return jsonify(result)
+
+
+_tmdb_episode_cache = {}
+
+
+@app.route('/epg-web/api/tmdb-episodes')
+def api_tmdb_episodes():
+    """Every episode of a series (season, number, name, overview) from TMDb, using the server's key."""
+    from urllib import request as urlreq
+    from urllib.parse import quote
+    title = str(request.args.get('title', '') or '').strip()
+    if not title:
+        return jsonify({'error': 'title is required'}), 400
+    tmdb_key = load_config().get('tmdb_key', '')
+    if not tmdb_key:
+        return jsonify({'error': 'No TMDb key is configured on the dashboard.'}), 503
+    clean_title, _year = _plex_title_and_year(title)
+    cache_key = _norm_plex_show(clean_title)
+    cached = _tmdb_episode_cache.get(cache_key)
+    if cached and time.time() - cached['at'] < 86400:
+        return jsonify(cached['data'])
+
+    def get(url):
+        with urlreq.urlopen(url, timeout=10) as response:
+            return json.loads(response.read())
+    try:
+        results = get(f'https://api.themoviedb.org/3/search/tv?api_key={tmdb_key}&query={quote(clean_title)}').get('results', [])
+        exact = next((item for item in results if _norm_plex_show(item.get('name', '')) == cache_key), None)
+        if not exact or not exact.get('id'):
+            return jsonify({'error': f'TMDb has no series named "{clean_title}".'}), 404
+        details = get(f'https://api.themoviedb.org/3/tv/{exact["id"]}?api_key={tmdb_key}')
+        episodes = []
+        for season in details.get('seasons', []):
+            number = int(season.get('season_number') or 0)
+            if number <= 0:
+                continue
+            data = get(f'https://api.themoviedb.org/3/tv/{exact["id"]}/season/{number}?api_key={tmdb_key}')
+            for episode in data.get('episodes', []):
+                episodes.append({'season': number, 'number': episode.get('episode_number'),
+                                 'name': episode.get('name') or '', 'summary': episode.get('overview') or ''})
+    except Exception as exc:
+        # The URL carries the key, so report only the kind of failure.
+        return jsonify({'error': f'TMDb lookup failed ({type(exc).__name__}).'}), 502
+    data = {'title': clean_title, 'premiered': str(details.get('first_air_date') or '')[:4], 'episodes': episodes}
+    _tmdb_episode_cache[cache_key] = {'at': time.time(), 'data': data}
+    return jsonify(data)
+
 
 @app.route('/epg-web/api/guide-descriptions')
 def api_guide_descriptions():
