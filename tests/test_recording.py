@@ -3660,6 +3660,11 @@ class SameAiringElsewhereTests(unittest.TestCase):
         self.now = time.time()
         self.start = int(self.now) + 7200
         conn = sqlite3.connect(guide_db)
+        for column, kind in (("episode_title", "TEXT"), ("season_num", "INTEGER"), ("episode_num", "INTEGER")):
+            try:
+                conn.execute(f"ALTER TABLE guide ADD COLUMN {column} {kind}")
+            except sqlite3.OperationalError:
+                pass                                     # already there
         conn.execute("INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,guide_stop_ts,status,stream_provider,stream_id) "
                      "VALUES ('mob','MobLand','Paramount+ with Showtime HD (Pacific)','hd22532',?,?,?,'queued','eaglecast','92020')",
                      (self.start, self.start + 3700, self.start + 3600))
@@ -3730,3 +3735,70 @@ class SameAiringElsewhereTests(unittest.TestCase):
             data = self._run(guide_db, True, cfg={"bad_channels": ["Paramount+ with Showtime (Pacific)"]})
             self.assertEqual(data["moved"], 0)
             self.assertEqual([e["id"] for e in data["cannot_move"]], ["mob"])
+
+
+    def _episode_setup(self, temp, east_gap_hours=3):
+        """The booked west row, and the same episode on an east row some hours earlier."""
+        guide_db = self._setup(temp)
+        stamp = lambda ts: time.strftime("%Y%m%d%H%M%S", time.gmtime(ts))
+        conn = sqlite3.connect(guide_db)
+        conn.execute("DELETE FROM guide")
+        self.start = int(self.now) + 8 * 3600                   # the booked west airing is eight hours out
+        conn.execute("UPDATE recordings SET start_ts=?, stop_ts=?, guide_stop_ts=? WHERE rec_id='mob'",
+                     (self.start, self.start + 3700, self.start + 3600))
+        east = self.start - east_gap_hours * 3600
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,category,episode_title,season_num,episode_num) "
+                     "VALUES ('MobLand','hd22532','Paramount+ with Showtime HD (Pacific)',?,?,'','','The Queen Is Dead',2,10)",
+                     (stamp(self.start), stamp(self.start + 3600)))
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,category,episode_title,season_num,episode_num) "
+                     "VALUES ('MobLand','plain','Paramount+ with Showtime HD',?,?,'','','The Queen Is Dead',2,10)",
+                     (stamp(east), stamp(east + 3600)))
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,category,episode_title,season_num,episode_num) "
+                     "VALUES ('MobLand','plain','Paramount+ with Showtime HD',?,?,'','','Nervous Breakdown',2,9)",
+                     (stamp(east + 7 * 86400), stamp(east + 7 * 86400 + 3600)))
+        conn.commit(); conn.close()
+        return guide_db, east
+
+    def test_the_same_episode_on_the_east_feed_is_used_when_nothing_airs_at_the_same_time(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db, east = self._episode_setup(temp)
+            data = self._run(guide_db, True)
+            self.assertEqual(data["moved"], 1)
+            row = self._row(guide_db)
+            self.assertEqual((row[0], row[5]), ("plain", "primestreams"))
+            self.assertEqual(int(row[2]), east)                                # now at the east airing's time
+            self.assertEqual(int(row[3]), east + 3700)                         # the recording keeps its padding
+
+    def test_a_different_episode_a_week_later_is_not_used(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db, _east = self._episode_setup(temp)
+            conn = sqlite3.connect(guide_db)
+            conn.execute("DELETE FROM guide WHERE channel_id='plain' AND episode_num=10")     # only the other episode is left
+            conn.commit(); conn.close()
+            data = self._run(guide_db, True)
+            self.assertEqual(data["moved"], 0)
+            self.assertEqual(self._row(guide_db)[0], "hd22532")
+
+    def test_an_episode_already_booked_is_not_booked_again_at_another_time(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db, east = self._episode_setup(temp)
+            conn = sqlite3.connect(guide_db)
+            conn.execute("INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,season_num,episode_num) "
+                         "VALUES ('already','MobLand','SHOWTIME','showtime.us',?,?,'queued','primestreams',2,10)",
+                         (east + 86400, east + 86400 + 3600))
+            conn.commit(); conn.close()
+            data = self._run(guide_db, True)
+            self.assertEqual(data["moved"], 0)
+            self.assertEqual(self._row(guide_db)[0], "hd22532")
+
+    def test_an_east_airing_that_is_too_close_to_start_is_not_used(self):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db, _east = self._episode_setup(temp, east_gap_hours=2)      # east airing starts at about now
+            conn = sqlite3.connect(guide_db)
+            conn.execute("UPDATE recordings SET start_ts=?, stop_ts=?, guide_stop_ts=? WHERE rec_id='mob'",
+                         (self.now + 5400, self.now + 9000, self.now + 8900))   # booked 90 minutes out
+            stamp = lambda ts: time.strftime("%Y%m%d%H%M%S", time.gmtime(ts))
+            conn.execute("UPDATE guide SET start_utc=?, end_utc=? WHERE channel_id='plain' AND episode_num=10",
+                         (stamp(self.now + 120), stamp(self.now + 3720)))        # two minutes from now
+            conn.commit(); conn.close()
+            self.assertEqual(self._run(guide_db, True)["moved"], 0)
