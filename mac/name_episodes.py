@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Work out which episode each recording in "_Needs Episode Info" is, and file it in Plex.
+"""Work out which episode each recording in "the holding folder" is, and file it in Plex.
 
 Run on the Mac mini:
     python3 ~/EPG-Manager/mac/name_episodes.py --show "I Dream of Jeannie"            show the matches, change nothing
@@ -232,9 +232,10 @@ def target_name(show, episode):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--show', required=True, help='the show, as named in _Needs Episode Info')
+    parser.add_argument('--show', required=True, help='the show, as named in the holding folder')
     parser.add_argument('--server', default='http://192.168.1.176:5001', help='the dashboard on the QNAP')
     parser.add_argument('--config', default='~/EPG-Manager/recording_agent.json')
+    parser.add_argument('--holding', default='', help='the holding folder (default: TV Needing Episode Info beside TV Shows)')
     parser.add_argument('--source', choices=('tmdb', 'tvmaze', 'both'), default='tmdb',
                         help='where the episode summaries come from; both = only moves files the two agree on')
     parser.add_argument('--min-score', type=float, default=CONFIDENT_SCORE, help='how well a plot line must match')
@@ -247,7 +248,11 @@ def main():
     from recording_agent import load_config, resolve_show_dir
     cfg = load_config(os.path.expanduser(args.config))
     tv_root = cfg.get('plex_tv_path', '/Volumes/Plex/TV Shows')
-    holding = os.path.join(tv_root, '_Needs Episode Info')
+    holding = args.holding or str(cfg.get('needs_episode_path', '') or '')
+    if not holding:
+        holding = os.path.join(os.path.dirname(tv_root.rstrip('/')), 'TV Needing Episode Info')
+        if not os.path.isdir(holding):                       # the older place, inside the TV library
+            holding = os.path.join(tv_root, '_Needs Episode Info')
     folders = [d for d in os.listdir(holding) if os.path.isdir(os.path.join(holding, d))
                and re.sub(r'\s*\(\d{4}\)$', '', d).lower() == args.show.lower()] if os.path.isdir(holding) else []
     if not folders:

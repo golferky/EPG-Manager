@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261114a"
+AGENT_VERSION = "v20261116a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -934,16 +934,28 @@ def verified_unyeared_movie_transfer(source, cfg, title, start_ts, progress_call
                           progress_callback)
 
 
+def needs_episode_root(cfg):
+    """Holding folder, outside the Plex TV library, for an episode whose season and number are unknown.
+
+    It must not sit inside the TV Shows folder: Plex scans everything under it, so held episodes (and
+    partial ones) would show up in the library as "Unknown Season".
+    """
+    configured = str(cfg.get('needs_episode_path', '') or '').strip()
+    if configured:
+        return Path(os.path.expanduser(configured))
+    return Path(cfg['plex_tv_path']).parent / 'TV Needing Episode Info'
+
+
 def verified_unidentified_episode_transfer(source, tv_root, show_title, start_ts,
-                                           progress_callback=None, year=''):
-    """Keep an identified-as-TV airing out of Movies until S/E data is available."""
+                                           progress_callback=None, year='', holding_root=None):
+    """Keep an identified-as-TV airing out of Plex until S/E data is available."""
     base, title_year = split_title_year(show_title)
     year = str(year or '').strip()[:4] or title_year
     show = safe_filename(base)
     folder = safe_filename(f'{base} ({year})' if year else base)
     aired = time.strftime('%Y-%m-%d_%H%M', time.localtime(start_ts))
-    destination = (Path(tv_root) / '_Needs Episode Info' / folder /
-                   f'{show} - {aired}.mp4')
+    holding = Path(holding_root) if holding_root else Path(tv_root).parent / 'TV Needing Episode Info'
+    destination = holding / folder / f'{show} - {aired}.mp4'
     return _verified_copy(source, destination, progress_callback)
 
 
@@ -1314,6 +1326,7 @@ def process_job(api, job, cfg):
         destination = verified_unidentified_episode_transfer(
             mp4_path, library_root, job['title'], job['start_ts'],
             progress_callback=transfer_progress, year=job.get('year', ''),
+            holding_root=needs_episode_root(cfg),
         )
     else:
         # The year chosen when the recording was set up beats a title lookup, which

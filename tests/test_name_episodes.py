@@ -144,6 +144,28 @@ class ApplyTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(holding, vague)))   # unsure: left in place
 
 
+class HoldingFolderLocationTests(unittest.TestCase):
+    def test_the_matcher_reads_the_holding_folder_beside_tv_shows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            tv = os.path.join(temp, "TV Shows")
+            holding = os.path.join(temp, "TV Needing Episode Info", "I Dream of Jeannie")
+            os.makedirs(tv)
+            os.makedirs(holding)
+            name = "I Dream of Jeannie - 2026-08-14_1100.mp4"
+            with open(os.path.join(holding, name), "wb") as handle:
+                handle.write(b"x" * 100)
+            airings = [{"start_ts": stamp("2026-08-14", "1100"), "channel": "A",
+                        "desc": "When Jeannie's nightmare comes true, Tony shrinks to six inches tall."}]
+            argv = ["name_episodes.py", "--show", "I Dream of Jeannie", "--apply"]
+            with mock.patch("recording_agent.load_config", return_value={"plex_tv_path": tv}), \
+                    mock.patch.object(ne, "load_tmdb", return_value=("1965", EPISODES)), \
+                    mock.patch.object(ne, "load_guide", return_value=airings), \
+                    mock.patch.object(sys, "argv", argv):
+                self.assertEqual(ne.main(), 0)
+            self.assertFalse(os.path.exists(os.path.join(holding, name)))
+            self.assertTrue(os.path.isdir(os.path.join(tv, "I Dream of Jeannie (1965)", "Season 02")))
+
+
 class TmdbEpisodesEndpointTests(unittest.TestCase):
     def test_endpoint_returns_episodes_without_exposing_the_key(self):
         import json as _json
