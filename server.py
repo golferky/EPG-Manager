@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116h"
+VERSION = "v20261116i"
 
 app = Flask(__name__)
 
@@ -3088,51 +3088,75 @@ def api_reminders():
     return jsonify({'reminders': _reminder_items()})
 
 
-def _same_airing_elsewhere(title, channel_id, start_ts, rec_id, cfg, reliability):
-    """The same title at (nearly) the same time on another channel PrimeStreams can carry, or None.
+def _same_airing_elsewhere(title, channel_id, start_ts, rec_id, cfg, reliability, episode=None):
+    """The same title on another channel PrimeStreams can carry, or None.
 
-    This is for a booking whose own channel PrimeStreams does not have, such as the HD guide row of a
-    channel whose plain row it does carry.  Poor, bad and foreign channels are never chosen, and an airing
-    already booked (on any channel) is not booked twice.
+    First the same time (within 10 minutes).  Failing that, the SAME EPISODE (matched by season and number, or
+    by episode title) on another channel within six hours, which is how an east and a west feed of one channel
+    differ.  Poor, bad and foreign channels are never chosen, an airing or episode that already has an active
+    booking is not booked twice, and a time too close to start is ignored.
     """
     plain = re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip()
-    low = datetime.fromtimestamp(float(start_ts) - 600, timezone.utc).strftime('%Y%m%d%H%M%S')
-    high = datetime.fromtimestamp(float(start_ts) + 600, timezone.utc).strftime('%Y%m%d%H%M%S')
+    stamp_of = lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime('%Y%m%d%H%M%S')
+    earliest = time.time() + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS
+    season, number, ep_title = (episode or (None, None, ''))
     try:
         conn = sqlite3.connect(_guide_db_path(), timeout=5)
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
+        if season is None and number is None and not ep_title:
+            own = conn.execute(
+                'SELECT episode_title, season_num, episode_num FROM guide WHERE channel_id=? '
+                'AND lower(title) IN (lower(?), lower(?)) AND start_utc BETWEEN ? AND ? LIMIT 1',
+                (channel_id, title, plain, stamp_of(float(start_ts) - 120), stamp_of(float(start_ts) + 120))).fetchone()
+            if own:
+                season, number, ep_title = own['season_num'], own['episode_num'], own['episode_title'] or ''
+        same_time = conn.execute(
             'SELECT channel_id, channel_name, start_utc, end_utc FROM guide '
             'WHERE lower(title) IN (lower(?), lower(?)) AND start_utc BETWEEN ? AND ? AND channel_id!=?',
-            (title, plain, low, high, channel_id)).fetchall()
+            (title, plain, stamp_of(float(start_ts) - 600), stamp_of(float(start_ts) + 600), channel_id)).fetchall()
+        same_episode = []
+        if season is not None and number is not None or ep_title:
+            same_episode = [r for r in conn.execute(
+                'SELECT channel_id, channel_name, start_utc, end_utc, episode_title, season_num, episode_num FROM guide '
+                'WHERE lower(title) IN (lower(?), lower(?)) AND start_utc BETWEEN ? AND ? AND channel_id!=?',
+                (title, plain, stamp_of(float(start_ts) - 6 * 3600), stamp_of(float(start_ts) + 6 * 3600), channel_id)).fetchall()
+                if ((season is not None and number is not None and r['season_num'] == season and r['episode_num'] == number)
+                    or (ep_title and str(r['episode_title'] or '').strip().lower() == ep_title.strip().lower()))]
         booked = conn.execute(
             "SELECT 1 FROM recordings WHERE lower(title) IN (lower(?), lower(?)) AND rec_id!=? "
             "AND status IN ('queued','scheduled','agent_claimed','preflight','waiting','recording') "
-            "AND start_ts BETWEEN ? AND ? LIMIT 1",
-            (title, plain, rec_id, float(start_ts) - 600, float(start_ts) + 600)).fetchone()
+            "AND (start_ts BETWEEN ? AND ? OR (? IS NOT NULL AND ? IS NOT NULL AND season_num=? AND episode_num=?) "
+            "     OR (?!='' AND lower(COALESCE(episode_title,''))=lower(?))) LIMIT 1",
+            (title, plain, rec_id, float(start_ts) - 600, float(start_ts) + 600,
+             season, number, season, number, ep_title or '', ep_title or '')).fetchone()
         conn.close()
     except sqlite3.Error:
         return None
     if booked:
         return None
-    options = []
-    for row in rows:
-        name, cid = row['channel_name'], row['channel_id']
-        if (_is_foreign_recording_feed(name) or _is_automatic_recording_quarantined_channel(name)
-                or _is_bad_channel(cfg, cid, name)
-                or reliability.get(cid, {}).get('level') == 'suspect'
-                or _channel_history_warning(cid, reliability)):
-            continue
-        url, error, debug = _stream_url(cid, 'primestreams')
-        if not url or error or not debug.get('stream_id'):
-            continue
-        options.append((0 if 'HD' in str(name).upper() else 1, row['start_utc'], dict(row), debug))
-    if not options:
-        return None
-    _hd, _start, row, debug = min(options, key=lambda item: (item[0], item[1]))
     stamp = lambda text: datetime.strptime(text, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
-    return {'channel_id': row['channel_id'], 'channel': row['channel_name'], 'start_ts': stamp(row['start_utc']),
-            'stream_id': str(debug.get('stream_id')), 'stream_extension': str(debug.get('stream_extension') or 'ts')}
+    for candidates in (same_time, same_episode):
+        options = []
+        for row in candidates:
+            name, cid = row['channel_name'], row['channel_id']
+            if stamp(row['start_utc']) < earliest:
+                continue
+            if (_is_foreign_recording_feed(name) or _is_automatic_recording_quarantined_channel(name)
+                    or _is_bad_channel(cfg, cid, name)
+                    or reliability.get(cid, {}).get('level') == 'suspect'
+                    or _channel_history_warning(cid, reliability)):
+                continue
+            url, error, debug = _stream_url(cid, 'primestreams')
+            if not url or error or not debug.get('stream_id'):
+                continue
+            gap = abs(stamp(row['start_utc']) - float(start_ts))
+            options.append((0 if 'HD' in str(name).upper() else 1, gap, dict(row), debug))
+        if options:
+            _hd, _gap, row, debug = min(options, key=lambda item: (item[0], item[1]))
+            return {'channel_id': row['channel_id'], 'channel': row['channel_name'], 'start_ts': stamp(row['start_utc']),
+                    'stream_id': str(debug.get('stream_id')),
+                    'stream_extension': str(debug.get('stream_extension') or 'ts')}
+    return None
 
 
 def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
@@ -3151,7 +3175,8 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
     try:
         conn = sqlite3.connect(_guide_db_path(), timeout=5)
         rows = conn.execute(
-            "SELECT rec_id, title, channel, channel_id, start_ts, stop_ts, guide_stop_ts FROM recordings "
+            "SELECT rec_id, title, channel, channel_id, start_ts, stop_ts, guide_stop_ts, "
+            "season_num, episode_num, episode_title FROM recordings "
             "WHERE status IN ('queued','scheduled') AND stream_provider='eaglecast' AND start_ts>? "
             "ORDER BY start_ts", (now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS,)).fetchall()
         conn.close()
@@ -3160,7 +3185,7 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
     cfg = load_config()
     reliability = _channel_recording_reliability()
     movable, stuck = [], []
-    for rec_id, title, channel, channel_id, start_ts, stop_ts, guide_stop_ts in rows:
+    for rec_id, title, channel, channel_id, start_ts, stop_ts, guide_stop_ts, season, number, ep_title in rows:
         if after_expiry_only and not (stop_ts and float(stop_ts) > expiry):
             continue
         url, error, debug = _stream_url(channel_id, 'primestreams')
@@ -3170,7 +3195,8 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
             entry['stream_extension'] = str(debug.get('stream_extension') or 'ts')
             movable.append(entry)
             continue
-        other = _same_airing_elsewhere(title, channel_id, start_ts, rec_id, cfg, reliability)
+        other = _same_airing_elsewhere(title, channel_id, start_ts, rec_id, cfg, reliability,
+                                       (season, number, ep_title or ''))
         if other:
             shift = other['start_ts'] - float(start_ts)
             entry.update({'stream_id': other['stream_id'], 'stream_extension': other['stream_extension'],
