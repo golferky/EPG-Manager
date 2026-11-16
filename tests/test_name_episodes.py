@@ -58,6 +58,31 @@ class AgreementTests(unittest.TestCase):
         self.assertEqual(ne.agree([self._row("ok", 2, 9)], [self._row("unsure", 2, 9)])[0]["status"], "unsure")
 
 
+class AcceptTests(unittest.TestCase):
+    def test_accept_text_is_parsed_and_bad_text_is_refused(self):
+        self.assertEqual(ne.parse_accept("2026-08-14_1130=S02E15, 2026-08-15_2100=s1e3"),
+                         {"2026-08-14_1130": (2, 15), "2026-08-15_2100": (1, 3)})
+        with self.assertRaises(ValueError):
+            ne.parse_accept("2026-08-14=S02E15")
+
+    def test_accepting_marks_the_file_ok_but_never_a_partial_or_a_clash(self):
+        def row(name, status, ep=None):
+            return {"name": name, "size": 1, "status": status, "episode": ep, "score": 0.0, "plot": ""}
+        rows = [row("Show - 2026-08-14_1130.mp4", "unsure"),
+                row("Show - 2026-08-15_2100.mp4", "ok", EPISODES[2]),      # already going to S02E09
+                row("Show - 2026-08-17_1100.mp4", "unsure"),
+                row("Show - 2026-09-24_1100.mp4", "partial episode (much smaller than the rest): not for Plex")]
+        notes = ne.apply_accepted(rows, {"2026-08-14_1130": (1, 2), "2026-08-17_1100": (2, 9),
+                                         "2026-09-24_1100": (1, 1), "2026-10-01_1100": (1, 1),
+                                         "2026-08-15_2100": (9, 9)}, EPISODES)
+        status = {r["name"]: r["status"] for r in rows}
+        self.assertEqual(status["Show - 2026-08-14_1130.mp4"], "ok")
+        self.assertTrue(status["Show - 2026-08-17_1100.mp4"].startswith("duplicate"))   # same episode as 08-15_2100
+        self.assertTrue(status["Show - 2026-08-15_2100.mp4"].startswith("duplicate"))
+        self.assertTrue(status["Show - 2026-09-24_1100.mp4"].startswith("partial"))
+        self.assertEqual(len(notes), 3)    # the partial, the missing file, the episode that does not exist
+
+
 class PlanTests(unittest.TestCase):
     def setUp(self):
         self.airings = [
