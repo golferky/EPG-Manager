@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116g"
+VERSION = "v20261116h"
 
 app = Flask(__name__)
 
@@ -3088,12 +3088,61 @@ def api_reminders():
     return jsonify({'reminders': _reminder_items()})
 
 
-def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
-    """Move queued Eaglecast bookings to PrimeStreams where it carries the same channel.
+def _same_airing_elsewhere(title, channel_id, start_ts, rec_id, cfg, reliability):
+    """The same title at (nearly) the same time on another channel PrimeStreams can carry, or None.
 
-    A booking keeps its title, channel and times: only its stored source changes.  A booking PrimeStreams
-    cannot carry is left exactly as it is.  With ``after_expiry_only`` only bookings that run past the
-    subscription end are considered.  Returns the lists and how many were moved (0 unless ``apply_it``).
+    This is for a booking whose own channel PrimeStreams does not have, such as the HD guide row of a
+    channel whose plain row it does carry.  Poor, bad and foreign channels are never chosen, and an airing
+    already booked (on any channel) is not booked twice.
+    """
+    plain = re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip()
+    low = datetime.fromtimestamp(float(start_ts) - 600, timezone.utc).strftime('%Y%m%d%H%M%S')
+    high = datetime.fromtimestamp(float(start_ts) + 600, timezone.utc).strftime('%Y%m%d%H%M%S')
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT channel_id, channel_name, start_utc, end_utc FROM guide '
+            'WHERE lower(title) IN (lower(?), lower(?)) AND start_utc BETWEEN ? AND ? AND channel_id!=?',
+            (title, plain, low, high, channel_id)).fetchall()
+        booked = conn.execute(
+            "SELECT 1 FROM recordings WHERE lower(title) IN (lower(?), lower(?)) AND rec_id!=? "
+            "AND status IN ('queued','scheduled','agent_claimed','preflight','waiting','recording') "
+            "AND start_ts BETWEEN ? AND ? LIMIT 1",
+            (title, plain, rec_id, float(start_ts) - 600, float(start_ts) + 600)).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return None
+    if booked:
+        return None
+    options = []
+    for row in rows:
+        name, cid = row['channel_name'], row['channel_id']
+        if (_is_foreign_recording_feed(name) or _is_automatic_recording_quarantined_channel(name)
+                or _is_bad_channel(cfg, cid, name)
+                or reliability.get(cid, {}).get('level') == 'suspect'
+                or _channel_history_warning(cid, reliability)):
+            continue
+        url, error, debug = _stream_url(cid, 'primestreams')
+        if not url or error or not debug.get('stream_id'):
+            continue
+        options.append((0 if 'HD' in str(name).upper() else 1, row['start_utc'], dict(row), debug))
+    if not options:
+        return None
+    _hd, _start, row, debug = min(options, key=lambda item: (item[0], item[1]))
+    stamp = lambda text: datetime.strptime(text, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
+    return {'channel_id': row['channel_id'], 'channel': row['channel_name'], 'start_ts': stamp(row['start_utc']),
+            'stream_id': str(debug.get('stream_id')), 'stream_extension': str(debug.get('stream_extension') or 'ts')}
+
+
+def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
+    """Move queued Eaglecast bookings to PrimeStreams.
+
+    A booking PrimeStreams carries on its own channel keeps its title, channel and times: only its stored
+    source changes.  One it does not carry is switched to the same airing on another channel PrimeStreams
+    does carry, when there is one (``via`` says which).  Anything else is left exactly as it is.  With
+    ``after_expiry_only`` only bookings that run past the subscription end are considered.  Returns the
+    lists and how many were moved (0 unless ``apply_it``).
     """
     now = time.time()
     expiry, _source = _eaglecast_expiry()
@@ -3102,14 +3151,16 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
     try:
         conn = sqlite3.connect(_guide_db_path(), timeout=5)
         rows = conn.execute(
-            "SELECT rec_id, title, channel, channel_id, start_ts, stop_ts FROM recordings "
+            "SELECT rec_id, title, channel, channel_id, start_ts, stop_ts, guide_stop_ts FROM recordings "
             "WHERE status IN ('queued','scheduled') AND stream_provider='eaglecast' AND start_ts>? "
             "ORDER BY start_ts", (now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS,)).fetchall()
         conn.close()
     except sqlite3.Error as exc:
         return {'error': str(exc)}
+    cfg = load_config()
+    reliability = _channel_recording_reliability()
     movable, stuck = [], []
-    for rec_id, title, channel, channel_id, start_ts, stop_ts in rows:
+    for rec_id, title, channel, channel_id, start_ts, stop_ts, guide_stop_ts in rows:
         if after_expiry_only and not (stop_ts and float(stop_ts) > expiry):
             continue
         url, error, debug = _stream_url(channel_id, 'primestreams')
@@ -3117,6 +3168,16 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
         if url and not error:
             entry['stream_id'] = str(debug.get('stream_id') or '')
             entry['stream_extension'] = str(debug.get('stream_extension') or 'ts')
+            movable.append(entry)
+            continue
+        other = _same_airing_elsewhere(title, channel_id, start_ts, rec_id, cfg, reliability)
+        if other:
+            shift = other['start_ts'] - float(start_ts)
+            entry.update({'stream_id': other['stream_id'], 'stream_extension': other['stream_extension'],
+                          'via': other['channel'], 'new_channel_id': other['channel_id'],
+                          'new_start_ts': other['start_ts'],
+                          'new_stop_ts': (float(stop_ts) + shift) if stop_ts else None,
+                          'new_guide_stop_ts': (float(guide_stop_ts) + shift) if guide_stop_ts else None})
             movable.append(entry)
         else:
             stuck.append(entry)
@@ -3127,9 +3188,16 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
         for entry in movable:
             if not entry['stream_id']:
                 continue
-            conn.execute("UPDATE recordings SET stream_provider='primestreams', stream_id=?, stream_extension=? "
-                         "WHERE rec_id=? AND status IN ('queued','scheduled')",
-                         (entry['stream_id'], entry['stream_extension'], entry['id']))
+            if entry.get('via'):
+                conn.execute("UPDATE recordings SET channel=?, channel_id=?, start_ts=?, stop_ts=?, guide_stop_ts=?, "
+                             "stream_provider='primestreams', stream_id=?, stream_extension=? "
+                             "WHERE rec_id=? AND status IN ('queued','scheduled')",
+                             (entry['via'], entry['new_channel_id'], entry['new_start_ts'], entry['new_stop_ts'],
+                              entry['new_guide_stop_ts'], entry['stream_id'], entry['stream_extension'], entry['id']))
+            else:
+                conn.execute("UPDATE recordings SET stream_provider='primestreams', stream_id=?, stream_extension=? "
+                             "WHERE rec_id=? AND status IN ('queued','scheduled')",
+                             (entry['stream_id'], entry['stream_extension'], entry['id']))
             moved += 1
         conn.commit()
         conn.close()
@@ -3139,7 +3207,10 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
                 if rec and entry['stream_id']:
                     rec.update({'stream_provider': 'primestreams', 'stream_id': entry['stream_id'],
                                 'stream_extension': entry['stream_extension']})
-    keep = ('id', 'title', 'channel', 'start_ts')
+                    if entry.get('via'):
+                        rec.update({'channel': entry['via'], 'channel_id': entry['new_channel_id'],
+                                    'start_ts': entry['new_start_ts'], 'stop_ts': entry['new_stop_ts']})
+    keep = ('id', 'title', 'channel', 'start_ts', 'via')
     strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
     return {'applied': bool(apply_it), 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)}
 
