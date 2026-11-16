@@ -3244,7 +3244,7 @@ class AutoRecordReasonsTests(unittest.TestCase):
         self.case._airing("Reason Film", "2004", "HBO", channel_id="aw-hbo", shift=86400)
         self._cancel_by_hand("c1", "aw-hbo")
         self._go()
-        self.assertEqual([round(r["start_ts"]) for r in server._recs.values()], [round(self.case.base + 86400)])
+        self.assertEqual([int(r["start_ts"]) for r in server._recs.values()], [int(self.case.base + 86400)])
 
     def test_cancelled_by_user_airings_are_listed_but_other_cancels_are_not(self):
         self._cancel_by_hand("c1", "aw-hbo")
