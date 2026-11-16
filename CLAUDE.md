@@ -14,7 +14,7 @@ Read this first. It records how the owner's machines are set up and how changes 
 2. Mac: `cd ~/EPG-Manager && git pull`
 3. Mac: `scp ~/EPG-Manager/server.py GaryAdmin@192.168.1.176:/share/CACHEDEV1_DATA/EPG-Manager/server.py`
 4. QNAP: `cd /share/CACHEDEV1_DATA/EPG-Manager && ./start_epg_server.sh`, then `grep -m1 '^VERSION' server.py` to confirm the new version.
-- Shortcut for steps 2 to 4, run on the Mac: `~/EPG-Manager/mac/deploy_dashboard.sh` (pulls, copies server.py, restarts the dashboard, prints the version).
+- Shortcut for steps 2 to 4, run on the Mac: `~/EPG-Manager/mac/deploy_dashboard.sh` (pulls, copies server.py, restarts the dashboard, then checks the RUNNING dashboard reports the new version; the version in the file alone proves nothing).
 - A change to `recording_agent.py` only needs the Mac `git pull`, then `mac/safe_restart.sh`. Never restart the recorder while a recording is running.
 
 ## Standing rules
