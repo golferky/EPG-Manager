@@ -3934,3 +3934,5 @@ class HideNonEnglishTests(unittest.TestCase):
         self.assertIn('id="hide-foreign"', html)
         self.assertIn("params.set('hide_foreign', '1')", html)
         self.assertIn("epg_hide_foreign", html)
+        self.assertRegex(html, r'<input id="hide-foreign" type="checkbox" checked')            # on by default
+        self.assertIn("getItem('epg_hide_foreign') !== '0'", html)                              # off only if you switched it off

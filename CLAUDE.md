@@ -38,7 +38,7 @@ Read this first. It records how the owner's machines are set up and how changes 
 - Reminders: the dashboard shows a banner when Schedules Direct is within 30 days of its end date (Eaglecast within 7). Set the date with POST `{"key": "schedules_direct", "expires": "YYYY-MM-DD"}` to `/epg-web/api/reminders`. Schedules Direct currently ends 2027-05-05. PrimeStreams is deliberately not tracked: the owner renews it monthly.
 
 ## Guide filters
-- **Hide non-English** (checkbox beside Hide quality duplicates, remembered in the browser, off by default): drops whole channels, and everything on them, that are clearly not English. It judges the channel only, from the language Schedules Direct gives the station (kept in `channel_languages`, filled on the next guide fetch), the language words and labels in the name, non-Latin writing, and a short list of known foreign networks (`_is_non_english_channel`). A bilingual (en plus another) station stays.
+- **Hide non-English** (checkbox beside Hide quality duplicates, remembered in the browser, on by default; untick it to see everything again): drops whole channels, and everything on them, that are clearly not English. It judges the channel only, from the language Schedules Direct gives the station (kept in `channel_languages`, filled on the next guide fetch), the language words and labels in the name, non-Latin writing, and a short list of known foreign networks (`_is_non_english_channel`). A bilingual (en plus another) station stays.
 
 ## Stop-hook note
 The "N unpushed commits" stop-hook warning is stale after a squash merge. Check `git ls-remote origin <branch>` against `git rev-parse HEAD`; if they match, nothing needs pushing.

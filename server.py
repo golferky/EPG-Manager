@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117b"
+VERSION = "v20261117c"
 
 app = Flask(__name__)
 
@@ -9534,7 +9534,7 @@ tr:hover td{background:#141414;}
       <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide quality duplicates
     </label>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide channels that are clearly not in English (Spanish, French, Filipino and so on)">
-      <input id="hide-foreign" type="checkbox" onchange="localStorage.setItem('epg_hide_foreign',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide non-English
+      <input id="hide-foreign" type="checkbox" checked onchange="localStorage.setItem('epg_hide_foreign',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide non-English
     </label>
     <div style="position:relative;display:inline-block;">
       <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value);updateSearchClear()" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;padding-right:30px;">
@@ -10077,7 +10077,7 @@ async function autoLoad() {
   const hideSd = document.getElementById('hide-sd-duplicates');
   if (hideSd) hideSd.checked = localStorage.getItem('epg_hide_sd_duplicates') !== '0';
   const hideForeign = document.getElementById('hide-foreign');
-  if (hideForeign) hideForeign.checked = localStorage.getItem('epg_hide_foreign') === '1';
+  if (hideForeign) hideForeign.checked = localStorage.getItem('epg_hide_foreign') !== '0';   // on unless you switched it off
   renderFavoriteTeams();
 })();
 autoLoad();
