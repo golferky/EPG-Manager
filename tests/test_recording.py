@@ -3802,3 +3802,87 @@ class SameAiringElsewhereTests(unittest.TestCase):
                          (stamp(self.now + 120), stamp(self.now + 3720)))        # two minutes from now
             conn.commit(); conn.close()
             self.assertEqual(self._run(guide_db, True)["moved"], 0)
+
+
+class SeriesNoDuplicateBookingTests(unittest.TestCase):
+    """One airing, or one episode, is booked once even when several channels carry it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.guide_db = os.path.join(self.temp.name, "guide.db")
+        server.ensure_guide_db(self.guide_db)
+        with mock.patch.object(server, "_guide_db_path", return_value=self.guide_db):
+            server._init_recordings_table()
+        conn = sqlite3.connect(self.guide_db)
+        for column, kind in (("episode_title", "TEXT"), ("season_num", "INTEGER"), ("episode_num", "INTEGER")):
+            try:
+                conn.execute(f"ALTER TABLE guide ADD COLUMN {column} {kind}")
+            except sqlite3.OperationalError:
+                pass
+        conn.commit(); conn.close()
+        self.base = int(time.time()) + 3 * 86400
+        with server._rec_lock:
+            server._recs.clear()
+
+    def tearDown(self):
+        with server._rec_lock:
+            server._recs.clear()
+        self.temp.cleanup()
+
+    def _guide(self, rows):
+        stamp = lambda ts: time.strftime("%Y%m%d%H%M%S", time.gmtime(ts))
+        conn = sqlite3.connect(self.guide_db)
+        conn.executemany(
+            "INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,category,episode_title,season_num,episode_num) "
+            "VALUES ('Show',?,?,?,?,'','',?,?,?)",
+            [(cid, name, stamp(start), stamp(start + 3600), ep, sn, en) for cid, name, start, ep, sn, en in rows])
+        conn.commit(); conn.close()
+
+    def _run(self):
+        channels = {"hd", "west", "plain", "other"}
+        with mock.patch.object(server, "_guide_db_path", return_value=self.guide_db), \
+                mock.patch.object(server, "load_config", return_value={}), \
+                mock.patch.object(server, "get_recordable_channel_ids", return_value=channels), \
+                mock.patch.object(server, "_plex_episode_keys", return_value=set()), \
+                mock.patch.object(server, "_plex_tv_path", return_value=self.temp.name), \
+                mock.patch.object(server, "_recording_backend", return_value="agent"), \
+                mock.patch.object(server, "_db_upsert_rec", return_value=True), \
+                mock.patch.object(server, "_recent_same_source_failure", return_value=False), \
+                mock.patch.object(server, "_resolve_recording_source",
+                                  return_value=("u", None, {"stream_id": "1", "provider": "primestreams"})):
+            return server._schedule_series_airings("Show", self.guide_db, "movies.db")
+
+    def _starts(self):
+        with server._rec_lock:
+            return sorted(round(r["start_ts"]) for r in server._recs.values())
+
+    def test_a_row_with_no_episode_number_at_the_same_time_is_not_booked_again(self):
+        self._guide([("hd", "Show HD", self.base, "Pilot", 1, 1),
+                     ("plain", "Show", self.base, None, None, None)])
+        self.assertEqual(self._run(), 1)
+        self.assertEqual(self._starts(), [self.base])
+
+    def test_the_same_episode_on_an_east_and_a_west_feed_is_booked_once(self):
+        self._guide([("hd", "Show HD", self.base, "Pilot", 1, 1),
+                     ("west", "Show West", self.base + 3 * 3600, "Pilot", 1, 1)])
+        self.assertEqual(self._run(), 1)
+
+    def test_an_episode_already_booked_is_not_booked_again_on_another_channel(self):
+        self._guide([("west", "Show West", self.base + 3 * 3600, "Pilot", 1, 1)])
+        with server._rec_lock:
+            server._recs["existing"] = {"title": "Show", "channel_id": "hd", "channel": "Show HD", "start_ts": float(self.base),
+                                        "stop_ts": float(self.base + 3600), "status": "queued", "season_num": 1, "episode_num": 1}
+        self.assertEqual(self._run(), 0)
+
+    def test_an_airing_with_no_episode_number_at_a_booked_time_is_not_booked_again(self):
+        self._guide([("plain", "Show", self.base + 60, None, None, None)])
+        with server._rec_lock:
+            server._recs["existing"] = {"title": "Show", "channel_id": "hd", "channel": "Show HD", "start_ts": float(self.base),
+                                        "stop_ts": float(self.base + 3600), "status": "queued", "season_num": 1, "episode_num": 1}
+        self.assertEqual(self._run(), 0)
+
+    def test_different_episodes_and_different_times_are_still_booked(self):
+        self._guide([("hd", "Show HD", self.base, "Pilot", 1, 1),
+                     ("hd", "Show HD", self.base + 7 * 86400, "Second", 1, 2),
+                     ("plain", "Show", self.base + 3 * 86400, None, None, None)])
+        self.assertEqual(self._run(), 3)

@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261116i"
+VERSION = "v20261117a"
 
 app = Flask(__name__)
 
@@ -7851,6 +7851,9 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         f"{show_key}|{int(r['season_num'])}|{int(r['episode_num'])}" not in plex_episode_keys
     )]
 
+    plain_name = lambda text: re.sub(r'\s*\(\d{4}\)\s*$', '', text or '').strip().lower()
+    mine = plain_name(title)
+    booked = []          # (start, season, episode) of this title's active bookings, on any channel
     with _rec_lock:
         # _recs also contains a few transient UI/playback entries.  They are
         # active but are not recordings and have no guide channel or start
@@ -7861,6 +7864,9 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             if (_rec_is_active(r) and r.get('channel_id') is not None
                 and r.get('start_ts') is not None)
         }
+        booked.extend((float(r['start_ts']), r.get('season_num'), r.get('episode_num')) for r in _recs.values()
+                      if (_rec_is_active(r) and r.get('start_ts') is not None
+                          and plain_name(r.get('title')) == mine))
     # The in-memory list is empty during early startup, so also consult the
     # durable queue before adding work from an active series rule.
     try:
@@ -7868,6 +7874,11 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         db_existing = conn.execute('''SELECT channel_id, start_ts FROM recordings
             WHERE status NOT IN ('done','done_ts','cancelled','failed','error',
                                  'skipped_existing_better','skipped_too_short')''').fetchall()
+        booked.extend((float(row[0]), row[1], row[2]) for row in conn.execute(
+            """SELECT start_ts, season_num, episode_num, title FROM recordings
+               WHERE status NOT IN ('done','done_ts','cancelled','failed','error',
+                                    'skipped_existing_better','skipped_too_short')""").fetchall()
+            if plain_name(row[3]) == mine and row[0] is not None)
         # An airing the owner cancelled by hand is not booked again.
         db_cancelled = conn.execute("""SELECT channel_id, start_ts FROM recordings
             WHERE status='cancelled' AND failure_reason='Cancelled by user'
@@ -7883,6 +7894,13 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             key = (r['channel_id'], su.timestamp())
             if key in existing_keys:
+                continue
+            # The same airing or the same episode on another channel (an HD and a plain row, an east and a west
+            # feed) is not booked again.  A row with no episode number still counts by its start time.
+            if any(abs(start - su.timestamp()) <= 600
+                   or (r.get('season_num') is not None and r.get('episode_num') is not None
+                       and season == r.get('season_num') and number == r.get('episode_num'))
+                   for start, season, number in booked):
                 continue
             rec_id = f"rec_{int(time.time()*1000)}_{r['channel_id'][:8]}"
             _url, stream_error, stream_debug = _resolve_recording_source(
@@ -7916,6 +7934,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 _recs[rec_id] = rec
                 _rec_cancel_events[rec_id] = threading.Event()
                 existing_keys.add(key)
+                booked.append((su.timestamp(), r.get('season_num'), r.get('episode_num')))
             if backend == 'local':
                 t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
                 t.start()
