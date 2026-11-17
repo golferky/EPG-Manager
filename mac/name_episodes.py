@@ -164,6 +164,11 @@ def plan(files, airings, episodes, min_score=None, margin=None):
             airing = nearest_airing(airings, start)
             if not airing:
                 row['status'] = 'no guide plot line for that air time'
+            elif airing.get('episode'):
+                known = airing['episode']                       # the dashboard found this exact description on a numbered airing
+                row['plot'] = airing['desc']
+                row['episode'] = {'season': known['season'], 'number': known['number'], 'name': known.get('name', ''), 'summary': ''}
+                row['score'], row['status'] = 1.0, 'ok'
             else:
                 row['plot'] = airing['desc']
                 episode, score, confident = pick(airing['desc'], episodes, min_score, margin)
