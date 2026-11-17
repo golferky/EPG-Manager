@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117e"
+VERSION = "v20261117f"
 
 app = Flask(__name__)
 
@@ -329,7 +329,7 @@ def _guide_program_matches_content(program, content):
     channel filter by ``api_guide`` because it means premium movie networks,
     not merely programmes tagged as movies.
     """
-    if not content or content == 'all' or content == 'premium_movies':
+    if not content or content in ('all', 'premium_movies', 'non_english', 'adult'):     # the last two are channel views in api_guide
         return True
     category = str(program.get('category') or '').lower()
     prog_type = str(program.get('prog_type') or '').upper()
@@ -3576,7 +3576,7 @@ def api_guide():
     valid_content_filters = {
         'all', 'sports', 'sports_football', 'sports_basketball', 'sports_baseball',
         'sports_golf', 'sports_hockey', 'sports_soccer', 'sports_tennis', 'sports_racing',
-        'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality',
+        'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality', 'non_english', 'adult',
     }
     if content_filter not in valid_content_filters:
         content_filter = 'all'
@@ -3746,6 +3746,26 @@ def api_guide():
     elif ch_filter:
         ordered_channels_raw = [c for c in ordered_channels_raw if ch_filter in c['name'].lower()]
 
+    # How many channels each switch hides, for the counts beside the checkboxes.
+    hidden_counts = {
+        'non_english': sum(1 for c in ordered_channels_raw if _is_non_english_channel(c.get('name', ''), c.get('language', ''))),
+        'adult': sum(1 for c in ordered_channels_raw if _is_adult_channel(c.get('name', ''))),
+    }
+    # The two "only" views show exactly what the switches hide, in the normal grid.
+    if content_filter == 'non_english':
+        hide_foreign = False
+        keep = {c['id'] for c in ordered_channels_raw if _is_non_english_channel(c.get('name', ''), c.get('language', ''))}
+        ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] in keep]
+        progs_in_window = [p for p in progs_in_window if p['channel_id'] in keep]
+    elif content_filter == 'adult':
+        if not _adult_may_be_shown():
+            return jsonify({'error': 'Adult content is locked. Enter the adult password to see it.', 'adult_locked': True})
+        hide_adult = False
+        adult_named = {c['id'] for c in ordered_channels_raw if _is_adult_channel(c.get('name', ''))}
+        progs_in_window = [p for p in progs_in_window
+                           if p['channel_id'] in adult_named or _is_adult_programme(p.get('category'))]
+        keep = adult_named | {p['channel_id'] for p in progs_in_window}
+        ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] in keep]
     # The Hide non-English switch drops clearly non-English channels and everything on them.
     if hide_foreign:
         foreign_ids = {c['id'] for c in ordered_channels_raw
@@ -3913,6 +3933,7 @@ def api_guide():
     return jsonify({
         'window_start': ws.astimezone(local_tz).isoformat(),
         'window_end':   we.astimezone(local_tz).isoformat(),
+        'hidden_counts': hidden_counts,
         'window_start_ts': ws_ts,
         'window_end_ts':   we_ts,
         'hours':        hours,
@@ -9686,15 +9707,17 @@ tr:hover td{background:#141414;}
       <option value="tv">📺 TV & series</option>
       <option value="docs">🎓 Documentaries</option>
       <option value="reality">🎭 Reality & talk</option>
+      <option value="non_english">🌐 Non-English only</option>
+      <option value="adult">🔞 Adult only</option>
     </select>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide redundant SD/HD channel-name duplicates; East, West, and Pacific stay visible">
       <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide quality duplicates
     </label>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide channels that are clearly not in English (Spanish, French, Filipino and so on)">
-      <input id="hide-foreign" type="checkbox" checked onchange="localStorage.setItem('epg_hide_foreign',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide non-English
+      <input id="hide-foreign" type="checkbox" checked onchange="localStorage.setItem('epg_hide_foreign',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide non-English <span id="hidden-count-foreign" style="color:#64748b;"></span>
     </label>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide adult channels and programmes. If a password is set, showing them asks for it.">
-      <input id="hide-adult" type="checkbox" checked onchange="onAdultToggle(this)"> Hide adult
+      <input id="hide-adult" type="checkbox" checked onchange="onAdultToggle(this)"> Hide adult <span id="hidden-count-adult" style="color:#64748b;"></span>
     </label>
     <button id="adult-lock-btn" class="btn btn-ghost btn-sm" onclick="showAdultModal('set')" title="Set, change or remove the adult password" style="padding:2px 7px;">🔒</button>
     <div style="position:relative;display:inline-block;">
@@ -10249,7 +10272,7 @@ async function autoLoad() {
   const saved = localStorage.getItem('epg_guide_mode');
   if (saved) { const el = document.getElementById('guide-ch-mode'); if (el) el.value = saved; }
   const savedContent = localStorage.getItem('epg_guide_content');
-  if (savedContent) { const el = document.getElementById('guide-content-filter'); if (el) el.value = savedContent; }
+  if (savedContent && savedContent !== 'adult') { const el = document.getElementById('guide-content-filter'); if (el) el.value = savedContent; }   // the adult view is never reopened by itself
   const hideSd = document.getElementById('hide-sd-duplicates');
   if (hideSd) hideSd.checked = localStorage.getItem('epg_hide_sd_duplicates') !== '0';
   const hideForeign = document.getElementById('hide-foreign');
@@ -11098,8 +11121,20 @@ function showAdultModal(mode) {
     (set ? has('adult-pw-current') : has('adult-pw-main')).focus();
   });
 }
+function setHiddenCounts(counts) {
+  const c = counts || {};
+  const put = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n ? '(' + n + ')' : ''; };
+  put('hidden-count-foreign', c.non_english);
+  put('hidden-count-adult', c.adult);
+}
 function closeAdultModal() {
   document.getElementById('adult-modal').style.display = 'none';
+  const view = document.getElementById('guide-content-filter');
+  if (view && view.value === 'adult' && !adultToken()) {          // cancelled out of the password box: leave the adult view
+    view.value = 'all';
+    localStorage.setItem('epg_guide_content', 'all');
+    fetchAndRenderGuide();
+  }
   ['adult-pw-current', 'adult-pw-main', 'adult-pw-confirm'].forEach(id => { document.getElementById(id).value = ''; });
 }
 async function adultPost(path, body) {
@@ -11285,8 +11320,10 @@ async function fetchAndRenderGuide() {
     // visible programme grid hostage.
     const r = await fetch('/epg-web/api/guide?' + params, {headers: adultHeaders()});
     const d = await r.json();
+    if (d.adult_locked) { showAdultModal('unlock'); return; }
     if (d.error) { setGS(d.error,'err'); return; }
     if (requestId !== _guideFetchId) return;
+    setHiddenCounts(d.hidden_counts);
     _guideData = d;
     if (!_guideWindowStart) _guideWindowStart = d.window_start;
     renderGuide();

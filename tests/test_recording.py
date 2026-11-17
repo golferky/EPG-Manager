@@ -4045,6 +4045,54 @@ class AdultLockTests(unittest.TestCase):
         channels, _titles = self._guide("&hide_adult=0", {"X-Adult-Token": token})
         self.assertEqual(channels, ["ESPN", "Brazzers TV Plus"])
 
+    def _view(self, query, headers=None, language_of=None):
+        """The guide with a mixed set of channels, returning the raw JSON."""
+        from datetime import datetime as _dt, timezone as _tz
+        start = _dt.now(_tz.utc).replace(minute=0, second=0, microsecond=0).timestamp()
+        rows = (("c1", "ESPN", "en"), ("c2", "Brazzers TV Plus", "en"), ("c3", "Telemundo", "es"), ("c4", "Plain Name", ""))
+        channels = [{"id": cid, "name": name, "icon": "", "language": lang} for cid, name, lang in rows]
+        progs = [{"title": f"Show {cid}", "channel_id": cid, "channel": name, "start_ts": start, "stop_ts": start + 3600,
+                  "start_iso": "", "stop_iso": "", "start_fmt": "", "stop_fmt": "", "desc": "", "category": ""}
+                 for cid, name, _lang in rows]
+        epg = {"channels": channels, "channel_map": {c["id"]: c["name"] for c in channels}, "programmes": progs,
+               "programme_starts": [start] * len(progs)}
+        deadline = time.time() + 10
+        while time.time() < deadline and (server._startup_status.get("loading") or server._startup_status.get("background_loading")):
+            time.sleep(0.05)
+        with mock.patch.dict(server._epg, epg):
+            return self.client.get("/epg-web/api/guide?hours=2" + query, headers=headers or {}).get_json()
+
+    def test_the_counts_say_how_many_channels_each_switch_hides(self):
+        data = self._view("&hide_foreign=1")
+        self.assertEqual(data["hidden_counts"], {"non_english": 1, "adult": 1})
+        self.assertEqual(sorted(c["name"] for c in data["channels"]), ["ESPN", "Plain Name"])
+
+    def test_the_non_english_view_shows_what_the_switch_hides(self):
+        data = self._view("&hide_foreign=1&content=non_english")                  # the switch is on, the view still shows them
+        self.assertEqual([c["name"] for c in data["channels"]], ["Telemundo"])
+        self.assertEqual([p["channel_id"] for p in data["programmes"]], ["c3"])
+
+    def test_the_adult_view_with_no_password_shows_only_adult_channels(self):
+        data = self._view("&content=adult")
+        self.assertEqual([c["name"] for c in data["channels"]], ["Brazzers TV Plus"])
+
+    def test_the_adult_view_is_locked_by_the_password_on_the_server(self):
+        self.client.post("/epg-web/api/adult/password", json={"new": "secret1"})
+        locked = self._view("&content=adult&hide_adult=0")
+        self.assertTrue(locked.get("adult_locked"))
+        self.assertNotIn("channels", locked)                                      # nothing is sent at all
+        token = self.client.post("/epg-web/api/adult/unlock", json={"password": "secret1"}).get_json()["token"]
+        data = self._view("&content=adult", {"X-Adult-Token": token})
+        self.assertEqual([c["name"] for c in data["channels"]], ["Brazzers TV Plus"])
+
+    def test_the_page_has_the_two_views_and_the_counts(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('<option value="non_english">', html)
+        self.assertIn('<option value="adult">', html)
+        self.assertIn('id="hidden-count-foreign"', html)
+        self.assertIn('id="hidden-count-adult"', html)
+        self.assertIn("savedContent !== 'adult'", html)                           # never reopened on its own
+
     def test_the_page_has_the_adult_controls_and_checkbox_spacing(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertRegex(html, r'<input id="hide-adult" type="checkbox" checked')
