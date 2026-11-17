@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117k"
+VERSION = "v20261117l"
 
 app = Flask(__name__)
 
@@ -3591,12 +3591,34 @@ def _guide_known_episode(conn, title, description):
     plain = re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip()
     rows = conn.execute(
         'SELECT season_num, episode_num, episode_title, COUNT(*) FROM guide WHERE lower(title) IN (lower(?), lower(?)) '
-        'AND desc=? AND season_num IS NOT NULL AND episode_num IS NOT NULL '
+        "AND desc=? AND season_num IS NOT NULL AND episode_num IS NOT NULL AND prog_type='EP' "
         'GROUP BY season_num, episode_num, episode_title ORDER BY COUNT(*) DESC LIMIT 2', (title, plain, text)).fetchall()
     if len(rows) != 1:                                  # none, or the same text on two different episodes: not telling
         return None
     return {'season': int(rows[0][0]), 'number': int(rows[0][1]), 'name': rows[0][2] or '',
             'score': 1.0, 'confident': True, 'source': 'guide'}
+
+
+def _exact_episode_for_airing(guide_db, channel_id, title, start_ts):
+    """The exact-description episode for one specific airing (channel and time), or None."""
+    if re.search(r'\(\d{4}\)\s*$', title or ''):
+        return None
+    plain = re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip()
+    try:
+        low = datetime.fromtimestamp(float(start_ts) - 120, timezone.utc).strftime('%Y%m%d%H%M%S')
+        high = datetime.fromtimestamp(float(start_ts) + 120, timezone.utc).strftime('%Y%m%d%H%M%S')
+        conn = sqlite3.connect(guide_db, timeout=3)
+        try:
+            row = conn.execute(
+                'SELECT desc, season_num FROM guide WHERE channel_id=? AND lower(title) IN (lower(?), lower(?)) '
+                'AND start_utc BETWEEN ? AND ? LIMIT 1', (channel_id, title, plain, low, high)).fetchone()
+            if not row or row[1] is not None:                       # no listing, or the guide already numbers it
+                return None
+            return _guide_known_episode(conn, title, row[0])
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
 
 
 def _guess_episode(episodes, description):
@@ -8311,7 +8333,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         rows = _query_in_chunks(
             conn,
             '''SELECT channel_id, channel_name, start_utc, end_utc,
-                   episode_title, season_num, episode_num
+                   episode_title, season_num, episode_num, desc
             FROM guide
             WHERE (lower(title)=lower(?) OR lower(title)=lower(?))
             AND start_utc > ? AND channel_id IN''',
@@ -8350,6 +8372,12 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                     item['episode_title'] = detail['episode_title'] or item['episode_title']
                     item['season_num'] = detail['season_num']
                     item['episode_num'] = detail['episode_num']
+            if item['season_num'] is None or item['episode_num'] is None:
+                # Still unnumbered: the same description on a numbered airing elsewhere names it exactly.
+                known = _guide_known_episode(conn, title, item.get('desc'))
+                if known:
+                    item['season_num'], item['episode_num'] = known['season'], known['number']
+                    item['episode_title'] = known['name'] or item.get('episode_title')
             enriched.append(item)
         rows = enriched
         conn.close()
@@ -9072,6 +9100,12 @@ def api_record():
         episode_num = int(episode_num) if episode_num is not None else None
     except (TypeError, ValueError):
         season_num = episode_num = None
+    if season_num is None and episode_num is None and not episode_title:
+        # An airing the guide did not number whose exact description is on a numbered airing elsewhere (ANTENNA TV
+        # and FETV, say) is that episode: record it as such so it is filed and named like any numbered recording.
+        known = _exact_episode_for_airing(_guide_db_path(), channel_id, title, start_ts)
+        if known:
+            season_num, episode_num, episode_title = known['season'], known['number'], known['name']
     rec_id     = str(uuid.uuid4())[:8]
     cfg2        = load_config()
     guide_db    = cfg2.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
