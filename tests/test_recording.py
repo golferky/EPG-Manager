@@ -3843,7 +3843,7 @@ class SeriesNoDuplicateBookingTests(unittest.TestCase):
         with mock.patch.object(server, "_guide_db_path", return_value=self.guide_db), \
                 mock.patch.object(server, "load_config", return_value={}), \
                 mock.patch.object(server, "get_recordable_channel_ids", return_value=channels), \
-                mock.patch.object(server, "_plex_episode_keys", return_value=set()), \
+                mock.patch.object(server, "_plex_episode_keys", side_effect=lambda *a, **k: set(getattr(self, "plex_keys", set()))), \
                 mock.patch.object(server, "_plex_tv_path", return_value=self.temp.name), \
                 mock.patch.object(server, "_recording_backend", return_value="agent"), \
                 mock.patch.object(server, "_db_upsert_rec", return_value=True), \
@@ -4419,3 +4419,117 @@ class GuideEpisodeGuessTests(unittest.TestCase):
         self.assertIn("'maybe '", html)
         self.assertIn("ar.guess_pending", html)
         self.assertIsNotNone(server._episode_match)               # the shared matcher is importable
+
+
+class ExactEpisodeUsedWhenRecordingTests(unittest.TestCase):
+    """An exact description match names the episode when it is booked, not just on screen."""
+    SHOW = "Zzz Exact Sitcom"
+    TEXT = "Darrin discovers that bedwarmers can be worse than mothers-in-law."
+
+    def setUp(self):
+        with server._rec_lock:
+            server._recs.clear()
+            server._rec_cancel_events.clear()
+        server._init_recordings_table()
+        self._clean()
+        self.start = int(time.time()) + 7200
+        self.stamp = lambda ts: time.strftime("%Y%m%d%H%M%S", time.gmtime(ts))
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("DELETE FROM guide WHERE title=?", (self.SHOW,))
+        conn.execute("DELETE FROM recordings WHERE title=?", (self.SHOW,))
+        conn.commit(); conn.close()
+
+    def _row(self, channel, desc, season=None, number=None, name="", prog_type="", shift=0):
+        conn = sqlite3.connect(server._guide_db_path())
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,category,prog_type,episode_title,season_num,episode_num) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (self.SHOW, channel, channel.upper(), self.stamp(self.start + shift), self.stamp(self.start + shift + 1800),
+                      desc, "", prog_type, name, season, number))
+        conn.commit(); conn.close()
+
+    def _record(self, channel="zz-antenna"):
+        body = {"title": self.SHOW, "channel_id": channel, "channel_name": channel.upper(),
+                "start_ts": self.start, "stop_ts": self.start + 1800}
+        with mock.patch.object(server, "_recording_backend", return_value="agent"), \
+                mock.patch.object(server, "_resolve_recording_source",
+                                  return_value=("http://x/1.ts", None, {"stream_id": "1", "provider": "primestreams"})):
+            return server.app.test_client().post("/epg-web/api/record", json=body)
+
+    def _saved(self):
+        conn = sqlite3.connect(server._guide_db_path())
+        row = conn.execute("SELECT season_num, episode_num, episode_title, is_series FROM recordings WHERE title=?", (self.SHOW,)).fetchone()
+        conn.close()
+        return row
+
+    def test_an_unnumbered_airing_is_booked_as_the_episode_its_exact_description_names(self):
+        self._row("zz-antenna", self.TEXT)
+        self._row("zz-fetv", self.TEXT, 7, 4, "Samantha's Hot Bedwarmer", "EP", shift=86400)
+        self.assertTrue(self._record().get_json()["ok"])
+        self.assertEqual(self._saved(), (7, 4, "Samantha's Hot Bedwarmer", 1))
+
+    def test_an_airing_with_no_exact_match_stays_unnumbered(self):
+        self._row("zz-antenna", self.TEXT)
+        self._row("zz-fetv", "A different story altogether about a boat race.", 7, 4, "Other", "EP", shift=86400)
+        self.assertTrue(self._record().get_json()["ok"])
+        self.assertEqual(self._saved()[:3], (None, None, ""))
+
+    def test_a_numbered_row_that_is_not_an_episode_listing_is_not_trusted(self):
+        self._row("zz-antenna", self.TEXT)
+        self._row("zz-fetv", self.TEXT, 7, 4, "Samantha's Hot Bedwarmer", "SH", shift=86400)      # a show-level listing
+        self.assertTrue(self._record().get_json()["ok"])
+        self.assertEqual(self._saved()[:2], (None, None))
+
+    def test_an_airing_the_guide_already_numbers_is_left_alone(self):
+        self._row("zz-antenna", self.TEXT, 1, 1, "Given", "EP")
+        self._row("zz-fetv", self.TEXT, 7, 4, "Samantha's Hot Bedwarmer", "EP", shift=86400)
+        self.assertTrue(self._record().get_json()["ok"])
+        self.assertNotEqual(self._saved()[:2], (7, 4))                 # the exact match is only for airings the guide did not number
+
+
+class SeriesPassUsesExactEpisodesTests(SeriesNoDuplicateBookingTests):
+    TEXT_A = "Darrin discovers that bedwarmers can be worse than mothers-in-law."
+    TEXT_B = "Samantha's cousin Serena turns up and everything goes wrong for Darrin."
+
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.guide_db)
+        conn.execute("ALTER TABLE guide ADD COLUMN prog_type TEXT")
+        conn.commit(); conn.close()
+
+    def _rows(self, rows):
+        stamp = lambda ts: time.strftime("%Y%m%d%H%M%S", time.gmtime(ts))
+        conn = sqlite3.connect(self.guide_db)
+        conn.executemany(
+            "INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,category,prog_type,episode_title,season_num,episode_num) "
+            "VALUES ('Show',?,?,?,?,?,'',?,?,?,?)",
+            [(cid, name, stamp(start), stamp(start + 1800), desc, prog, ep, sn, en)
+             for cid, name, start, desc, prog, ep, sn, en in rows])
+        conn.commit(); conn.close()
+
+    def _booked(self):
+        with server._rec_lock:
+            return sorted((r["season_num"], r["episode_num"], r["channel_id"]) for r in server._recs.values())
+
+    def test_unnumbered_airings_are_booked_with_the_episode_their_exact_description_names(self):
+        self._rows([("hd", "Show HD", self.base - 10 * 86400, self.TEXT_A, "EP", "Bedwarmer", 7, 4),     # an earlier numbered airing
+                    ("plain", "Show", self.base, self.TEXT_A, "", "", None, None)])
+        self.assertEqual(self._run(), 1)
+        self.assertEqual(self._booked(), [(7, 4, "plain")])
+
+    def test_an_unnumbered_row_whose_text_matches_nothing_is_still_booked_unnumbered(self):
+        self._rows([("plain", "Show", self.base, self.TEXT_B, "", "", None, None)])
+        self.assertEqual(self._run(), 1)
+        self.assertEqual(self._booked(), [(None, None, "plain")])
+
+    def test_an_episode_already_in_plex_is_not_booked_again_even_when_the_guide_did_not_number_it(self):
+        self._rows([("hd", "Show HD", self.base - 10 * 86400, self.TEXT_A, "EP", "Bedwarmer", 7, 4),
+                    ("plain", "Show", self.base, self.TEXT_A, "", "", None, None),
+                    ("plain", "Show", self.base + 86400, self.TEXT_B, "", "", None, None)])
+        self.plex_keys = {"show|7|4"}
+        self.assertEqual(self._run(), 1)
+        self.assertEqual(self._booked(), [(None, None, "plain")])                         # only the unidentified one is booked
