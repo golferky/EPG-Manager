@@ -12,9 +12,9 @@ Read this first. It records how the owner's machines are set up and how changes 
 ## Deploying a dashboard change (server.py)
 1. Open a PR and merge it only when the user says so ("open the pull request", "merge it"; "open the pull request then merge it" means both). Before merging, merge `origin/main` into the branch. Squash merges leave version-line conflicts; keep the branch's newer `VERSION`.
 2. Mac: `cd ~/EPG-Manager && git pull`
-3. Mac: `scp ~/EPG-Manager/server.py GaryAdmin@192.168.1.176:/share/CACHEDEV1_DATA/EPG-Manager/server.py`
+3. Mac: `scp ~/EPG-Manager/server.py ~/EPG-Manager/sd_guide.py GaryAdmin@192.168.1.176:/share/CACHEDEV1_DATA/EPG-Manager/` (BOTH files: the dashboard calls sd_guide.py for every guide fetch; a change to it that is not copied does nothing)
 4. QNAP: `cd /share/CACHEDEV1_DATA/EPG-Manager && ./start_epg_server.sh`, then `grep -m1 '^VERSION' server.py` to confirm the new version.
-- Shortcut for steps 2 to 4, run on the Mac: `~/EPG-Manager/mac/deploy_dashboard.sh` (pulls, copies server.py, restarts the dashboard, then checks the RUNNING dashboard reports the new version; the version in the file alone proves nothing).
+- Shortcut for steps 2 to 4, run on the Mac: `~/EPG-Manager/mac/deploy_dashboard.sh` (pulls, copies server.py and sd_guide.py, restarts the dashboard, then checks the RUNNING dashboard reports the new version; the version in the file alone proves nothing).
 - A change to `recording_agent.py` only needs the Mac `git pull`, then `mac/safe_restart.sh`. Never restart the recorder while a recording is running.
 
 ## Standing rules
@@ -39,6 +39,7 @@ Read this first. It records how the owner's machines are set up and how changes 
 
 ## Guide filters
 - **Hide non-English** (checkbox beside Hide quality duplicates, remembered in the browser, on by default; untick it to see everything again): drops whole channels, and everything on them, that are clearly not English. It judges the channel only, from the language Schedules Direct gives the station (kept in `channel_languages`, filled on the next guide fetch), the language words and labels in the name, non-Latin writing, and a short list of known foreign networks (`_is_non_english_channel`). A bilingual (en plus another) station stays.
+- **Hide adult** (checkbox beside it, on by default, 🔒 button next to it): hides adult channels (a name list: Brazzers, Playboy, Penthouse and so on; "Adult Swim" is not one) and any programme tagged "Adults only", in the grid and in search; adult channels are also never booked by automation. If an adult password is set, the SERVER hides adult content unless the browser session has entered it (a token header, 2 hours sliding, cleared when the tab closes or the server restarts). Only a salted PBKDF2 hash is stored (`adult_password_hash` in the dashboard config). Changing or removing the password needs the current one; 5 wrong tries pause attempts for 5 minutes. The password is typed only in the dashboard, never in chat or a command. The owner has also asked about user accounts and admins; not built.
 
 ## Stop-hook note
 The "N unpushed commits" stop-hook warning is stale after a squash merge. Check `git ls-remote origin <branch>` against `git rev-parse HEAD`; if they match, nothing needs pushing.

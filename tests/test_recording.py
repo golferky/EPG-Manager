@@ -3936,3 +3936,114 @@ class HideNonEnglishTests(unittest.TestCase):
         self.assertIn("epg_hide_foreign", html)
         self.assertRegex(html, r'<input id="hide-foreign" type="checkbox" checked')            # on by default
         self.assertIn("getItem('epg_hide_foreign') !== '0'", html)                              # off only if you switched it off
+
+
+class AdultLockTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"timezone": "UTC"}
+        self.patches = [mock.patch.object(server, "load_config", lambda: self.cfg),
+                        mock.patch.object(server, "save_config", lambda c: self.cfg.update(c))]
+        for p in self.patches:
+            p.start()
+        with server._adult_lock:
+            server._adult_tokens.clear()
+            server._adult_failures.update({"count": 0, "first": 0.0, "locked_until": 0.0})
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def test_what_counts_as_adult(self):
+        for name in ("BraZZers TV Plus", "Playboy TV", "PENTHOUSE", "Hustler TV", "Private Spice", "Dorcel TV", "XXX Hits"):
+            self.assertTrue(server._is_adult_channel(name), name)
+        for name in ("Adult Swim", "ESPN", "Hallmark Channel", "HBO", "Private Practice Reruns", "Starz Encore"):
+            self.assertFalse(server._is_adult_channel(name), name)
+        self.assertTrue(server._is_adult_programme("Adults only"))
+        self.assertFalse(server._is_adult_programme("Drama"))
+        self.assertTrue(server._is_automatic_recording_quarantined_channel("Playboy TV"))     # never booked by automation
+
+    def test_only_a_salted_hash_is_stored_and_it_checks_out(self):
+        stored = server._hash_password("open sesame")
+        self.assertNotIn("open sesame", stored)
+        self.assertTrue(server._password_matches("open sesame", stored))
+        self.assertFalse(server._password_matches("open sesame ", stored))
+        self.assertNotEqual(server._hash_password("open sesame"), stored)                     # fresh salt each time
+
+    def test_set_unlock_and_lock(self):
+        post = lambda path, body, headers=None: self.client.post("/epg-web/api/adult" + path, json=body, headers=headers or {})
+        self.assertEqual(self.client.get("/epg-web/api/adult").get_json(), {"password_set": False, "unlocked": False})
+        self.assertEqual(post("/password", {"new": "abc"}).status_code, 400)                    # too short
+        reply = post("/password", {"new": "secret1"}).get_json()
+        self.assertTrue(reply["ok"])
+        self.assertNotIn("secret1", str(self.cfg))                                               # never stored in the clear
+        self.assertEqual(post("/unlock", {"password": "nope"}).status_code, 403)
+        token = post("/unlock", {"password": "secret1"}).get_json()["token"]
+        status = self.client.get("/epg-web/api/adult", headers={"X-Adult-Token": token}).get_json()
+        self.assertEqual(status, {"password_set": True, "unlocked": True})
+        post("/lock", {}, {"X-Adult-Token": token})
+        self.assertFalse(self.client.get("/epg-web/api/adult", headers={"X-Adult-Token": token}).get_json()["unlocked"])
+
+    def test_changing_or_removing_needs_the_current_password(self):
+        post = lambda body: self.client.post("/epg-web/api/adult/password", json=body)
+        post({"new": "secret1"})
+        self.assertEqual(post({"new": "other22", "current": "wrong"}).status_code, 403)
+        self.assertEqual(post({"new": "", "current": "wrong"}).status_code, 403)
+        self.assertTrue(post({"new": "other22", "current": "secret1"}).get_json()["ok"])
+        self.assertTrue(server._password_matches("other22", self.cfg["adult_password_hash"]))
+        self.assertTrue(post({"new": "", "current": "other22"}).get_json()["ok"])
+        self.assertNotIn("adult_password_hash", self.cfg)                                        # protection removed
+
+    def test_too_many_wrong_guesses_pause_trying(self):
+        self.client.post("/epg-web/api/adult/password", json={"new": "secret1"})
+        for _ in range(server.ADULT_MAX_FAILURES):
+            self.client.post("/epg-web/api/adult/unlock", json={"password": "bad"})
+        reply = self.client.post("/epg-web/api/adult/unlock", json={"password": "secret1"})      # even the right one is refused now
+        self.assertEqual(reply.status_code, 429)
+
+    def test_a_token_expires(self):
+        self.client.post("/epg-web/api/adult/password", json={"new": "secret1"})
+        token = self.client.post("/epg-web/api/adult/unlock", json={"password": "secret1"}).get_json()["token"]
+        with server._adult_lock:
+            server._adult_tokens[token] = time.time() - 1
+        self.assertFalse(self.client.get("/epg-web/api/adult", headers={"X-Adult-Token": token}).get_json()["unlocked"])
+
+    def _guide(self, query, headers=None):
+        from datetime import datetime as _dt, timezone as _tz
+        start = _dt.now(_tz.utc).replace(minute=0, second=0, microsecond=0).timestamp()
+        channels = [{"id": cid, "name": name, "icon": "", "language": ""}
+                    for cid, name in (("c1", "ESPN"), ("c2", "Brazzers TV Plus"))]
+        progs = [{"title": t, "channel_id": cid, "channel": name, "start_ts": start, "stop_ts": start + 3600, "start_iso": "",
+                  "stop_iso": "", "start_fmt": "", "stop_fmt": "", "desc": "", "category": cat}
+                 for t, cid, name, cat in (("Game", "c1", "ESPN", "Sports"), ("Adult film", "c1", "ESPN", "Adults only"),
+                                           ("Feature", "c2", "Brazzers TV Plus", ""))]
+        epg = {"channels": channels, "channel_map": {c["id"]: c["name"] for c in channels}, "programmes": progs,
+               "programme_starts": [start] * len(progs)}
+        deadline = time.time() + 10
+        while time.time() < deadline and (server._startup_status.get("loading") or server._startup_status.get("background_loading")):
+            time.sleep(0.05)
+        with mock.patch.dict(server._epg, epg):
+            data = self.client.get("/epg-web/api/guide?hours=2" + query, headers=headers or {}).get_json()
+        return [c["name"] for c in data["channels"]], sorted(p["title"] for p in data["programmes"])
+
+    def test_the_guide_hides_adult_channels_and_tagged_programmes_by_default(self):
+        self.assertEqual(self._guide(""), (["ESPN"], ["Game"]))
+
+    def test_with_no_password_the_page_can_ask_to_show_adult(self):
+        channels, titles = self._guide("&hide_adult=0")
+        self.assertEqual(channels, ["ESPN", "Brazzers TV Plus"])
+        self.assertEqual(titles, ["Adult film", "Feature", "Game"])
+
+    def test_with_a_password_asking_to_show_adult_is_ignored_without_the_token(self):
+        self.client.post("/epg-web/api/adult/password", json={"new": "secret1"})
+        self.assertEqual(self._guide("&hide_adult=0"), (["ESPN"], ["Game"]))                     # a changed page gets nothing
+        token = self.client.post("/epg-web/api/adult/unlock", json={"password": "secret1"}).get_json()["token"]
+        channels, _titles = self._guide("&hide_adult=0", {"X-Adult-Token": token})
+        self.assertEqual(channels, ["ESPN", "Brazzers TV Plus"])
+
+    def test_the_page_has_the_adult_controls_and_checkbox_spacing(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertRegex(html, r'<input id="hide-adult" type="checkbox" checked')
+        self.assertIn("function onAdultToggle", html)
+        self.assertIn("type=\"password\"", html)
+        self.assertIn(".guide-toolbar input[type=checkbox]{width:auto", html)                    # label sits next to its box
