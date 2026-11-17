@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Deploy a dashboard change from the Mac mini to the QNAP in one go:
 #   ~/EPG-Manager/mac/deploy_dashboard.sh
-# 1. pulls the latest code, 2. copies server.py to the QNAP, 3. restarts the dashboard there,
+# 1. pulls the latest code, 2. copies server.py and sd_guide.py to the QNAP, 3. restarts the dashboard there,
 # 4. asks the RUNNING dashboard for its version and checks it matches (a stale server fails loudly).
 # If you do not use an SSH key it asks for the QNAP password twice (once to copy, once to restart).
 # This does NOT touch the recorder: after a recording_agent.py change run mac/safe_restart.sh instead.
@@ -16,8 +16,13 @@ echo "== Pulling the latest code"
 git pull
 echo "== Local version:  $(grep -m1 '^VERSION' server.py)"
 
-echo "== Copying server.py to the QNAP"
-scp server.py "$QNAP:$QDIR/server.py"
+echo "== Copying the dashboard files to the QNAP"
+# server.py and the guide fetcher it calls (sd_guide.py) always go; recording_agent.py only if the QNAP keeps a copy,
+# because the dashboard imports a few helpers from it.
+scp server.py sd_guide.py "$QNAP:$QDIR/"
+if ssh "$QNAP" "[ -f $QDIR/recording_agent.py ]"; then
+  scp recording_agent.py "$QNAP:$QDIR/recording_agent.py"
+fi
 
 echo "== Restarting the dashboard on the QNAP"
 # start_epg_server.sh stops the old server, starts the new one detached and checks it answers.

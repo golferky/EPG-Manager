@@ -3,7 +3,7 @@
 import functools
 import html as _html
 import unicodedata
-import faulthandler, hmac, json, os, re, shutil, signal, sqlite3, subprocess, threading, time, uuid
+import faulthandler, hashlib, hmac, json, os, re, secrets, shutil, signal, sqlite3, subprocess, threading, time, uuid
 from bisect import bisect_left
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117c"
+VERSION = "v20261117d"
 
 app = Flask(__name__)
 
@@ -400,6 +400,21 @@ def _is_non_english_channel(name, language=''):
     return bool(_is_foreign_recording_feed(text) or _NON_LATIN_SCRIPT.search(text) or _FOREIGN_NETWORKS.search(text))
 
 
+_ADULT_CHANNELS = re.compile(
+    r'(?:brazzers|playboy|penthouse|hustler|dorcel|private (?:spice|tv|gold)|red ?light|\bxxx\b|erotic|eroxx|sextreme|'
+    r'vivid tv|naughty america|hot ?choice|spice (?:ultra|xtra|live)|adult time|babes tv|red ?hot)', re.I)
+
+
+def _is_adult_channel(name):
+    """Whether a guide channel is clearly an adult-content channel (by name; "Adult Swim" is not one)."""
+    return bool(_ADULT_CHANNELS.search(name or ''))
+
+
+def _is_adult_programme(category):
+    """Gracenote tags adult programmes with the genre "Adults only"."""
+    return 'adults only' in str(category or '').lower()
+
+
 def _is_automatic_recording_quarantined_channel(name):
     """Keep verified guide/stream mismatches out of unattended recordings.
 
@@ -409,7 +424,7 @@ def _is_automatic_recording_quarantined_channel(name):
     so an explicitly requested one-off recording can still be made.
     """
     normalized = re.sub(r'[^a-z0-9]+', '', (name or '').lower())
-    return normalized.startswith('tastemade')
+    return normalized.startswith('tastemade') or _is_adult_channel(name)     # adult channels are never booked by automation
 
 
 def _is_bad_channel(cfg, channel_id, channel_name):
@@ -3059,6 +3074,132 @@ def api_eaglecast_switch():
                     'days_left': round((expiry - time.time()) / 86400, 1) if expiry else None})
 
 
+# ── Adult-content lock ──────────────────────────────────────────────────────
+# Adult channels are hidden by default.  If an adult password has been set, they can only be shown to a browser
+# session that has entered it: the server checks a short-lived token on every guide and search request, so a
+# changed page cannot skip the lock.  Only a salted hash of the password is ever stored.
+ADULT_TOKEN_SECONDS = 2 * 3600
+ADULT_MAX_FAILURES = 5
+ADULT_LOCKOUT_SECONDS = 300
+_adult_tokens = {}                                  # token -> expiry (seconds)
+_adult_failures = {'count': 0, 'first': 0.0, 'locked_until': 0.0}
+_adult_lock = threading.Lock()
+
+
+def _hash_password(password, salt_hex=None):
+    salt_hex = salt_hex or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac('sha256', str(password).encode('utf-8'), bytes.fromhex(salt_hex), 200000).hex()
+    return f'{salt_hex}${digest}'
+
+
+def _password_matches(password, stored):
+    try:
+        salt_hex, _digest = str(stored).split('$', 1)
+        return hmac.compare_digest(_hash_password(password, salt_hex), str(stored))
+    except Exception:
+        return False
+
+
+def _adult_password_set():
+    return bool(load_config().get('adult_password_hash'))
+
+
+def _adult_token_valid(token):
+    now = time.time()
+    with _adult_lock:
+        for key in [k for k, expiry in _adult_tokens.items() if expiry <= now]:
+            del _adult_tokens[key]
+        if token and token in _adult_tokens:
+            _adult_tokens[token] = now + ADULT_TOKEN_SECONDS            # sliding: use keeps it open
+            return True
+    return False
+
+
+def _adult_may_be_shown():
+    """True when this request is allowed to see adult content (no password set, or a valid unlock token)."""
+    return (not _adult_password_set()) or _adult_token_valid(request.headers.get('X-Adult-Token', ''))
+
+
+def _hide_adult_for_request():
+    """Adult content is hidden unless the page asked to show it AND the lock allows it."""
+    wants_it_shown = request.args.get('hide_adult', '1') == '0'
+    return not (wants_it_shown and _adult_may_be_shown())
+
+
+def _adult_attempt_blocked():
+    with _adult_lock:
+        return _adult_failures['locked_until'] > time.time()
+
+
+def _adult_record_failure():
+    now = time.time()
+    with _adult_lock:
+        if now - _adult_failures['first'] > ADULT_LOCKOUT_SECONDS:
+            _adult_failures.update({'count': 0, 'first': now})
+        _adult_failures['count'] += 1
+        if _adult_failures['count'] >= ADULT_MAX_FAILURES:
+            _adult_failures['locked_until'] = now + ADULT_LOCKOUT_SECONDS
+            _adult_failures.update({'count': 0, 'first': 0.0})
+
+
+@app.route('/epg-web/api/adult', methods=['GET'])
+def api_adult_status():
+    return jsonify({'password_set': _adult_password_set(),
+                    'unlocked': _adult_password_set() and _adult_token_valid(request.headers.get('X-Adult-Token', ''))})
+
+
+@app.route('/epg-web/api/adult/unlock', methods=['POST'])
+def api_adult_unlock():
+    if _adult_attempt_blocked():
+        return jsonify({'ok': False, 'error': 'Too many wrong tries. Wait a few minutes and try again.'}), 429
+    stored = load_config().get('adult_password_hash', '')
+    if not stored:
+        return jsonify({'ok': True, 'token': '', 'seconds': 0})                 # nothing to unlock
+    if not _password_matches((request.json or {}).get('password', ''), stored):
+        _adult_record_failure()
+        return jsonify({'ok': False, 'error': 'Wrong password.'}), 403
+    token = secrets.token_urlsafe(24)
+    with _adult_lock:
+        _adult_tokens[token] = time.time() + ADULT_TOKEN_SECONDS
+    return jsonify({'ok': True, 'token': token, 'seconds': ADULT_TOKEN_SECONDS})
+
+
+@app.route('/epg-web/api/adult/lock', methods=['POST'])
+def api_adult_lock():
+    with _adult_lock:
+        _adult_tokens.pop(request.headers.get('X-Adult-Token', ''), None)
+    return jsonify({'ok': True})
+
+
+@app.route('/epg-web/api/adult/password', methods=['POST'])
+def api_adult_password():
+    """Set, change or remove the adult password.  Changing or removing needs the current one."""
+    body = request.json or {}
+    cfg = load_config()
+    stored = cfg.get('adult_password_hash', '')
+    if stored:
+        if _adult_attempt_blocked():
+            return jsonify({'ok': False, 'error': 'Too many wrong tries. Wait a few minutes and try again.'}), 429
+        if not _password_matches(body.get('current', ''), stored):
+            _adult_record_failure()
+            return jsonify({'ok': False, 'error': 'The current password is wrong.'}), 403
+    new = str(body.get('new', ''))
+    if new == '':
+        if not stored:
+            return jsonify({'ok': False, 'error': 'Choose a password.'}), 400
+        cfg.pop('adult_password_hash', None)                                       # remove the protection
+        with _adult_lock:
+            _adult_tokens.clear()
+    else:
+        if len(new) < 4:
+            return jsonify({'ok': False, 'error': 'Use at least 4 characters.'}), 400
+        cfg['adult_password_hash'] = _hash_password(new)
+        with _adult_lock:
+            _adult_tokens.clear()                                                  # everyone must unlock again
+    save_config(cfg)
+    return jsonify({'ok': True, 'password_set': bool(cfg.get('adult_password_hash'))})
+
+
 # How many days before an account ends the dashboard starts reminding.  Schedules Direct opens renewal
 # 45 days ahead and does not bill by itself, so 30 days leaves time; Eaglecast is a short subscription.
 REMINDER_WINDOWS = {'schedules_direct': ('Schedules Direct', 30), 'eaglecast': ('Eaglecast', 7)}
@@ -3444,6 +3585,7 @@ def api_guide():
     sd_only    = request.args.get('sd',  '0') == '1'
     hide_sd_duplicates = request.args.get('hide_sd', '1') != '0'
     hide_foreign = request.args.get('hide_foreign', '0') == '1'
+    hide_adult = _hide_adult_for_request()
     ps_only = ps_only or ps_episode_only
 
     # Build allowed channel set from Movies.db if filtering
@@ -3612,6 +3754,14 @@ def api_guide():
             ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in foreign_ids]
             progs_in_window = [p for p in progs_in_window if p['channel_id'] not in foreign_ids]
 
+    # Hide adult drops adult channels, and any programme tagged "Adults only" on other channels.
+    if hide_adult:
+        adult_ids = {c['id'] for c in ordered_channels_raw if _is_adult_channel(c.get('name', ''))}
+        if adult_ids:
+            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in adult_ids]
+        progs_in_window = [p for p in progs_in_window
+                           if p['channel_id'] not in adult_ids and not _is_adult_programme(p.get('category'))]
+
     # Keep just one quality-labelled duplicate (plain/HD/SD) while preserving
     # distinct geographic variants such as East, West, and Pacific.
     if hide_sd_duplicates and not sd_only:
@@ -3643,6 +3793,8 @@ def api_guide():
         for c in _epg['channels']:
             if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
                 if hide_foreign and _is_non_english_channel(c.get('name', ''), c.get('language', '')):
+                    continue
+                if hide_adult and _is_adult_channel(c.get('name', '')):
                     continue
                 if not ch_filter or ch_filter in c['name'].lower():
                     ordered_channels_raw.append(dict(c, no_data=True))
@@ -3925,6 +4077,10 @@ def api_search():
         conn.close()
     except Exception as e:
         print(f'[search] {e}')
+    if _hide_adult_for_request():
+        results['channels'] = [c for c in results['channels'] if not _is_adult_channel(c.get('name', ''))]
+        results['programs'] = [p for p in results['programs']
+                               if not _is_adult_channel(p.get('channel_name', '')) and not _is_adult_programme(p.get('category'))]
     return jsonify(results)
 
 @app.route('/epg-web/api/sports-teams')
@@ -9285,6 +9441,7 @@ nav{background:#111;border-bottom:1px solid #1e1e1e;padding:0 20px;
 .guide-toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;}
 .guide-toolbar input{background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;
   color:#e2e8f0;padding:6px 10px;font-size:13px;width:220px;}
+.guide-toolbar input[type=checkbox]{width:auto;padding:0;margin:0;flex:none;}
 .guide-wrap{overflow:auto;max-height:calc(100vh - 180px);border:1px solid #1e1e1e;
             border-radius:8px;}
 .guide-grid{display:grid;min-width:max-content;}
@@ -9536,6 +9693,10 @@ tr:hover td{background:#141414;}
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide channels that are clearly not in English (Spanish, French, Filipino and so on)">
       <input id="hide-foreign" type="checkbox" checked onchange="localStorage.setItem('epg_hide_foreign',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide non-English
     </label>
+    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide adult channels and programmes. If a password is set, showing them asks for it.">
+      <input id="hide-adult" type="checkbox" checked onchange="onAdultToggle(this)"> Hide adult
+    </label>
+    <button id="adult-lock-btn" class="btn btn-ghost btn-sm" onclick="showAdultModal('set')" title="Set, change or remove the adult password" style="padding:2px 7px;">🔒</button>
     <div style="position:relative;display:inline-block;">
       <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value);updateSearchClear()" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;padding-right:30px;">
       <button id="ch-filter-clear" type="button" onclick="clearSearch()" aria-label="Clear search" title="Clear search" style="display:none;position:absolute;right:5px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:#94a3b8;font-size:19px;line-height:1;cursor:pointer;padding:1px 4px;">×</button>
@@ -9602,6 +9763,21 @@ tr:hover td{background:#141414;}
       <button class="btn btn-primary btn-sm" onclick="addFavoriteTeam()">Add</button>
     </div>
     <div style="display:flex;justify-content:flex-end;margin-top:18px;"><button class="btn btn-ghost btn-sm" onclick="closeFavoriteTeams()">Done</button></div>
+  </div>
+</div>
+<div id="adult-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:2000;align-items:center;justify-content:center;">
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:20px 22px;width:340px;max-width:92vw;color:#e2e8f0;">
+    <div id="adult-modal-title" style="font-weight:700;margin-bottom:6px;">Adult content</div>
+    <div id="adult-modal-help" style="font-size:12px;color:#94a3b8;margin-bottom:12px;"></div>
+    <input id="adult-pw-current" type="password" autocomplete="off" placeholder="Current password" style="display:none;width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;">
+    <input id="adult-pw-main" type="password" autocomplete="off" placeholder="Password" style="width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;" onkeydown="if(event.key==='Enter')submitAdultModal()">
+    <input id="adult-pw-confirm" type="password" autocomplete="off" placeholder="Type it again" style="display:none;width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;" onkeydown="if(event.key==='Enter')submitAdultModal()">
+    <div id="adult-modal-msg" style="font-size:12px;min-height:16px;margin-bottom:10px;color:#f87171;"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn btn-ghost btn-sm" id="adult-remove-btn" style="display:none;margin-right:auto;" onclick="removeAdultPassword()">Remove password</button>
+      <button class="btn btn-ghost btn-sm" onclick="closeAdultModal()">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="submitAdultModal()">OK</button>
+    </div>
   </div>
 </div>
 <div id="prog-modal-overlay" onclick="if(event.target===this)closeProg()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center;">
@@ -10078,6 +10254,8 @@ async function autoLoad() {
   if (hideSd) hideSd.checked = localStorage.getItem('epg_hide_sd_duplicates') !== '0';
   const hideForeign = document.getElementById('hide-foreign');
   if (hideForeign) hideForeign.checked = localStorage.getItem('epg_hide_foreign') !== '0';   // on unless you switched it off
+  const hideAdult = document.getElementById('hide-adult');
+  if (hideAdult) hideAdult.checked = localStorage.getItem('epg_hide_adult') !== '0';   // on unless you unlocked it
   renderFavoriteTeams();
 })();
 autoLoad();
@@ -10438,7 +10616,7 @@ function onSearchInput(val) {
   _searchTimer = setTimeout(async () => {
     let d;
     try {
-      const r = await fetch('/epg-web/api/search?q=' + encodeURIComponent(val));
+      const r = await fetch('/epg-web/api/search?q=' + encodeURIComponent(val) + adultQuery(), {headers: adultHeaders()});
       d = await r.json();
     } catch (e) {
       if (seq === _searchSeq) dd.innerHTML = '<div style="padding:12px 14px;color:#f87171;font-size:13px;">Search could not finish. Please try again.</div>';
@@ -10548,12 +10726,12 @@ async function searchOpenProg(title, episodeTitle, seasonNum, episodeNum) {
   // Strip year suffix e.g. "Minority Report (2002)" → "Minority Report"
   const baseTitle = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
   // Build query — include episode title if available
-  let url = '/epg-web/api/search?q=' + encodeURIComponent(baseTitle);
+  let url = '/epg-web/api/search?q=' + encodeURIComponent(baseTitle) + adultQuery();
   if (episodeTitle) url += '&episode=' + encodeURIComponent(episodeTitle);
   if (seasonNum)    url += '&season='  + encodeURIComponent(seasonNum);
   if (episodeNum)   url += '&ep='      + encodeURIComponent(episodeNum);
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, {headers: adultHeaders()});
     const d = await r.json();
     const progs = (d.programs || []).filter(p => p.start_ts && p.stop_ts);
     if (progs.length) {
@@ -10866,6 +11044,108 @@ function dismissReminders() {
   document.getElementById('reminder-bar').style.display = 'none';
 }
 document.addEventListener('DOMContentLoaded', loadReminders);
+
+// Adult-content lock.  The server decides; this only collects the password and carries the token it hands back.
+let _adultMode = 'unlock';
+function adultToken() { return sessionStorage.getItem('epg_adult_token') || ''; }
+function adultHeaders() { const t = adultToken(); return t ? {'X-Adult-Token': t} : {}; }
+function adultQuery() { return document.getElementById('hide-adult').checked ? '' : '&hide_adult=0'; }
+async function onAdultToggle(box) {
+  if (box.checked) {                                   // hide again: forget the unlock
+    try { await fetch('/epg-web/api/adult/lock', {method: 'POST', headers: adultHeaders()}); } catch (e) {}
+    sessionStorage.removeItem('epg_adult_token');
+    localStorage.setItem('epg_hide_adult', '1');
+    fetchAndRenderGuide();
+    return;
+  }
+  let st = {password_set: false, unlocked: false};
+  try { st = await (await fetch('/epg-web/api/adult', {headers: adultHeaders()})).json(); } catch (e) {}
+  if (!st.password_set || st.unlocked) {
+    localStorage.setItem('epg_hide_adult', '0');
+    fetchAndRenderGuide();
+    return;
+  }
+  box.checked = true;                                  // stay hidden until the password is right
+  showAdultModal('unlock');
+}
+function showAdultModal(mode) {
+  _adultMode = mode;
+  const has = (id) => document.getElementById(id);
+  has('adult-modal-msg').textContent = '';
+  ['adult-pw-current', 'adult-pw-main', 'adult-pw-confirm'].forEach(id => { has(id).value = ''; });
+  has('adult-pw-current').style.display = 'none';
+  has('adult-pw-confirm').style.display = 'none';
+  has('adult-remove-btn').style.display = 'none';
+  if (mode === 'unlock') {
+    has('adult-modal-title').textContent = 'Show adult content';
+    has('adult-modal-help').textContent = 'Enter the adult password. It stays unlocked in this browser tab until you tick Hide adult or close the tab.';
+    has('adult-pw-main').placeholder = 'Password';
+    has('adult-modal').style.display = 'flex';
+    has('adult-pw-main').focus();
+    return;
+  }
+  fetch('/epg-web/api/adult', {headers: adultHeaders()}).then(r => r.json()).then(st => {
+    const set = !!st.password_set;
+    has('adult-modal-title').textContent = set ? 'Change the adult password' : 'Set an adult password';
+    has('adult-modal-help').textContent = set
+      ? 'Enter the current password and a new one.'
+      : 'With a password set, adult content cannot be shown without it. Use at least 4 characters.';
+    has('adult-pw-main').placeholder = 'New password';
+    has('adult-pw-confirm').style.display = '';
+    has('adult-pw-current').style.display = set ? '' : 'none';
+    has('adult-remove-btn').style.display = set ? '' : 'none';
+    has('adult-modal').style.display = 'flex';
+    (set ? has('adult-pw-current') : has('adult-pw-main')).focus();
+  });
+}
+function closeAdultModal() {
+  document.getElementById('adult-modal').style.display = 'none';
+  ['adult-pw-current', 'adult-pw-main', 'adult-pw-confirm'].forEach(id => { document.getElementById(id).value = ''; });
+}
+async function adultPost(path, body) {
+  const r = await fetch('/epg-web/api/adult' + path, {method: 'POST', headers: Object.assign({'Content-Type': 'application/json'}, adultHeaders()), body: JSON.stringify(body)});
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  return d;
+}
+async function submitAdultModal() {
+  const msg = document.getElementById('adult-modal-msg');
+  const main = document.getElementById('adult-pw-main').value;
+  if (_adultMode === 'unlock') {
+    const d = await adultPost('/unlock', {password: main});
+    if (!d.ok) { msg.textContent = d.error || 'That did not work.'; return; }
+    if (d.token) sessionStorage.setItem('epg_adult_token', d.token);
+    document.getElementById('hide-adult').checked = false;
+    localStorage.setItem('epg_hide_adult', '0');
+    closeAdultModal();
+    fetchAndRenderGuide();
+    return;
+  }
+  if (main !== document.getElementById('adult-pw-confirm').value) { msg.textContent = 'The two passwords do not match.'; return; }
+  const d = await adultPost('/password', {current: document.getElementById('adult-pw-current').value, new: main});
+  if (!d.ok) { msg.textContent = d.error || 'That did not work.'; return; }
+  sessionStorage.removeItem('epg_adult_token');
+  document.getElementById('hide-adult').checked = true;
+  localStorage.setItem('epg_hide_adult', '1');
+  closeAdultModal();
+  fetchAndRenderGuide();
+}
+async function removeAdultPassword() {
+  const msg = document.getElementById('adult-modal-msg');
+  const d = await adultPost('/password', {current: document.getElementById('adult-pw-current').value, new: ''});
+  if (!d.ok) { msg.textContent = d.error || 'Enter the current password first.'; return; }
+  sessionStorage.removeItem('epg_adult_token');
+  closeAdultModal();
+}
+(async function initAdultSwitch() {                    // a password is set and this tab has not unlocked it: stay hidden
+  try {
+    const st = await (await fetch('/epg-web/api/adult', {headers: adultHeaders()})).json();
+    if (st.password_set && !st.unlocked) {
+      document.getElementById('hide-adult').checked = true;
+      localStorage.setItem('epg_hide_adult', '1');
+    }
+  } catch (e) {}
+})();
 setInterval(loadReminders, 30 * 60 * 1000);
 updatePlayerPrefBtn();
 
@@ -10997,12 +11277,13 @@ async function fetchAndRenderGuide() {
   if (content !== 'all') params.set('content', content);
   if (!document.getElementById('hide-sd-duplicates').checked) params.set('hide_sd', '0');
   if (document.getElementById('hide-foreign').checked) params.set('hide_foreign', '1');
+  if (!document.getElementById('hide-adult').checked) params.set('hide_adult', '0');
   params.set('ch_offset', _chOffset);
   try {
     // Draw the guide as soon as its own response arrives.  Plex badges and
     // recording dots are useful extras, but a NAS lookup must never hold the
     // visible programme grid hostage.
-    const r = await fetch('/epg-web/api/guide?' + params);
+    const r = await fetch('/epg-web/api/guide?' + params, {headers: adultHeaders()});
     const d = await r.json();
     if (d.error) { setGS(d.error,'err'); return; }
     if (requestId !== _guideFetchId) return;
