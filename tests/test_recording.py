@@ -4110,3 +4110,62 @@ class AdultLockTests(unittest.TestCase):
         self.assertIn("function onAdultToggle", html)
         self.assertIn("type=\"password\"", html)
         self.assertIn(".guide-toolbar input[type=checkbox]{width:auto", html)                    # label sits next to its box
+
+
+class ProviderEpgProbeTests(unittest.TestCase):
+    def test_probe_decodes_every_field_and_never_exposes_the_login(self):
+        import base64, json as _json
+        guide_db_dir = tempfile.TemporaryDirectory()
+        guide_db = os.path.join(guide_db_dir.name, "guide.db")
+        server.ensure_guide_db(guide_db)
+        conn = sqlite3.connect(guide_db)
+        conn.execute("INSERT INTO provider_stream_authority(provider,stream_id,epg_channel_id,provider_name,checked_at) "
+                     "VALUES ('primestreams','777','antenna.us','ANTENNA TV',0)")
+        conn.commit(); conn.close()
+        enc = lambda text: base64.b64encode(text.encode()).decode()
+        item = {"id": "1", "title": enc("Sanford and Son"), "description": enc("Fred fakes a heart attack."),
+                "start_timestamp": 1800000000, "stop_timestamp": 1800001800, "season": "2", "episode_num": "16"}
+
+        class Reply:
+            def read(self):
+                return _json.dumps({"epg_listings": [item]}).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        seen = []
+
+        def fake_urlopen(req, timeout=0):
+            seen.append(req.full_url)
+            return Reply()
+        cfg = {"epg_url": "http://provider.example", "epg_user": "USERNAME1", "epg_pass": "PASSWORD1"}
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch.object(server, "_guide_db_path", return_value=guide_db), \
+                mock.patch("urllib.request.urlopen", fake_urlopen):
+            data = server.app.test_client().get("/epg-web/api/provider-epg-probe?name=antenna").get_json()
+            bad = server.app.test_client().get("/epg-web/api/provider-epg-probe?name=a")
+        guide_db_dir.cleanup()
+        row = data["results"][0]
+        self.assertEqual((row["stream_id"], row["provider_name"]), ("777", "ANTENNA TV"))
+        self.assertEqual(row["items"][0]["title"], "Sanford and Son")
+        self.assertEqual(row["items"][0]["episode_num"], "16")                 # unknown extra fields are passed through
+        self.assertIn("episode_num", row["keys"])
+        self.assertIn("get_short_epg", seen[0])
+        text = str(data)
+        self.assertNotIn("USERNAME1", text)
+        self.assertNotIn("PASSWORD1", text)
+        self.assertNotIn("provider.example", text)
+        self.assertEqual(bad.status_code, 400)
+
+    def test_probe_errors_do_not_leak_the_address(self):
+        guide_db_dir = tempfile.TemporaryDirectory()
+        cfg = {"epg_url": "http://provider.example", "epg_user": "USERNAME1", "epg_pass": "PASSWORD1"}
+
+        def boom(req, timeout=0):
+            raise OSError("failed for " + req.full_url)
+        with mock.patch.object(server, "load_config", lambda: cfg), \
+                mock.patch("urllib.request.urlopen", boom):
+            data = server.app.test_client().get("/epg-web/api/provider-epg-probe?stream_id=777").get_json()
+        guide_db_dir.cleanup()
+        self.assertEqual(data["results"][0]["error"], "OSError")
+        self.assertNotIn("PASSWORD1", str(data))
