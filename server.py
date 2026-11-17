@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117a"
+VERSION = "v20261117b"
 
 app = Flask(__name__)
 
@@ -378,6 +378,26 @@ def _is_foreign_recording_feed(name):
         r'urdu|chinese|mandarin|cantonese|korean|japanese|vietnamese|'
         r'tagalog|filipino|russian|polish|greek|turkish)\b',
         name or '', re.I))
+
+
+_NON_LATIN_SCRIPT = re.compile(r'[\u0400-\u06ff\u0750-\u077f\u0900-\u0dff\u0e00-\u0eff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]')
+_FOREIGN_NETWORKS = re.compile(
+    r'(?:telemundo|univision|unimas|unim\u00e1s|galavision|azteca|abs-?cbn|tv globo|record tv|zee tv|cctv)', re.I)
+
+
+def _is_non_english_channel(name, language=''):
+    """Whether a guide channel is clearly non-English, for the guide's Hide non-English switch.
+
+    Uses the language Schedules Direct gives the station when we have it (a station whose languages
+    do not include English), then the language labels the recording rule already uses, writing that is
+    not Latin script, and a short list of well-known foreign-language networks.  It judges the channel,
+    not each programme, so a Spanish show on an English channel is still shown.
+    """
+    languages = [part.strip().lower() for part in str(language or '').split(',') if part.strip()]
+    if languages and 'en' not in languages:
+        return True
+    text = name or ''
+    return bool(_is_foreign_recording_feed(text) or _NON_LATIN_SCRIPT.search(text) or _FOREIGN_NETWORKS.search(text))
 
 
 def _is_automatic_recording_quarantined_channel(name):
@@ -1061,6 +1081,12 @@ def ensure_guide_db(db_path):
         )
     ''')
     conn.execute('''
+        CREATE TABLE IF NOT EXISTS channel_languages (
+            channel_id TEXT PRIMARY KEY,
+            language TEXT
+        )
+    ''')
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS channel_favorites (
             channel_id TEXT PRIMARY KEY,
             favorite INTEGER NOT NULL DEFAULT 1
@@ -1322,9 +1348,13 @@ def load_epg_from_db(db_path, tz_str='America/New_York', *,
 
     channels = []
     channel_map = {}
+    try:
+        languages = {r[0]: r[1] or '' for r in conn.execute('SELECT channel_id, language FROM channel_languages')}
+    except sqlite3.Error:
+        languages = {}
     for row in conn.execute('SELECT channel_id, channel_name, icon FROM guide_channels ORDER BY channel_name'):
         cid, name, icon = row['channel_id'], row['channel_name'], row['icon'] or ''
-        channels.append({'id': cid, 'name': name, 'icon': icon})
+        channels.append({'id': cid, 'name': name, 'icon': icon, 'language': languages.get(cid, '')})
         channel_map[cid] = name
 
     has_year = any(r[1] == 'year' for r in conn.execute('PRAGMA table_info(guide)'))
@@ -3413,6 +3443,7 @@ def api_guide():
     ps_episode_only = request.args.get('ps_episode', '0') == '1'
     sd_only    = request.args.get('sd',  '0') == '1'
     hide_sd_duplicates = request.args.get('hide_sd', '1') != '0'
+    hide_foreign = request.args.get('hide_foreign', '0') == '1'
     ps_only = ps_only or ps_episode_only
 
     # Build allowed channel set from Movies.db if filtering
@@ -3573,6 +3604,14 @@ def api_guide():
     elif ch_filter:
         ordered_channels_raw = [c for c in ordered_channels_raw if ch_filter in c['name'].lower()]
 
+    # The Hide non-English switch drops clearly non-English channels and everything on them.
+    if hide_foreign:
+        foreign_ids = {c['id'] for c in ordered_channels_raw
+                       if _is_non_english_channel(c.get('name', ''), c.get('language', ''))}
+        if foreign_ids:
+            ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] not in foreign_ids]
+            progs_in_window = [p for p in progs_in_window if p['channel_id'] not in foreign_ids]
+
     # Keep just one quality-labelled duplicate (plain/HD/SD) while preserving
     # distinct geographic variants such as East, West, and Pacific.
     if hide_sd_duplicates and not sd_only:
@@ -3603,6 +3642,8 @@ def api_guide():
         present_ids = {c['id'] for c in ordered_channels_raw}
         for c in _epg['channels']:
             if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
+                if hide_foreign and _is_non_english_channel(c.get('name', ''), c.get('language', '')):
+                    continue
                 if not ch_filter or ch_filter in c['name'].lower():
                     ordered_channels_raw.append(dict(c, no_data=True))
 
@@ -9492,6 +9533,9 @@ tr:hover td{background:#141414;}
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide redundant SD/HD channel-name duplicates; East, West, and Pacific stay visible">
       <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide quality duplicates
     </label>
+    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide channels that are clearly not in English (Spanish, French, Filipino and so on)">
+      <input id="hide-foreign" type="checkbox" onchange="localStorage.setItem('epg_hide_foreign',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide non-English
+    </label>
     <div style="position:relative;display:inline-block;">
       <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value);updateSearchClear()" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;padding-right:30px;">
       <button id="ch-filter-clear" type="button" onclick="clearSearch()" aria-label="Clear search" title="Clear search" style="display:none;position:absolute;right:5px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:#94a3b8;font-size:19px;line-height:1;cursor:pointer;padding:1px 4px;">×</button>
@@ -10032,6 +10076,8 @@ async function autoLoad() {
   if (savedContent) { const el = document.getElementById('guide-content-filter'); if (el) el.value = savedContent; }
   const hideSd = document.getElementById('hide-sd-duplicates');
   if (hideSd) hideSd.checked = localStorage.getItem('epg_hide_sd_duplicates') !== '0';
+  const hideForeign = document.getElementById('hide-foreign');
+  if (hideForeign) hideForeign.checked = localStorage.getItem('epg_hide_foreign') === '1';
   renderFavoriteTeams();
 })();
 autoLoad();
@@ -10950,6 +10996,7 @@ async function fetchAndRenderGuide() {
   if (mode === 'sd')    params.set('sd',    '1');
   if (content !== 'all') params.set('content', content);
   if (!document.getElementById('hide-sd-duplicates').checked) params.set('hide_sd', '0');
+  if (document.getElementById('hide-foreign').checked) params.set('hide_foreign', '1');
   params.set('ch_offset', _chOffset);
   try {
     // Draw the guide as soon as its own response arrives.  Plex badges and

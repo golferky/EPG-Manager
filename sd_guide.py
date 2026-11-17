@@ -232,6 +232,7 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
                 station_map[sid] = {
                     'name': name,
                     'icon': icon,
+                    'language': ','.join(str(x) for x in (st.get('broadcastLanguage') or [])),
                 }
                 ch_num = mapping.get('channel', '')
                 channel_map[sid] = f'{ch_num} {name}'.strip()
@@ -241,11 +242,14 @@ def fetch_sd_guide(username, password, db_path, days=14, log=print):
     # 3. Upsert channels into guide.db
     conn = sqlite3.connect(db_path, timeout=120)  # wait for other writers instead of failing
     conn.execute('PRAGMA busy_timeout=120000')
+    conn.execute('CREATE TABLE IF NOT EXISTS channel_languages (channel_id TEXT PRIMARY KEY, language TEXT)')
     for sid, info in station_map.items():
         conn.execute(
             'INSERT OR REPLACE INTO guide_channels(channel_id, channel_name, icon) VALUES (?,?,?)',
             (sid, info['name'], info['icon'])
         )
+        conn.execute('INSERT OR REPLACE INTO channel_languages(channel_id, language) VALUES (?,?)',
+                     (sid, info.get('language', '')))
     conn.commit()
 
     # 4. Build date list
