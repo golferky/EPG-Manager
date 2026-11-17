@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117i"
+VERSION = "v20261117j"
 
 app = Flask(__name__)
 
@@ -7870,6 +7870,11 @@ def api_airings():
                 guess = _guess_episode(episodes, a.get('desc'))
                 if guess:
                     a['episode_guess'] = guess
+                if request.args.get('debug_guess') == '1' and a.get('desc'):          # read-only aid for tuning the matcher
+                    a['guess_debug'] = {'desc': a['desc'], 'nearest': [
+                        {'season': int(ep['season']), 'number': int(ep['number']), 'name': ep.get('name') or '',
+                         'score': round(float(score), 2)}
+                        for score, ep in _episode_match.top_candidates(a['desc'], episodes, 3)]}
     for a in airings:
         a.pop('desc', None)
 
