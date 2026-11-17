@@ -4297,6 +4297,21 @@ class GuideEpisodeGuessTests(unittest.TestCase):
         self.assertFalse(data["guess_pending"])
         self.assertNotIn("desc", first)
 
+    def test_debug_mode_shows_the_description_and_the_nearest_episodes_with_scores(self):
+        self._seed(self.EPISODES)
+        conn = sqlite3.connect(self.guide_db)
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,prog_type) VALUES (?,?,?,?,?,?,?)",
+                     (self.SHOW, "ant", "ANTENNA TV", "20990830120000", "20990830123000", "A completely unrelated story about a tuba.", ""))
+        conn.commit(); conn.close()
+        plain = server.app.test_client().get("/epg-web/api/airings?title=" + self.SHOW.replace(" ", "+")).get_json()
+        self.assertNotIn("guess_debug", plain["airings"][0])                          # off unless asked for
+        data = server.app.test_client().get("/epg-web/api/airings?debug_guess=1&title=" + self.SHOW.replace(" ", "+")).get_json()
+        debug = data["airings"][0]["guess_debug"]
+        self.assertEqual(debug["desc"], "A completely unrelated story about a tuba.")
+        self.assertEqual(len(debug["nearest"]), 3)
+        self.assertEqual(set(debug["nearest"][0]), {"season", "number", "name", "score"})
+        self.assertNotIn("episode_guess", data["airings"][0])                         # too poor to show, yet visible here
+
     def test_while_the_episode_list_is_fetched_the_window_is_told_to_ask_again(self):
         with mock.patch.object(server, "_warm_series") as warm:
             data = self._airings(["Jeannie writes a book."])
