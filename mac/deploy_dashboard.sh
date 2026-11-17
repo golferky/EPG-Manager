@@ -14,12 +14,17 @@ QDIR="${EPG_QNAP_DIR:-/share/CACHEDEV1_DATA/EPG-Manager}"
 cd "$REPO"
 echo "== Pulling the latest code"
 git pull
+# The pull can replace THIS script.  Run again from the top once, so the new version is the one that copies the files.
+if [ -z "$EPG_DEPLOY_RERUN" ]; then
+  export EPG_DEPLOY_RERUN=1
+  exec "$0" "$@"
+fi
 echo "== Local version:  $(grep -m1 '^VERSION' server.py)"
 
 echo "== Copying the dashboard files to the QNAP"
-# server.py and the guide fetcher it calls (sd_guide.py) always go; recording_agent.py only if the QNAP keeps a copy,
+# server.py, the guide fetcher it calls (sd_guide.py) and the episode matcher it imports (episode_match.py) always go; recording_agent.py only if the QNAP keeps a copy,
 # because the dashboard imports a few helpers from it.
-scp server.py sd_guide.py "$QNAP:$QDIR/"
+scp server.py sd_guide.py episode_match.py "$QNAP:$QDIR/"
 if ssh "$QNAP" "[ -f $QDIR/recording_agent.py ]"; then
   scp recording_agent.py "$QNAP:$QDIR/recording_agent.py"
 fi

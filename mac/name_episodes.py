@@ -34,76 +34,12 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from episode_match import (CONFIDENT_MARGIN, CONFIDENT_SCORE, STOP_WORDS, clean_summary, episode_texts,  # noqa: E402,F401
+                           merge_episodes, pick, rank_episodes, similarity, title_key, top_candidates,
+                           word_weights, words)
+
 NAME_TIME = re.compile(r' - (\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})\.\w+$')
-STOP_WORDS = set('a an and the of to in on at for with his her their he she it is are was be by as that this '
-                 'from but or who when while after before into out up down over'.split())
-CONFIDENT_SCORE = 0.5       # share of the plot line's telling words found in the episode summary
-CONFIDENT_MARGIN = 0.15     # how much better than the second-best episode
 PARTIAL_RATIO = 0.85        # smaller than this share of the typical file size = a partial
-
-
-def words(text):
-    found = re.findall(r"[a-z0-9']+", str(text or '').lower())
-    return [w.strip("'") for w in found if w.strip("'") not in STOP_WORDS and len(w.strip("'")) > 1]
-
-
-def clean_summary(text):
-    return html.unescape(re.sub(r'<[^>]+>', ' ', str(text or ''))).strip()
-
-
-_IDF_CACHE = {}
-
-
-def word_weights(episodes):
-    """How telling each word is: one that is in every summary ("Tony", "Jeannie") counts for little."""
-    key = id(episodes)
-    if key in _IDF_CACHE and _IDF_CACHE[key][0] is episodes:
-        return _IDF_CACHE[key][1]
-    docs = [set(words(clean_summary(ep.get('summary')))) for ep in episodes]
-    total = len(docs) or 1
-    frequency = {}
-    for doc in docs:
-        for word in doc:
-            frequency[word] = frequency.get(word, 0) + 1
-    weights = {word: math.log((total + 1) / (count + 1)) + 0.1 for word, count in frequency.items()}
-    _IDF_CACHE[key] = (episodes, weights)
-    return weights
-
-
-def similarity(guide_text, summary, weights=None):
-    """0 to 1: how much of a short guide plot line is found in an episode summary, rare words counting most."""
-    guide_words, summary_words = set(words(guide_text)), set(words(summary))
-    if not guide_words or not summary_words:
-        return 0.0
-    weights = weights or {}
-    unseen = max(weights.values()) if weights else 1.0       # a word no summary has can only be unmatched
-    def weight(word):
-        return weights.get(word, unseen)
-    return sum(weight(w) for w in guide_words & summary_words) / sum(weight(w) for w in guide_words)
-
-
-def rank_episodes(guide_text, episodes):
-    """[(score, episode)] best first."""
-    weights = word_weights(episodes)
-    scored = [(similarity(guide_text, clean_summary(ep.get('summary')), weights), ep) for ep in episodes]
-    return sorted(scored, key=lambda pair: pair[0], reverse=True)
-
-
-def pick(guide_text, episodes, min_score=None, margin=None):
-    """(episode, score, confident) for a plot line."""
-    min_score = CONFIDENT_SCORE if min_score is None else min_score
-    margin = CONFIDENT_MARGIN if margin is None else margin
-    ranked = rank_episodes(guide_text, episodes)
-    if not ranked or ranked[0][0] <= 0:
-        return None, 0.0, False
-    best_score, best = ranked[0]
-    second = ranked[1][0] if len(ranked) > 1 else 0.0
-    return best, best_score, (best_score >= min_score and best_score - second >= margin)
-
-
-def top_candidates(plot, episodes, count=3):
-    """The closest few episodes to a plot line: [(score, episode)], best first."""
-    return rank_episodes(plot, episodes)[:max(0, count)]
 
 
 def file_start_ts(filename):
@@ -134,6 +70,31 @@ def load_tvmaze(show):
 def load_tmdb(server, show):
     """Episodes from TMDb, fetched by the dashboard (it holds the key)."""
     data = fetch_json(server.rstrip('/') + '/epg-web/api/tmdb-episodes?title=' + urllib.parse.quote(show))
+    episodes = [ep for ep in data.get('episodes', []) if ep.get('season') and ep.get('number')]
+    return str(data.get('premiered') or '')[:4], episodes
+
+
+def load_omdb(server, show, poll_seconds=5, max_minutes=30):
+    """Episodes with OMDb plots, fetched by the dashboard in the background (it holds the key)."""
+    url = server.rstrip('/') + '/epg-web/api/omdb-episodes?title=' + urllib.parse.quote(show)
+    deadline = time.time() + max_minutes * 60
+    last = None
+    while True:
+        data = fetch_json(url)
+        if data.get('error') and 'episodes' not in data:
+            raise RuntimeError(data['error'])
+        state = data.get('status')
+        if state != 'running' or time.time() > deadline:
+            break
+        progress = (data.get('done'), data.get('total'))
+        if progress != last:
+            print(f'  OMDb: fetching plots {progress[0]}/{progress[1]} ...')
+            last = progress
+        time.sleep(poll_seconds)
+    if state == 'limit':
+        print('  OMDb: its daily request limit was reached; using the plots fetched so far (run again tomorrow for the rest).')
+    elif state == 'error':
+        print(f"  OMDb: could not finish ({data.get('error') or 'error'}); using what was fetched.")
     episodes = [ep for ep in data.get('episodes', []) if ep.get('season') and ep.get('number')]
     return str(data.get('premiered') or '')[:4], episodes
 
@@ -228,6 +189,32 @@ def agree(rows_a, rows_b):
     return rows_a
 
 
+def evaluate(truth, airings, episode_sets):
+    """How often the right episode is first (and in the first three) for each wording source.
+
+    truth: {"2026-08-14_1130": (2, 15)}; episode_sets: {"tmdb": [...], "omdb": [...], "tmdb+omdb": [...]}.
+    The truth list was chosen by eye partly because TMDb already matched, so it flatters TMDb; the fairer
+    test is how many of the files still unresolved get a confident match.
+    """
+    report = {}
+    for mode, episodes in episode_sets.items():
+        top1 = top3 = counted = 0
+        misses = []
+        for stamp, key in truth.items():
+            airing = nearest_airing(airings, file_start_ts(f'x - {stamp}.mp4'))
+            if not airing:
+                continue
+            counted += 1
+            ranked = rank_episodes(airing['desc'], episodes)
+            order = [(int(ep['season']), int(ep['number'])) for score, ep in ranked[:3] if score > 0]     # a zero score is no answer
+            top1 += bool(order) and order[0] == key
+            top3 += key in order
+            if not order or order[0] != key:
+                misses.append(stamp)
+        report[mode] = {'counted': counted, 'top1': top1, 'top3': top3, 'misses': misses}
+    return report
+
+
 def target_name(show, episode):
     from recording_agent import safe_filename
     title = safe_filename(episode.get('name') or '')
@@ -241,8 +228,10 @@ def main():
     parser.add_argument('--server', default='http://192.168.1.176:5001', help='the dashboard on the QNAP')
     parser.add_argument('--config', default='~/EPG-Manager/recording_agent.json')
     parser.add_argument('--holding', default='', help='the holding folder (default: TV Needing Episode Info beside TV Shows)')
-    parser.add_argument('--source', choices=('tmdb', 'tvmaze', 'both'), default='tmdb',
-                        help='where the episode summaries come from; both = only moves files the two agree on')
+    parser.add_argument('--source', choices=('tmdb', 'tvmaze', 'both', 'omdb', 'tmdb+omdb'), default='tmdb',
+                        help='where the episode summaries come from; tmdb+omdb scores each episode by its best wording; both = only moves files the two agree on')
+    parser.add_argument('--evaluate', default='', metavar='TRUTH',
+                        help='measure each source against episodes you know, e.g. 2026-08-14_1130=S02E15,...  (changes nothing)')
     parser.add_argument('--min-score', type=float, default=CONFIDENT_SCORE, help='how well a plot line must match')
     parser.add_argument('--margin', type=float, default=CONFIDENT_MARGIN, help='how far ahead of the runner-up')
     parser.add_argument('--top', type=int, default=0, metavar='N',
@@ -252,6 +241,18 @@ def main():
     parser.add_argument('--apply', action='store_true', help='move the confident matches into Plex')
     args = parser.parse_args()
 
+    if args.evaluate:
+        airings = load_guide(args.server, args.show)
+        _year, tmdb_eps = load_tmdb(args.server, args.show)
+        _year, omdb_eps = load_omdb(args.server, args.show)
+        truth = parse_accept(args.evaluate)
+        report = evaluate(truth, airings, {'tmdb': tmdb_eps, 'omdb': omdb_eps, 'tmdb+omdb': merge_episodes(tmdb_eps, omdb_eps)})
+        print(f'\nKnown episodes checked: {len(truth)}')
+        for mode, r in report.items():
+            print(f"  {mode:10} right first: {r['top1']}/{r['counted']}   right in the top 3: {r['top3']}/{r['counted']}")
+        print('\nThis only measures episodes you already confirmed, which were partly chosen because TMDb matched them.')
+        print('The real test is how many of the unresolved files now get a confident match: run the normal command with --source tmdb+omdb.')
+        return 0
     from recording_agent import load_config, resolve_show_dir
     cfg = load_config(os.path.expanduser(args.config))
     tv_root = cfg.get('plex_tv_path', '/Volumes/Plex/TV Shows')
@@ -276,6 +277,13 @@ def main():
     if args.source in ('tmdb', 'both'):
         year, episodes = load_tmdb(args.server, args.show)
         sets.append(('TMDb', episodes))
+    if args.source == 'omdb':
+        year, episodes = load_omdb(args.server, args.show)
+        sets.append(('OMDb', episodes))
+    if args.source == 'tmdb+omdb':
+        year, tmdb_eps = load_tmdb(args.server, args.show)
+        _y, omdb_eps = load_omdb(args.server, args.show)
+        sets.append(('TMDb+OMDb', merge_episodes(tmdb_eps, omdb_eps)))
     if args.source in ('tvmaze', 'both'):
         tv_year, episodes = load_tvmaze(args.show)
         year = year or tv_year

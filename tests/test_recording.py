@@ -4169,3 +4169,189 @@ class ProviderEpgProbeTests(unittest.TestCase):
         guide_db_dir.cleanup()
         self.assertEqual(data["results"][0]["error"], "OSError")
         self.assertNotIn("PASSWORD1", str(data))
+
+
+class OmdbEpisodesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.patches = [mock.patch.object(server, "BASE_DIR", self.temp.name),
+                        mock.patch.object(server, "load_config", lambda: {"omdb_key": "SECRETKEY"}),
+                        mock.patch.object(server, "_OMDB_BACKGROUND", False)]
+        for p in self.patches:
+            p.start()
+        server._omdb_jobs.clear()
+        self.calls = []
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        server._omdb_jobs.clear()
+        self.temp.cleanup()
+
+    def _fake(self, limit_after=None):
+        def fake(params, key):
+            self.calls.append(dict(params))
+            assert key == "SECRETKEY"
+            if limit_after is not None and len(self.calls) > limit_after:
+                return {"Response": "False", "Error": "Request limit reached!"}
+            if params.get("t"):
+                return {"Response": "True", "imdbID": "tt1", "Title": "Test Show", "Year": "1965–1970", "totalSeasons": "2"}
+            if params.get("Season"):
+                n = int(params["Season"])
+                return {"Response": "True", "Episodes": [
+                    {"Title": f"Ep {n}-{e}", "Episode": str(e), "imdbID": f"tt{n}{e}"} for e in (1, 2)]}
+            return {"Response": "True", "Plot": f"Plot of {params['i']}"}
+        return fake
+
+    def test_fetches_every_episode_plot_once_and_then_serves_from_the_file(self):
+        with mock.patch.object(server, "_omdb_get", self._fake()):
+            data = server.app.test_client().get("/epg-web/api/omdb-episodes?title=Test+Show").get_json()
+            self.assertEqual(data["status"], "done")
+            self.assertEqual([(e["season"], e["number"], e["summary"]) for e in data["episodes"]],
+                             [(1, 1, "Plot of tt11"), (1, 2, "Plot of tt12"), (2, 1, "Plot of tt21"), (2, 2, "Plot of tt22")])
+            self.assertEqual(data["premiered"], "1965")
+            made = len(self.calls)
+            again = server.app.test_client().get("/epg-web/api/omdb-episodes?title=Test+Show").get_json()
+            self.assertEqual(again["status"], "done")
+            self.assertEqual(len(self.calls), made)                                      # nothing refetched
+        self.assertNotIn("SECRETKEY", str(data))
+        self.assertNotIn("SECRETKEY", open(server._omdb_cache_path(), encoding="utf-8").read())
+
+    def test_a_daily_limit_keeps_what_was_fetched_and_says_so(self):
+        with mock.patch.object(server, "_omdb_get", self._fake(limit_after=5)):          # search, 2 lists, then 2 plots
+            data = server.app.test_client().get("/epg-web/api/omdb-episodes?title=Test+Show").get_json()
+        self.assertEqual(data["status"], "limit")
+        summaries = [e["summary"] for e in data["episodes"]]
+        self.assertEqual(sum(1 for text in summaries if text), 2)                       # the two it got are kept
+        self.assertEqual(len(summaries), 4)
+
+    def test_no_key_and_no_title_are_refused_and_errors_do_not_leak_the_key(self):
+        client = server.app.test_client()
+        self.assertEqual(client.get("/epg-web/api/omdb-episodes").status_code, 400)
+
+        def boom(params, key):
+            raise OSError("failed for key=" + key)
+        with mock.patch.object(server, "_omdb_get", boom):
+            data = client.get("/epg-web/api/omdb-episodes?title=Other+Show").get_json()
+        self.assertEqual(data["status"], "error")
+        self.assertNotIn("SECRETKEY", str(data))
+        with mock.patch.object(server, "load_config", lambda: {}):
+            self.assertEqual(client.get("/epg-web/api/omdb-episodes?title=X+Show").status_code, 503)
+
+
+class GuideEpisodeGuessTests(unittest.TestCase):
+    """The programme window shows the probable episode for an airing the guide gave no episode number."""
+    SHOW = "Zzz Test Sitcom"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.guide_db = os.path.join(self.temp.name, "guide.db")
+        server.ensure_guide_db(self.guide_db)
+        conn = sqlite3.connect(self.guide_db)
+        for column, typedef in (("episode_title", "TEXT"), ("season_num", "INTEGER"), ("episode_num", "INTEGER"), ("prog_type", "TEXT")):
+            conn.execute(f"ALTER TABLE guide ADD COLUMN {column} {typedef}")
+        conn.commit(); conn.close()
+        self.key = server._norm_plex_show(self.SHOW)
+        server._tmdb_episode_cache.pop(self.key, None)
+        server._series_unknown.pop(self.key, None)
+        server._series_warming.discard(self.key)
+        self.cfg = {"guide_db_path": self.guide_db, "timezone": "UTC", "tmdb_key": "KEY"}
+        self.patches = [mock.patch.object(server, "load_config", lambda: self.cfg),
+                        mock.patch.object(server, "BASE_DIR", self.temp.name),
+                        mock.patch.object(server, "_stream_url", return_value=("private-url", None, {})),
+                        mock.patch.object(server, "_SERIES_WARM_BACKGROUND", False)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        server._tmdb_episode_cache.pop(self.key, None)
+        self.temp.cleanup()
+
+    def _airings(self, rows, title=None):
+        conn = sqlite3.connect(self.guide_db)
+        conn.executemany("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,prog_type) VALUES (?,?,?,?,?,?,?)",
+                         [(self.SHOW, "ant", "ANTENNA TV", f"2099081{i}120000", f"2099081{i}123000", desc, "")
+                          for i, desc in enumerate(rows, 1)])
+        conn.commit(); conn.close()
+        return server.app.test_client().get("/epg-web/api/airings?title=" + (title or self.SHOW).replace(" ", "+")).get_json()
+
+    def _seed(self, episodes):
+        server._tmdb_episode_cache[self.key] = {"at": time.time(), "data": {"title": self.SHOW, "premiered": "1965", "episodes": episodes}}
+
+    EPISODES = [
+        {"season": 2, "number": 15, "name": "Jeannie Breaks the Bank", "summary": "Tony draws attention when Jeannie puts three million dollars into his bank account."},
+        {"season": 2, "number": 16, "name": "My Master, the Author", "summary": "Jeannie writes a book about child care and sends it to a publisher."},
+        {"season": 2, "number": 17, "name": "The Greatest Invention", "summary": "Roger convinces Tony to let Jeannie grant him a wish."},
+    ]
+
+    def test_a_matching_description_shows_the_episode_and_makes_it_a_series(self):
+        self._seed(self.EPISODES)
+        data = self._airings(["Jeannie puts 3 million dollars in Tony's bank account.", "Nothing at all like any episode."])
+        first, second = data["airings"][0], data["airings"][1]
+        self.assertEqual((first["episode_guess"]["season"], first["episode_guess"]["number"]), (2, 15))
+        self.assertTrue(first["episode_guess"]["confident"])
+        self.assertNotIn("episode_guess", second)                 # a poor match is not shown
+        self.assertTrue(data["is_series"])                        # so Record series is offered
+        self.assertFalse(data["guess_pending"])
+        self.assertNotIn("desc", first)
+
+    def test_while_the_episode_list_is_fetched_the_window_is_told_to_ask_again(self):
+        with mock.patch.object(server, "_warm_series") as warm:
+            data = self._airings(["Jeannie writes a book."])
+        warm.assert_called_once_with(self.SHOW)
+        self.assertTrue(data["guess_pending"])
+        self.assertNotIn("episode_guess", data["airings"][0])
+        self.assertFalse(data["is_series"])
+
+    def test_a_year_in_the_title_means_a_film_and_is_not_matched(self):
+        self._seed(self.EPISODES)
+        conn = sqlite3.connect(self.guide_db)
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,prog_type) VALUES (?,?,?,?,?,?,?)",
+                     (self.SHOW + " (2005)", "ant", "ANTENNA TV", "20990820120000", "20990820140000", "Jeannie writes a book.", ""))
+        conn.commit(); conn.close()
+        with mock.patch.object(server, "_warm_series") as warm:
+            data = server.app.test_client().get("/epg-web/api/airings?title=" + (self.SHOW + " (2005)").replace(" ", "+")).get_json()
+        warm.assert_not_called()
+        self.assertNotIn("episode_guess", data["airings"][0])
+
+    def test_an_omdb_plot_can_make_the_match_the_tmdb_wording_could_not(self):
+        episodes = [dict(e) for e in self.EPISODES]
+        self._seed(episodes)
+        with open(server._omdb_cache_path(), "w", encoding="utf-8") as handle:
+            json.dump({self.key: {"episodes": [
+                {"season": 2, "number": 17, "name": "The Greatest Invention", "summary": "Tony cannot change history when Jeannie takes him to Napoleon's court."}]}}, handle)
+        data = self._airings(["Tony cannot change history when Jeannie takes him to Napoleon's court."])
+        guess = data["airings"][0]["episode_guess"]
+        self.assertEqual((guess["season"], guess["number"]), (2, 17))
+
+    def test_a_series_tmdb_does_not_know_is_not_asked_about_again(self):
+        calls = []
+
+        def unknown(title, key):
+            calls.append(title)
+            return None, "TMDb has no series named", 404
+        with mock.patch.object(server, "_fetch_tmdb_series", unknown):
+            server._warm_series(self.SHOW)
+            server._warm_series(self.SHOW)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_omdb_daily_budget_stops_requests_without_calling_omdb(self):
+        def never(*args, **kwargs):
+            raise AssertionError("OMDb must not be called once the day's budget is spent")
+        server._omdb_budget.update({"day": time.strftime("%Y-%m-%d"), "used": server.OMDB_DAILY_BUDGET})
+        try:
+            with mock.patch("urllib.request.urlopen", never):
+                reply = server._omdb_get({"t": "x"}, "KEY")
+        finally:
+            server._omdb_budget.update({"day": "", "used": 0})
+        self.assertEqual(reply["Response"], "False")
+        self.assertIn("limit", reply["Error"].lower())
+
+    def test_the_page_shows_the_guess_and_asks_again_while_it_is_fetched(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("a.episode_guess", html)
+        self.assertIn("'maybe '", html)
+        self.assertIn("ar.guess_pending", html)
+        self.assertIsNotNone(server._episode_match)               # the shared matcher is importable

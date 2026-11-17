@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117h"
+VERSION = "v20261117i"
 
 app = Flask(__name__)
 
@@ -3527,22 +3527,211 @@ def api_eaglecast_dependency():
 _tmdb_episode_cache = {}
 
 
-@app.route('/epg-web/api/tmdb-episodes')
-def api_tmdb_episodes():
-    """Every episode of a series (season, number, name, overview) from TMDb, using the server's key."""
+# ── Probable episode for an airing the guide gave no episode number ───────────
+try:
+    import episode_match as _episode_match        # shared with mac/name_episodes.py; absent only if the file was not deployed
+except ImportError:
+    _episode_match = None
+_SERIES_WARM_BACKGROUND = True
+_series_warming = set()
+_series_unknown = {}                              # series key -> when TMDb last said it has no such series
+GUESS_SHOW_SCORE = 0.30                           # below this a match is not worth showing
+
+
+def _series_episodes(title):
+    """The series' episodes (TMDb numbering) with any cached OMDb plots added, or None if not fetched yet."""
+    key = _norm_plex_show(_plex_title_and_year(title)[0])
+    cached = _tmdb_episode_cache.get(key)
+    if not cached or time.time() - cached['at'] > 86400 or _episode_match is None:
+        return None
+    episodes = cached['data'].get('episodes', [])
+    omdb = _omdb_read_cache().get(key) or {}
+    if omdb.get('episodes'):
+        episodes = _episode_match.merge_episodes(episodes, omdb['episodes'])
+    return episodes
+
+
+def _warm_series(title):
+    """Fetch a series' episode list (TMDb, then OMDb plots if its budget allows) in the background."""
+    clean_title = _plex_title_and_year(title)[0]
+    key = _norm_plex_show(clean_title)
+    cfg = load_config()
+    tmdb_key, omdb_key = str(cfg.get('tmdb_key', '') or ''), str(cfg.get('omdb_key', '') or '')
+    if (not tmdb_key or key in _series_warming or _episode_match is None
+            or time.time() - _series_unknown.get(key, 0) < 86400):
+        return
+
+    def work():
+        try:
+            data, error, _status = _fetch_tmdb_series(clean_title, tmdb_key)
+            if error:
+                _series_unknown[key] = time.time()
+                return
+            _tmdb_episode_cache[key] = {'at': time.time(), 'data': data}
+            if omdb_key:
+                _omdb_fetch_series(title, omdb_key)
+        finally:
+            _series_warming.discard(key)
+    _series_warming.add(key)
+    if _SERIES_WARM_BACKGROUND:
+        threading.Thread(target=work, daemon=True).start()
+    else:
+        work()
+
+
+def _guess_episode(episodes, description):
+    """{season, number, name, score, confident} for the episode a description most likely belongs to, or None."""
+    if not episodes or not description:
+        return None
+    episode, score, confident = _episode_match.pick(description, episodes)
+    if not episode or score < GUESS_SHOW_SCORE:
+        return None
+    return {'season': int(episode['season']), 'number': int(episode['number']), 'name': episode.get('name') or '',
+            'score': round(float(score), 2), 'confident': bool(confident)}
+
+
+# ── OMDb episode plots ───────────────────────────────────────────────────────
+# OMDb (IMDb data) gives one plot per episode request, so a series is fetched once in the background and saved
+# to a file; later calls read the file.  It is a second wording of each episode's story, useful for matching a
+# guide's one-line description when TMDb's summary is worded differently.  The key never leaves the server.
+_OMDB_BACKGROUND = True
+_omdb_lock = threading.Lock()
+_omdb_jobs = {}                       # series key -> {'state': running|done|limit|error, 'done': n, 'total': n, 'error': str}
+
+
+def _omdb_cache_path():
+    return os.path.join(BASE_DIR, 'omdb_episodes_cache.json')
+
+
+def _omdb_read_cache():
+    try:
+        with open(_omdb_cache_path(), encoding='utf-8') as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _omdb_write_cache(cache):
+    tmp = _omdb_cache_path() + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as handle:
+        json.dump(cache, handle)
+    os.replace(tmp, _omdb_cache_path())
+
+
+OMDB_DAILY_BUDGET = 800                # OMDb's free key allows 1000 requests a day; leave room
+_omdb_budget = {'day': '', 'used': 0}
+
+
+def _omdb_get(params, key):
     from urllib import request as urlreq
-    from urllib.parse import quote
+    from urllib.parse import urlencode
+    today = time.strftime('%Y-%m-%d')
+    with _omdb_lock:
+        if _omdb_budget['day'] != today:
+            _omdb_budget.update({'day': today, 'used': 0})
+        if _omdb_budget['used'] >= OMDB_DAILY_BUDGET:
+            return {'Response': 'False', 'Error': 'Request limit reached! (daily budget)'}
+        _omdb_budget['used'] += 1
+    url = 'https://www.omdbapi.com/?' + urlencode(dict(params, apikey=key))
+    with urlreq.urlopen(url, timeout=15) as response:
+        return json.loads(response.read())
+
+
+def _omdb_fetch_series(title, key):
+    """Fetch (or finish fetching) one series' episode list and plots into the cache file."""
+    cache_key = _norm_plex_show(_plex_title_and_year(title)[0])
+    clean_title = _plex_title_and_year(title)[0]
+    job = _omdb_jobs.setdefault(cache_key, {})
+    job.update({'state': 'running', 'done': 0, 'total': 0, 'error': ''})
+    try:
+        with _omdb_lock:
+            cache = _omdb_read_cache()
+        entry = cache.get(cache_key) or {}
+        if not entry.get('imdb_id'):
+            found = _omdb_get({'t': clean_title, 'type': 'series'}, key)
+            if str(found.get('Response')) != 'True':
+                job.update({'state': 'limit' if 'limit' in str(found.get('Error', '')).lower() else 'error',
+                            'error': str(found.get('Error', 'not found'))[:80]})
+                return
+            entry = {'imdb_id': found.get('imdbID', ''), 'title': found.get('Title', clean_title),
+                     'premiered': str(found.get('Year', ''))[:4], 'seasons': int(found.get('totalSeasons') or 0),
+                     'episodes': []}
+        have = {(e['season'], e['number']): e for e in entry.get('episodes', [])}
+        for season in range(1, entry['seasons'] + 1):                       # pass 1: the episode lists
+            listing = _omdb_get({'i': entry['imdb_id'], 'Season': str(season)}, key)
+            if str(listing.get('Response')) != 'True':
+                job.update({'state': 'limit' if 'limit' in str(listing.get('Error', '')).lower() else 'error',
+                            'error': str(listing.get('Error', ''))[:80]})
+                break
+            for ep in listing.get('Episodes', []):
+                try:
+                    number = int(ep.get('Episode'))
+                except (TypeError, ValueError):
+                    continue
+                have.setdefault((season, number), {'season': season, 'number': number, 'name': ep.get('Title', ''),
+                                                    'imdb_id': ep.get('imdbID', ''), 'summary': ''})
+        episodes = sorted(have.values(), key=lambda e: (e['season'], e['number']))
+        entry['episodes'] = episodes
+        job['total'] = len(episodes)
+        if job['state'] != 'running':                                       # the lists were cut short: keep what we have
+            with _omdb_lock:
+                cache = _omdb_read_cache(); cache[cache_key] = entry; _omdb_write_cache(cache)
+            return
+        for index, ep in enumerate(episodes, 1):                           # pass 2: each episode's plot
+            job['done'] = index
+            if ep.get('summary') or not ep.get('imdb_id'):
+                continue
+            detail = _omdb_get({'i': ep['imdb_id'], 'plot': 'full'}, key)
+            if str(detail.get('Response')) != 'True':
+                job.update({'state': 'limit' if 'limit' in str(detail.get('Error', '')).lower() else 'error',
+                            'error': str(detail.get('Error', ''))[:80]})
+                break
+            plot = str(detail.get('Plot', '') or '')
+            ep['summary'] = '' if plot == 'N/A' else plot
+            if index % 10 == 0:
+                with _omdb_lock:
+                    cache = _omdb_read_cache(); cache[cache_key] = entry; _omdb_write_cache(cache)
+        with _omdb_lock:
+            cache = _omdb_read_cache(); cache[cache_key] = entry; _omdb_write_cache(cache)
+        if job['state'] == 'running':
+            job['state'] = 'done'
+    except Exception as exc:
+        job.update({'state': 'error', 'error': type(exc).__name__})          # a message could carry the key
+
+
+@app.route('/epg-web/api/omdb-episodes')
+def api_omdb_episodes():
+    """A series' episodes with OMDb plots.  First call starts a background fetch; poll until status is done."""
     title = str(request.args.get('title', '') or '').strip()
     if not title:
         return jsonify({'error': 'title is required'}), 400
-    tmdb_key = load_config().get('tmdb_key', '')
-    if not tmdb_key:
-        return jsonify({'error': 'No TMDb key is configured on the dashboard.'}), 503
-    clean_title, _year = _plex_title_and_year(title)
+    key = str(load_config().get('omdb_key', '') or '')
+    if not key:
+        return jsonify({'error': 'No OMDb key is configured on the dashboard.'}), 503
+    cache_key = _norm_plex_show(_plex_title_and_year(title)[0])
+    job = _omdb_jobs.get(cache_key, {})
+    cached = _omdb_read_cache().get(cache_key) or {}
+    complete = bool(cached.get('episodes')) and all(e.get('summary') or not e.get('imdb_id') for e in cached['episodes'])
+    if job.get('state') != 'running' and not complete and job.get('state') not in ('limit', 'error'):
+        if _OMDB_BACKGROUND:
+            threading.Thread(target=_omdb_fetch_series, args=(title, key), daemon=True).start()
+            job = {'state': 'running', 'done': 0, 'total': 0}
+        else:
+            _omdb_fetch_series(title, key)
+            job = _omdb_jobs.get(cache_key, {})
+            cached = _omdb_read_cache().get(cache_key) or {}
+    state = 'done' if complete else job.get('state', 'running')
+    return jsonify({'status': state, 'done': job.get('done', 0), 'total': job.get('total', 0),
+                    'error': job.get('error', ''), 'premiered': cached.get('premiered', ''),
+                    'episodes': cached.get('episodes', [])})
+
+
+def _fetch_tmdb_series(clean_title, tmdb_key):
+    """(data, error, status) for a series' episodes from TMDb.  The key is in the URL, so errors name only the kind."""
+    from urllib import request as urlreq
+    from urllib.parse import quote
     cache_key = _norm_plex_show(clean_title)
-    cached = _tmdb_episode_cache.get(cache_key)
-    if cached and time.time() - cached['at'] < 86400:
-        return jsonify(cached['data'])
 
     def get(url):
         with urlreq.urlopen(url, timeout=10) as response:
@@ -3551,7 +3740,7 @@ def api_tmdb_episodes():
         results = get(f'https://api.themoviedb.org/3/search/tv?api_key={tmdb_key}&query={quote(clean_title)}').get('results', [])
         exact = next((item for item in results if _norm_plex_show(item.get('name', '')) == cache_key), None)
         if not exact or not exact.get('id'):
-            return jsonify({'error': f'TMDb has no series named "{clean_title}".'}), 404
+            return None, f'TMDb has no series named "{clean_title}".', 404
         details = get(f'https://api.themoviedb.org/3/tv/{exact["id"]}?api_key={tmdb_key}')
         episodes = []
         for season in details.get('seasons', []):
@@ -3563,9 +3752,27 @@ def api_tmdb_episodes():
                 episodes.append({'season': number, 'number': episode.get('episode_number'),
                                  'name': episode.get('name') or '', 'summary': episode.get('overview') or ''})
     except Exception as exc:
-        # The URL carries the key, so report only the kind of failure.
-        return jsonify({'error': f'TMDb lookup failed ({type(exc).__name__}).'}), 502
-    data = {'title': clean_title, 'premiered': str(details.get('first_air_date') or '')[:4], 'episodes': episodes}
+        return None, f'TMDb lookup failed ({type(exc).__name__}).', 502
+    return {'title': clean_title, 'premiered': str(details.get('first_air_date') or '')[:4], 'episodes': episodes}, '', 200
+
+
+@app.route('/epg-web/api/tmdb-episodes')
+def api_tmdb_episodes():
+    """Every episode of a series (season, number, name, overview) from TMDb, using the server's key."""
+    title = str(request.args.get('title', '') or '').strip()
+    if not title:
+        return jsonify({'error': 'title is required'}), 400
+    tmdb_key = load_config().get('tmdb_key', '')
+    if not tmdb_key:
+        return jsonify({'error': 'No TMDb key is configured on the dashboard.'}), 503
+    clean_title, _year = _plex_title_and_year(title)
+    cache_key = _norm_plex_show(clean_title)
+    cached = _tmdb_episode_cache.get(cache_key)
+    if cached and time.time() - cached['at'] < 86400:
+        return jsonify(cached['data'])
+    data, error, status = _fetch_tmdb_series(clean_title, tmdb_key)
+    if error:
+        return jsonify({'error': error}), status
     _tmdb_episode_cache[cache_key] = {'at': time.time(), 'data': data}
     return jsonify(data)
 
@@ -7527,7 +7734,7 @@ def api_airings():
         # named *Arthur*.
         rows = conn.execute('''
             SELECT channel_id, channel_name, start_utc, end_utc, prog_type,
-                   category, episode_title, season_num, episode_num
+                   category, episode_title, season_num, episode_num, desc
             FROM guide
             WHERE lower(title) = lower(?)
             AND end_utc > ?
@@ -7537,7 +7744,7 @@ def api_airings():
         if not rows and clean_title.lower() != title.lower():
             rows = conn.execute('''
                 SELECT channel_id, channel_name, start_utc, end_utc, prog_type,
-                       category, episode_title, season_num, episode_num
+                       category, episode_title, season_num, episode_num, desc
                 FROM guide
                 WHERE lower(title) = lower(?)
                 AND end_utc > ?
@@ -7644,9 +7851,27 @@ def api_airings():
                 'episode_title': r['episode_title'] or '',
                 'season_num':   r['season_num'],
                 'episode_num':  r['episode_num'],
+                'desc':         (r['desc'] if 'desc' in r.keys() else '') or '',
             })
         except Exception:
             continue
+
+    # An airing with no season/episode (ANTENNA TV's classic shows have none) is matched to its most likely
+    # episode by description, so the window can show it before anything is recorded.
+    guess_pending = False
+    unnumbered = [a for a in airings if a['season_num'] is None and a['episode_num'] is None and not a['episode_title']]
+    if unnumbered and not re.search(r'\(\d{4}\)\s*$', title) and not any(a['prog_type'] == 'MV' for a in airings):
+        episodes = _series_episodes(title)
+        if episodes is None:
+            _warm_series(title)
+            guess_pending = _episode_match is not None and bool(load_config().get('tmdb_key'))
+        else:
+            for a in unnumbered:
+                guess = _guess_episode(episodes, a.get('desc'))
+                if guess:
+                    a['episode_guess'] = guess
+    for a in airings:
+        a.pop('desc', None)
 
     # Collapse duplicate SD/XMLTV rows for the same channel family and time.
     # Prefer a playable row, then the HD-labelled guide row for display.
@@ -7655,7 +7880,8 @@ def api_airings():
 
     prog_type = next((a['prog_type'] for a in airings if a['prog_type']), '')
     is_series = (prog_type in ('EP', 'SH') or any(
-        a['season_num'] is not None or a['episode_title'] for a in airings
+        a['season_num'] is not None or a['episode_title'] or (a.get('episode_guess') or {}).get('confident')
+        for a in airings
     ))
     deduped = {}
     for airing in airings:
@@ -7671,7 +7897,7 @@ def api_airings():
             deduped[key] = airing
     airings = sorted(deduped.values(), key=lambda item: item['start_ts'])
     return jsonify({
-        'airings': airings, 'prog_type': prog_type, 'is_series': is_series,
+        'airings': airings, 'prog_type': prog_type, 'is_series': is_series, 'guess_pending': guess_pending,
         'commercial_free_only': False,
     })
 
@@ -12155,6 +12381,10 @@ async function openProg(p) {
     // to a misleading "no future airings" panel with no Record button.
     const ar = await fetchJsonWithin(`/epg-web/api/airings?${airingParams}`, 12000);
     if (!ar) throw new Error('Airings lookup timed out');
+    if (ar.guess_pending && window._guessRetriedFor !== p.title) {          // the show's episode list is still being fetched
+      window._guessRetriedFor = p.title;
+      setTimeout(() => { if (_currentProg === p) openProg(p); }, 8000);
+    }
     if (ar.airings && ar.airings.length > 0) {
       const isSeries = !!ar.is_series;
       window._currentProgWantedType = isSeries ? 'series' : 'movie';
@@ -12335,7 +12565,7 @@ async function openProg(p) {
           const inPlex = !!episodeKey && _plexEpisodes.has(episodeKey);
           return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;${best ? 'background:#2b2208;border-left:3px solid #fbbf24;padding-left:7px;' : ''}">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span style="color:#fde68a;background:#6b4b08;border:1px solid #d97706;border-radius:3px;padding:1px 3px;font-weight:700;" title="Eaglecast recording source">🦅 EC</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : '')}</span>
+            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span style="color:#fde68a;background:#6b4b08;border:1px solid #d97706;border-radius:3px;padding:1px 3px;font-weight:700;" title="Eaglecast recording source">🦅 EC</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (a.episode_guess ? '<br><span style="color:'+(a.episode_guess.confident ? '#d9a441' : '#64748b')+';font-size:11px;" title="Matched from the description. The guide itself gives no episode number.">'+esc((a.episode_guess.confident ? '≈ ' : 'maybe ')+'S'+a.episode_guess.season+'E'+a.episode_guess.number+' · '+a.episode_guess.name+' ('+Math.round(a.episode_guess.score*100)+'%)')+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : ''))}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)

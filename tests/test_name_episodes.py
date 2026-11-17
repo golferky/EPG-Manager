@@ -242,3 +242,49 @@ class GuideDescriptionsEndpointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OmdbMergeAndEvaluateTests(unittest.TestCase):
+    def test_merging_adds_the_omdb_plot_by_title_then_by_number(self):
+        base = [{"season": 1, "number": 1, "name": "The Lady in the Bottle", "summary": "An astronaut finds a genie."},
+                {"season": 1, "number": 2, "name": "Different Name Here", "summary": "Thief story."}]
+        extra = [{"season": 1, "number": 1, "name": "The Lady in the Bottle!", "summary": "Tony frees Jeannie from a bottle."},
+                 {"season": 1, "number": 2, "name": "Another Title", "summary": "Roger meets a safecracker."}]
+        merged = ne.merge_episodes(base, extra)
+        self.assertEqual(merged[0]["extra_summaries"], ["Tony frees Jeannie from a bottle."])    # matched by title
+        self.assertEqual(merged[1]["extra_summaries"], ["Roger meets a safecracker."])           # titles differ: same season and number
+        self.assertNotIn("extra_summaries", base[0])                                              # the originals are untouched
+
+    def test_an_episode_scores_by_its_best_wording(self):
+        episodes = [{"season": 1, "number": 1, "name": "One", "summary": "A genie is freed from a bottle on a beach."},
+                    {"season": 1, "number": 2, "name": "Two", "summary": "Roger meets a safecracker in Reno."}]
+        guide = "Jeannie pops Tony back to Napoleon's court."
+        before = ne.rank_episodes(guide, episodes)[0][0]
+        merged = ne.merge_episodes(episodes, [{"season": 1, "number": 1, "name": "One",
+                                               "summary": "Jeannie takes Tony to Napoleon's court and Tony cannot change history."}])
+        ranked = ne.rank_episodes(guide, merged)
+        self.assertEqual((ranked[0][1]["season"], ranked[0][1]["number"]), (1, 1))               # the OMDb wording wins it
+        self.assertGreater(ranked[0][0], before)
+
+    def test_evaluate_counts_right_answers_for_each_source(self):
+        tmdb = [{"season": 1, "number": 1, "name": "A", "summary": "A genie is freed from a bottle on a beach."},
+                {"season": 1, "number": 2, "name": "B", "summary": "Roger meets a safecracker in Reno."}]
+        omdb = [{"season": 1, "number": 1, "name": "A", "summary": "Tony visits Napoleon's court."},
+                {"season": 1, "number": 2, "name": "B", "summary": "A safecracker in Reno."}]
+        airings = [{"start_ts": stamp("2026-08-14", "1130"), "channel": "A", "desc": "Tony visits Napoleon's court."},
+                   {"start_ts": stamp("2026-08-15", "1130"), "channel": "A", "desc": "Roger meets a safecracker in Reno."}]
+        truth = {"2026-08-14_1130": (1, 1), "2026-08-15_1130": (1, 2)}
+        report = ne.evaluate(truth, airings, {"tmdb": tmdb, "omdb": omdb, "tmdb+omdb": ne.merge_episodes(tmdb, omdb)})
+        self.assertEqual((report["tmdb"]["top1"], report["tmdb"]["counted"]), (1, 2))
+        self.assertEqual(report["tmdb"]["misses"], ["2026-08-14_1130"])
+        self.assertEqual(report["omdb"]["top1"], 2)
+        self.assertEqual(report["tmdb+omdb"]["top1"], 2)
+
+    def test_the_loader_waits_for_the_dashboard_and_uses_a_partial_result_after_a_limit(self):
+        replies = [{"status": "running", "done": 3, "total": 10, "episodes": []},
+                   {"status": "limit", "done": 6, "total": 10, "premiered": "1965",
+                    "episodes": [{"season": 1, "number": 1, "name": "A", "summary": "x"}, {"season": 0, "number": 0}]}]
+        with mock.patch.object(ne, "fetch_json", side_effect=replies), mock.patch.object(ne.time, "sleep"):
+            year, episodes = ne.load_omdb("http://dashboard", "Show")
+        self.assertEqual(year, "1965")
+        self.assertEqual([(e["season"], e["number"]) for e in episodes], [(1, 1)])
