@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117d"
+VERSION = "v20261117e"
 
 app = Flask(__name__)
 
@@ -394,7 +394,7 @@ def _is_non_english_channel(name, language=''):
     not each programme, so a Spanish show on an English channel is still shown.
     """
     languages = [part.strip().lower() for part in str(language or '').split(',') if part.strip()]
-    if languages and 'en' not in languages:
+    if languages and not any(code == 'en' or code.startswith('en-') for code in languages):    # en, en-CA, en-GB ...
         return True
     text = name or ''
     return bool(_is_foreign_recording_feed(text) or _NON_LATIN_SCRIPT.search(text) or _FOREIGN_NETWORKS.search(text))

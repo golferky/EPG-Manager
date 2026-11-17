@@ -3900,6 +3900,10 @@ class HideNonEnglishTests(unittest.TestCase):
         self.assertTrue(classify("Some Channel", "fr,es"))
         self.assertFalse(classify("Some Channel", "en"))
         self.assertFalse(classify("Some Channel", "en,es"))             # bilingual feeds stay
+        self.assertFalse(classify("Some Channel", "en-CA"))             # an English variant is still English
+        self.assertFalse(classify("Some Channel", "en,fr-CA"))
+        self.assertTrue(classify("Some Channel", "fr-CA"))
+        self.assertTrue(classify("Some Channel", "tl,zh"))
         self.assertFalse(classify("Some Channel", ""))                  # language unknown: judged by name only
 
     def _guide(self, hide):
