@@ -3886,3 +3886,53 @@ class SeriesNoDuplicateBookingTests(unittest.TestCase):
                      ("hd", "Show HD", self.base + 7 * 86400, "Second", 1, 2),
                      ("plain", "Show", self.base + 3 * 86400, None, None, None)])
         self.assertEqual(self._run(), 3)
+
+
+class HideNonEnglishTests(unittest.TestCase):
+    def test_the_classifier(self):
+        classify = server._is_non_english_channel
+        for name in ("Telemundo", "UNIVISION", "ABS-CBN News Channel", "TV5 French", "HBO Latino HD", "CINE ESPAÑOL",
+                     "Россия 24", "NHK 世界", "ZEE TV"):
+            self.assertTrue(classify(name), name)
+        for name in ("ESPN", "HBO", "Paramount+ with Showtime HD", "AMC (WEST)", "Hallmark Channel", "AFRO"):
+            self.assertFalse(classify(name), name)
+        self.assertTrue(classify("Some Channel", "es"))                 # Schedules Direct says Spanish
+        self.assertTrue(classify("Some Channel", "fr,es"))
+        self.assertFalse(classify("Some Channel", "en"))
+        self.assertFalse(classify("Some Channel", "en,es"))             # bilingual feeds stay
+        self.assertFalse(classify("Some Channel", ""))                  # language unknown: judged by name only
+
+    def _guide(self, hide):
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc).replace(minute=0, second=0, microsecond=0)
+        start = now.timestamp()
+        channels = [{"id": cid, "name": name, "icon": "", "language": lang}
+                    for cid, name, lang in (("c1", "ESPN", "en"), ("c2", "Telemundo", ""), ("c3", "Plain Name", "es"))]
+        progs = [{"title": f"Show {c['id']}", "channel_id": c["id"], "channel": c["name"], "start_ts": start,
+                  "stop_ts": start + 3600, "start_iso": "", "stop_iso": "", "start_fmt": "", "stop_fmt": "",
+                  "desc": "", "category": ""} for c in channels]
+        epg = {"channels": channels, "channel_map": {c["id"]: c["name"] for c in channels}, "programmes": progs,
+               "programme_starts": [start] * len(progs)}
+        query = "/epg-web/api/guide?hours=2" + ("&hide_foreign=1" if hide else "")
+        deadline = time.time() + 10              # the startup guide load must not overwrite the sample guide
+        while time.time() < deadline and (server._startup_status.get("loading") or server._startup_status.get("background_loading")):
+            time.sleep(0.05)
+        with mock.patch.dict(server._epg, epg), \
+                mock.patch.object(server, "load_config", lambda: {"timezone": "UTC"}):
+            data = server.app.test_client().get(query).get_json()
+        return data
+
+    def test_the_guide_hides_non_english_channels_and_their_programmes_only_when_asked(self):
+        shown = self._guide(False)
+        self.assertEqual(sorted(c["name"] for c in shown["channels"]), ["ESPN", "Plain Name", "Telemundo"])
+        hidden = self._guide(True)
+        self.assertEqual([c["name"] for c in hidden["channels"]], ["ESPN"])
+        self.assertEqual([p["channel_id"] for p in hidden["programmes"]], ["c1"])
+
+    def test_the_page_has_the_switch_and_sends_it(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="hide-foreign"', html)
+        self.assertIn("params.set('hide_foreign', '1')", html)
+        self.assertIn("epg_hide_foreign", html)
+        self.assertRegex(html, r'<input id="hide-foreign" type="checkbox" checked')            # on by default
+        self.assertIn("getItem('epg_hide_foreign') !== '0'", html)                              # off only if you switched it off
