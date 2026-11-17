@@ -67,6 +67,17 @@ class TopCandidatesTests(unittest.TestCase):
         self.assertEqual(ne.top_candidates("x", EPISODES, 0), [])
 
 
+class KnownEpisodeTests(unittest.TestCase):
+    def test_an_episode_the_dashboard_already_identified_is_used_without_guessing(self):
+        files = [("I Dream of Jeannie - 2026-08-14_1130.mp4", 600)]
+        airings = [{"start_ts": stamp("2026-08-14", "1130"), "channel": "A", "desc": "Nothing like any summary at all.",
+                    "episode": {"season": 7, "number": 15, "name": "Mary, the Good Fairy"}}]
+        row = ne.plan(files, airings, EPISODES)[0]
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual((row["episode"]["season"], row["episode"]["number"], row["episode"]["name"]), (7, 15, "Mary, the Good Fairy"))
+        self.assertEqual(row["score"], 1.0)
+
+
 class AcceptTests(unittest.TestCase):
     def test_accept_text_is_parsed_and_bad_text_is_refused(self):
         self.assertEqual(ne.parse_accept("2026-08-14_1130=S02E15, 2026-08-15_2100=s1e3"),

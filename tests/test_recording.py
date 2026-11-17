@@ -4297,6 +4297,55 @@ class GuideEpisodeGuessTests(unittest.TestCase):
         self.assertFalse(data["guess_pending"])
         self.assertNotIn("desc", first)
 
+    def _numbered(self, desc, season, number, name, channel="FETV"):
+        conn = sqlite3.connect(self.guide_db)
+        conn.execute("INSERT INTO guide(title,channel_id,channel_name,start_utc,end_utc,desc,episode_title,season_num,episode_num,prog_type) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (self.SHOW, channel.lower(), channel, "20990701100000", "20990701103000", desc, name, season, number, "EP"))
+        conn.commit(); conn.close()
+
+    def test_the_same_description_on_a_numbered_airing_elsewhere_names_the_episode_exactly(self):
+        text = "Darrin discovers that bedwarmers can be worse than mothers-in-law."
+        self._numbered(text, 7, 15, "Mary, the Good Fairy")
+        with mock.patch.object(server, "_warm_series") as warm:
+            data = self._airings([text])                      # no TMDb data at all: the guide itself is enough
+        ant = next(a for a in data["airings"] if a["channel_name"] == "ANTENNA TV")
+        self.assertEqual((ant["episode_guess"]["season"], ant["episode_guess"]["number"]), (7, 15))
+        self.assertEqual((ant["episode_guess"]["name"], ant["episode_guess"]["score"], ant["episode_guess"]["source"]),
+                         ("Mary, the Good Fairy", 1.0, "guide"))
+        self.assertTrue(data["is_series"])
+        warm.assert_not_called()                              # nothing was left to guess
+
+    def test_a_description_on_two_different_episodes_is_not_trusted(self):
+        text = "A story that two different episodes happen to share in words."
+        self._numbered(text, 1, 1, "One")
+        self._numbered(text, 2, 2, "Two", channel="DTV323")
+        with mock.patch.object(server, "_warm_series"):
+            data = self._airings([text])
+        self.assertNotIn("episode_guess", next(a for a in data["airings"] if a["channel_name"] == "ANTENNA TV"))
+
+    def test_a_short_description_is_not_trusted(self):
+        self._numbered("A short one.", 1, 1, "One")
+        with mock.patch.object(server, "_warm_series"):
+            data = self._airings(["A short one."])
+        self.assertNotIn("episode_guess", next(a for a in data["airings"] if a["channel_name"] == "ANTENNA TV"))
+
+    def test_the_naming_tool_is_told_about_exact_matches(self):
+        text = "Darrin discovers that bedwarmers can be worse than mothers-in-law."
+        self._numbered(text, 7, 15, "Mary, the Good Fairy")
+        self._airings([text])
+        data = server.app.test_client().get("/epg-web/api/guide-descriptions?title=" + self.SHOW.replace(" ", "+")).get_json()
+        ant = next(a for a in data["airings"] if a["channel"] == "ANTENNA TV")
+        self.assertEqual(ant["episode"], {"season": 7, "number": 15, "name": "Mary, the Good Fairy"})
+
+    def test_a_different_description_still_falls_back_to_the_wording_match(self):
+        self._numbered("Some other story entirely, about a boat.", 3, 3, "Three")
+        self._seed(self.EPISODES)
+        data = self._airings(["Jeannie puts 3 million dollars in Tony's bank account."])
+        guess = next(a for a in data["airings"] if a["channel_name"] == "ANTENNA TV")["episode_guess"]
+        self.assertEqual((guess["season"], guess["number"]), (2, 15))
+        self.assertNotEqual(guess.get("source"), "guide")
+
     def test_debug_mode_shows_the_description_and_the_nearest_episodes_with_scores(self):
         self._seed(self.EPISODES)
         conn = sqlite3.connect(self.guide_db)

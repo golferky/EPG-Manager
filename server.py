@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117j"
+VERSION = "v20261117k"
 
 app = Flask(__name__)
 
@@ -3579,6 +3579,26 @@ def _warm_series(title):
         work()
 
 
+def _guide_known_episode(conn, title, description):
+    """The episode a description belongs to, when the SAME description is already on a numbered airing of this show.
+
+    Descriptions come from one shared source, so one episode has the same text on every channel.  If a channel that
+    does give season and episode (FETV, DTV323 ...) listed the same text, that is the episode, with no guessing.
+    """
+    text = str(description or '').strip()
+    if len(text) < 20:                                  # too short to be telling
+        return None
+    plain = re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip()
+    rows = conn.execute(
+        'SELECT season_num, episode_num, episode_title, COUNT(*) FROM guide WHERE lower(title) IN (lower(?), lower(?)) '
+        'AND desc=? AND season_num IS NOT NULL AND episode_num IS NOT NULL '
+        'GROUP BY season_num, episode_num, episode_title ORDER BY COUNT(*) DESC LIMIT 2', (title, plain, text)).fetchall()
+    if len(rows) != 1:                                  # none, or the same text on two different episodes: not telling
+        return None
+    return {'season': int(rows[0][0]), 'number': int(rows[0][1]), 'name': rows[0][2] or '',
+            'score': 1.0, 'confident': True, 'source': 'guide'}
+
+
 def _guess_episode(episodes, description):
     """{season, number, name, score, confident} for the episode a description most likely belongs to, or None."""
     if not episodes or not description:
@@ -3793,12 +3813,22 @@ def api_guide_descriptions():
     except sqlite3.Error as exc:
         return jsonify({'error': str(exc)}), 500
     airings = []
+    try:
+        known_conn = sqlite3.connect(_guide_db_path(), timeout=3)
+    except sqlite3.Error:
+        known_conn = None
     for start_utc, channel, desc in rows:
         try:
             ts = datetime.strptime(start_utc, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()
         except ValueError:
             continue
-        airings.append({'start_ts': ts, 'channel': channel, 'desc': desc})
+        item = {'start_ts': ts, 'channel': channel, 'desc': desc}
+        known = _guide_known_episode(known_conn, title, desc) if known_conn else None
+        if known:                                       # the same text is on a numbered airing elsewhere: no guessing needed
+            item['episode'] = {'season': known['season'], 'number': known['number'], 'name': known['name']}
+        airings.append(item)
+    if known_conn:
+        known_conn.close()
     return jsonify({'title': title, 'airings': airings})
 
 
@@ -7861,16 +7891,26 @@ def api_airings():
     guess_pending = False
     unnumbered = [a for a in airings if a['season_num'] is None and a['episode_num'] is None and not a['episode_title']]
     if unnumbered and not re.search(r'\(\d{4}\)\s*$', title) and not any(a['prog_type'] == 'MV' for a in airings):
-        episodes = _series_episodes(title)
-        if episodes is None:
+        try:                                              # first: the same description on a numbered airing elsewhere
+            exact_conn = sqlite3.connect(db_path, timeout=3)
+            for a in unnumbered:
+                known = _guide_known_episode(exact_conn, title, a.get('desc'))
+                if known:
+                    a['episode_guess'] = known
+            exact_conn.close()
+        except sqlite3.Error:
+            pass
+        remaining = [a for a in unnumbered if 'episode_guess' not in a]
+        episodes = _series_episodes(title) if remaining else None
+        if remaining and episodes is None:
             _warm_series(title)
             guess_pending = _episode_match is not None and bool(load_config().get('tmdb_key'))
         else:
-            for a in unnumbered:
+            for a in remaining:
                 guess = _guess_episode(episodes, a.get('desc'))
                 if guess:
                     a['episode_guess'] = guess
-                if request.args.get('debug_guess') == '1' and a.get('desc'):          # read-only aid for tuning the matcher
+                if request.args.get('debug_guess') == '1' and a.get('desc') and episodes:          # read-only aid for tuning the matcher
                     a['guess_debug'] = {'desc': a['desc'], 'nearest': [
                         {'season': int(ep['season']), 'number': int(ep['number']), 'name': ep.get('name') or '',
                          'score': round(float(score), 2)}
@@ -12570,7 +12610,7 @@ async function openProg(p) {
           const inPlex = !!episodeKey && _plexEpisodes.has(episodeKey);
           return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;${best ? 'background:#2b2208;border-left:3px solid #fbbf24;padding-left:7px;' : ''}">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span style="color:#fde68a;background:#6b4b08;border:1px solid #d97706;border-radius:3px;padding:1px 3px;font-weight:700;" title="Eaglecast recording source">🦅 EC</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (a.episode_guess ? '<br><span style="color:'+(a.episode_guess.confident ? '#d9a441' : '#64748b')+';font-size:11px;" title="Matched from the description. The guide itself gives no episode number.">'+esc((a.episode_guess.confident ? '≈ ' : 'maybe ')+'S'+a.episode_guess.season+'E'+a.episode_guess.number+' · '+a.episode_guess.name+' ('+Math.round(a.episode_guess.score*100)+'%)')+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : ''))}</span>
+            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span style="color:#fde68a;background:#6b4b08;border:1px solid #d97706;border-radius:3px;padding:1px 3px;font-weight:700;" title="Eaglecast recording source">🦅 EC</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (a.episode_guess ? '<br><span style="color:'+(a.episode_guess.confident ? '#d9a441' : '#64748b')+';font-size:11px;" title="'+(a.episode_guess.source === 'guide' ? 'The same description is on a numbered airing of this show on another channel.' : 'Matched from the description wording. The guide itself gives no episode number.')+'">'+esc((a.episode_guess.confident ? '≈ ' : 'maybe ')+'S'+a.episode_guess.season+'E'+a.episode_guess.number+' · '+a.episode_guess.name+' ('+Math.round(a.episode_guess.score*100)+'%)')+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : ''))}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)
