@@ -4085,13 +4085,24 @@ class AdultLockTests(unittest.TestCase):
         data = self._view("&content=adult", {"X-Adult-Token": token})
         self.assertEqual([c["name"] for c in data["channels"]], ["Brazzers TV Plus"])
 
-    def test_the_page_has_the_two_views_and_the_counts(self):
+    def test_the_page_renders_and_has_no_backslash_escapes_in_its_script(self):
+        reply = server.app.test_client().get("/epg-web")
+        self.assertEqual(reply.status_code, 200)                                  # a stray \\ud83d-style escape once made this a 500
+        self.assertNotIn("\\ud83d", reply.get_data(as_text=True))
+
+    def test_the_adult_controls_are_tucked_behind_the_admin_button(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn('<option value="non_english">', html)
-        self.assertIn('<option value="adult">', html)
+        self.assertNotIn('<option value="adult">', html)                          # not in the page at all until an admin session adds it
+        self.assertIn("option.value = 'adult'", html)
+        self.assertIn('id="admin-btn"', html)
+        self.assertIn("function setAdminMode", html)
+        hidden_span = html.index('id="adult-controls" style="display:none;"')
+        self.assertLess(hidden_span, html.index('id="hide-adult"'))               # the checkbox sits inside the hidden block
+        self.assertLess(hidden_span, html.index('id="hidden-count-adult"'))
         self.assertIn('id="hidden-count-foreign"', html)
-        self.assertIn('id="hidden-count-adult"', html)
         self.assertIn("savedContent !== 'adult'", html)                           # never reopened on its own
+        self.assertIn("setAdminMode(!!st.unlocked)", html)                        # on only for an unlocked tab
 
     def test_the_page_has_the_adult_controls_and_checkbox_spacing(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)

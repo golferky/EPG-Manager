@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117f"
+VERSION = "v20261117g"
 
 app = Flask(__name__)
 
@@ -9649,6 +9649,7 @@ tr:hover td{background:#141414;}
   <button class="btn btn-ghost btn-sm" id="btn-fetch-guide" onclick="fetchGuide()">↻ Refresh Guide</button>
   <button class="btn btn-ghost btn-sm" id="rec-window-btn" onclick="openRecWindow()" title="What is recording and what is coming up">⏺ Recordings</button>
   <button class="btn btn-ghost btn-sm" id="player-pref-btn" onclick="togglePlayerPref()" title="Where Play opens videos on this device">Player: VLC</button>
+  <button class="btn btn-ghost btn-sm" id="admin-btn" onclick="onAdminButton()" style="opacity:.55;" title="Admin">Admin</button>
   <button class="btn btn-ghost btn-sm" onclick="openSettings()">⚙ Settings</button>
 </header>
 <div id="reminder-bar" style="display:none;background:#78350f;color:#fde68a;padding:6px 16px;font-size:13px;border-bottom:1px solid #b45309;">
@@ -9708,7 +9709,6 @@ tr:hover td{background:#141414;}
       <option value="docs">🎓 Documentaries</option>
       <option value="reality">🎭 Reality & talk</option>
       <option value="non_english">🌐 Non-English only</option>
-      <option value="adult">🔞 Adult only</option>
     </select>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide redundant SD/HD channel-name duplicates; East, West, and Pacific stay visible">
       <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide quality duplicates
@@ -9716,10 +9716,11 @@ tr:hover td{background:#141414;}
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide channels that are clearly not in English (Spanish, French, Filipino and so on)">
       <input id="hide-foreign" type="checkbox" checked onchange="localStorage.setItem('epg_hide_foreign',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide non-English <span id="hidden-count-foreign" style="color:#64748b;"></span>
     </label>
-    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide adult channels and programmes. If a password is set, showing them asks for it.">
-      <input id="hide-adult" type="checkbox" checked onchange="onAdultToggle(this)"> Hide adult <span id="hidden-count-adult" style="color:#64748b;"></span>
-    </label>
-    <button id="adult-lock-btn" class="btn btn-ghost btn-sm" onclick="showAdultModal('set')" title="Set, change or remove the adult password" style="padding:2px 7px;">🔒</button>
+    <span id="adult-controls" style="display:none;">
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide adult channels and programmes">
+        <input id="hide-adult" type="checkbox" checked onchange="onAdultToggle(this)"> Hide adult <span id="hidden-count-adult" style="color:#64748b;"></span>
+      </label>
+    </span>
     <div style="position:relative;display:inline-block;">
       <input id="ch-filter" placeholder="🔍 Search channels & shows…" oninput="onSearchInput(this.value);updateSearchClear()" onkeydown="if(event.key==='Escape')clearSearch()" autocomplete="off" style="width:220px;padding-right:30px;">
       <button id="ch-filter-clear" type="button" onclick="clearSearch()" aria-label="Clear search" title="Clear search" style="display:none;position:absolute;right:5px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:#94a3b8;font-size:19px;line-height:1;cursor:pointer;padding:1px 4px;">×</button>
@@ -9798,6 +9799,8 @@ tr:hover td{background:#141414;}
     <div id="adult-modal-msg" style="font-size:12px;min-height:16px;margin-bottom:10px;color:#f87171;"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;">
       <button class="btn btn-ghost btn-sm" id="adult-remove-btn" style="display:none;margin-right:auto;" onclick="removeAdultPassword()">Remove password</button>
+      <button class="btn btn-ghost btn-sm" id="admin-change-btn" style="display:none;" onclick="showAdultModal('set')">Change password</button>
+      <button class="btn btn-ghost btn-sm" id="admin-lock-btn" style="display:none;" onclick="lockAdmin()">Lock admin</button>
       <button class="btn btn-ghost btn-sm" onclick="closeAdultModal()">Cancel</button>
       <button class="btn btn-primary btn-sm" onclick="submitAdultModal()">OK</button>
     </div>
@@ -11099,9 +11102,21 @@ function showAdultModal(mode) {
   has('adult-pw-current').style.display = 'none';
   has('adult-pw-confirm').style.display = 'none';
   has('adult-remove-btn').style.display = 'none';
+  has('admin-change-btn').style.display = 'none';
+  has('admin-lock-btn').style.display = 'none';
+  has('adult-pw-main').style.display = '';
+  if (mode === 'menu') {
+    has('adult-modal-title').textContent = 'Admin';
+    has('adult-modal-help').textContent = 'Admin is unlocked in this browser tab. It locks again when you close the tab, press Lock admin, or the dashboard restarts.';
+    has('adult-pw-main').style.display = 'none';
+    has('admin-change-btn').style.display = '';
+    has('admin-lock-btn').style.display = '';
+    has('adult-modal').style.display = 'flex';
+    return;
+  }
   if (mode === 'unlock') {
-    has('adult-modal-title').textContent = 'Show adult content';
-    has('adult-modal-help').textContent = 'Enter the adult password. It stays unlocked in this browser tab until you tick Hide adult or close the tab.';
+    has('adult-modal-title').textContent = 'Admin';
+    has('adult-modal-help').textContent = 'Enter the admin password. Admin stays unlocked in this browser tab until you press Lock admin or close the tab.';
     has('adult-pw-main').placeholder = 'Password';
     has('adult-modal').style.display = 'flex';
     has('adult-pw-main').focus();
@@ -11109,10 +11124,10 @@ function showAdultModal(mode) {
   }
   fetch('/epg-web/api/adult', {headers: adultHeaders()}).then(r => r.json()).then(st => {
     const set = !!st.password_set;
-    has('adult-modal-title').textContent = set ? 'Change the adult password' : 'Set an adult password';
+    has('adult-modal-title').textContent = set ? 'Change the admin password' : 'Set an admin password';
     has('adult-modal-help').textContent = set
       ? 'Enter the current password and a new one.'
-      : 'With a password set, adult content cannot be shown without it. Use at least 4 characters.';
+      : 'Admin keeps the adult controls out of sight and locked. Choose a password of at least 4 characters.';
     has('adult-pw-main').placeholder = 'New password';
     has('adult-pw-confirm').style.display = '';
     has('adult-pw-current').style.display = set ? '' : 'none';
@@ -11120,6 +11135,41 @@ function showAdultModal(mode) {
     has('adult-modal').style.display = 'flex';
     (set ? has('adult-pw-current') : has('adult-pw-main')).focus();
   });
+}
+// Admin mode: the adult controls exist in the page only while this tab has an admin session.
+function setAdminMode(on) {
+  const controls = document.getElementById('adult-controls');
+  if (controls) controls.style.display = on ? '' : 'none';
+  const btn = document.getElementById('admin-btn');
+  if (btn) { btn.textContent = on ? 'Admin ✓' : 'Admin'; btn.style.opacity = on ? '1' : '.55'; }
+  const view = document.getElementById('guide-content-filter');
+  if (!view) return;
+  const existing = Array.from(view.options).find(o => o.value === 'adult');
+  if (on && !existing) {
+    const option = document.createElement('option');
+    option.value = 'adult';
+    option.textContent = '🔞 Adult only';
+    view.appendChild(option);
+  }
+  if (!on && existing) {
+    if (view.value === 'adult') { view.value = 'all'; localStorage.setItem('epg_guide_content', 'all'); }
+    existing.remove();
+  }
+}
+async function onAdminButton() {
+  let st = {password_set: false, unlocked: false};
+  try { st = await (await fetch('/epg-web/api/adult', {headers: adultHeaders()})).json(); } catch (e) {}
+  if (st.unlocked) { showAdultModal('menu'); return; }
+  showAdultModal(st.password_set ? 'unlock' : 'set');
+}
+async function lockAdmin() {
+  try { await fetch('/epg-web/api/adult/lock', {method: 'POST', headers: adultHeaders()}); } catch (e) {}
+  sessionStorage.removeItem('epg_adult_token');
+  document.getElementById('hide-adult').checked = true;
+  localStorage.setItem('epg_hide_adult', '1');
+  setAdminMode(false);
+  closeAdultModal();
+  fetchAndRenderGuide();
 }
 function setHiddenCounts(counts) {
   const c = counts || {};
@@ -11150,18 +11200,23 @@ async function submitAdultModal() {
     const d = await adultPost('/unlock', {password: main});
     if (!d.ok) { msg.textContent = d.error || 'That did not work.'; return; }
     if (d.token) sessionStorage.setItem('epg_adult_token', d.token);
-    document.getElementById('hide-adult').checked = false;
-    localStorage.setItem('epg_hide_adult', '0');
+    setAdminMode(true);                                 // the adult controls appear; adult itself stays hidden until you untick it
     closeAdultModal();
     fetchAndRenderGuide();
     return;
   }
   if (main !== document.getElementById('adult-pw-confirm').value) { msg.textContent = 'The two passwords do not match.'; return; }
+  const first = document.getElementById('adult-pw-current').style.display === 'none';     // no password existed yet
   const d = await adultPost('/password', {current: document.getElementById('adult-pw-current').value, new: main});
   if (!d.ok) { msg.textContent = d.error || 'That did not work.'; return; }
   sessionStorage.removeItem('epg_adult_token');
   document.getElementById('hide-adult').checked = true;
   localStorage.setItem('epg_hide_adult', '1');
+  setAdminMode(false);
+  if (first) {                                           // a brand new password: sign this tab straight in
+    const u = await adultPost('/unlock', {password: main});
+    if (u.ok && u.token) { sessionStorage.setItem('epg_adult_token', u.token); setAdminMode(true); }
+  }
   closeAdultModal();
   fetchAndRenderGuide();
 }
@@ -11170,6 +11225,7 @@ async function removeAdultPassword() {
   const d = await adultPost('/password', {current: document.getElementById('adult-pw-current').value, new: ''});
   if (!d.ok) { msg.textContent = d.error || 'Enter the current password first.'; return; }
   sessionStorage.removeItem('epg_adult_token');
+  setAdminMode(false);
   closeAdultModal();
 }
 (async function initAdultSwitch() {                    // a password is set and this tab has not unlocked it: stay hidden
@@ -11179,6 +11235,7 @@ async function removeAdultPassword() {
       document.getElementById('hide-adult').checked = true;
       localStorage.setItem('epg_hide_adult', '1');
     }
+    setAdminMode(!!st.unlocked);                         // controls are in the page only for an unlocked admin tab
   } catch (e) {}
 })();
 setInterval(loadReminders, 30 * 60 * 1000);
