@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261117g"
+VERSION = "v20261117h"
 
 app = Flask(__name__)
 
@@ -3198,6 +3198,63 @@ def api_adult_password():
             _adult_tokens.clear()                                                  # everyone must unlock again
     save_config(cfg)
     return jsonify({'ok': True, 'password_set': bool(cfg.get('adult_password_hash'))})
+
+
+@app.route('/epg-web/api/provider-epg-probe')
+def api_provider_epg_probe():
+    """Read-only: what the provider's live listings contain for a channel (every field, decoded).
+
+    ``?name=ANTENNA`` finds PrimeStreams channels whose name contains that text (at most three), or
+    ``?stream_id=1234`` asks for one directly.  It exists to find out whether the provider sends season and
+    episode numbers that the guide lacks.  The provider address and login are never included.
+    """
+    from urllib import parse as urlparse, request as urlreq
+    cfg = load_config()
+    base = str(cfg.get('epg_url') or '').rstrip('/')
+    user, password = str(cfg.get('epg_user') or ''), str(cfg.get('epg_pass') or '')
+    if not (base and user and password):
+        return jsonify({'error': 'Provider credentials are not configured'}), 503
+    limit = max(1, min(int(request.args.get('limit', 8) or 8), 24))
+    targets = []
+    if request.args.get('stream_id'):
+        targets.append((str(request.args['stream_id']), ''))
+    else:
+        name = str(request.args.get('name', '')).strip().upper()
+        if len(name) < 3:
+            return jsonify({'error': 'give ?name= of at least 3 letters, or ?stream_id='}), 400
+        try:
+            conn = sqlite3.connect(_guide_db_path(), timeout=5)
+            targets = [(str(r[0]), str(r[1] or '')) for r in conn.execute(
+                "SELECT stream_id, provider_name FROM provider_stream_authority WHERE provider='primestreams' "
+                "AND upper(provider_name) LIKE ? ORDER BY provider_name LIMIT 3", ('%' + name + '%',)).fetchall()]
+            conn.close()
+        except sqlite3.Error as exc:
+            return jsonify({'error': str(exc)}), 500
+    results = []
+    for stream_id, provider_name in targets:
+        entry = {'stream_id': stream_id, 'provider_name': provider_name}
+        try:
+            query = urlparse.urlencode({'username': user, 'password': password, 'action': 'get_short_epg',
+                                        'stream_id': stream_id, 'limit': str(limit)})
+            req = urlreq.Request(base + '/player_api.php?' + query, headers={'User-Agent': 'TiViMate/4.7.0'})
+            with urlreq.urlopen(req, timeout=15) as response:
+                payload = json.loads(response.read())
+            items = payload.get('epg_listings') if isinstance(payload, dict) else []
+            decoded = []
+            for item in items or []:
+                row = {}
+                for key, value in item.items():
+                    if key in ('title', 'description'):
+                        row[key] = _decode_provider_epg_text(value)[:200]
+                    else:
+                        row[key] = value if isinstance(value, (int, float, bool)) or value is None else str(value)[:80]
+                decoded.append(row)
+            entry['keys'] = sorted({k for row in decoded for k in row})
+            entry['items'] = decoded
+        except Exception as exc:
+            entry['error'] = f'{type(exc).__name__}'        # the message could carry the address
+        results.append(entry)
+    return jsonify({'results': results})
 
 
 # How many days before an account ends the dashboard starts reminding.  Schedules Direct opens renewal
