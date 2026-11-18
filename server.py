@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118f"
+VERSION = "v20261118g"
 
 app = Flask(__name__)
 
@@ -436,8 +436,8 @@ def _local_call_signs_for_zip(zip_code):
     if zip_code == DEFAULT_LOCAL_ZIP:
         return list(LOCAL_CALL_SIGNS)
     try:
-        from sd_guide import get_token, ota_callsigns
-        signs = ota_callsigns(get_token(cfg.get('sd_user', ''), cfg.get('sd_pass', '')), zip_code)
+        from sd_guide import ota_callsigns
+        signs = ota_callsigns(cfg.get('sd_user', ''), cfg.get('sd_pass', ''), zip_code)
     except Exception as exc:
         print(f'[local] could not look up stations for {zip_code}: {exc}')
         return None

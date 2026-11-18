@@ -4605,3 +4605,28 @@ class LocalByZipTests(unittest.TestCase):
     def test_the_built_in_zip_needs_no_lookup_and_a_bad_zip_gives_none(self):
         self.assertIn('wcpo', server._local_call_signs_for_zip(server.DEFAULT_LOCAL_ZIP))
         self.assertIsNone(server._local_call_signs_for_zip('12'))
+
+
+class OtaLookupTokenTests(unittest.TestCase):
+    def test_an_expired_token_is_dropped_and_the_lookup_retried_once(self):
+        import sd_guide
+        calls, tokens = [], iter(['old', 'new'])
+        def fake_req(method, path, body=None, token=None):
+            calls.append(token)
+            if token == 'old':
+                raise RuntimeError('SD HTTP 403: {"response":"TOKEN_EXPIRED","code":4006}')
+            return [{'callsign': 'WCPO'}, {'callsign': 'WLWT'}]
+        with mock.patch.object(sd_guide, '_req', fake_req), \
+             mock.patch.object(sd_guide, 'get_token', lambda u, p: next(tokens)), \
+             mock.patch.object(sd_guide.os, 'remove') as removed:
+            self.assertEqual(sd_guide.ota_callsigns('u', 'p', '41042'), ['wcpo', 'wlwt'])
+        self.assertEqual(calls, ['old', 'new'])
+        removed.assert_called_once()
+
+    def test_other_errors_are_not_retried(self):
+        import sd_guide
+        with mock.patch.object(sd_guide, '_req', side_effect=RuntimeError('SD HTTP 404: no such lineup')) as req, \
+             mock.patch.object(sd_guide, 'get_token', lambda u, p: 't'):
+            with self.assertRaises(RuntimeError):
+                sd_guide.ota_callsigns('u', 'p', '00000')
+        self.assertEqual(req.call_count, 1)
