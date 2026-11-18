@@ -40,9 +40,23 @@ def _req(method, path, body=None, token=None):
         body = e.read().decode('utf-8', errors='replace')
         raise RuntimeError(f'SD HTTP {e.code}: {body}')
 
-def ota_callsigns(token, zip_code):
-    """Call signs of the over-the-air stations Schedules Direct lists for a US ZIP code (its USA-OTA lineup)."""
-    data = _req('GET', f'/lineups/preview/USA-OTA-{zip_code}', token=token)
+def ota_callsigns(username, password, zip_code):
+    """Call signs of the over-the-air stations Schedules Direct lists for a US ZIP code (its USA-OTA lineup).
+
+    The saved login token can be refused as expired before its saved time is up (a login elsewhere replaces it),
+    so one refusal clears it and tries again with a fresh login.
+    """
+    for attempt in (1, 2):
+        try:
+            data = _req('GET', f'/lineups/preview/USA-OTA-{zip_code}', token=get_token(username, password))
+            break
+        except RuntimeError as exc:
+            if attempt == 2 or 'TOKEN' not in str(exc).upper():
+                raise
+            try:
+                os.remove(SD_TOKEN_FILE)
+            except OSError:
+                pass
     rows = data if isinstance(data, list) else data.get('map', []) if isinstance(data, dict) else []
     return sorted({str(r.get('callsign') or '').strip().lower() for r in rows if isinstance(r, dict) and r.get('callsign')})
 
