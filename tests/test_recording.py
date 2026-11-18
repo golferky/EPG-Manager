@@ -42,6 +42,21 @@ class RecordingTests(unittest.TestCase):
         self.assertTrue(server._is_premium_channel("Sky Cinema Greats"))
         self.assertFalse(server._is_premium_channel("ANTENNA TV"))
 
+    def test_cinemax_flix_and_the_plex_channels_sit_with_the_premium_favorites(self):
+        for name in ("Cinemax", "Cinemax Action", "Cinemax Hits", "Cinemax Hits (West)", "Flix", "INDIEPLEX", "MOVIEPLEX", "RETROPLEX"):
+            self.assertTrue(server._is_premium_favorite_channel(name), name)
+        for name in ("FAMILY ENTERTAINMENT TELEVISION", "AMC", "Flixster Movies", "Hallmark Channel"):
+            self.assertFalse(server._is_premium_favorite_channel(name), name)
+
+    def test_only_cinemax_gains_premium_status_for_recording_decisions(self):
+        for name in ("Cinemax Action", "Cinemax Hits"):                          # a real fix: they are commercial-free premium
+            self.assertTrue(server._is_premium_channel(name), name)
+            self.assertTrue(server._is_commercial_free_channel(name), name)
+        for name in ("Flix", "INDIEPLEX", "MOVIEPLEX", "RETROPLEX"):             # grouping only: the rules for recording are unchanged
+            self.assertFalse(server._is_premium_channel(name), name)
+            self.assertFalse(server._is_premium_movie_channel(name), name)
+        self.assertTrue(server._is_commercial_free_channel("Flix"))              # as before, through its own rule
+
     def test_non_english_channel_classifier(self):
         self.assertTrue(server._is_foreign_recording_feed("HBO Latino HD"))
         self.assertTrue(server._is_foreign_recording_feed("CINE ESPAÑOL"))
