@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118g"
+VERSION = "v20261118h"
 
 app = Flask(__name__)
 
@@ -408,8 +408,20 @@ LOCAL_CALL_SIGNS = ('wcpo', 'wkrc', 'wlwt', 'wxix', 'wcet', 'wpto', 'wstr')
 DEFAULT_LOCAL_ZIP = '45202'      # Cincinnati
 
 
+def _base_call_sign(sign):
+    """WCPO-DT, WCPODT, WCPO-DT2 and WCPO all give wcpo; a four-letter sign such as WGTV is left whole."""
+    text = str(sign or '').lower().strip()
+    base = re.split(r'[-_ /]', text)[0]
+    base = re.sub(r'[^a-z0-9]', '', base)
+    if len(base) > 4:
+        base = re.sub(r'\d+$', '', base)
+        if len(base) > 4 and base.endswith(('dt', 'hd', 'ld', 'cd', 'lp')):
+            base = base[:-2]
+    return base
+
+
 def _local_regex(call_signs):
-    signs = sorted({re.sub(r'[^a-z0-9]', '', str(c).lower()) for c in call_signs if c}, key=len, reverse=True)
+    signs = sorted({b for b in (_base_call_sign(c) for c in call_signs if c) if b}, key=len, reverse=True)
     if not signs:
         return None
     return re.compile(r'(?<![a-z0-9])(?:' + '|'.join(signs) + r')(?:[- ]?(?:dt|hd|tv|ld|cd|lp))?\d*(?![a-z0-9])')
