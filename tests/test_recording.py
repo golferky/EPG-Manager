@@ -4589,6 +4589,19 @@ class FavoriteEmptyRowsTests(unittest.TestCase):
 class LocalChannelTests(unittest.TestCase):
     def test_cincinnati_stations_are_local_and_look_alikes_are_not(self):
         for name in ('WCPO', 'WCPO-DT', 'WLWT HD', 'US| ABC 9 CINCINNATI OH (WCPO)', 'WKRC-DT2', 'WXIX', 'WCET', 'WPTO', 'WSTR HD', 'FOX 19 Cincinnati'):
-            self.assertTrue(server._is_local_channel(name), name)
+            self.assertTrue(server._is_local_channel(name, server.LOCAL_CALL_SIGNS, 'cincinnati'), name)
         for name in ('ESPN', 'HBO', 'WCPOX Shopping', 'KABC', 'WLWTV Foo', 'Cinemax', ''):
-            self.assertFalse(server._is_local_channel(name), name)
+            self.assertFalse(server._is_local_channel(name, server.LOCAL_CALL_SIGNS, 'cincinnati'), name)
+
+
+class LocalByZipTests(unittest.TestCase):
+    def test_a_zip_codes_call_signs_decide_what_is_local(self):
+        self.assertTrue(server._is_local_channel('WKYT-DT', ['wkyt', 'wlex']))
+        self.assertFalse(server._is_local_channel('WCPO', ['wkyt', 'wlex']))
+        self.assertTrue(server._is_local_channel('WLEX HD2', ['wkyt', 'wlex']))
+        self.assertFalse(server._is_local_channel('WLEXTRA', ['wlex']))
+        self.assertFalse(server._is_local_channel('WCPO', []))
+
+    def test_the_built_in_zip_needs_no_lookup_and_a_bad_zip_gives_none(self):
+        self.assertIn('wcpo', server._local_call_signs_for_zip(server.DEFAULT_LOCAL_ZIP))
+        self.assertIsNone(server._local_call_signs_for_zip('12'))
