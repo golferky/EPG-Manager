@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118c"
+VERSION = "v20261118d"
 
 app = Flask(__name__)
 
@@ -3871,6 +3871,28 @@ def api_guide_descriptions():
     return jsonify({'title': title, 'airings': airings})
 
 
+def _favorite_rows_without_data(channels, present_ids, allowed_ids, ch_filter, ch_id_filter, hide_foreign, hide_adult):
+    """Starred channels with nothing in the window, shown as empty "No guide data" rows so an expired one is visible.
+
+    When the guide is focused on one channel (a click on its name, ``ch_id``) or searched by name, only that match
+    may appear: the other starred channels must not come back as empty rows.
+    """
+    rows = []
+    for c in channels:
+        if c['id'] not in allowed_ids or c['id'] in present_ids:
+            continue
+        if ch_id_filter and c['id'].lower() != ch_id_filter:
+            continue
+        if hide_foreign and _is_non_english_channel(c.get('name', ''), c.get('language', '')):
+            continue
+        if hide_adult and _is_adult_channel(c.get('name', '')):
+            continue
+        if ch_filter and ch_filter not in c['name'].lower():
+            continue
+        rows.append(dict(c, no_data=True))
+    return rows
+
+
 @app.route('/epg-web/api/guide')
 def api_guide():
     """Return programmes in a time window for the grid."""
@@ -4142,15 +4164,9 @@ def api_guide():
     # empty rows to make an expired favourite/source visible.
     if (allowed_ch_ids is not None and not eagle_only
             and content_filter in {'all', 'premium_movies'}):
-        present_ids = {c['id'] for c in ordered_channels_raw}
-        for c in _epg['channels']:
-            if c['id'] in allowed_ch_ids and c['id'] not in present_ids:
-                if hide_foreign and _is_non_english_channel(c.get('name', ''), c.get('language', '')):
-                    continue
-                if hide_adult and _is_adult_channel(c.get('name', '')):
-                    continue
-                if not ch_filter or ch_filter in c['name'].lower():
-                    ordered_channels_raw.append(dict(c, no_data=True))
+        ordered_channels_raw.extend(_favorite_rows_without_data(
+            _epg['channels'], {c['id'] for c in ordered_channels_raw}, allowed_ch_ids,
+            ch_filter, ch_id_filter, hide_foreign, hide_adult))
 
     # A legacy XMLTV ID (for example ``axstv.us``) can retain an old provider
     # map after its current Schedules Direct numeric counterpart has taken
