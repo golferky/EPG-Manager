@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118a"
+VERSION = "v20261118b"
 
 app = Flask(__name__)
 
@@ -311,7 +311,8 @@ def _is_premium_favorite_channel(name):
 
 # Commercial-free channels that are not "premium" in the Favorites sense: Flix and The Movie
 # Channel (Showtime's sister networks), TCM, and Crave's premium channels.
-_COMMERCIAL_FREE_EXTRA_PREFIXES = ('flix', 'themoviechannel', 'tmc', 'tcm', 'turnerclassicmovies', 'crave')
+_COMMERCIAL_FREE_EXTRA_PREFIXES = ('flix', 'themoviechannel', 'tmc', 'tcm', 'turnerclassicmovies', 'crave',
+                                   'indieplex', 'movieplex', 'retroplex')      # the Starz Encore family's ad-free plex channels
 
 
 def _is_commercial_free_channel(name):
