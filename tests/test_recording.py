@@ -43,9 +43,12 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(server._is_premium_channel("ANTENNA TV"))
 
     def test_cinemax_flix_and_the_plex_channels_sit_with_the_premium_favorites(self):
-        for name in ("Cinemax", "Cinemax Action", "Cinemax Hits", "Cinemax Hits (West)", "Flix", "INDIEPLEX", "MOVIEPLEX", "RETROPLEX"):
+        for name in ("Cinemax", "Cinemax Action", "Cinemax Hits", "Cinemax Hits (West)", "Flix", "INDIEPLEX", "MOVIEPLEX", "RETROPLEX",
+                     "SHO x BET", "SHO Extreme", "THE MOVIE CHANNEL", "The Movie Channel", "The Movie Channel (SD)",
+                     "The Movie Channel (West)", "The Movie Channel Xtra", "TMC"):
             self.assertTrue(server._is_premium_favorite_channel(name), name)
-        for name in ("FAMILY ENTERTAINMENT TELEVISION", "AMC", "Flixster Movies", "Hallmark Channel"):
+        for name in ("FAMILY ENTERTAINMENT TELEVISION", "AMC", "Flixster Movies", "Hallmark Channel", "Shop HQ", "ShopTV",
+                     "Turner Classic Movies", "TCM (SD)"):
             self.assertFalse(server._is_premium_favorite_channel(name), name)
 
     def test_only_cinemax_gains_premium_status_for_recording_decisions(self):
@@ -58,6 +61,14 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue(server._is_commercial_free_channel(name), name)      # but commercial-free, so films can be recorded from them
             self.assertTrue(server._is_rerecord_channel(name), name)
         self.assertFalse(server._is_commercial_free_channel("FAMILY ENTERTAINMENT TELEVISION"))
+
+    def test_showtimes_own_channels_are_premium_and_the_movie_channel_is_grouping_only(self):
+        for name in ("SHO x BET", "SHO Extreme"):
+            self.assertTrue(server._is_premium_channel(name), name)
+            self.assertTrue(server._is_commercial_free_channel(name), name)
+        self.assertFalse(server._is_premium_channel("Shop HQ"))                  # a bare "sho" must not catch shopping channels
+        self.assertFalse(server._is_premium_channel("The Movie Channel"))        # grouping only: its recording rules are unchanged
+        self.assertTrue(server._is_commercial_free_channel("The Movie Channel"))
 
     def test_non_english_channel_classifier(self):
         self.assertTrue(server._is_foreign_recording_feed("HBO Latino HD"))
@@ -4550,3 +4561,26 @@ class SeriesPassUsesExactEpisodesTests(SeriesNoDuplicateBookingTests):
         self.plex_keys = {"show|7|4"}
         self.assertEqual(self._run(), 1)
         self.assertEqual(self._booked(), [(None, None, "plain")])                         # only the unidentified one is booked
+
+
+class FavoriteEmptyRowsTests(unittest.TestCase):
+    CHANNELS = [{"id": "c1", "name": "Cinemax"}, {"id": "c2", "name": "Cinemax Action"}, {"id": "c3", "name": "HBO"},
+                {"id": "c4", "name": "Brazzers TV Plus"}, {"id": "c5", "name": "Telemundo", "language": "es"}]
+
+    def _rows(self, present=(), ch_filter="", ch_id_filter="", hide_foreign=False, hide_adult=False):
+        return [c["id"] for c in server._favorite_rows_without_data(
+            self.CHANNELS, set(present), {"c1", "c2", "c3", "c4", "c5"}, ch_filter, ch_id_filter, hide_foreign, hide_adult)]
+
+    def test_with_no_focus_every_starred_channel_without_data_gets_an_empty_row(self):
+        self.assertEqual(self._rows(present={"c3"}), ["c1", "c2", "c4", "c5"])
+
+    def test_focusing_one_channel_does_not_bring_back_the_others_as_empty_rows(self):
+        self.assertEqual(self._rows(present={"c1"}, ch_id_filter="c1"), [])               # the clicked channel has data
+        self.assertEqual(self._rows(present=(), ch_id_filter="c1"), ["c1"])               # it has none: only it is shown empty
+        self.assertEqual(self._rows(present=(), ch_id_filter="c2"), ["c2"])
+
+    def test_a_name_search_keeps_only_matching_empty_rows(self):
+        self.assertEqual(self._rows(ch_filter="cinemax"), ["c1", "c2"])
+
+    def test_the_hide_switches_still_apply_to_the_empty_rows(self):
+        self.assertEqual(self._rows(hide_foreign=True, hide_adult=True), ["c1", "c2", "c3"])
