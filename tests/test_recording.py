@@ -4630,3 +4630,13 @@ class OtaLookupTokenTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 sd_guide.ota_callsigns('u', 'p', '00000')
         self.assertEqual(req.call_count, 1)
+
+
+class LocalCallSignFormTests(unittest.TestCase):
+    def test_call_signs_with_a_digital_suffix_still_match_plain_channel_names(self):
+        for sign in ('WCPO-DT', 'WCPODT', 'WCPO-DT2', 'WCPO', 'wcpo-hd'):
+            self.assertEqual(server._base_call_sign(sign), 'wcpo', sign)
+        self.assertEqual(server._base_call_sign('WGTV'), 'wgtv')
+        self.assertTrue(server._is_local_channel('WCPO', ['WCPO-DT', 'WLWT-DT']))
+        self.assertTrue(server._is_local_channel('WLWT HD', ['WCPODT', 'WLWTDT']))
+        self.assertFalse(server._is_local_channel('ESPN', ['WCPO-DT']))
