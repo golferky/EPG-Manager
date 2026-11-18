@@ -4661,3 +4661,25 @@ class NoFeedMessageTests(unittest.TestCase):
     def test_it_says_so_when_no_listing_of_the_station_has_a_feed(self):
         msg = self._message(set())
         self.assertIn("no other listing of this station has one", msg)
+
+
+class LiveStreamFallbackTests(unittest.TestCase):
+    def _pick(self, busy_titles, ps_ok=True):
+        def fake(cid, provider=None):
+            if provider == 'primestreams':
+                return (('ps-url', None, {'provider': 'primestreams'}) if ps_ok
+                        else (None, 'No stream_id found for channel', {}))
+            return 'eagle-url', None, {'provider': 'eaglecast'}
+        with mock.patch.object(server, '_stream_url', fake), \
+             mock.patch.object(server, '_busy_eaglecast_titles', lambda recs: busy_titles):
+            return server._live_stream_url('retroplex.us')
+
+    def test_a_free_eaglecast_connection_is_still_used_first(self):
+        self.assertEqual(self._pick([])[0], 'eagle-url')
+
+    def test_a_busy_eaglecast_connection_hands_live_play_to_primestreams(self):
+        url, err, dbg = self._pick(['Before I Fall'])
+        self.assertEqual((url, err, dbg['provider']), ('ps-url', None, 'primestreams'))
+
+    def test_a_busy_eaglecast_with_no_primestreams_feed_keeps_the_eaglecast_answer(self):
+        self.assertEqual(self._pick(['Before I Fall'], ps_ok=False)[0], 'eagle-url')
