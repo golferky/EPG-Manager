@@ -40,6 +40,13 @@ def _req(method, path, body=None, token=None):
         body = e.read().decode('utf-8', errors='replace')
         raise RuntimeError(f'SD HTTP {e.code}: {body}')
 
+def ota_callsigns(token, zip_code):
+    """Call signs of the over-the-air stations Schedules Direct lists for a US ZIP code (its USA-OTA lineup)."""
+    data = _req('GET', f'/lineups/preview/USA-OTA-{zip_code}', token=token)
+    rows = data if isinstance(data, list) else data.get('map', []) if isinstance(data, dict) else []
+    return sorted({str(r.get('callsign') or '').strip().lower() for r in rows if isinstance(r, dict) and r.get('callsign')})
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def get_token(username, password):

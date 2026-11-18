@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118d"
+VERSION = "v20261118f"
 
 app = Flask(__name__)
 
@@ -346,7 +346,7 @@ def _guide_program_matches_content(program, content):
     channel filter by ``api_guide`` because it means premium movie networks,
     not merely programmes tagged as movies.
     """
-    if not content or content in ('all', 'premium_movies', 'non_english', 'adult'):     # the last two are channel views in api_guide
+    if not content or content in ('all', 'premium_movies', 'non_english', 'adult', 'local'):     # the last three are channel views in api_guide
         return True
     category = str(program.get('category') or '').lower()
     prog_type = str(program.get('prog_type') or '').upper()
@@ -400,6 +400,52 @@ def _is_foreign_recording_feed(name):
 _NON_LATIN_SCRIPT = re.compile(r'[\u0400-\u06ff\u0750-\u077f\u0900-\u0dff\u0e00-\u0eff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]')
 _FOREIGN_NETWORKS = re.compile(
     r'(?:telemundo|univision|unimas|unim\u00e1s|galavision|azteca|abs-?cbn|tv globo|record tv|zee tv|cctv)', re.I)
+
+
+# Over-the-air stations of the Cincinnati market, for the "Local channels" view.  Edit this list to follow a move.
+LOCAL_CALL_SIGNS = ('wcpo', 'wkrc', 'wlwt', 'wxix', 'wcet', 'wpto', 'wstr')
+
+DEFAULT_LOCAL_ZIP = '45202'      # Cincinnati
+
+
+def _local_regex(call_signs):
+    signs = sorted({re.sub(r'[^a-z0-9]', '', str(c).lower()) for c in call_signs if c}, key=len, reverse=True)
+    if not signs:
+        return None
+    return re.compile(r'(?<![a-z0-9])(?:' + '|'.join(signs) + r')(?:[- ]?(?:dt|hd|tv|ld|cd|lp))?\d*(?![a-z0-9])')
+
+
+def _is_local_channel(name, call_signs=LOCAL_CALL_SIGNS, place=''):
+    """True for a channel that carries one of the area's call signs (WCPO, WLWT ...) or names its place."""
+    text = str(name or '').lower()
+    rx = _local_regex(call_signs)
+    if rx and rx.search(text):
+        return True
+    return bool(place) and place.lower() in text
+
+
+def _local_call_signs_for_zip(zip_code):
+    """Call signs for a ZIP from Schedules Direct, remembered in the config; None when they cannot be had."""
+    zip_code = re.sub(r'\D', '', str(zip_code or ''))[:5]
+    if len(zip_code) != 5:
+        return None
+    cfg = load_config()
+    known = cfg.get('local_stations') or {}
+    if known.get(zip_code):
+        return known[zip_code]
+    if zip_code == DEFAULT_LOCAL_ZIP:
+        return list(LOCAL_CALL_SIGNS)
+    try:
+        from sd_guide import get_token, ota_callsigns
+        signs = ota_callsigns(get_token(cfg.get('sd_user', ''), cfg.get('sd_pass', '')), zip_code)
+    except Exception as exc:
+        print(f'[local] could not look up stations for {zip_code}: {exc}')
+        return None
+    if signs:
+        known[zip_code] = signs
+        cfg['local_stations'] = known
+        save_config(cfg)
+    return signs or None
 
 
 def _is_non_english_channel(name, language=''):
@@ -3931,7 +3977,7 @@ def api_guide():
     valid_content_filters = {
         'all', 'sports', 'sports_football', 'sports_basketball', 'sports_baseball',
         'sports_golf', 'sports_hockey', 'sports_soccer', 'sports_tennis', 'sports_racing',
-        'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality', 'non_english', 'adult',
+        'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality', 'non_english', 'adult', 'local',
     }
     if content_filter not in valid_content_filters:
         content_filter = 'all'
@@ -4107,7 +4153,15 @@ def api_guide():
         'adult': sum(1 for c in ordered_channels_raw if _is_adult_channel(c.get('name', ''))),
     }
     # The two "only" views show exactly what the switches hide, in the normal grid.
-    if content_filter == 'non_english':
+    if content_filter == 'local':
+        local_zip = re.sub(r'\D', '', request.args.get('local_zip', '') or '')[:5] or DEFAULT_LOCAL_ZIP
+        local_signs = _local_call_signs_for_zip(local_zip)
+        if local_signs is None:
+            return jsonify({'error': 'Could not find the local stations for ZIP ' + local_zip + '. Check the ZIP code, or try again.', 'local_failed': True})
+        keep = {c['id'] for c in ordered_channels_raw if _is_local_channel(c.get('name', ''), local_signs, 'cincinnati' if local_zip == DEFAULT_LOCAL_ZIP else '')}
+        ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] in keep]
+        progs_in_window = [p for p in progs_in_window if p['channel_id'] in keep]
+    elif content_filter == 'non_english':
         hide_foreign = False
         keep = {c['id'] for c in ordered_channels_raw if _is_non_english_channel(c.get('name', ''), c.get('language', ''))}
         ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] in keep]
@@ -10103,8 +10157,12 @@ tr:hover td{background:#141414;}
       <option value="tv">📺 TV & series</option>
       <option value="docs">🎓 Documentaries</option>
       <option value="reality">🎭 Reality & talk</option>
+      <option value="local">📍 Local channels</option>
       <option value="non_english">🌐 Non-English only</option>
     </select>
+    <span id="local-zip-wrap" style="display:none;font-size:12px;color:#94a3b8;white-space:nowrap;" title="Your ZIP code, used to find the local stations. Remembered in this browser.">
+      ZIP <input id="local-zip" type="text" inputmode="numeric" maxlength="5" size="5" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:4px 6px;font-size:13px;" onchange="localStorage.setItem('epg_local_zip',this.value.trim());_chOffset=0;fetchAndRenderGuide()">
+    </span>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide redundant SD/HD channel-name duplicates; East, West, and Pacific stay visible">
       <input id="hide-sd-duplicates" type="checkbox" onchange="localStorage.setItem('epg_hide_sd_duplicates',this.checked ? '1' : '0');fetchAndRenderGuide()"> Hide quality duplicates
     </label>
@@ -11762,6 +11820,13 @@ async function fetchAndRenderGuide() {
   if (mode === 'ps_episode') params.set('ps_episode', '1');
   if (mode === 'sd')    params.set('sd',    '1');
   if (content !== 'all') params.set('content', content);
+  const zipWrap = document.getElementById('local-zip-wrap');
+  if (zipWrap) zipWrap.style.display = content === 'local' ? 'inline' : 'none';
+  if (content === 'local') {
+    const zipBox = document.getElementById('local-zip');
+    if (zipBox && !zipBox.value) zipBox.value = localStorage.getItem('epg_local_zip') || '45202';
+    if (zipBox) params.set('local_zip', zipBox.value.trim());
+  }
   if (!document.getElementById('hide-sd-duplicates').checked) params.set('hide_sd', '0');
   if (document.getElementById('hide-foreign').checked) params.set('hide_foreign', '1');
   if (!document.getElementById('hide-adult').checked) params.set('hide_adult', '0');
