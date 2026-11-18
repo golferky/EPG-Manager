@@ -4584,3 +4584,11 @@ class FavoriteEmptyRowsTests(unittest.TestCase):
 
     def test_the_hide_switches_still_apply_to_the_empty_rows(self):
         self.assertEqual(self._rows(hide_foreign=True, hide_adult=True), ["c1", "c2", "c3"])
+
+
+class LocalChannelTests(unittest.TestCase):
+    def test_cincinnati_stations_are_local_and_look_alikes_are_not(self):
+        for name in ('WCPO', 'WCPO-DT', 'WLWT HD', 'US| ABC 9 CINCINNATI OH (WCPO)', 'WKRC-DT2', 'WXIX', 'WCET', 'WPTO', 'WSTR HD', 'FOX 19 Cincinnati'):
+            self.assertTrue(server._is_local_channel(name), name)
+        for name in ('ESPN', 'HBO', 'WCPOX Shopping', 'KABC', 'WLWTV Foo', 'Cinemax', ''):
+            self.assertFalse(server._is_local_channel(name), name)

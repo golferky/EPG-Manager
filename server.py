@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118d"
+VERSION = "v20261118e"
 
 app = Flask(__name__)
 
@@ -346,7 +346,7 @@ def _guide_program_matches_content(program, content):
     channel filter by ``api_guide`` because it means premium movie networks,
     not merely programmes tagged as movies.
     """
-    if not content or content in ('all', 'premium_movies', 'non_english', 'adult'):     # the last two are channel views in api_guide
+    if not content or content in ('all', 'premium_movies', 'non_english', 'adult', 'local'):     # the last three are channel views in api_guide
         return True
     category = str(program.get('category') or '').lower()
     prog_type = str(program.get('prog_type') or '').upper()
@@ -400,6 +400,17 @@ def _is_foreign_recording_feed(name):
 _NON_LATIN_SCRIPT = re.compile(r'[\u0400-\u06ff\u0750-\u077f\u0900-\u0dff\u0e00-\u0eff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]')
 _FOREIGN_NETWORKS = re.compile(
     r'(?:telemundo|univision|unimas|unim\u00e1s|galavision|azteca|abs-?cbn|tv globo|record tv|zee tv|cctv)', re.I)
+
+
+# Over-the-air stations of the Cincinnati market, for the "Local channels" view.  Edit this list to follow a move.
+LOCAL_CALL_SIGNS = ('wcpo', 'wkrc', 'wlwt', 'wxix', 'wcet', 'wpto', 'wstr')
+
+_LOCAL_CHANNEL_RE = re.compile(r'\b(?:' + '|'.join(LOCAL_CALL_SIGNS) + r')(?:[- ]?(?:dt|hd|tv|ld|cd))?\d*\b|cincinnati')
+
+
+def _is_local_channel(name):
+    """True for a channel that carries one of the local stations' call signs (WCPO, WLWT ...) or says Cincinnati."""
+    return bool(_LOCAL_CHANNEL_RE.search(str(name or '').lower()))
 
 
 def _is_non_english_channel(name, language=''):
@@ -3931,7 +3942,7 @@ def api_guide():
     valid_content_filters = {
         'all', 'sports', 'sports_football', 'sports_basketball', 'sports_baseball',
         'sports_golf', 'sports_hockey', 'sports_soccer', 'sports_tennis', 'sports_racing',
-        'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality', 'non_english', 'adult',
+        'premium_movies', 'movies', 'news', 'tv', 'docs', 'reality', 'non_english', 'adult', 'local',
     }
     if content_filter not in valid_content_filters:
         content_filter = 'all'
@@ -4107,7 +4118,11 @@ def api_guide():
         'adult': sum(1 for c in ordered_channels_raw if _is_adult_channel(c.get('name', ''))),
     }
     # The two "only" views show exactly what the switches hide, in the normal grid.
-    if content_filter == 'non_english':
+    if content_filter == 'local':
+        keep = {c['id'] for c in ordered_channels_raw if _is_local_channel(c.get('name', ''))}
+        ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] in keep]
+        progs_in_window = [p for p in progs_in_window if p['channel_id'] in keep]
+    elif content_filter == 'non_english':
         hide_foreign = False
         keep = {c['id'] for c in ordered_channels_raw if _is_non_english_channel(c.get('name', ''), c.get('language', ''))}
         ordered_channels_raw = [c for c in ordered_channels_raw if c['id'] in keep]
@@ -10103,6 +10118,7 @@ tr:hover td{background:#141414;}
       <option value="tv">📺 TV & series</option>
       <option value="docs">🎓 Documentaries</option>
       <option value="reality">🎭 Reality & talk</option>
+      <option value="local">📍 Local channels</option>
       <option value="non_english">🌐 Non-English only</option>
     </select>
     <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;" title="Hide redundant SD/HD channel-name duplicates; East, West, and Pacific stay visible">
