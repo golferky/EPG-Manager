@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118b"
+VERSION = "v20261118c"
 
 app = Flask(__name__)
 
@@ -285,6 +285,9 @@ def _is_premium_channel(name):
         'hbo', 'showtime', 'starz', 'encore', 'cinemax', 'mgm', 'epix',
         # Cinemax Action and Cinemax Hits are matched under their original network names.
         'actionmax', 'moremax',
+        # Showtime's own channels, as the guide abbreviates them ("SHO x BET", "SHO Extreme").  Not a bare "sho":
+        # that would take in shopping channels.
+        'shoxbet', 'shoextreme', 'shonext', 'shoshowcase', 'shofamilyzone', 'showomen',
         # This is the premium Paramount+ with Showtime linear feed.  Do not
         # use a broad "paramount" prefix: Paramount Network is ad-supported.
         'paramountwithshowtime',
@@ -301,12 +304,12 @@ def _is_premium_channel(name):
 def _is_premium_favorite_channel(name):
     """Which group a starred channel sits in on the guide's Favorites list (display only).
 
-    Premium networks, plus Flix and the Encore family's Indieplex/Movieplex/Retroplex, which the owner keeps with
-    them.  This does NOT make those channels "premium" for recording choices or the Premium movies view.
+    Premium networks, plus Flix, The Movie Channel and the Encore family's Indieplex/Movieplex/Retroplex, which the
+    owner keeps with them.  This does NOT make those channels "premium" for recording choices or the Premium movies view.
     """
     base = _channel_match_base(name)
     return (_is_premium_channel(name) or base in ('flix', 'flixwest')
-            or base.startswith(('indieplex', 'movieplex', 'retroplex')))
+            or base.startswith(('indieplex', 'movieplex', 'retroplex', 'tmc', 'themoviechannel')))
 
 
 # Commercial-free channels that are not "premium" in the Favorites sense: Flix and The Movie

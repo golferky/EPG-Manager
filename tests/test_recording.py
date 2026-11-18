@@ -43,9 +43,12 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(server._is_premium_channel("ANTENNA TV"))
 
     def test_cinemax_flix_and_the_plex_channels_sit_with_the_premium_favorites(self):
-        for name in ("Cinemax", "Cinemax Action", "Cinemax Hits", "Cinemax Hits (West)", "Flix", "INDIEPLEX", "MOVIEPLEX", "RETROPLEX"):
+        for name in ("Cinemax", "Cinemax Action", "Cinemax Hits", "Cinemax Hits (West)", "Flix", "INDIEPLEX", "MOVIEPLEX", "RETROPLEX",
+                     "SHO x BET", "SHO Extreme", "THE MOVIE CHANNEL", "The Movie Channel", "The Movie Channel (SD)",
+                     "The Movie Channel (West)", "The Movie Channel Xtra", "TMC"):
             self.assertTrue(server._is_premium_favorite_channel(name), name)
-        for name in ("FAMILY ENTERTAINMENT TELEVISION", "AMC", "Flixster Movies", "Hallmark Channel"):
+        for name in ("FAMILY ENTERTAINMENT TELEVISION", "AMC", "Flixster Movies", "Hallmark Channel", "Shop HQ", "ShopTV",
+                     "Turner Classic Movies", "TCM (SD)"):
             self.assertFalse(server._is_premium_favorite_channel(name), name)
 
     def test_only_cinemax_gains_premium_status_for_recording_decisions(self):
@@ -58,6 +61,14 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue(server._is_commercial_free_channel(name), name)      # but commercial-free, so films can be recorded from them
             self.assertTrue(server._is_rerecord_channel(name), name)
         self.assertFalse(server._is_commercial_free_channel("FAMILY ENTERTAINMENT TELEVISION"))
+
+    def test_showtimes_own_channels_are_premium_and_the_movie_channel_is_grouping_only(self):
+        for name in ("SHO x BET", "SHO Extreme"):
+            self.assertTrue(server._is_premium_channel(name), name)
+            self.assertTrue(server._is_commercial_free_channel(name), name)
+        self.assertFalse(server._is_premium_channel("Shop HQ"))                  # a bare "sho" must not catch shopping channels
+        self.assertFalse(server._is_premium_channel("The Movie Channel"))        # grouping only: its recording rules are unchanged
+        self.assertTrue(server._is_commercial_free_channel("The Movie Channel"))
 
     def test_non_english_channel_classifier(self):
         self.assertTrue(server._is_foreign_recording_feed("HBO Latino HD"))
