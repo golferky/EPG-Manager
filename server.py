@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118h"
+VERSION = "v20261118i"
 
 app = Flask(__name__)
 
@@ -8151,6 +8151,37 @@ def _forward_to_play_agent(endpoint, payload):
     except Exception as exc:
         return {'error': str(exc)}
 
+_CALL_SIGN_IN_NAME = re.compile(r'(?<![a-z0-9])([wk][a-z]{2,3})(?:[- ]?(?:dt|hd|tv|ld|cd|lp))?\d*(?![a-z0-9])')
+
+
+def _no_feed_message(channel_id, ch_name):
+    """Plain words for a listing with no live stream, naming another listing of the same station that has one."""
+    label = str(ch_name or channel_id)
+    found = _CALL_SIGN_IN_NAME.search(label.lower())
+    better = []
+    if found:
+        sign = found.group(1)
+        for c in list(_epg.get('channels', [])):
+            other = str(c.get('name', ''))
+            if c.get('id') == channel_id or other == label:
+                continue
+            m = _CALL_SIGN_IN_NAME.search(other.lower())
+            if not m or m.group(1) != sign:
+                continue
+            try:
+                url, error, _dbg = _stream_url(c['id'], 'primestreams')
+            except Exception:
+                continue
+            if url and not error and other not in better:
+                better.append(other)
+            if len(better) >= 3:
+                break
+    if better:
+        return (f'"{label}" is a guide listing with no live stream of its own. '
+                'Play it from "' + '" or "'.join(better) + '" instead.')
+    return f'"{label}" is a guide listing with no live stream, and no other listing of this station has one either.'
+
+
 @app.route('/epg-web/api/play', methods=['POST'])
 def api_play():
     data       = request.json or {}
@@ -8160,6 +8191,8 @@ def api_play():
     ch_name    = data.get('ch_name', channel_id)
     url, err, dbg = _stream_url(channel_id)
     if err:
+        if 'No stream_id found' in str(err):
+            err = _no_feed_message(channel_id, ch_name)
         return jsonify({'error': err, 'debug': dbg}), 400
     agent_result = _forward_to_play_agent('/play', {
         'channel_id': channel_id, 'url': url,

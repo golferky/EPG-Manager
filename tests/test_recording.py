@@ -4640,3 +4640,24 @@ class LocalCallSignFormTests(unittest.TestCase):
         self.assertTrue(server._is_local_channel('WCPO', ['WCPO-DT', 'WLWT-DT']))
         self.assertTrue(server._is_local_channel('WLWT HD', ['WCPODT', 'WLWTDT']))
         self.assertFalse(server._is_local_channel('ESPN', ['WCPO-DT']))
+
+
+class NoFeedMessageTests(unittest.TestCase):
+    CHANNELS = [{"id": "a", "name": "WXIX"}, {"id": "b", "name": "FOX (WXIX) Cincinnati OH"},
+                {"id": "c", "name": "WXIX-DT"}, {"id": "d", "name": "WCPO"}]
+
+    def _message(self, playable, channel_id="a", name="WXIX"):
+        def fake_stream(cid, provider=None):
+            return ("<url>", None, {}) if cid in playable else (None, "No stream_id found for channel", {})
+        with mock.patch.dict(server._epg, {"channels": self.CHANNELS}), mock.patch.object(server, "_stream_url", fake_stream):
+            return server._no_feed_message(channel_id, name)
+
+    def test_it_names_another_listing_of_the_same_station_that_has_a_feed(self):
+        msg = self._message({"b"})
+        self.assertIn('"FOX (WXIX) Cincinnati OH"', msg)
+        self.assertNotIn("WCPO", msg)
+        self.assertNotIn("No stream_id", msg)
+
+    def test_it_says_so_when_no_listing_of_the_station_has_a_feed(self):
+        msg = self._message(set())
+        self.assertIn("no other listing of this station has one", msg)
