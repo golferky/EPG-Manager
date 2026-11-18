@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118i"
+VERSION = "v20261118j"
 
 app = Flask(__name__)
 
@@ -8189,7 +8189,7 @@ def api_play():
     title      = data.get('title', '')
     ch_label   = data.get('ch_label', '')
     ch_name    = data.get('ch_name', channel_id)
-    url, err, dbg = _stream_url(channel_id)
+    url, err, dbg = _live_stream_url(channel_id)
     if err:
         if 'No stream_id found' in str(err):
             err = _no_feed_message(channel_id, ch_name)
@@ -8276,7 +8276,7 @@ def api_play_playlist():
         if not url:
             return jsonify({"error": "That Eaglecast sports feed is not available."}), 404
     else:
-        url, err, dbg = _stream_url(channel_id)
+        url, err, dbg = _live_stream_url(channel_id)
         if err:
             return jsonify({"error": err}), 400
     body = f"#EXTM3U\n#EXTINF:-1,{title}\n{url}\n"
@@ -8293,11 +8293,24 @@ def _busy_eaglecast_titles(recs):
                    if (r.get('stream_provider') or 'primestreams') == 'eaglecast'
                    and _rec_status_base(r.get('status')) in _PROVIDER_CONNECTION_STATES})
 
+def _live_stream_url(channel_id):
+    """Stream for watching a channel live now: Eaglecast first when it is mapped, but PrimeStreams when a recording
+    holds Eaglecast's single connection and PrimeStreams carries the channel too."""
+    url, err, dbg = _stream_url(channel_id)
+    if (dbg or {}).get('provider') == 'eaglecast':
+        with _rec_lock:
+            busy = _busy_eaglecast_titles(list(_recs.values()))
+        if busy:
+            ps_url, ps_err, ps_dbg = _stream_url(channel_id, 'primestreams')
+            if ps_url and not ps_err:
+                return ps_url, None, ps_dbg
+    return url, err, dbg
+
 @app.route("/epg-web/api/play/provider")
 def api_play_provider():
     """Which provider a live channel uses, and whether playing it would collide
     with a recording that already holds that provider's single connection."""
-    _url, _err, dbg = _stream_url(request.args.get("channel_id", ""))
+    _url, _err, dbg = _live_stream_url(request.args.get("channel_id", ""))
     provider = (dbg or {}).get('provider') or 'primestreams'
     busy = []
     if provider == 'eaglecast':
@@ -8308,7 +8321,7 @@ def api_play_provider():
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
-    url, err, dbg = _stream_url(channel_id)
+    url, err, dbg = _live_stream_url(channel_id)
     if err:
         return jsonify({"error": err, "debug": dbg}), 400
     return jsonify({"ok": True, "url": url})
