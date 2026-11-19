@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119i"
+VERSION = "v20261119j"
 
 app = Flask(__name__)
 
@@ -2077,14 +2077,17 @@ def _channel_recording_reliability(days=30):
         conn = sqlite3.connect(_guide_db_path(), timeout=1)
         conn.execute('PRAGMA busy_timeout=1000')
         conn.row_factory = sqlite3.Row
-        rows = conn.execute('''SELECT channel_id,status,failure_reason FROM recordings
+        rows = conn.execute('''SELECT channel_id,status,failure_reason,start_ts FROM recordings
                                WHERE start_ts >= ? AND channel_id IS NOT NULL
                                  AND TRIM(channel_id) != '' ''', (since,)).fetchall()
         conn.close()
     except Exception:
         return outcomes
+    resets = _channel_resets()
     for row in rows:
         status = _rec_status_base(row['status'])
+        if row['start_ts'] is not None and row['start_ts'] < resets.get(str(row['channel_id']), 0):
+            continue                      # before a reset on this channel: it no longer counts
         if status == 'done':
             key = row['channel_id']
             outcomes.setdefault(key, {'ok': 0, 'failed': 0, 'damaged': 0})['ok'] += 1
@@ -2175,15 +2178,24 @@ def _better_channel_airings(title, year, channel_id, limit=5):
     return out
 
 
-def _recent_same_source_failure(title, channel_id, days=14):
-    """Avoid automatic retry loops for one title from one proven-bad source."""
+def _recent_same_source_failure(title, channel_id, days=14, season=None, episode=None):
+    """Avoid automatic retry loops for one title from one proven-bad source.
+
+    For a numbered episode only a failure of THAT episode counts, so one bad episode does not stop the
+    rest of the series from being booked on the channel.  A reset on the channel (the channel report's Reset
+    button) ignores failures from before it.
+    """
     try:
+        cutoff = max(time.time() - days * 86400, _channel_resets().get(str(channel_id), 0))
+        sql = '''SELECT 1 FROM recordings
+                   WHERE lower(title)=lower(?) AND channel_id=? AND start_ts>=?
+                     AND status IN ('failed','error','done_ts')'''
+        params = [title, channel_id, cutoff]
+        if season is not None and episode is not None:
+            sql += ' AND season_num=? AND episode_num=?'
+            params += [season, episode]
         conn = sqlite3.connect(_guide_db_path(), timeout=5)
-        row = conn.execute('''SELECT 1 FROM recordings
-                              WHERE lower(title)=lower(?) AND channel_id=?
-                                AND start_ts>=?
-                                AND status IN ('failed','error','done_ts')
-                              LIMIT 1''', (title, channel_id, time.time() - days * 86400)).fetchone()
+        row = conn.execute(sql + ' LIMIT 1', params).fetchone()
         conn.close()
         return bool(row)
     except Exception:
@@ -8840,7 +8852,8 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             if not _is_foreign_recording_feed(row['channel_name'])
             and not _is_automatic_recording_quarantined_channel(row['channel_name'])
             and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
-            and not _recent_same_source_failure(title, row['channel_id'])]
+            and not _recent_same_source_failure(title, row['channel_id'], season=row.get('season_num'),
+                                                episode=row.get('episode_num'))]
     ep_best = {}   # (sn, en) → row with best channel quality
     unknown_best = {}  # (channel, time) → unknown episode airing
     for r in rows:
