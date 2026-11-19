@@ -4865,3 +4865,17 @@ class ChannelResetStorageTests(unittest.TestCase):
             self.assertEqual(server._channel_resets(), {'c1': 456.0})
             server._set_channel_reset('c1', None)
             self.assertEqual(server._channel_resets(), {})
+
+
+class ResetAllChannelsTests(unittest.TestCase):
+    def test_reset_all_covers_every_channel_with_a_recording_and_can_be_undone(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(server, '_guide_db_path', lambda: temp + '/g.db'):
+            conn = sqlite3.connect(temp + '/g.db')
+            conn.execute('CREATE TABLE recordings (rec_id TEXT, channel_id TEXT)')
+            conn.executemany('INSERT INTO recordings VALUES(?,?)', [('1', 'a'), ('2', 'a'), ('3', 'b'), ('4', ''), ('5', None)])
+            conn.commit(); conn.close()
+            self.assertEqual(server._reset_all_channels(1000.0), 2)
+            self.assertEqual(server._channel_resets(), {'a': 1000.0, 'b': 1000.0})
+            self.assertEqual(server._reset_all_channels(None), 2)
+            self.assertEqual(server._channel_resets(), {})
