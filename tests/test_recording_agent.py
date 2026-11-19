@@ -3180,3 +3180,25 @@ class SeriesSafeguardTests(unittest.TestCase):
             movie.assert_not_called()
             held.assert_called_once()
             self.assertIn("series_safeguard", archive.call_args.kwargs["result"])
+
+
+class PrivateShareGuardTests(unittest.TestCase):
+    def test_a_private_folder_that_is_its_own_network_volume_is_never_created(self):
+        self.assertTrue(recording_agent.is_mount_point_path("/Volumes/Private"))
+        self.assertFalse(recording_agent.is_mount_point_path("/Volumes/Plex/Movies Private"))
+        self.assertFalse(recording_agent.is_mount_point_path("/Volumes/Private/Films"))
+        cfg = {"plex_path": "/Volumes/Plex/Movies", "private_movies_path": "/Volumes/PrivateGuardTest"}
+        with mock.patch.object(Path, "mkdir") as mkdir, \
+             mock.patch.object(recording_agent, "plex_mount_available", return_value=True):
+            root = recording_agent.ensure_private_root(cfg)
+        self.assertEqual(str(root), "/Volumes/PrivateGuardTest")
+        mkdir.assert_not_called()
+
+    def test_the_default_folder_next_to_movies_is_still_created_when_the_share_is_mounted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            movies = Path(temp) / "Movies"
+            movies.mkdir()
+            cfg = {"plex_path": str(movies)}
+            with mock.patch.object(recording_agent, "plex_mount_available", return_value=True):
+                root = recording_agent.ensure_private_root(cfg)
+            self.assertTrue(root.is_dir())

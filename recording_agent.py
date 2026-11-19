@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261119b"
+AGENT_VERSION = "v20261119c"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -472,9 +472,22 @@ def find_movie_candidates(cfg, library_root, title, year=''):
     return found
 
 
+def is_mount_point_path(path):
+    """True for the top of a network volume, such as /Volumes/Private: only the Mac may create that."""
+    parts = Path(path).parts
+    return len(parts) == 3 and parts[1] == 'Volumes'
+
+
 def ensure_private_root(cfg):
-    """The private folder, created if the Plex share is mounted and it is not there yet."""
+    """The private folder, created if the Plex share is mounted and it is not there yet.
+
+    A private folder that IS a network volume (its own QNAP share, mounted at /Volumes/Name) is never created
+    here: a stand-in folder with that name would make macOS mount the real share as "Name 1", and recordings
+    would wait for a share that never appears at the configured path.
+    """
     root = private_movies_root(cfg)
+    if is_mount_point_path(root):
+        return root
     if not root.is_dir() and plex_mount_available(Path(cfg['plex_path']), cfg.get('plex_mount_marker', '')):
         try:
             root.mkdir(parents=False, exist_ok=True)
