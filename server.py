@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119c"
+VERSION = "v20261119d"
 
 app = Flask(__name__)
 
@@ -12587,7 +12587,18 @@ async function openProg(p) {
     document.getElementById('pm-next-info').textContent = isLive
       ? `ON NOW  ·  ${_nextAiring.channel_name}${p.stop_fmt ? `  (until ${p.stop_fmt})` : ''}`
       : `${p.start_fmt || ''} – ${p.stop_fmt || ''}  ·  ${_nextAiring.channel_name}`;
-    document.getElementById('pm-play-btn').style.display = 'none';
+    // A live programme always offers Play.  If the channel has no feed, the server says so in plain words.
+    const directPlay = document.getElementById('pm-play-btn');
+    if (isLive) {
+      const alreadyPlaying = !!_activeStreams[p.channel_id];
+      directPlay.style.display = '';
+      directPlay.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
+      directPlay.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
+      refreshPlayBusy(p.channel_id);
+    } else {
+      directPlay.style.display = 'none';
+    }
+    showReliability(p.channel_id);
     const quickRecord = document.getElementById('pm-rec-next-btn');
     quickRecord.textContent = isLive ? '● Record remaining' : '⏱ Record';
     quickRecord.disabled = false;
