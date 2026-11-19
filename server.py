@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119a"
+VERSION = "v20261119b"
 
 app = Flask(__name__)
 
@@ -4949,6 +4949,71 @@ def _daily_recording_summary(rows, now, hours=24):
             skipped += 1
     problems.sort(key=lambda p: p['start_ts'], reverse=True)
     return {'hours': hours, 'done': done, 'failed': failed, 'skipped': skipped, 'problems': problems}
+
+
+def _failure_kind(reason):
+    """A short plain-words kind for a failure reason, so a channel's problems can be counted."""
+    text = str(reason or '').lower()
+    if 'damaged' in text or 'decode error' in text:
+        return 'damaged video'
+    if 'ended early' in text or 'captured' in text:
+        return 'streams that end early'
+    if 'wrong programme' in text:
+        return 'the wrong programme'
+    if '403' in text or 'forbidden' in text or 'probe failed' in text or 'no stream' in text:
+        return 'streams that will not open'
+    return 'other failures'
+
+
+def _channel_reliability(rows, now, days=30, min_attempts=3):
+    """How often recordings on each channel worked, from finished recordings in the last ``days`` days.
+
+    ``rows`` are dicts with channel_id, channel, start_ts, status and failure_reason.  The level is
+    ``unknown`` below ``min_attempts`` finished recordings, then ``bad`` at half or more failing, ``warn`` at a
+    quarter or more, otherwise ``good``.
+    """
+    since = now - days * 86400
+    stats = {}
+    for row in rows:
+        start = row.get('start_ts') or 0
+        cid = row.get('channel_id') or ''
+        if not cid or not (since <= start <= now):
+            continue
+        status = _rec_status_base(row.get('status'))
+        if status in ('done', 'done_ts'):
+            kind = None
+        elif status in ('failed', 'error'):
+            kind = _failure_kind(row.get('failure_reason'))
+        else:
+            continue
+        entry = stats.setdefault(cid, {'channel': row.get('channel') or cid, 'done': 0, 'failed': 0, 'kinds': {}})
+        if kind is None:
+            entry['done'] += 1
+        else:
+            entry['failed'] += 1
+            entry['kinds'][kind] = entry['kinds'].get(kind, 0) + 1
+    for entry in stats.values():
+        attempts = entry['done'] + entry['failed']
+        share = entry['failed'] / attempts if attempts else 0
+        entry['level'] = ('unknown' if attempts < min_attempts else
+                          'bad' if share >= 0.5 else 'warn' if share >= 0.25 else 'good')
+        entry['top_reason'] = max(entry['kinds'], key=entry['kinds'].get) if entry['kinds'] else ''
+    return stats
+
+
+@app.route('/epg-web/api/recording-health/channels')
+def api_recording_health_channels():
+    """Per-channel recording success over the last 30 days, shown as a warning when picking a channel to record."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute('''SELECT channel_id, channel, start_ts, status, failure_reason
+                                                 FROM recordings WHERE start_ts > ? AND start_ts <= ?''',
+                                              (time.time() - 30 * 86400, time.time())).fetchall()]
+        conn.close()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'channels': {}}), 500
+    return jsonify({'days': 30, 'channels': _channel_reliability(rows, time.time())})
 
 
 @app.route('/epg-web/api/recording-health/daily')
@@ -10419,6 +10484,7 @@ tr:hover td{background:#141414;}
           <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
           <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="display:none;border-color:#f59e0b;color:#fbbf24;">📅 Record series</button>
         </div>
+        <div id="pm-reliability" style="display:none;font-size:12px;margin-top:8px;"></div>
       </div>
       <!-- All future airings -->
       <div id="pm-airings-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;">
@@ -11658,6 +11724,37 @@ async function dismissHealthBar() {
   document.getElementById('health-bar').style.display = 'none';
 }
 document.addEventListener('DOMContentLoaded', loadHealthBar);
+
+// How often recordings on each channel worked over the last 30 days: a warning beside a channel when you pick it to record.
+window._chReliability = {};
+async function loadChannelReliability() {
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/channels')).json();
+    window._chReliability = d.channels || {};
+  } catch (e) { /* the warning is optional */ }
+}
+function reliabilityText(s) {
+  const total = s.done + s.failed;
+  if (s.level === 'good') return '✓ ' + s.done + ' of ' + total + ' recordings worked (30 days)';
+  return '⚠ Only ' + s.done + ' of ' + total + ' recordings worked (30 days)' + (s.top_reason ? ', mostly ' + s.top_reason : '');
+}
+function reliabilityColor(s) { return s.level === 'bad' ? '#f87171' : s.level === 'warn' ? '#fbbf24' : '#4ade80'; }
+function reliabilityBadge(channelId) {
+  const s = window._chReliability[channelId];
+  if (!s || s.level === 'unknown') return '';
+  return ' <span style="color:' + reliabilityColor(s) + ';font-size:11px;">' + esc(reliabilityText(s)) + '</span>';
+}
+function showReliability(channelId) {
+  const el = document.getElementById('pm-reliability');
+  if (!el) return;
+  const s = window._chReliability[channelId];
+  if (!s || s.level === 'unknown') { el.style.display = 'none'; return; }
+  el.style.color = reliabilityColor(s);
+  el.textContent = reliabilityText(s) + (s.level === 'good' ? '' : '. A failed recording never goes into Plex and stays on Wanted to be tried again.');
+  el.style.display = '';
+}
+document.addEventListener('DOMContentLoaded', loadChannelReliability);
+setInterval(loadChannelReliability, 10 * 60 * 1000);
 setInterval(loadHealthBar, 30 * 60 * 1000);
 
 // Adult-content lock.  The server decides; this only collects the password and carries the token it hands back.
@@ -12386,6 +12483,7 @@ async function openProg(p) {
   _nextAiring = null;
   { const privateBox = document.getElementById('pm-private'); if (privateBox) privateBox.checked = false; }
   { const busyLbl = document.getElementById('pm-play-busy'); if (busyLbl) busyLbl.style.display = 'none'; }
+  { const rel = document.getElementById('pm-reliability'); if (rel) rel.style.display = 'none'; }
   // Show overlay in loading state
   const overlay = document.getElementById('prog-modal-overlay');
   overlay.style.display = 'flex';
@@ -12444,6 +12542,7 @@ async function openProg(p) {
     quickPlay.textContent = alreadyPlaying ? '■ Stop' : '▶ Play';
     quickPlay.onclick = alreadyPlaying ? () => stopStream(p.channel_id) : playStream;
     refreshPlayBusy(p.channel_id);
+    showReliability(p.channel_id);
     const quickRecord = document.getElementById('pm-rec-next-btn');
     quickRecord.textContent = '● Record remaining';
     quickRecord.disabled = false;
@@ -12465,6 +12564,7 @@ async function openProg(p) {
     document.getElementById('pm-next-info').textContent =
       `${p.start_fmt || ''} – ${p.stop_fmt || ''}  ·  ${_nextAiring.channel_name}`;
     document.getElementById('pm-play-btn').style.display = 'none';
+    showReliability(p.channel_id);
     const quickRecord = document.getElementById('pm-rec-next-btn');
     quickRecord.textContent = '⏱ Record';
     quickRecord.disabled = false;
@@ -12767,6 +12867,7 @@ async function openProg(p) {
           ? `ON NOW  ·  ${featPS.channel_name}  (until ${featPS.stop_fmt})`
           : `${featPS.start_fmt} – ${featPS.stop_fmt}  ·  ${featPS.channel_name}`;
         document.getElementById('pm-next-info').textContent = label;
+        showReliability(featPS.channel_id);
         document.getElementById('pm-next-heading').textContent = featPS.stream_provider === 'eaglecast'
           ? '🦅 Next on Eaglecast' : '📡 Next on PrimeStreams';
 
@@ -12878,7 +12979,7 @@ async function openProg(p) {
           const inPlex = !!episodeKey && _plexEpisodes.has(episodeKey);
           return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #1a2332;font-size:12px;${best ? 'background:#2b2208;border-left:3px solid #fbbf24;padding-left:7px;' : ''}">
             <span style="color:#94a3b8;min-width:170px;">${esc(a.start_fmt)} – ${esc(a.stop_fmt)}</span>
-            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span style="color:#fde68a;background:#6b4b08;border:1px solid #d97706;border-radius:3px;padding:1px 3px;font-weight:700;" title="Eaglecast recording source">🦅 EC</span> ' : ''}${esc(a.channel_name)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (a.episode_guess ? '<br><span style="color:'+(a.episode_guess.confident ? '#d9a441' : '#64748b')+';font-size:11px;" title="'+(a.episode_guess.source === 'guide' ? 'The same description is on a numbered airing of this show on another channel.' : 'Matched from the description wording. The guide itself gives no episode number.')+'">'+esc((a.episode_guess.confident ? '≈ ' : 'maybe ')+'S'+a.episode_guess.season+'E'+a.episode_guess.number+' · '+a.episode_guess.name+' ('+Math.round(a.episode_guess.score*100)+'%)')+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : ''))}</span>
+            <span style="color:#64748b;flex:1;">${best ? '<span style="color:#fbbf24;font-weight:700;animation:pulse-rec 1.6s ease-in-out infinite;">★ BEST AVAILABLE</span> ' : ''}${a.stream_provider === 'eaglecast' ? '<span style="color:#fde68a;background:#6b4b08;border:1px solid #d97706;border-radius:3px;padding:1px 3px;font-weight:700;" title="Eaglecast recording source">🦅 EC</span> ' : ''}${esc(a.channel_name)}${reliabilityBadge(a.channel_id)}${epInfo ? '<br><span style="color:#475569;font-size:11px;">'+esc(epInfo)+'</span>' : (a.episode_guess ? '<br><span style="color:'+(a.episode_guess.confident ? '#d9a441' : '#64748b')+';font-size:11px;" title="'+(a.episode_guess.source === 'guide' ? 'The same description is on a numbered airing of this show on another channel.' : 'Matched from the description wording. The guide itself gives no episode number.')+'">'+esc((a.episode_guess.confident ? '≈ ' : 'maybe ')+'S'+a.episode_guess.season+'E'+a.episode_guess.number+' · '+a.episode_guess.name+' ('+Math.round(a.episode_guess.score*100)+'%)')+'</span>' : (unidentified ? '<br><span style="color:#64748b;font-size:11px;">No S/E data · one-off only</span>' : ''))}</span>
             ${scheduled
               ? `<span style="color:#22c55e;font-size:11px;">✅</span>`
               : (a.can_record && !a.on_now)
