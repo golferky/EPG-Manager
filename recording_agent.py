@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261119a"
+AGENT_VERSION = "v20261119b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -433,6 +433,21 @@ def find_tv_episode_candidates(tv_root, show_title, season, episode, year=''):
                 and pattern.search(path.stem)]
     except OSError:
         return []
+
+
+def series_safeguard_applies(cfg, job):
+    """True for a recording filed as a film that is really an episode of a show we already have.
+
+    A one-off booking of a TV airing has no season, no episode and no year.  Left alone it would be filed
+    under Movies.  When the title matches a show folder in the TV library and the job gives no year (a real
+    film is booked with one), it is held in "TV Needing Episode Info" instead, where nothing is lost.
+    """
+    if episode_metadata(job) or job.get('is_series') or str(job.get('year') or '').strip():
+        return False
+    tv_root = cfg.get('plex_tv_path')
+    if not tv_root or not Path(tv_root).is_dir():
+        return False
+    return resolve_show_dir(tv_root, job['title'], '').is_dir()
 
 
 def private_movies_root(cfg):
@@ -1093,6 +1108,12 @@ def process_job(api, job, cfg):
                      job.get('stream_extension', 'ts'))
     episode = episode_metadata(job)
     is_series = bool(job.get('is_series'))
+    series_safeguard = False
+    if not (episode or is_series) and series_safeguard_applies(cfg, job):
+        # A booking with no season, episode or year for a title we already have as a show: an episode, not a film.
+        is_series = series_safeguard = True
+        print(f'[series-safeguard] {job["title"]} matches a show in the TV library; holding it, not filing it as a film',
+              flush=True)
     # A film recorded privately goes to the private folder, never into the Plex library.
     private_film = bool(job.get('private')) and not (episode or is_series)
     library_root = (cfg['plex_tv_path'] if (episode or is_series) else
@@ -1129,6 +1150,8 @@ def process_job(api, job, cfg):
         'decision': decision, 'incoming': incoming_probe,
         'existing': existing_probe, 'existing_path': str(existing_path or ''),
     }
+    if series_safeguard:
+        quality['series_safeguard'] = 'title matches a show in the TV library; held, not filed under Movies'
     if not should_record:
         api.patient_heartbeat(job['id'], 'skipped_existing_better',
                       quality_decision=decision, result=quality)

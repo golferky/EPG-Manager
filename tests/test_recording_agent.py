@@ -3132,3 +3132,51 @@ class MovieSeverityFlowTests(ShortRecordingFlowTests):
     def test_fifty_errors_are_critical(self):
         archive, preserve = self._run(138, damage=50)
         self.assertEqual(archive.call_args.kwargs['result']['severity'], 'critical')
+
+
+class SeriesSafeguardTests(unittest.TestCase):
+    """A one-off booking of a title that is already a show must not be filed under Movies."""
+
+    def _cfg(self, temp):
+        return {"local_recordings": temp, "plex_path": temp + "/Movies", "plex_tv_path": temp + "/TV",
+                "ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "recording_tail_seconds": 45,
+                "epg_url": "http://x.test", "epg_user": "u", "epg_pass": "p", "heartbeat_seconds": 1,
+                "transfer_wait_timeout": 5, "transfer_retry_seconds": 1}
+
+    def test_it_applies_only_to_a_yearless_one_off_whose_title_is_a_known_show(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "TV" / "The Sopranos (1999)").mkdir(parents=True)
+            cfg = self._cfg(temp)
+            applies = recording_agent.series_safeguard_applies
+            self.assertTrue(applies(cfg, {"title": "The Sopranos"}))
+            self.assertFalse(applies(cfg, {"title": "The Sopranos", "year": "1999"}))          # booked as a film
+            self.assertFalse(applies(cfg, {"title": "The Sopranos", "is_series": 1}))
+            self.assertFalse(applies(cfg, {"title": "The Sopranos", "season_num": 4, "episode_num": 9}))
+            self.assertFalse(applies(cfg, {"title": "Heat"}))                                    # not a show we have
+            self.assertFalse(applies(dict(cfg, plex_tv_path=temp + "/missing"), {"title": "The Sopranos"}))
+
+    def test_such_a_recording_is_held_for_episode_info_and_never_reaches_movies(self):
+        now = time.time()
+        job = {"id": "s1", "title": "The Sopranos", "stream_id": "1", "start_ts": now - 2,
+               "stop_ts": now - 2 + 58 * 60, "stream_provider": "primestreams", "stream_extension": "ts"}
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "TV" / "The Sopranos (1999)").mkdir(parents=True)
+            (Path(temp) / "Movies").mkdir()
+            cfg = self._cfg(temp)
+            api = mock.Mock()
+            probe = {"duration": 58 * 60 + 40, "height": 480}
+            with mock.patch.object(recording_agent, "probe_media", return_value=probe), \
+                 mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
+                 mock.patch.object(recording_agent, "record_with_resume", return_value=0), \
+                 mock.patch.object(recording_agent, "run_process", return_value=0), \
+                 mock.patch.object(recording_agent, "plex_mount_available", return_value=True), \
+                 mock.patch.object(recording_agent, "count_decode_errors", return_value=0), \
+                 mock.patch.object(recording_agent, "archive_terminal_result") as archive, \
+                 mock.patch.object(recording_agent, "discard_failed_media"), \
+                 mock.patch.object(recording_agent, "verified_transfer") as movie, \
+                 mock.patch.object(recording_agent, "verified_unidentified_episode_transfer",
+                                   return_value=Path(temp) / "x.mp4") as held:
+                recording_agent.process_job(api, job, cfg)
+            movie.assert_not_called()
+            held.assert_called_once()
+            self.assertIn("series_safeguard", archive.call_args.kwargs["result"])
