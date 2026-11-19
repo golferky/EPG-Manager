@@ -4921,3 +4921,39 @@ class SeriesFailureGuardTests(unittest.TestCase):
             self.assertEqual(server._channel_recording_reliability()['bad']['level'], 'suspect')
             server._set_channel_reset('bad', now - 60)
             self.assertNotIn('bad', server._channel_recording_reliability())
+
+
+class SeriesWhyTests(SeriesNoDuplicateBookingTests):
+    """The dry run names the reason each airing is or is not booked, and books nothing."""
+
+    def _why(self, recordable=("hd",), failure=False, plex=None, stream_error=None):
+        explain = []
+        with mock.patch.object(server, "_guide_db_path", return_value=self.guide_db), \
+                mock.patch.object(server, "load_config", return_value={}), \
+                mock.patch.object(server, "get_recordable_channel_ids", return_value=set(recordable)), \
+                mock.patch.object(server, "_plex_episode_keys", side_effect=lambda *a, **k: set(plex or ())), \
+                mock.patch.object(server, "_plex_tv_path", return_value=self.temp.name), \
+                mock.patch.object(server, "_recording_backend", return_value="agent"), \
+                mock.patch.object(server, "_db_upsert_rec", return_value=True) as upsert, \
+                mock.patch.object(server, "_recent_same_source_failure", return_value=failure), \
+                mock.patch.object(server, "_resolve_recording_source",
+                                  return_value=(None if stream_error else "u", stream_error, {"stream_id": "1", "provider": "primestreams"})):
+            count = server._schedule_series_airings("Show", self.guide_db, "movies.db", explain=explain, dry_run=True)
+        return explain, count, upsert
+
+    def test_a_normal_airing_would_be_booked_and_nothing_is_booked(self):
+        self._guide([("hd", "Show HD", self.base, "Pilot", 1, 1)])
+        explain, count, upsert = self._why()
+        self.assertEqual([e["why"] for e in explain], ["would be booked"])
+        self.assertEqual((count, self._starts()), (0, []))
+        upsert.assert_not_called()
+
+    def test_each_reason_is_named(self):
+        self._guide([("hd", "Show HD", self.base, "Pilot", 1, 1), ("hd", "Show HD", self.base + 86400, "Two", 1, 2),
+                     ("gone", "No Stream Channel", self.base, "Pilot", 1, 1)])
+        why = lambda **kw: " | ".join(e["why"] for e in self._why(**kw)[0])
+        self.assertIn("no recording stream is set up", why())                                   # channel 'gone' is not recordable
+        self.assertIn("this episode failed on this channel", why(failure=True))
+        self.assertIn("already in Plex", why(plex={"show|1|2"}))
+        self.assertIn("no usable stream: boom", why(stream_error="boom"))
+        self.assertEqual([e["episode"] for e in self._why()[0]].count("S1E1"), 2)             # both S1E1 rows are explained

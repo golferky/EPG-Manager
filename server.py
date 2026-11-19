@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119j"
+VERSION = "v20261119k"
 
 app = Flask(__name__)
 
@@ -8768,8 +8768,12 @@ def api_play_status():
 
 # ── Series Recordings ────────────────────────────────────────────────────────
 
-def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='America/New_York'):
-    """Queue recordings for all future primestreams airings of title. Returns count scheduled."""
+def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='America/New_York', explain=None, dry_run=False):
+    """Queue recordings for all future primestreams airings of title. Returns count scheduled.
+
+    With ``explain`` (a list) it also says, for each upcoming airing, why it was or was not booked; with
+    ``dry_run`` nothing is booked at all (the "why wasn't this booked" check).
+    """
     from zoneinfo import ZoneInfo
     import re as _re3
     local_tz  = ZoneInfo(tz_str)
@@ -8779,6 +8783,18 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     clean_title = clean.group(1).strip() if clean else title
     recordable = get_recordable_channel_ids(guide_db_path, movies_db_path)
     scheduled = 0
+
+    def note(row, why):
+        if explain is None:
+            return
+        try:
+            when = _local_dt(datetime.strptime(row['start_utc'], '%Y%m%d%H%M%S').replace(
+                tzinfo=timezone.utc).timestamp()).strftime('%a %b %d %H:%M')
+        except Exception:
+            when = str(row.get('start_utc', ''))
+        sn, en = row.get('season_num'), row.get('episode_num')
+        explain.append({'when': when, 'channel': row.get('channel_name') or row.get('channel_id'),
+                        'episode': f'S{sn}E{en}' if sn is not None and en is not None else '', 'why': why})
     try:
         conn = sqlite3.connect(guide_db_path)
         conn.row_factory = sqlite3.Row
@@ -8792,6 +8808,12 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             recordable,
             extra_params=[title, clean_title, now_str]
         )
+        if explain is not None:
+            for other in conn.execute('''SELECT channel_id, channel_name, start_utc, season_num, episode_num FROM guide
+                                         WHERE (lower(title)=lower(?) OR lower(title)=lower(?)) AND start_utc > ?''',
+                                      (title, clean_title, now_str)).fetchall():
+                if other['channel_id'] not in recordable:
+                    note(dict(other), 'no recording stream is set up for this channel')
         # Some provider rows omit episode details while a duplicate guide row
         # for the same airing contains them.  Match the closest such row so a
         # series recording gets a Plex-ready season/episode filename.
@@ -8848,12 +8870,20 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     # Do not automatically queue repeated attempts from a channel whose real
     # recording history marks it red/suspect.  A manual record remains allowed.
     reliability = _channel_recording_reliability()
-    rows = [row for row in rows
-            if not _is_foreign_recording_feed(row['channel_name'])
-            and not _is_automatic_recording_quarantined_channel(row['channel_name'])
-            and reliability.get(row['channel_id'], {}).get('level') != 'suspect'
-            and not _recent_same_source_failure(title, row['channel_id'], season=row.get('season_num'),
-                                                episode=row.get('episode_num'))]
+    kept_rows = []
+    for row in rows:
+        if _is_foreign_recording_feed(row['channel_name']):
+            note(row, 'a foreign-language feed')
+        elif _is_automatic_recording_quarantined_channel(row['channel_name']):
+            note(row, 'the channel is excluded from automatic recording')
+        elif reliability.get(row['channel_id'], {}).get('level') == 'suspect':
+            note(row, 'the channel has a poor recording record (reset it in the channel report if it is fixed)')
+        elif _recent_same_source_failure(title, row['channel_id'], season=row.get('season_num'),
+                                         episode=row.get('episode_num')):
+            note(row, 'this episode failed on this channel in the last 14 days')
+        else:
+            kept_rows.append(row)
+    rows = kept_rows
     ep_best = {}   # (sn, en) → row with best channel quality
     unknown_best = {}  # (channel, time) → unknown episode airing
     for r in rows:
@@ -8867,16 +8897,25 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             # the TV holding area on the recording Mac, never Movies.
             unknown_best[(r['channel_id'], r['start_utc'])] = r
     best_rows = list(ep_best.values()) + list(unknown_best.values())
+    if explain is not None:
+        chosen = {id(r) for r in best_rows}
+        for r in rows:
+            if id(r) not in chosen:
+                note(r, 'the same episode is booked from a better channel')
 
     # A recurring rule means “get what is missing,” not “make another copy of
     # every episode Plex already owns.”  Episodes without S/E data remain
     # eligible because they cannot be matched safely to a Plex filename.
     plex_episode_keys = _plex_episode_keys(_plex_tv_path(load_config()))
     show_key = _norm_plex_show(clean_title)
-    best_rows = [r for r in best_rows if (
-        r['season_num'] is None or r['episode_num'] is None or
-        f"{show_key}|{int(r['season_num'])}|{int(r['episode_num'])}" not in plex_episode_keys
-    )]
+    not_in_plex = []
+    for r in best_rows:
+        if (r['season_num'] is None or r['episode_num'] is None or
+                f"{show_key}|{int(r['season_num'])}|{int(r['episode_num'])}" not in plex_episode_keys):
+            not_in_plex.append(r)
+        else:
+            note(r, 'this episode is already in Plex')
+    best_rows = not_in_plex
 
     plain_name = lambda text: re.sub(r'\s*\(\d{4}\)\s*$', '', text or '').strip().lower()
     mine = plain_name(title)
@@ -8921,6 +8960,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
             eu = datetime.strptime(r['end_utc'],   '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
             key = (r['channel_id'], su.timestamp())
             if key in existing_keys:
+                note(r, 'already queued, or cancelled by you')
                 continue
             # The same airing or the same episode on another channel (an HD and a plain row, an east and a west
             # feed) is not booked again.  A row with no episode number still counts by its start time.
@@ -8928,17 +8968,22 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                    or (r.get('season_num') is not None and r.get('episode_num') is not None
                        and season == r.get('season_num') and number == r.get('episode_num'))
                    for start, season, number in booked):
+                note(r, 'this time or this episode is already booked')
                 continue
             rec_id = f"rec_{int(time.time()*1000)}_{r['channel_id'][:8]}"
             _url, stream_error, stream_debug = _resolve_recording_source(
                 r['channel_id'], su.timestamp(), eu.timestamp()
             )
             if stream_error:
+                note(r, 'no usable stream: ' + re.sub(r'https?://\S+', '<address>', str(stream_error))[:120])
                 if not hasattr(_resolve_recording_source, '_no_stream_warned'):
                     _resolve_recording_source._no_stream_warned = set()
                 if r['channel_id'] not in _resolve_recording_source._no_stream_warned:
                     print(f'[series] stream lookup failed for {r["channel_id"]}: {stream_error} (will not repeat)')
                     _resolve_recording_source._no_stream_warned.add(r['channel_id'])
+                continue
+            if dry_run:
+                note(r, 'would be booked')
                 continue
             backend = _recording_backend()
             rec = {
@@ -8969,6 +9014,29 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         except Exception as e:
             print(f'[series] airing error: {e}')
     return scheduled
+
+
+@app.route('/epg-web/api/series-why')
+def api_series_why():
+    """Read-only: why each upcoming airing of a show was or was not booked by its series rule (``?title=``)."""
+    title = request.args.get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'give ?title='}), 400
+    cfg = load_config()
+    db_path = cfg.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
+    rule = None
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        row = conn.execute('SELECT active FROM series_recordings WHERE lower(title)=lower(?)', (title,)).fetchone()
+        conn.close()
+        rule = None if row is None else bool(row[0])
+    except sqlite3.Error:
+        pass
+    explain = []
+    _schedule_series_airings(title, db_path, cfg.get('db_path', '/Volumes/EPG/Movies.db'),
+                             cfg.get('timezone', 'America/New_York'), explain=explain, dry_run=True)
+    return jsonify({'title': title, 'series_rule': ('none' if rule is None else 'on' if rule else 'paused'),
+                    'airings': explain[:60]})
 
 
 def _schedule_active_series(guide_db_path=None):
