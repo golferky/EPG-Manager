@@ -4709,3 +4709,46 @@ class DailyRecordingSummaryTests(unittest.TestCase):
     def test_a_quiet_day_has_no_problems(self):
         out = server._daily_recording_summary([self._row(1, 'done')], self.NOW)
         self.assertEqual((out['failed'], out['problems']), (0, []))
+
+
+class ChannelReliabilityTests(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def _rows(self, channel_id, done, failed, reason='Video is damaged: 90 decode errors', days_ago=2):
+        base = {'channel_id': channel_id, 'channel': channel_id.upper(), 'start_ts': self.NOW - days_ago * 86400}
+        return ([dict(base, status='done', failure_reason='') for _ in range(done)] +
+                [dict(base, status='failed', failure_reason=reason) for _ in range(failed)])
+
+    def test_levels_follow_the_share_of_failures(self):
+        rows = (self._rows('good', 9, 1) + self._rows('warn', 6, 3) + self._rows('bad', 2, 4)
+                + self._rows('new', 1, 1))
+        out = server._channel_reliability(rows, self.NOW)
+        self.assertEqual({k: v['level'] for k, v in out.items()},
+                         {'good': 'good', 'warn': 'warn', 'bad': 'bad', 'new': 'unknown'})
+        self.assertEqual((out['bad']['done'], out['bad']['failed']), (2, 4))
+
+    def test_the_main_failure_kind_is_named(self):
+        rows = self._rows('c', 1, 3, 'Recording ended early: 42 min captured of 58 min scheduled') + \
+               self._rows('c', 0, 1, 'Video is damaged: 5 decode errors')
+        self.assertEqual(server._channel_reliability(rows, self.NOW)['c']['top_reason'], 'streams that end early')
+
+    def test_old_cancelled_queued_and_channelless_rows_do_not_count(self):
+        rows = (self._rows('c', 3, 0, days_ago=40) + self._rows('c', 3, 0)
+                + [{'channel_id': 'c', 'channel': 'C', 'start_ts': self.NOW - 3600, 'status': 'cancelled', 'failure_reason': 'x'},
+                   {'channel_id': 'c', 'channel': 'C', 'start_ts': self.NOW - 3600, 'status': 'queued', 'failure_reason': ''},
+                   {'channel_id': '', 'channel': '?', 'start_ts': self.NOW - 3600, 'status': 'failed', 'failure_reason': 'x'}])
+        out = server._channel_reliability(rows, self.NOW)
+        self.assertEqual(list(out), ['c'])
+        self.assertEqual((out['c']['done'], out['c']['failed']), (3, 0))
+
+
+class GuideNowTitlesTests(unittest.TestCase):
+    def test_it_lists_the_programme_on_now_then_the_next_ones_for_one_channel(self):
+        now = 1_800_000_000
+        progs = [{'channel_id': 'a', 'title': 'Past', 'start_ts': now - 7200, 'stop_ts': now - 3600},
+                 {'channel_id': 'a', 'title': 'Now', 'start_ts': now - 600, 'stop_ts': now + 3000},
+                 {'channel_id': 'a', 'title': 'Next', 'start_ts': now + 3000, 'stop_ts': now + 6600},
+                 {'channel_id': 'b', 'title': 'Other', 'start_ts': now - 600, 'stop_ts': now + 3000}]
+        with mock.patch.dict(server._epg, {'programmes': progs}):
+            titles = [row['title'] for row in server._guide_now_titles('a', now)]
+        self.assertEqual(titles, ['Now', 'Next'])
