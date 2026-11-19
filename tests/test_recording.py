@@ -4879,3 +4879,45 @@ class ResetAllChannelsTests(unittest.TestCase):
             self.assertEqual(server._channel_resets(), {'a': 1000.0, 'b': 1000.0})
             self.assertEqual(server._reset_all_channels(None), 2)
             self.assertEqual(server._channel_resets(), {})
+
+
+class SeriesFailureGuardTests(unittest.TestCase):
+    NOW = None
+
+    def _db(self, temp, rows):
+        conn = sqlite3.connect(temp + '/g.db')
+        conn.execute('CREATE TABLE recordings (title TEXT, channel_id TEXT, start_ts REAL, status TEXT, '
+                     'failure_reason TEXT, season_num INTEGER, episode_num INTEGER)')
+        conn.executemany('INSERT INTO recordings VALUES(?,?,?,?,?,?,?)', rows)
+        conn.commit(); conn.close()
+
+    def test_one_failed_episode_does_not_block_the_rest_of_the_series_on_that_channel(self):
+        import tempfile
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(server, '_guide_db_path', lambda: temp + '/g.db'):
+            self._db(temp, [('The Sopranos', 'hbo', now - 3600, 'failed', 'ended early', 4, 9)])
+            guard = server._recent_same_source_failure
+            self.assertTrue(guard('The Sopranos', 'hbo', season=4, episode=9))        # the same episode: still blocked
+            self.assertFalse(guard('The Sopranos', 'hbo', season=5, episode=7))       # another episode: free to book
+            self.assertTrue(guard('The Sopranos', 'hbo'))                              # unnumbered or a film: title level
+            self.assertFalse(guard('The Sopranos', 'other', season=4, episode=9))      # another channel
+
+    def test_a_reset_on_the_channel_lifts_the_block(self):
+        import tempfile
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(server, '_guide_db_path', lambda: temp + '/g.db'):
+            self._db(temp, [('The Sopranos', 'hbo', now - 3600, 'failed', 'ended early', 4, 9)])
+            self.assertTrue(server._recent_same_source_failure('The Sopranos', 'hbo', season=4, episode=9))
+            server._set_channel_reset('hbo', now - 60)
+            self.assertFalse(server._recent_same_source_failure('The Sopranos', 'hbo', season=4, episode=9))
+            self.assertFalse(server._recent_same_source_failure('The Sopranos', 'hbo'))
+
+    def test_a_reset_also_clears_a_suspect_channel_for_automatic_booking(self):
+        import tempfile
+        now = time.time()
+        rows = [('Show %d' % i, 'bad', now - 7200 + i, 'failed', 'Video is damaged: 90 decode errors', None, None) for i in range(3)]
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(server, '_guide_db_path', lambda: temp + '/g.db'):
+            self._db(temp, rows)
+            self.assertEqual(server._channel_recording_reliability()['bad']['level'], 'suspect')
+            server._set_channel_reset('bad', now - 60)
+            self.assertNotIn('bad', server._channel_recording_reliability())
