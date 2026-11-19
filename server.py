@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119d"
+VERSION = "v20261119e"
 
 app = Flask(__name__)
 
@@ -13987,17 +13987,50 @@ async function addWanted(type) {
   return findWantedTitle(title.trim(), type);
 }
 
-async function findWantedTitle(query, type, statusId='rec-status') {
+// A guide title can carry a possessive credit that IMDb leaves out ("John Grisham's The Rainmaker" is The Rainmaker on IMDb).
+// Search the title as given and without that credit, then show exact title matches first.
+function wantedTitleVariants(query) {
+  const variants = [query];
+  const quotes = [String.fromCharCode(39), String.fromCharCode(8217)];
+  for (const q of quotes) {
+    const marker = q + 's ';
+    const at = query.indexOf(marker);
+    if (at <= 0) continue;
+    const words = query.slice(0, at).split(' ').filter(w => w);
+    const rest = query.slice(at + marker.length).trim();
+    const capitalised = words.length >= 1 && words.length <= 3 && words.every(w => w[0] === w[0].toUpperCase());
+    if (capitalised && rest.length > 1 && !variants.includes(rest)) variants.push(rest);
+  }
+  return variants;
+}
+function wantedKey(text) { return String(text || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+async function findWantedTitle(query, type, statusId='rec-status', year='') {
   const kind = type === 'series' ? 'series' : 'movie';
   setEl(statusId, `Looking up IMDb ${kind} choices…`, '');
   try {
-    const d = await (await fetch(`/epg-web/api/wanted/movie-matches?q=${encodeURIComponent(query)}&type=${kind}`)).json();
-    if (d.error) { setEl(statusId, d.error, 'err'); return; }
-    if (!d.matches || !d.matches.length) {
-      setEl(statusId, d.message || `No IMDb ${kind} choices found for “${query}”. Nothing was added.`, 'err');
+    const variants = wantedTitleVariants(query);
+    const yearText = /^(19|20)[0-9]{2}$/.test(String(year || '')) ? ' (' + year + ')' : '';
+    const replies = await Promise.all(variants.map(v =>
+      fetch(`/epg-web/api/wanted/movie-matches?q=${encodeURIComponent(v + yearText)}&type=${kind}`).then(r => r.json()).catch(() => ({}))));
+    const failed = replies.find(d => d.error);
+    const seen = new Set();
+    const exact = [], others = [];
+    replies.forEach((d, i) => {
+      (d.matches || []).forEach(m => {
+        if (seen.has(m.imdb_id)) return;
+        seen.add(m.imdb_id);
+        (variants.some(v => wantedKey(v) === wantedKey(m.title)) ? exact : others).push(m);
+      });
+    });
+    const matches = exact.concat(others);
+    if (!matches.length) {
+      if (failed) { setEl(statusId, failed.error, 'err'); return; }
+      const first = replies[0] || {};
+      setEl(statusId, first.message || `No IMDb ${kind} choices found for “${query}”. Nothing was added.`, 'err');
       return;
     }
-    showWantedTitlePicker(query, d.matches, kind, statusId);
+    showWantedTitlePicker(query, matches, kind, statusId);
   } catch (e) {
     setEl(statusId, 'Could not look up movie choices: ' + e.message, 'err');
   }
@@ -14007,7 +14040,7 @@ function addCurrentProgToWanted() {
   const title = (_currentProg && _currentProg.title || '').trim();
   if (!title) return;
   const type = window._currentProgWantedType === 'series' ? 'series' : 'movie';
-  return findWantedTitle(title, type, 'pm-status');
+  return findWantedTitle(title, type, 'pm-status', _currentProg.year || '');
 }
 
 function showWantedTitlePicker(query, matches, type, statusId='rec-status') {
