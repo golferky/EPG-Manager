@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119h"
+VERSION = "v20261119i"
 
 app = Flask(__name__)
 
@@ -4994,6 +4994,24 @@ def _set_channel_reset(channel_id, when):
     conn.close()
 
 
+def _reset_all_channels(when):
+    """Reset every channel that has any recording (``when`` a time), or clear every reset (``when`` None).  Returns how many."""
+    conn = sqlite3.connect(_guide_db_path(), timeout=30)
+    conn.execute('CREATE TABLE IF NOT EXISTS channel_report_resets (channel_id TEXT PRIMARY KEY, reset_ts REAL NOT NULL)')
+    if when is None:
+        count = conn.execute('SELECT COUNT(*) FROM channel_report_resets').fetchone()[0]
+        conn.execute('DELETE FROM channel_report_resets')
+    else:
+        ids = [r[0] for r in conn.execute("SELECT DISTINCT channel_id FROM recordings WHERE channel_id IS NOT NULL AND channel_id != ''")]
+        for cid in ids:
+            conn.execute('INSERT INTO channel_report_resets(channel_id, reset_ts) VALUES(?,?) '
+                         'ON CONFLICT(channel_id) DO UPDATE SET reset_ts=excluded.reset_ts', (cid, float(when)))
+        count = len(ids)
+    conn.commit()
+    conn.close()
+    return count
+
+
 def _channel_reliability(rows, now, days=30, min_attempts=3, resets=None):
     """How often recordings on each channel worked, from finished recordings in the last ``days`` days.
 
@@ -5155,6 +5173,12 @@ def api_recording_health_channel_report():
 def api_recording_health_channel_reset():
     """Reset a channel's history (only recordings from now on count against it), or clear that reset."""
     data = request.get_json(silent=True) or {}
+    if data.get('action') in ('reset_all', 'clear_all'):
+        try:
+            count = _reset_all_channels(time.time() if data['action'] == 'reset_all' else None)
+        except sqlite3.Error as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 500
+        return jsonify({'ok': True, 'channels': count})
     channel_id = str(data.get('channel_id') or '').strip()
     if not channel_id:
         return jsonify({'ok': False, 'error': 'channel_id is required'}), 400
@@ -10831,6 +10855,8 @@ tr:hover td{background:#141414;}
         <option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option>
       </select>
       <label style="font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;"><input id="chreport-reset" type="checkbox" onchange="loadChannelReport()"> Show reset channels</label>
+      <button class="btn btn-ghost btn-sm" onclick="resetAllChannels('reset_all')" title="Start fresh: older recordings stop counting against every channel">Reset all</button>
+      <button class="btn btn-ghost btn-sm" onclick="resetAllChannels('clear_all')" title="Bring back the history of every channel you reset">Undo all resets</button>
       <input id="chreport-q" type="search" placeholder="Channel contains…" onchange="loadChannelReport()" style="width:170px;background:#111827;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:6px 9px;font-size:12px;">
       <button class="btn btn-ghost btn-sm" onclick="loadChannelReport()">Refresh</button>
     </div>
@@ -14532,6 +14558,21 @@ function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex, l
   const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${logPenalty.detail ? ' · ' + logPenalty.detail : ''}${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
   return {score, color, detail};
 }
+async function resetAllChannels(action) {
+  const text = action === 'reset_all'
+    ? 'Reset ALL channels? Recordings before now will stop counting against every channel, in this report and in the warning when you pick a channel to record. The old recordings stay listed under each channel.'
+    : 'Undo every reset? Every channel goes back to counting its full history.';
+  if (!confirm(text)) return;
+  try {
+    const r = await fetch('/epg-web/api/recording-health/channel-reset', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: action})});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'failed');
+    loadChannelReport();
+    loadChannelReliability();
+  } catch (e) { alert('Could not save the reset: ' + e.message); }
+}
+
 async function resetChannel(button) {
   const clear = button.dataset.action === 'clear';
   if (!clear && !confirm('Reset ' + (button.dataset.name || 'this channel') + '? Recordings before now will stop counting against it, in this report and in the warning when you pick it to record. They stay listed under the channel.')) return;
