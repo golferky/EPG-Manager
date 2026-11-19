@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119e"
+VERSION = "v20261119f"
 
 app = Flask(__name__)
 
@@ -4930,7 +4930,7 @@ def _daily_recording_summary(rows, now, hours=24):
     ``rows`` are dicts with title, channel, start_ts, status, failure_reason and stream_provider.
     """
     since = now - hours * 3600
-    done = failed = skipped = 0
+    done = failed = skipped = minor = 0
     problems = []
     for row in rows:
         start = row.get('start_ts') or 0
@@ -4939,6 +4939,8 @@ def _daily_recording_summary(rows, now, hours=24):
         status = _rec_status_base(row.get('status'))
         if status in ('done', 'done_ts'):
             done += 1
+            if 'minor video errors' in str(row.get('quality_decision') or ''):
+                minor += 1
         elif status in ('failed', 'error'):
             failed += 1
             reason = re.sub(r'https?://\S+', '<address>', str(row.get('failure_reason') or '')).strip()
@@ -4948,12 +4950,14 @@ def _daily_recording_summary(rows, now, hours=24):
         elif status.startswith('skipped'):
             skipped += 1
     problems.sort(key=lambda p: p['start_ts'], reverse=True)
-    return {'hours': hours, 'done': done, 'failed': failed, 'skipped': skipped, 'problems': problems}
+    return {'hours': hours, 'done': done, 'minor': minor, 'failed': failed, 'skipped': skipped, 'problems': problems}
 
 
 def _failure_kind(reason):
     """A short plain-words kind for a failure reason, so a channel's problems can be counted."""
     text = str(reason or '').lower()
+    if 'started late' in text and 'ended early' not in text:
+        return 'late starts'
     if 'damaged' in text or 'decode error' in text:
         return 'damaged video'
     if 'ended early' in text or 'captured' in text:
@@ -5001,6 +5005,71 @@ def _channel_reliability(rows, now, days=30, min_attempts=3):
     return stats
 
 
+def _channel_report(rows, now, days=30, text=''):
+    """Channels with failed recordings in the last ``days`` days, worst first, with the reasons.
+
+    ``rows`` are dicts with channel_id, channel, title, start_ts, status, failure_reason, quality_decision and
+    stream_provider.  A failed recording is critical; a finished one with a few video errors is minor.
+    """
+    since = now - days * 86400
+    needle = str(text or '').strip().lower()
+    report = {}
+    for row in sorted(rows, key=lambda r: r.get('start_ts') or 0):
+        start = row.get('start_ts') or 0
+        cid = row.get('channel_id') or ''
+        name = row.get('channel') or cid
+        if not cid or not (since <= start <= now) or (needle and needle not in str(name).lower()):
+            continue
+        status = _rec_status_base(row.get('status'))
+        failed = status in ('failed', 'error')
+        if not (failed or status in ('done', 'done_ts')):
+            continue
+        entry = report.setdefault(cid, {'channel': name, 'channel_id': cid, 'providers': set(), 'done': 0,
+                                        'minor': 0, 'failed': 0, 'reasons': {}, 'last_failure': None})
+        entry['providers'].add(row.get('stream_provider') or 'primestreams')
+        if failed:
+            entry['failed'] += 1
+            kind = _failure_kind(row.get('failure_reason'))
+            entry['reasons'][kind] = entry['reasons'].get(kind, 0) + 1
+            reason = re.sub(r'https?://\S+', '<address>', str(row.get('failure_reason') or '')).strip()
+            entry['last_failure'] = {'title': row.get('title') or '', 'when': _local_dt(start).strftime('%Y-%m-%d %H:%M'),
+                                     'reason': reason[:160]}
+        else:
+            entry['done'] += 1
+            if 'minor video errors' in str(row.get('quality_decision') or ''):
+                entry['minor'] += 1
+    out = []
+    for entry in report.values():
+        if not entry['failed']:
+            continue
+        total = entry['done'] + entry['failed']
+        entry['providers'] = sorted(entry['providers'])
+        entry['failure_pct'] = round(100 * entry['failed'] / total) if total else 0
+        out.append(entry)
+    out.sort(key=lambda e: (-e['failure_pct'], -e['failed'], e['channel']))
+    return out
+
+
+@app.route('/epg-web/api/recording-health/channel-report')
+def api_recording_health_channel_report():
+    """Read-only report of channels with failed recordings and why: ``?days=30`` and ``?q=sky`` narrow it."""
+    try:
+        days = max(1, min(int(request.args.get('days', 30)), 365))
+    except ValueError:
+        days = 30
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute('''SELECT channel_id, channel, title, start_ts, status, failure_reason,
+                                                        quality_decision, stream_provider
+                                                 FROM recordings WHERE start_ts > ? AND start_ts <= ?''',
+                                              (time.time() - days * 86400, time.time())).fetchall()]
+        conn.close()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'channels': []}), 500
+    return jsonify({'days': days, 'channels': _channel_report(rows, time.time(), days, request.args.get('q', ''))})
+
+
 @app.route('/epg-web/api/recording-health/channels')
 def api_recording_health_channels():
     """Per-channel recording success over the last 30 days, shown as a warning when picking a channel to record."""
@@ -5022,7 +5091,7 @@ def api_recording_health_daily():
     try:
         conn = sqlite3.connect(_guide_db_path(), timeout=30)
         conn.row_factory = sqlite3.Row
-        rows = [dict(r) for r in conn.execute('''SELECT title, channel, start_ts, status, failure_reason, stream_provider
+        rows = [dict(r) for r in conn.execute('''SELECT title, channel, start_ts, status, failure_reason, stream_provider, quality_decision
                                                  FROM recordings WHERE start_ts > ? AND start_ts <= ?''',
                                               (time.time() - 24 * 3600, time.time())).fetchall()]
         conn.close()
@@ -10658,6 +10727,20 @@ tr:hover td{background:#141414;}
     <div id="recording-health-list" style="max-height:460px;overflow-y:auto;"></div>
   </div>
   <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+      <div>
+        <h2 style="margin:0;">📉 Channel report</h2>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">Channels with failed recordings and why, worst first. A failed recording is critical; a few video errors are minor.</div>
+      </div>
+      <select id="chreport-days" onchange="loadChannelReport()" style="margin-left:auto;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#cbd5e1;padding:5px 8px;font-size:12px;">
+        <option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option>
+      </select>
+      <input id="chreport-q" type="search" placeholder="Channel contains…" onchange="loadChannelReport()" style="width:170px;background:#111827;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:6px 9px;font-size:12px;">
+      <button class="btn btn-ghost btn-sm" onclick="loadChannelReport()">Refresh</button>
+    </div>
+    <div id="chreport-list" style="max-height:420px;overflow-y:auto;font-size:13px;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
       <div>
         <h2 style="margin:0;">✂️ Commercial Review</h2>
@@ -10925,7 +11008,7 @@ function switchTab(name) {
   if (name === '247') load247();
   if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
   if (name === 'plex-series') loadPlexSeries();
-  if (name === 'health') { loadRecordingHealth(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
+  if (name === 'health') { loadRecordingHealth(); loadChannelReport(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
 }
@@ -11707,10 +11790,10 @@ async function loadHealthBar() {
     const text = document.getElementById('health-text');
     if (d.failed) {
       const names = d.problems.slice(0, 3).map(p => p.title + ' (' + p.channel + ')').join(', ');
-      text.textContent = '🔎 Last 24 hours: ' + d.done + ' recorded, ' + d.failed + ' failed: ' + names + (d.failed > 3 ? ' and ' + (d.failed - 3) + ' more' : '');
+      text.textContent = '🔎 Last 24 hours: ' + d.done + ' recorded' + (d.minor ? ' (' + d.minor + ' with minor blips)' : '') + ', ' + d.failed + ' critical: ' + names + (d.failed > 3 ? ' and ' + (d.failed - 3) + ' more' : '');
       bar.style.background = '#7f1d1d'; bar.style.color = '#fecaca';
     } else {
-      text.textContent = '🔎 Last 24 hours: ' + d.done + ' recorded, none failed.';
+      text.textContent = '🔎 Last 24 hours: ' + d.done + ' recorded' + (d.minor ? ' (' + d.minor + ' with minor blips)' : '') + ', none critical.';
       bar.style.background = '#14532d'; bar.style.color = '#bbf7d0';
     }
     bar.style.display = '';
@@ -14353,6 +14436,29 @@ function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex, l
   const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${logPenalty.detail ? ' · ' + logPenalty.detail : ''}${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
   return {score, color, detail};
 }
+async function loadChannelReport() {
+  const list = document.getElementById('chreport-list');
+  if (!list) return;
+  list.textContent = 'Loading…';
+  try {
+    const days = document.getElementById('chreport-days').value;
+    const q = document.getElementById('chreport-q').value.trim();
+    const d = await (await fetch('/epg-web/api/recording-health/channel-report?days=' + days + '&q=' + encodeURIComponent(q))).json();
+    if (d.error) throw new Error(d.error);
+    if (!d.channels.length) { list.innerHTML = '<div style="color:#64748b;padding:6px 0;">No channels with failed recordings in this period.</div>'; return; }
+    list.innerHTML = d.channels.map(c => {
+      const reasons = Object.keys(c.reasons).map(k => c.reasons[k] + ' x ' + k).join(', ');
+      const color = c.failure_pct >= 50 ? '#f87171' : c.failure_pct >= 25 ? '#fbbf24' : '#94a3b8';
+      const last = c.last_failure ? '<div style="color:#64748b;font-size:12px;">Last failure: ' + esc(c.last_failure.title) + ' (' + esc(c.last_failure.when) + '): ' + esc(c.last_failure.reason) + '</div>' : '';
+      return '<div style="padding:8px 0;border-bottom:1px solid #1e293b;">'
+        + '<div><span style="color:#e2e8f0;font-weight:600;">' + esc(c.channel) + '</span> '
+        + '<span style="color:' + color + ';">' + c.failure_pct + '% failed (' + c.failed + ' of ' + (c.done + c.failed) + ')</span> '
+        + '<span style="color:#64748b;font-size:12px;">' + esc(c.providers.join(', ')) + (c.minor ? ' · ' + c.minor + ' with minor blips' : '') + '</span></div>'
+        + '<div style="color:#94a3b8;font-size:12px;">' + esc(reasons) + '</div>' + last + '</div>';
+    }).join('');
+  } catch (e) { list.textContent = 'Could not load the channel report: ' + e.message; }
+}
+
 async function loadRecordingHealth() {
   const list = document.getElementById('recording-health-list');
   const empty = document.getElementById('recording-health-empty');
@@ -14383,7 +14489,9 @@ async function loadRecordingHealth() {
       const technical = result.log_excerpt || '';
       const when = r.start_time || (r.start_ts ? new Date(Number(r.start_ts) * 1000).toLocaleString() : '');
       const score = recordingQualityScore(recorded, scheduled, actual, result.transferred_to_plex, result.log_excerpt);
-      const compactResult = isGood ? 'Complete' : (timing || esc(label));
+      const minorBlips = isGood && String(r.quality_decision || '').includes('minor video errors');
+      const compactResult = isGood ? (minorBlips ? 'Complete · minor blips' : 'Complete')
+        : (isActive ? (timing || label) : 'CRITICAL · ' + (timing || label));
       const action = !isGood && !isActive ? (retry
         ? `<span style="color:#86efac;font-size:11px;font-weight:700;white-space:nowrap;">✓ Re-record queued</span>`
         : `<button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;white-space:nowrap;" onclick="rerecordFromHealth('${String(r.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Find re-record</button>`) : '';
