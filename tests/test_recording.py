@@ -4752,3 +4752,46 @@ class GuideNowTitlesTests(unittest.TestCase):
         with mock.patch.dict(server._epg, {'programmes': progs}):
             titles = [row['title'] for row in server._guide_now_titles('a', now)]
         self.assertEqual(titles, ['Now', 'Next'])
+
+
+class ChannelReportTests(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def _row(self, cid, name, status, days_ago=1, reason='', decision='', provider='primestreams', title='T'):
+        return {'channel_id': cid, 'channel': name, 'title': title, 'start_ts': self.NOW - days_ago * 86400,
+                'status': status, 'failure_reason': reason, 'quality_decision': decision, 'stream_provider': provider}
+
+    def test_it_lists_only_channels_with_failures_worst_first_with_reasons_and_the_last_failure(self):
+        rows = ([self._row('a', 'Sky A', 'done')] * 2
+                + [self._row('a', 'Sky A', 'failed', 3, 'Video is damaged: 90 decode errors', title='Old'),
+                   self._row('a', 'Sky A', 'failed', 1, 'Recording started late: 120 s after the scheduled start', title='New')]
+                + [self._row('b', 'Good B', 'done')] * 5
+                + [self._row('c', 'Never C', 'done')] * 3
+                + [self._row('b', 'Good B', 'failed', 2, 'Recording ended early: 9 min missing')])
+        out = server._channel_report(rows, self.NOW)
+        self.assertEqual([c['channel'] for c in out], ['Sky A', 'Good B'])
+        self.assertEqual((out[0]['done'], out[0]['failed'], out[0]['failure_pct']), (2, 2, 50))
+        self.assertEqual(out[0]['reasons'], {'damaged video': 1, 'late starts': 1})
+        self.assertEqual(out[0]['last_failure']['title'], 'New')
+
+    def test_minor_blips_are_counted_and_the_text_filter_narrows_the_report(self):
+        rows = [self._row('a', 'Sky A', 'done', decision='recording because Plex has no copy; 4 minor video errors'),
+                self._row('a', 'Sky A', 'failed', 1, 'Video is damaged: 90 decode errors'),
+                self._row('b', 'Starz B', 'failed', 1, 'Video is damaged: 90 decode errors')]
+        out = server._channel_report(rows, self.NOW, text='sky')
+        self.assertEqual([(c['channel'], c['minor']) for c in out], [('Sky A', 1)])
+
+    def test_failures_outside_the_period_or_still_running_do_not_count(self):
+        rows = [self._row('a', 'A', 'failed', 40, 'Video is damaged: 90 decode errors'), self._row('a', 'A', 'recording')]
+        self.assertEqual(server._channel_report(rows, self.NOW, days=30), [])
+
+
+class DailySummaryMinorTests(unittest.TestCase):
+    def test_finished_recordings_with_a_few_video_errors_are_counted_as_minor(self):
+        now = 1_800_000_000
+        rows = [{'title': 'A', 'channel': 'C', 'start_ts': now - 3600, 'status': 'done', 'failure_reason': '',
+                 'stream_provider': 'primestreams', 'quality_decision': 'recording because Plex has no copy; 4 minor video errors'},
+                {'title': 'B', 'channel': 'C', 'start_ts': now - 3600, 'status': 'done', 'failure_reason': '',
+                 'stream_provider': 'primestreams', 'quality_decision': 'recording because Plex has no copy'}]
+        out = server._daily_recording_summary(rows, now)
+        self.assertEqual((out['done'], out['minor'], out['failed']), (2, 1, 0))

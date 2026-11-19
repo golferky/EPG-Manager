@@ -538,10 +538,10 @@ class AgentVersionPayloadTests(unittest.TestCase):
 class ShortRecordingFlowTests(unittest.TestCase):
     """A recording a few minutes short goes to Incomplete Recordings, not Plex."""
 
-    def _run(self, recorded_minutes, damage=None, existing_errors=None):
+    def _run(self, recorded_minutes, damage=None, existing_errors=None, late=2):
         now = time.time()
-        job = {"id": "j1", "title": "Short Movie", "stream_id": "1", "start_ts": now - 3600,
-               "stop_ts": now - 3600 + 137 * 60, "stream_provider": "primestreams",
+        job = {"id": "j1", "title": "Short Movie", "stream_id": "1", "start_ts": now - late,
+               "stop_ts": now - late + 137 * 60, "stream_provider": "primestreams",
                "stream_extension": "ts"}
         with tempfile.TemporaryDirectory() as temp:
             cfg = {"local_recordings": temp, "plex_path": temp + "/Movies", "plex_tv_path": temp + "/TV",
@@ -1713,8 +1713,8 @@ class PrivateRecordingFlowTests(unittest.TestCase):
 
     def _run(self, private, existing_year=None):
         now = time.time()
-        job = {"id": "p1", "title": "Private Film", "stream_id": "1", "start_ts": now - 3600,
-               "stop_ts": now - 3600 + 100 * 60, "stream_provider": "primestreams", "stream_extension": "ts",
+        job = {"id": "p1", "title": "Private Film", "stream_id": "1", "start_ts": now - 2,
+               "stop_ts": now - 2 + 100 * 60, "stream_provider": "primestreams", "stream_extension": "ts",
                "year": "2004", "private": private}
         with tempfile.TemporaryDirectory() as temp:
             movies, private_dir = Path(temp) / "Movies", Path(temp) / "Movies Private"
@@ -3090,3 +3090,45 @@ class DamagedExistingCopyTests(unittest.TestCase):
         self.assertIs(seen["kw"]["stdin"], recording_agent.subprocess.DEVNULL)
         with mock.patch.object(recording_agent.subprocess, "run", side_effect=OSError("no ffmpeg")):
             self.assertIsNone(recording_agent.tail_decode_errors("/p/x.mp4", self.CFG))
+
+
+class MovieTimelinessTests(unittest.TestCase):
+    def test_a_movie_more_than_a_minute_short_is_missing_content_but_tv_keeps_the_looser_rule(self):
+        missing = recording_agent.recording_missing_seconds
+        slot = 6300                                   # a 105 minute slot
+        self.assertEqual(missing({'duration': slot - 120}, 0, slot, movie=True), 120)
+        self.assertEqual(missing({'duration': slot - 120}, 0, slot), 0)         # TV: under 3 minutes is allowed
+        self.assertEqual(missing({'duration': slot - 30}, 0, slot, movie=True), 0)
+        self.assertEqual(missing({'duration': slot + 50}, 0, slot, movie=True), 0)   # the normal early start and tail
+
+    def test_a_late_start_is_measured_from_the_scheduled_start(self):
+        self.assertEqual(recording_agent.late_start_seconds(1000, 1005), 0)     # began 5 seconds early
+        self.assertEqual(recording_agent.late_start_seconds(1100, 1000), 100)
+        self.assertGreater(100, recording_agent.MOVIE_MAX_LATE_START_SECONDS)
+
+
+class MovieSeverityFlowTests(ShortRecordingFlowTests):
+    """The film rules: late start or more than a minute short is critical; a few blips are minor."""
+
+    def test_a_film_that_started_two_minutes_late_is_critical_even_at_full_length(self):
+        archive, preserve = self._run(137, late=120)
+        preserve.assert_called_once()
+        kwargs = archive.call_args.kwargs
+        self.assertIn('started late', kwargs['message'])
+        self.assertEqual(kwargs['result']['severity'], 'critical')
+        self.assertEqual(kwargs['result']['late_start_seconds'], 120)
+
+    def test_a_film_ninety_seconds_short_is_critical(self):
+        archive, preserve = self._run(135.5)
+        preserve.assert_called_once()
+        self.assertEqual(archive.call_args.kwargs['result']['severity'], 'critical')
+
+    def test_a_film_on_time_with_a_few_blips_is_minor_and_goes_to_plex(self):
+        archive, preserve = self._run(138, damage=4)
+        preserve.assert_not_called()
+        self.assertEqual(archive.call_args.kwargs['result']['severity'], 'minor')
+        self.assertEqual(archive.call_args.kwargs['result']['late_start_seconds'], 2)
+
+    def test_fifty_errors_are_critical(self):
+        archive, preserve = self._run(138, damage=50)
+        self.assertEqual(archive.call_args.kwargs['result']['severity'], 'critical')

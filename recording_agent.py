@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261116a"
+AGENT_VERSION = "v20261119a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -303,8 +303,19 @@ def incomplete_for_scheduled_window(existing, start_ts, stop_ts):
 SHORT_RECORDING_MIN_SECONDS = 180
 SHORT_RECORDING_FRACTION = 0.04
 
+# A film that does not start and end on time is critical.  The recorder starts 5 seconds early and keeps a
+# 45-second tail, so a complete recording is never short of its slot: more than a minute short, or a start more
+# than half a minute after the scheduled one, means part of the film is missing.  TV keeps the looser rule above.
+MOVIE_MAX_MISSING_SECONDS = 60
+MOVIE_MAX_LATE_START_SECONDS = 30
 
-def recording_missing_seconds(recorded, start_ts, stop_ts):
+
+def late_start_seconds(capture_began, start_ts):
+    """Seconds after the scheduled start that capture began (0 when it began on time or early)."""
+    return max(0.0, float(capture_began) - float(start_ts))
+
+
+def recording_missing_seconds(recorded, start_ts, stop_ts, movie=False):
     """Seconds of the scheduled slot that a fresh recording did not capture.
 
     Returns 0 when the recording is complete enough.  This is stricter than
@@ -318,7 +329,8 @@ def recording_missing_seconds(recorded, start_ts, stop_ts):
     if scheduled < 900 or duration <= 0:
         return 0
     missing = scheduled - duration
-    allowed = max(SHORT_RECORDING_MIN_SECONDS, scheduled * SHORT_RECORDING_FRACTION)
+    allowed = (MOVIE_MAX_MISSING_SECONDS if movie
+               else max(SHORT_RECORDING_MIN_SECONDS, scheduled * SHORT_RECORDING_FRACTION))
     return missing if missing > allowed else 0
 
 
@@ -1135,6 +1147,7 @@ def process_job(api, job, cfg):
 
     # IPTV providers close long-lived connections; resume so a dropped stream
     # continues instead of ending the recording early.
+    capture_began = time.time()
     rc = record_with_resume(api, job, cfg, url, ts_path, log_path,
                             time.time() + remaining)
     quality['record_log_tail'] = _log_excerpt(log_path, 3000)
@@ -1193,15 +1206,26 @@ def process_job(api, job, cfg):
     recorded_probe = probe_media(mp4_path, ffprobe=cfg['ffprobe'])
     # FFmpeg can exit successfully when a live HTTP source simply stops
     # sending data. Do not let a short fragment replace the Plex copy.
-    missing_seconds = recording_missing_seconds(recorded_probe, job['start_ts'], job['stop_ts'])
-    if missing_seconds or incomplete_for_scheduled_window(
+    is_movie = not (episode or is_series)
+    late_seconds = late_start_seconds(capture_began, job['start_ts'])
+    quality['late_start_seconds'] = round(late_seconds)
+    started_late = is_movie and late_seconds > MOVIE_MAX_LATE_START_SECONDS
+    missing_seconds = recording_missing_seconds(recorded_probe, job['start_ts'], job['stop_ts'], movie=is_movie)
+    if missing_seconds or started_late or incomplete_for_scheduled_window(
             recorded_probe, job['start_ts'], job['stop_ts']):
         expected_minutes = (job['stop_ts'] - job['start_ts']) / 60
         actual_minutes = recorded_probe['duration'] / 60
-        message = (f'Recording ended early: {actual_minutes:.0f} min captured '
-                   f'of {expected_minutes:.0f} min scheduled')
-        if missing_seconds:
-            message += f' (about {missing_seconds / 60:.0f} min missing)'
+        if started_late and not missing_seconds:
+            message = (f'Recording started late: {late_seconds:.0f} s after the scheduled start, so the opening '
+                       f'is missing ({actual_minutes:.0f} min captured of {expected_minutes:.0f} min scheduled)')
+        else:
+            message = (f'Recording ended early: {actual_minutes:.0f} min captured '
+                       f'of {expected_minutes:.0f} min scheduled')
+            if missing_seconds:
+                message += f' (about {missing_seconds / 60:.0f} min missing)'
+            if started_late:
+                message += f'; started {late_seconds:.0f} s late'
+        quality['severity'] = 'critical'
         end_reason = ffmpeg_end_reason(log_path)
         if end_reason:
             message += f'; why: {end_reason}'
@@ -1241,6 +1265,7 @@ def process_job(api, job, cfg):
         if damage is not None:
             quality['decode_errors'] = damage
             limit = int(cfg.get('damaged_error_lines') or DAMAGED_ERROR_LINES)
+            quality['severity'] = 'critical' if damage >= limit else ('minor' if damage else 'clean')
             if damage >= limit:
                 message = (f'Video is damaged: {damage} decode errors (the limit is {limit}); '
                            'not added to Plex')
