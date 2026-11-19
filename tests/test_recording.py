@@ -4683,3 +4683,29 @@ class LiveStreamFallbackTests(unittest.TestCase):
 
     def test_a_busy_eaglecast_with_no_primestreams_feed_keeps_the_eaglecast_answer(self):
         self.assertEqual(self._pick(['Before I Fall'], ps_ok=False)[0], 'eagle-url')
+
+
+class DailyRecordingSummaryTests(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def _row(self, hours_ago, status, title='T', reason=''):
+        return {'title': title, 'channel': 'Ch', 'start_ts': self.NOW - hours_ago * 3600, 'status': status,
+                'failure_reason': reason, 'stream_provider': 'eaglecast'}
+
+    def test_it_counts_the_last_24_hours_and_lists_the_failures(self):
+        rows = [self._row(1, 'done'), self._row(5, 'done'), self._row(6, 'failed', 'Bad', 'Video is damaged: 90 decode errors'),
+                self._row(10, 'skipped_existing_better'), self._row(30, 'failed', 'Old'), self._row(2, 'cancelled'),
+                self._row(-3, 'queued')]            # a booking still in the future
+        out = server._daily_recording_summary(rows, self.NOW)
+        self.assertEqual((out['done'], out['failed'], out['skipped']), (2, 1, 1))
+        self.assertEqual([p['title'] for p in out['problems']], ['Bad'])
+        self.assertIn('decode errors', out['problems'][0]['reason'])
+
+    def test_an_address_in_a_failure_reason_is_hidden(self):
+        out = server._daily_recording_summary([self._row(1, 'failed', 'X', 'could not open http://host:80/live/u/p/1.ts now')], self.NOW)
+        self.assertNotIn('http', out['problems'][0]['reason'])
+        self.assertIn('<address>', out['problems'][0]['reason'])
+
+    def test_a_quiet_day_has_no_problems(self):
+        out = server._daily_recording_summary([self._row(1, 'done')], self.NOW)
+        self.assertEqual((out['failed'], out['problems']), (0, []))

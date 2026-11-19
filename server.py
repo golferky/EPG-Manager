@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261118j"
+VERSION = "v20261119a"
 
 app = Flask(__name__)
 
@@ -4923,6 +4923,48 @@ def api_scheduled_programme():
         }})
     except Exception as exc:
         return jsonify({'error': f'Could not open scheduled recording: {exc}'}), 500
+
+def _daily_recording_summary(rows, now, hours=24):
+    """Counts and the failures for recordings that started in the last ``hours`` hours.
+
+    ``rows`` are dicts with title, channel, start_ts, status, failure_reason and stream_provider.
+    """
+    since = now - hours * 3600
+    done = failed = skipped = 0
+    problems = []
+    for row in rows:
+        start = row.get('start_ts') or 0
+        if not (since <= start <= now):
+            continue
+        status = _rec_status_base(row.get('status'))
+        if status in ('done', 'done_ts'):
+            done += 1
+        elif status in ('failed', 'error'):
+            failed += 1
+            reason = re.sub(r'https?://\S+', '<address>', str(row.get('failure_reason') or '')).strip()
+            problems.append({'title': row.get('title') or '', 'channel': row.get('channel') or '',
+                             'provider': row.get('stream_provider') or 'primestreams',
+                             'reason': reason[:160], 'start_ts': start})
+        elif status.startswith('skipped'):
+            skipped += 1
+    problems.sort(key=lambda p: p['start_ts'], reverse=True)
+    return {'hours': hours, 'done': done, 'failed': failed, 'skipped': skipped, 'problems': problems}
+
+
+@app.route('/epg-web/api/recording-health/daily')
+def api_recording_health_daily():
+    """One-glance summary of the last 24 hours, for the banner at the top of the dashboard."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute('''SELECT title, channel, start_ts, status, failure_reason, stream_provider
+                                                 FROM recordings WHERE start_ts > ? AND start_ts <= ?''',
+                                              (time.time() - 24 * 3600, time.time())).fetchall()]
+        conn.close()
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    return jsonify(_daily_recording_summary(rows, time.time()))
+
 
 @app.route('/epg-web/api/recording-health')
 def api_recording_health():
@@ -10164,6 +10206,12 @@ tr:hover td{background:#141414;}
   <button class="btn btn-ghost btn-sm" style="margin-left:12px;" onclick="dismissReminders()">Dismiss for today</button>
 </div>
 
+<div id="health-bar" style="display:none;padding:6px 16px;font-size:13px;border-bottom:1px solid #2d2d2d;">
+  <span id="health-text"></span>
+  <button class="btn btn-ghost btn-sm" style="margin-left:12px;" onclick="switchTab('health')">Open Recording Health</button>
+  <button class="btn btn-ghost btn-sm" onclick="dismissHealthBar()">Dismiss for today</button>
+</div>
+
 <nav>
   <div class="tab active" onclick="switchTab('guide')">📺 Guide</div>
   <div class="tab" onclick="switchTab('recommendations')">⭐ Recommendations</div>
@@ -11581,6 +11629,36 @@ function dismissReminders() {
   document.getElementById('reminder-bar').style.display = 'none';
 }
 document.addEventListener('DOMContentLoaded', loadReminders);
+
+// Daily recording check: the last 24 hours at a glance.  Hidden for the rest of the day once dismissed, unless more recordings have failed since.
+async function loadHealthBar() {
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/daily')).json();
+    if (d.error) return;
+    const bar = document.getElementById('health-bar');
+    const today = new Date().toISOString().slice(0, 10);
+    if (localStorage.getItem('epg_health_dismissed') === today + ':' + d.failed) { bar.style.display = 'none'; return; }
+    const text = document.getElementById('health-text');
+    if (d.failed) {
+      const names = d.problems.slice(0, 3).map(p => p.title + ' (' + p.channel + ')').join(', ');
+      text.textContent = '🔎 Last 24 hours: ' + d.done + ' recorded, ' + d.failed + ' failed: ' + names + (d.failed > 3 ? ' and ' + (d.failed - 3) + ' more' : '');
+      bar.style.background = '#7f1d1d'; bar.style.color = '#fecaca';
+    } else {
+      text.textContent = '🔎 Last 24 hours: ' + d.done + ' recorded, none failed.';
+      bar.style.background = '#14532d'; bar.style.color = '#bbf7d0';
+    }
+    bar.style.display = '';
+  } catch (e) { /* a status line is never worth an error */ }
+}
+async function dismissHealthBar() {
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/daily')).json();
+    localStorage.setItem('epg_health_dismissed', new Date().toISOString().slice(0, 10) + ':' + d.failed);
+  } catch (e) {}
+  document.getElementById('health-bar').style.display = 'none';
+}
+document.addEventListener('DOMContentLoaded', loadHealthBar);
+setInterval(loadHealthBar, 30 * 60 * 1000);
 
 // Adult-content lock.  The server decides; this only collects the password and carries the token it hands back.
 let _adultMode = 'unlock';
