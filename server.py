@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119f"
+VERSION = "v20261119g"
 
 app = Flask(__name__)
 
@@ -5048,6 +5048,46 @@ def _channel_report(rows, now, days=30, text=''):
         out.append(entry)
     out.sort(key=lambda e: (-e['failure_pct'], -e['failed'], e['channel']))
     return out
+
+
+def _channel_recordings(rows, limit=300):
+    """Every past recording on one channel, newest first, in plain words (cancelled ones are left out)."""
+    labels = {'done': 'recorded', 'done_ts': 'kept as TS', 'failed': 'failed', 'error': 'failed',
+              'skipped_existing_better': 'skipped (better copy already in Plex)', 'recording': 'recording now'}
+    out = []
+    for row in sorted(rows, key=lambda r: r.get('start_ts') or 0, reverse=True):
+        status = _rec_status_base(row.get('status'))
+        if status not in labels:
+            continue
+        failed = status in ('failed', 'error')
+        decision = str(row.get('quality_decision') or '')
+        severity = 'critical' if failed else ('minor' if 'minor video errors' in decision else '')
+        reason = re.sub(r'https?://\S+', '<address>', str(row.get('failure_reason') or '')).strip()
+        out.append({'title': row.get('title') or '', 'when': _local_dt(row['start_ts']).strftime('%Y-%m-%d %H:%M'),
+                    'result': labels[status], 'severity': severity,
+                    'provider': row.get('stream_provider') or 'primestreams',
+                    'detail': (reason if failed else decision)[:160]})
+        if len(out) >= limit:
+            break
+    return out
+
+
+@app.route('/epg-web/api/recording-health/channel-recordings')
+def api_recording_health_channel_recordings():
+    """Read-only: every past recording on one channel (``?channel_id=``), for the channel report's expanded row."""
+    channel_id = request.args.get('channel_id', '').strip()
+    if not channel_id:
+        return jsonify({'error': 'give ?channel_id='}), 400
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute('''SELECT title, start_ts, status, failure_reason, quality_decision, stream_provider
+                                                 FROM recordings WHERE channel_id=? AND start_ts <= ?''',
+                                              (channel_id, time.time())).fetchall()]
+        conn.close()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'recordings': []}), 500
+    return jsonify({'channel_id': channel_id, 'recordings': _channel_recordings(rows)})
 
 
 @app.route('/epg-web/api/recording-health/channel-report')
@@ -14436,6 +14476,31 @@ function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex, l
   const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${logPenalty.detail ? ' · ' + logPenalty.detail : ''}${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
   return {score, color, detail};
 }
+async function toggleChannelRecordings(head) {
+  const detail = head.parentNode.querySelector('.chrec-detail');
+  if (!detail) return;
+  if (detail.style.display !== 'none') { detail.style.display = 'none'; head.firstChild.textContent = '▸'; return; }
+  head.firstChild.textContent = '▾';
+  detail.style.display = '';
+  detail.textContent = 'Loading…';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/channel-recordings?channel_id=' + encodeURIComponent(head.dataset.cid))).json();
+    if (d.error) throw new Error(d.error);
+    if (!d.recordings.length) { detail.textContent = 'No past recordings on this channel.'; return; }
+    detail.innerHTML = '<div style="color:#64748b;font-size:12px;margin-bottom:4px;">' + d.recordings.length + ' recording(s), newest first</div>'
+      + d.recordings.map(r => {
+        const color = r.severity === 'critical' ? '#f87171' : r.severity === 'minor' ? '#fbbf24' : '#4ade80';
+        const tag = r.severity === 'critical' ? 'CRITICAL · ' : r.severity === 'minor' ? 'minor blips · ' : '';
+        return '<div style="font-size:12px;padding:3px 0;border-bottom:1px solid #172033;">'
+          + '<span style="color:#94a3b8;">' + esc(r.when) + '</span> '
+          + '<span style="color:#e2e8f0;">' + esc(r.title) + '</span> '
+          + '<span style="color:' + color + ';">' + tag + esc(r.result) + '</span> '
+          + '<span style="color:#64748b;">(' + esc(r.provider) + ')</span>'
+          + (r.detail ? '<div style="color:#64748b;">' + esc(r.detail) + '</div>' : '') + '</div>';
+      }).join('');
+  } catch (e) { detail.textContent = 'Could not load the recordings: ' + e.message; }
+}
+
 async function loadChannelReport() {
   const list = document.getElementById('chreport-list');
   if (!list) return;
@@ -14451,10 +14516,11 @@ async function loadChannelReport() {
       const color = c.failure_pct >= 50 ? '#f87171' : c.failure_pct >= 25 ? '#fbbf24' : '#94a3b8';
       const last = c.last_failure ? '<div style="color:#64748b;font-size:12px;">Last failure: ' + esc(c.last_failure.title) + ' (' + esc(c.last_failure.when) + '): ' + esc(c.last_failure.reason) + '</div>' : '';
       return '<div style="padding:8px 0;border-bottom:1px solid #1e293b;">'
-        + '<div><span style="color:#e2e8f0;font-weight:600;">' + esc(c.channel) + '</span> '
+        + '<div data-cid="' + esc(c.channel_id) + '" onclick="toggleChannelRecordings(this)" style="cursor:pointer;" title="Click to see every recording on this channel"><span style="color:#64748b;">▸</span> <span style="color:#e2e8f0;font-weight:600;">' + esc(c.channel) + '</span> '
         + '<span style="color:' + color + ';">' + c.failure_pct + '% failed (' + c.failed + ' of ' + (c.done + c.failed) + ')</span> '
         + '<span style="color:#64748b;font-size:12px;">' + esc(c.providers.join(', ')) + (c.minor ? ' · ' + c.minor + ' with minor blips' : '') + '</span></div>'
-        + '<div style="color:#94a3b8;font-size:12px;">' + esc(reasons) + '</div>' + last + '</div>';
+        + '<div style="color:#94a3b8;font-size:12px;">' + esc(reasons) + '</div>' + last
+        + '<div class="chrec-detail" style="display:none;margin:8px 0 0 14px;"></div></div>';
     }).join('');
   } catch (e) { list.textContent = 'Could not load the channel report: ' + e.message; }
 }

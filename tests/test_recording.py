@@ -4795,3 +4795,23 @@ class DailySummaryMinorTests(unittest.TestCase):
                  'stream_provider': 'primestreams', 'quality_decision': 'recording because Plex has no copy'}]
         out = server._daily_recording_summary(rows, now)
         self.assertEqual((out['done'], out['minor'], out['failed']), (2, 1, 0))
+
+
+class ChannelRecordingsTests(unittest.TestCase):
+    def test_every_past_recording_is_listed_newest_first_without_cancelled_ones(self):
+        base = 1_800_000_000
+        rows = [{'title': 'Old', 'start_ts': base, 'status': 'done', 'failure_reason': '',
+                 'quality_decision': 'recording because Plex has no copy; 3 minor video errors', 'stream_provider': 'eaglecast'},
+                {'title': 'New', 'start_ts': base + 86400, 'status': 'failed',
+                 'failure_reason': 'Video is damaged: 90 decode errors; opened http://h:80/live/u/p/1.ts', 'quality_decision': '',
+                 'stream_provider': 'primestreams'},
+                {'title': 'Gone', 'start_ts': base + 100, 'status': 'cancelled', 'failure_reason': 'Cancelled by user',
+                 'quality_decision': '', 'stream_provider': 'primestreams'},
+                {'title': 'Skip', 'start_ts': base + 50, 'status': 'skipped_existing_better', 'failure_reason': '',
+                 'quality_decision': 'Plex is better', 'stream_provider': 'primestreams'}]
+        out = server._channel_recordings(rows)
+        self.assertEqual([r['title'] for r in out], ['New', 'Skip', 'Old'])
+        self.assertEqual((out[0]['severity'], out[0]['result']), ('critical', 'failed'))
+        self.assertNotIn('http', out[0]['detail'])
+        self.assertEqual(out[2]['severity'], 'minor')
+        self.assertEqual(out[1]['severity'], '')
