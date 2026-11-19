@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119b"
+VERSION = "v20261119c"
 
 app = Flask(__name__)
 
@@ -14753,6 +14753,60 @@ def _eaglecast_live_streams(cfg):
     with urlreq.urlopen(req, timeout=30) as response:
         payload = json.loads(response.read().decode('utf-8'))
     return payload if isinstance(payload, list) else []
+
+@app.route('/epg-web/api/eaglecast-epg-probe')
+def api_eaglecast_epg_probe():
+    """Read-only: what Eaglecast says is airing on a stream, beside what the guide says is airing on the channel mapped to it.
+
+    ``?stream_id=176929``.  A different title on the two sides means the stream carries a different feed (a Canadian or
+    other-region schedule) than the guide channel it is mapped to.  The provider address and login are never included.
+    """
+    from urllib import parse as urlparse, request as urlreq
+    stream_id = re.sub(r'\D', '', request.args.get('stream_id', ''))
+    if not stream_id:
+        return jsonify({'error': 'give ?stream_id='}), 400
+    cfg = _load_eaglecast_test_config()
+    if not all(cfg.get(key) for key in ('server_url', 'username', 'password')):
+        return jsonify({'error': 'Eaglecast is not set up'}), 503
+    out = {'stream_id': stream_id, 'guide_channel': '', 'guide_now': [], 'provider_now': []}
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        row = conn.execute("SELECT channel_id, provider_channel_name FROM provider_streams "
+                           "WHERE provider='eaglecast' AND stream_id=?", (stream_id,)).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        row = None
+    if row:
+        out['guide_channel'] = str(row[0])
+        out['provider_name'] = str(row[1] or '')
+        out['guide_now'] = _guide_now_titles(row[0], time.time())
+    try:
+        query = urlparse.urlencode({'username': cfg['username'], 'password': cfg['password'],
+                                    'action': 'get_short_epg', 'stream_id': stream_id, 'limit': '4'})
+        req = urlreq.Request(cfg['server_url'].rstrip('/') + '/player_api.php?' + query,
+                             headers={'User-Agent': 'EPG-Manager Eaglecast Test'})
+        with urlreq.urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read())
+        for item in (payload.get('epg_listings') if isinstance(payload, dict) else None) or []:
+            out['provider_now'].append({
+                'title': _decode_provider_epg_text(item.get('title'))[:120],
+                'start': str(item.get('start', ''))[:25], 'end': str(item.get('end', ''))[:25]})
+    except Exception as exc:
+        out['provider_error'] = type(exc).__name__          # the message could carry the address
+    return jsonify(out)
+
+
+def _guide_now_titles(channel_id, now, count=3):
+    """The guide's programme on a channel now, then the next ones: [{title, start, stop}] (local times)."""
+    rows = []
+    for p in _epg.get('programmes', []):
+        if p.get('channel_id') == channel_id and (p.get('stop_ts') or 0) > now:
+            rows.append(p)
+    rows.sort(key=lambda p: p.get('start_ts') or 0)
+    return [{'title': str(p.get('title') or '')[:120],
+             'start': _local_dt(p['start_ts']).strftime('%a %H:%M'),
+             'stop': _local_dt(p['stop_ts']).strftime('%H:%M')} for p in rows[:count]]
+
 
 def _eaglecast_public_recording_status():
     with _eaglecast_recording_lock:

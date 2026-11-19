@@ -4740,3 +4740,15 @@ class ChannelReliabilityTests(unittest.TestCase):
         out = server._channel_reliability(rows, self.NOW)
         self.assertEqual(list(out), ['c'])
         self.assertEqual((out['c']['done'], out['c']['failed']), (3, 0))
+
+
+class GuideNowTitlesTests(unittest.TestCase):
+    def test_it_lists_the_programme_on_now_then_the_next_ones_for_one_channel(self):
+        now = 1_800_000_000
+        progs = [{'channel_id': 'a', 'title': 'Past', 'start_ts': now - 7200, 'stop_ts': now - 3600},
+                 {'channel_id': 'a', 'title': 'Now', 'start_ts': now - 600, 'stop_ts': now + 3000},
+                 {'channel_id': 'a', 'title': 'Next', 'start_ts': now + 3000, 'stop_ts': now + 6600},
+                 {'channel_id': 'b', 'title': 'Other', 'start_ts': now - 600, 'stop_ts': now + 3000}]
+        with mock.patch.dict(server._epg, {'programmes': progs}):
+            titles = [row['title'] for row in server._guide_now_titles('a', now)]
+        self.assertEqual(titles, ['Now', 'Next'])
