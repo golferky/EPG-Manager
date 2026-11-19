@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119g"
+VERSION = "v20261119h"
 
 app = Flask(__name__)
 
@@ -4969,7 +4969,32 @@ def _failure_kind(reason):
     return 'other failures'
 
 
-def _channel_reliability(rows, now, days=30, min_attempts=3):
+def _channel_resets():
+    """{channel_id: reset time}: after a reset only newer recordings count against a channel."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=30)
+        conn.execute('CREATE TABLE IF NOT EXISTS channel_report_resets (channel_id TEXT PRIMARY KEY, reset_ts REAL NOT NULL)')
+        rows = conn.execute('SELECT channel_id, reset_ts FROM channel_report_resets').fetchall()
+        conn.close()
+        return {str(r[0]): float(r[1]) for r in rows}
+    except sqlite3.Error:
+        return {}
+
+
+def _set_channel_reset(channel_id, when):
+    """Reset a channel's history from ``when`` on, or clear its reset when ``when`` is None."""
+    conn = sqlite3.connect(_guide_db_path(), timeout=30)
+    conn.execute('CREATE TABLE IF NOT EXISTS channel_report_resets (channel_id TEXT PRIMARY KEY, reset_ts REAL NOT NULL)')
+    if when is None:
+        conn.execute('DELETE FROM channel_report_resets WHERE channel_id=?', (channel_id,))
+    else:
+        conn.execute('INSERT INTO channel_report_resets(channel_id, reset_ts) VALUES(?,?) '
+                     'ON CONFLICT(channel_id) DO UPDATE SET reset_ts=excluded.reset_ts', (channel_id, float(when)))
+    conn.commit()
+    conn.close()
+
+
+def _channel_reliability(rows, now, days=30, min_attempts=3, resets=None):
     """How often recordings on each channel worked, from finished recordings in the last ``days`` days.
 
     ``rows`` are dicts with channel_id, channel, start_ts, status and failure_reason.  The level is
@@ -4981,7 +5006,7 @@ def _channel_reliability(rows, now, days=30, min_attempts=3):
     for row in rows:
         start = row.get('start_ts') or 0
         cid = row.get('channel_id') or ''
-        if not cid or not (since <= start <= now):
+        if not cid or not (since <= start <= now) or start < (resets or {}).get(cid, 0):
             continue
         status = _rec_status_base(row.get('status'))
         if status in ('done', 'done_ts'):
@@ -5005,7 +5030,7 @@ def _channel_reliability(rows, now, days=30, min_attempts=3):
     return stats
 
 
-def _channel_report(rows, now, days=30, text=''):
+def _channel_report(rows, now, days=30, text='', resets=None, include_reset=False):
     """Channels with failed recordings in the last ``days`` days, worst first, with the reasons.
 
     ``rows`` are dicts with channel_id, channel, title, start_ts, status, failure_reason, quality_decision and
@@ -5024,9 +5049,21 @@ def _channel_report(rows, now, days=30, text=''):
         failed = status in ('failed', 'error')
         if not (failed or status in ('done', 'done_ts')):
             continue
+        reset_ts = (resets or {}).get(cid, 0)
         entry = report.setdefault(cid, {'channel': name, 'channel_id': cid, 'providers': set(), 'done': 0,
-                                        'minor': 0, 'failed': 0, 'reasons': {}, 'last_failure': None})
+                                        'minor': 0, 'failed': 0, 'reasons': {}, 'last_failure': None,
+                                        'reset_at': '', 'before_reset': 0, 'last_result': '', 'last_when': '',
+                                        'last_success': ''})
+        if reset_ts:
+            entry['reset_at'] = _local_dt(reset_ts).strftime('%Y-%m-%d')
+        if start < reset_ts:                      # before the reset: it no longer counts
+            entry['before_reset'] += 1 if failed else 0
+            continue
         entry['providers'].add(row.get('stream_provider') or 'primestreams')
+        when = _local_dt(start).strftime('%Y-%m-%d')
+        entry['last_result'], entry['last_when'] = ('failed' if failed else 'recorded'), when
+        if not failed:
+            entry['last_success'] = when
         if failed:
             entry['failed'] += 1
             kind = _failure_kind(row.get('failure_reason'))
@@ -5040,7 +5077,7 @@ def _channel_report(rows, now, days=30, text=''):
                 entry['minor'] += 1
     out = []
     for entry in report.values():
-        if not entry['failed']:
+        if not entry['failed'] and not (include_reset and entry['reset_at']):
             continue
         total = entry['done'] + entry['failed']
         entry['providers'] = sorted(entry['providers'])
@@ -5050,7 +5087,7 @@ def _channel_report(rows, now, days=30, text=''):
     return out
 
 
-def _channel_recordings(rows, limit=300):
+def _channel_recordings(rows, limit=300, reset_ts=0):
     """Every past recording on one channel, newest first, in plain words (cancelled ones are left out)."""
     labels = {'done': 'recorded', 'done_ts': 'kept as TS', 'failed': 'failed', 'error': 'failed',
               'skipped_existing_better': 'skipped (better copy already in Plex)', 'recording': 'recording now'}
@@ -5065,6 +5102,7 @@ def _channel_recordings(rows, limit=300):
         reason = re.sub(r'https?://\S+', '<address>', str(row.get('failure_reason') or '')).strip()
         out.append({'title': row.get('title') or '', 'when': _local_dt(row['start_ts']).strftime('%Y-%m-%d %H:%M'),
                     'result': labels[status], 'severity': severity,
+                    'before_reset': bool(reset_ts and (row.get('start_ts') or 0) < reset_ts),
                     'provider': row.get('stream_provider') or 'primestreams',
                     'detail': (reason if failed else decision)[:160]})
         if len(out) >= limit:
@@ -5087,7 +5125,8 @@ def api_recording_health_channel_recordings():
         conn.close()
     except Exception as exc:
         return jsonify({'error': str(exc), 'recordings': []}), 500
-    return jsonify({'channel_id': channel_id, 'recordings': _channel_recordings(rows)})
+    return jsonify({'channel_id': channel_id,
+                    'recordings': _channel_recordings(rows, reset_ts=_channel_resets().get(channel_id, 0))})
 
 
 @app.route('/epg-web/api/recording-health/channel-report')
@@ -5107,7 +5146,23 @@ def api_recording_health_channel_report():
         conn.close()
     except Exception as exc:
         return jsonify({'error': str(exc), 'channels': []}), 500
-    return jsonify({'days': days, 'channels': _channel_report(rows, time.time(), days, request.args.get('q', ''))})
+    return jsonify({'days': days, 'channels': _channel_report(
+        rows, time.time(), days, request.args.get('q', ''), _channel_resets(),
+        include_reset=request.args.get('include_reset') == '1')})
+
+
+@app.route('/epg-web/api/recording-health/channel-reset', methods=['POST'])
+def api_recording_health_channel_reset():
+    """Reset a channel's history (only recordings from now on count against it), or clear that reset."""
+    data = request.get_json(silent=True) or {}
+    channel_id = str(data.get('channel_id') or '').strip()
+    if not channel_id:
+        return jsonify({'ok': False, 'error': 'channel_id is required'}), 400
+    try:
+        _set_channel_reset(channel_id, None if data.get('action') == 'clear' else time.time())
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+    return jsonify({'ok': True})
 
 
 @app.route('/epg-web/api/recording-health/channels')
@@ -5122,7 +5177,7 @@ def api_recording_health_channels():
         conn.close()
     except Exception as exc:
         return jsonify({'error': str(exc), 'channels': {}}), 500
-    return jsonify({'days': 30, 'channels': _channel_reliability(rows, time.time())})
+    return jsonify({'days': 30, 'channels': _channel_reliability(rows, time.time(), resets=_channel_resets())})
 
 
 @app.route('/epg-web/api/recording-health/daily')
@@ -10775,6 +10830,7 @@ tr:hover td{background:#141414;}
       <select id="chreport-days" onchange="loadChannelReport()" style="margin-left:auto;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#cbd5e1;padding:5px 8px;font-size:12px;">
         <option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option>
       </select>
+      <label style="font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;"><input id="chreport-reset" type="checkbox" onchange="loadChannelReport()"> Show reset channels</label>
       <input id="chreport-q" type="search" placeholder="Channel contains…" onchange="loadChannelReport()" style="width:170px;background:#111827;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:6px 9px;font-size:12px;">
       <button class="btn btn-ghost btn-sm" onclick="loadChannelReport()">Refresh</button>
     </div>
@@ -14476,6 +14532,19 @@ function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex, l
   const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${logPenalty.detail ? ' · ' + logPenalty.detail : ''}${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
   return {score, color, detail};
 }
+async function resetChannel(button) {
+  const clear = button.dataset.action === 'clear';
+  if (!clear && !confirm('Reset ' + (button.dataset.name || 'this channel') + '? Recordings before now will stop counting against it, in this report and in the warning when you pick it to record. They stay listed under the channel.')) return;
+  try {
+    const r = await fetch('/epg-web/api/recording-health/channel-reset', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({channel_id: button.dataset.cid, action: clear ? 'clear' : 'reset'})});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'failed');
+    loadChannelReport();
+    loadChannelReliability();
+  } catch (e) { alert('Could not save the reset: ' + e.message); }
+}
+
 async function toggleChannelRecordings(head) {
   const detail = head.parentNode.querySelector('.chrec-detail');
   if (!detail) return;
@@ -14492,7 +14561,7 @@ async function toggleChannelRecordings(head) {
         const color = r.severity === 'critical' ? '#f87171' : r.severity === 'minor' ? '#fbbf24' : '#4ade80';
         const tag = r.severity === 'critical' ? 'CRITICAL · ' : r.severity === 'minor' ? 'minor blips · ' : '';
         return '<div style="font-size:12px;padding:3px 0;border-bottom:1px solid #172033;">'
-          + '<span style="color:#94a3b8;">' + esc(r.when) + '</span> '
+          + '<span style="color:#94a3b8;">' + esc(r.when) + '</span> ' + (r.before_reset ? '<span style="color:#a78bfa;">(before reset)</span> ' : '')
           + '<span style="color:#e2e8f0;">' + esc(r.title) + '</span> '
           + '<span style="color:' + color + ';">' + tag + esc(r.result) + '</span> '
           + '<span style="color:#64748b;">(' + esc(r.provider) + ')</span>'
@@ -14508,17 +14577,26 @@ async function loadChannelReport() {
   try {
     const days = document.getElementById('chreport-days').value;
     const q = document.getElementById('chreport-q').value.trim();
-    const d = await (await fetch('/epg-web/api/recording-health/channel-report?days=' + days + '&q=' + encodeURIComponent(q))).json();
+    const showReset = document.getElementById('chreport-reset').checked ? '&include_reset=1' : '';
+    const d = await (await fetch('/epg-web/api/recording-health/channel-report?days=' + days + '&q=' + encodeURIComponent(q) + showReset)).json();
     if (d.error) throw new Error(d.error);
     if (!d.channels.length) { list.innerHTML = '<div style="color:#64748b;padding:6px 0;">No channels with failed recordings in this period.</div>'; return; }
     list.innerHTML = d.channels.map(c => {
       const reasons = Object.keys(c.reasons).map(k => c.reasons[k] + ' x ' + k).join(', ');
       const color = c.failure_pct >= 50 ? '#f87171' : c.failure_pct >= 25 ? '#fbbf24' : '#94a3b8';
+      const latest = c.last_result
+        ? '<div style="color:' + (c.last_result === 'recorded' ? '#4ade80' : '#f87171') + ';font-size:12px;">Latest recording: '
+          + (c.last_result === 'recorded' ? 'worked' : 'failed') + ' (' + esc(c.last_when) + ')'
+          + (c.last_result === 'failed' && c.last_success ? ' · last success ' + esc(c.last_success) : '') + '</div>' : '';
+      const resetTag = c.reset_at ? ' <span style="color:#a78bfa;font-size:12px;">reset ' + esc(c.reset_at) + '</span>' : '';
+      const resetBtn = c.reset_at
+        ? '<button class="btn btn-ghost btn-sm" style="margin-left:8px;" data-cid="' + esc(c.channel_id) + '" data-action="clear" onclick="event.stopPropagation();resetChannel(this)">Undo reset</button>'
+        : '<button class="btn btn-ghost btn-sm" style="margin-left:8px;" data-cid="' + esc(c.channel_id) + '" data-name="' + esc(c.channel) + '" data-action="reset" onclick="event.stopPropagation();resetChannel(this)" title="Old failures stop counting against this channel from now on">Reset</button>';
       const last = c.last_failure ? '<div style="color:#64748b;font-size:12px;">Last failure: ' + esc(c.last_failure.title) + ' (' + esc(c.last_failure.when) + '): ' + esc(c.last_failure.reason) + '</div>' : '';
       return '<div style="padding:8px 0;border-bottom:1px solid #1e293b;">'
         + '<div data-cid="' + esc(c.channel_id) + '" onclick="toggleChannelRecordings(this)" style="cursor:pointer;" title="Click to see every recording on this channel"><span style="color:#64748b;">▸</span> <span style="color:#e2e8f0;font-weight:600;">' + esc(c.channel) + '</span> '
         + '<span style="color:' + color + ';">' + c.failure_pct + '% failed (' + c.failed + ' of ' + (c.done + c.failed) + ')</span> '
-        + '<span style="color:#64748b;font-size:12px;">' + esc(c.providers.join(', ')) + (c.minor ? ' · ' + c.minor + ' with minor blips' : '') + '</span></div>'
+        + '<span style="color:#64748b;font-size:12px;">' + esc(c.providers.join(', ')) + (c.minor ? ' · ' + c.minor + ' with minor blips' : '') + '</span>' + resetTag + resetBtn + '</div>' + latest
         + '<div style="color:#94a3b8;font-size:12px;">' + esc(reasons) + '</div>' + last
         + '<div class="chrec-detail" style="display:none;margin:8px 0 0 14px;"></div></div>';
     }).join('');

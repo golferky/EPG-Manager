@@ -4815,3 +4815,53 @@ class ChannelRecordingsTests(unittest.TestCase):
         self.assertNotIn('http', out[0]['detail'])
         self.assertEqual(out[2]['severity'], 'minor')
         self.assertEqual(out[1]['severity'], '')
+
+
+class ChannelResetTests(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def _row(self, status, days_ago, reason='', cid='a', name='Chan A'):
+        return {'channel_id': cid, 'channel': name, 'title': 'T', 'start_ts': self.NOW - days_ago * 86400,
+                'status': status, 'failure_reason': reason, 'quality_decision': '', 'stream_provider': 'eaglecast'}
+
+    def test_a_reset_stops_older_failures_counting_and_shows_the_latest_result(self):
+        rows = [self._row('failed', 20, 'Recording ended early: 9 min missing'), self._row('failed', 10, 'Video is damaged: 90 decode errors'),
+                self._row('done', 3), self._row('done', 1)]
+        resets = {'a': self.NOW - 5 * 86400}
+        self.assertEqual(server._channel_report(rows, self.NOW, resets=resets), [])        # nothing left to complain about
+        out = server._channel_report(rows, self.NOW, resets=resets, include_reset=True)
+        self.assertEqual(len(out), 1)
+        self.assertEqual((out[0]['failed'], out[0]['done'], out[0]['before_reset']), (0, 2, 2))
+        self.assertEqual((out[0]['last_result'], out[0]['reset_at'] != ''), ('recorded', True))
+
+    def test_failures_after_the_reset_still_count_and_without_a_reset_the_latest_result_is_shown(self):
+        rows = [self._row('done', 8), self._row('failed', 2, 'Video is damaged: 90 decode errors')]
+        out = server._channel_report(rows, self.NOW, resets={'a': self.NOW - 5 * 86400})
+        self.assertEqual((out[0]['failed'], out[0]['done']), (1, 0))
+        plain = server._channel_report(rows, self.NOW)
+        self.assertEqual((plain[0]['last_result'], plain[0]['last_success']), ('failed', server._local_dt(self.NOW - 8 * 86400).strftime('%Y-%m-%d')))
+
+    def test_the_reliability_warning_ignores_recordings_before_a_reset(self):
+        rows = [self._row('failed', 20, 'Video is damaged: 9 decode errors')] * 4 + [self._row('done', 1)] * 3
+        before = server._channel_reliability(rows, self.NOW)['a']
+        after = server._channel_reliability(rows, self.NOW, resets={'a': self.NOW - 5 * 86400})['a']
+        self.assertEqual(before['level'], 'bad')
+        self.assertEqual((after['level'], after['failed']), ('good', 0))
+
+    def test_old_recordings_are_marked_before_reset_in_the_channel_list(self):
+        rows = [{'title': 'Old', 'start_ts': self.NOW - 86400 * 9, 'status': 'failed', 'failure_reason': 'x', 'quality_decision': '', 'stream_provider': 'p'},
+                {'title': 'New', 'start_ts': self.NOW - 86400, 'status': 'done', 'failure_reason': '', 'quality_decision': '', 'stream_provider': 'p'}]
+        out = server._channel_recordings(rows, reset_ts=self.NOW - 5 * 86400)
+        self.assertEqual([(r['title'], r['before_reset']) for r in out], [('New', False), ('Old', True)])
+
+
+class ChannelResetStorageTests(unittest.TestCase):
+    def test_a_reset_is_saved_read_back_and_cleared(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(server, '_guide_db_path', lambda: temp + '/g.db'):
+            server._set_channel_reset('c1', 123.0)
+            self.assertEqual(server._channel_resets(), {'c1': 123.0})
+            server._set_channel_reset('c1', 456.0)
+            self.assertEqual(server._channel_resets(), {'c1': 456.0})
+            server._set_channel_reset('c1', None)
+            self.assertEqual(server._channel_resets(), {})
