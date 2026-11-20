@@ -73,6 +73,7 @@ class Record247Tests(unittest.TestCase):
             arguments = open(os.path.join(temp, "args"), encoding="utf-8").read()
             self.assertNotIn("reconnect", arguments)                           # no ffmpeg reconnect: it repeats a minute
             self.assertIn("-nostdin", arguments)
+            self.assertIn("-rw_timeout 120000000", arguments)                  # a short stall is waited out, not reconnected
             logged = open(out + ".log", encoding="utf-8").read()
             for text in messages + [logged]:
                 self.assertNotIn("SECRET", text)

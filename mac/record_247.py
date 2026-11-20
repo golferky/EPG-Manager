@@ -23,6 +23,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import recording_agent  # noqa: E402
 
 PAUSE_SECONDS = 15
+# How long a stall is waited out before the stream is given up on.  On a 24/7 channel a short stall usually
+# recovers by itself, whereas giving up and reconnecting makes the provider restart the feed about a minute EARLIER
+# (a repeated minute).  The recorder's 15 s is meant for live channels.
+STALL_TIMEOUT_MICROSECONDS = str(120 * 1000000)
 POLL_SECONDS = 5
 MAX_EMPTY_IN_A_ROW = 5
 
@@ -45,7 +49,7 @@ def record(cfg, stream_id, minutes, out, log=print):
         # ffmpeg re-opens a dropped connection, which repeats that minute in the file.  A dropped stream ends this
         # ffmpeg instead, and the next segment starts at the live point.  The hidden banner would print the address.
         cmd = [cfg.get('ffmpeg', 'ffmpeg'), '-nostdin', '-hide_banner', '-loglevel', 'warning', '-y',
-               '-rw_timeout', '15000000', '-i', url, '-t', str(int(end_time - time.time())),
+               '-rw_timeout', STALL_TIMEOUT_MICROSECONDS, '-i', url, '-t', str(int(end_time - time.time())),
                '-c', 'copy', '-f', 'mpegts', str(segment)]
         with open(str(out) + '.log', 'a', encoding='utf-8') as errors:
             process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errors, stdin=subprocess.DEVNULL)
