@@ -17,11 +17,11 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$(command -v python3 || echo /usr/bin/python3)"
 export EPG_SOON_SECONDS="${EPG_SOON_SECONDS:-90}"
 
-# True when an ffmpeg started by the recorder (a descendant of its process) is running.
-recorder_ffmpeg_running() {
+# The process ids of ffmpeg processes started by the recorder (descendants of its process), one per line.
+recorder_ffmpeg_pids() {
   local roots
   roots="$(pgrep -f recording_agent.py 2>/dev/null | tr '\n' ' ')"
-  [ -n "$roots" ] || return 1
+  [ -n "$roots" ] || return 0
   ps -A -o pid=,ppid=,stat=,comm= 2>/dev/null | awk -v roots="$roots" '
     BEGIN { n = split(roots, r, " "); for (i = 1; i <= n; i++) isroot[r[i]] = 1 }
     { parent[$1] = $2; state[$1] = $3; name[$1] = $4 }
@@ -30,17 +30,31 @@ recorder_ffmpeg_running() {
         if (name[p] !~ /ffmpeg/ || state[p] ~ /^Z/) continue      # not ffmpeg, or already finished (zombie)
         q = p; depth = 0
         while ((q in parent) && q > 1 && depth < 30) {
-          if (q in isroot) exit 0
+          if (q in isroot) { print p; break }
           q = parent[q]; depth++
         }
       }
-      exit 1
     }'
+}
+
+# True when the recorder has an ffmpeg running.
+recorder_ffmpeg_running() {
+  [ -n "$(recorder_ffmpeg_pids)" ]
+}
+
+# Say which ffmpeg that is: its process id, how long it has run and its output file (any address hidden).
+describe_recorder_ffmpeg() {
+  local pid line out
+  for pid in $(recorder_ffmpeg_pids); do
+    line="$(ps -o etime=,args= -p "$pid" 2>/dev/null | sed -E 's#https?://[^ ]+#<address>#g')"
+    out="${line##* }"
+    printf 'ffmpeg %s (running %s, writing %s) ' "$pid" "$(printf '%s' "$line" | awk '{print $1}')" "$out"
+  done
 }
 
 busy_reason() {
   local proc="" body detail
-  if recorder_ffmpeg_running; then proc="the recorder has an ffmpeg running (a recording or its finishing step)"; fi
+  if recorder_ffmpeg_running; then proc="the recorder has an ffmpeg running: $(describe_recorder_ffmpeg)"; fi
   body="$(curl -fsS -m 15 "$SERVER/epg-web/api/recordings/overview" 2>/dev/null)" \
     || { echo "${proc:-dashboard server not reachable (state unknown)}"; return 0; }
   if detail="$(printf '%s' "$body" | "$PY" -c '
@@ -75,6 +89,7 @@ if soon:
     print("starts within %d s: " % limit + "" + ", ".join(e["title"] for e in soon)); sys.exit(0)
 sys.exit(1)
 ')"; then
+    [ -n "$proc" ] && detail="$detail [$proc]"
     echo "$detail"; return 0
   fi
   if [ -n "$proc" ]; then echo "$proc"; return 0; fi
