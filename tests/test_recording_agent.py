@@ -237,7 +237,7 @@ class ResumeRecordingTests(unittest.TestCase):
         """plan: list of (bytes_written, seconds_elapsed, rc) per FFmpeg run."""
         calls = []
 
-        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None):
+        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None, **kwargs):
             data, elapsed, rc = plan[len(calls)]
             seg = Path(cmd[-1])
             seg.write_bytes(data)
@@ -264,7 +264,7 @@ class ResumeRecordingTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.ts.parent.glob("show*.ts")), ["show.ts"])
 
     def test_wrong_programme_result_is_returned_and_pieces_are_removed(self):
-        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None):
+        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None, **kwargs):
             Path(cmd[-1]).write_bytes(b"XXXX")
             self.now[0] += 100
             if Path(cmd[-1]).name != "show.ts":
@@ -3260,3 +3260,297 @@ class CommercialFreeReplacementFlowTests(unittest.TestCase):
     def test_a_normal_booking_leaves_an_equal_quality_copy_alone(self):
         archive, transfer = self._run(False)
         transfer.assert_not_called()
+
+
+class SurviveRestartTests(unittest.TestCase):
+    """A recording's ffmpeg keeps running through a recorder restart and the new recorder takes it over."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.temp = Path(self.tmp.name)
+        self.cfg = {"local_recordings": str(self.temp), "heartbeat_seconds": 0.05, "ffmpeg": "ffmpeg", "ffprobe": "ffprobe",
+                    "plex_path": str(self.temp / "Movies"), "plex_tv_path": str(self.temp / "TV"),
+                    "recording_tail_seconds": 45, "epg_url": "http://x.test", "epg_user": "u", "epg_pass": "p",
+                    "transfer_wait_timeout": 5, "transfer_retry_seconds": 1}
+        self.job = {"id": "job1", "title": "Show Film", "stream_id": "1", "start_ts": time.time() - 2,
+                    "stop_ts": time.time() + 3000, "stream_provider": "primestreams", "stream_extension": "ts"}
+        self.procs = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        self.tmp.cleanup()
+
+    def _fake_ffmpeg(self, seconds, output):
+        script = self.temp / "ffmpeg"
+        script.write_text(f"#!/bin/sh\nsleep {seconds}\n")
+        script.chmod(0o755)
+        proc = subprocess.Popen([str(script), "-i", "x", str(output)], start_new_session=True)
+        self.procs.append(proc)
+        return proc
+
+    def test_the_note_is_saved_updated_read_back_and_cleared(self):
+        recording_agent.save_state(self.cfg, self.job, stage="recording", pid=123)
+        recording_agent.save_state(self.cfg, self.job, stage="processing")
+        state = recording_agent.load_state(self.cfg, "job1")
+        self.assertEqual((state["stage"], state["pid"], state["job"]["title"]), ("processing", 123, "Show Film"))
+        self.assertEqual([s["job"]["id"] for s in recording_agent.load_all_states(self.cfg)], ["job1"])
+        recording_agent.clear_state(self.cfg, "job1")
+        self.assertIsNone(recording_agent.load_state(self.cfg, "job1"))
+        self.assertEqual(recording_agent.load_all_states(self.cfg), [])
+
+    def test_a_damaged_note_is_ignored(self):
+        folder = recording_agent.state_dir(self.cfg)
+        folder.mkdir(parents=True)
+        (folder / "bad.json").write_text("{not json")
+        self.assertEqual(recording_agent.load_all_states(self.cfg), [])
+
+    def test_the_note_never_holds_the_stream_address(self):
+        recording_agent.save_state(self.cfg, self.job, stage="recording", pid=1)
+        text = (recording_agent.state_dir(self.cfg) / "job1.json").read_text()
+        self.assertNotIn("http", text)
+
+    def test_a_process_is_recognised_only_while_it_is_that_ffmpeg_writing_that_file(self):
+        out = self.temp / "film.ts"
+        proc = self._fake_ffmpeg(30, out)
+        time.sleep(0.2)
+        self.assertTrue(recording_agent.process_matches(proc.pid, out))
+        self.assertFalse(recording_agent.process_matches(proc.pid, self.temp / "other.ts"))     # another file
+        self.assertFalse(recording_agent.process_matches(999999, out))                           # no such process
+        proc.kill(); proc.wait()
+        self.assertFalse(recording_agent.process_matches(proc.pid, out))                         # finished
+
+    def test_the_recording_ffmpeg_is_started_in_its_own_session_and_its_process_id_is_reported(self):
+        seen = {}
+
+        class FakeProcess:
+            pid = 4242
+            returncode = 0
+            def poll(self): return 0
+
+        def fake_popen(cmd, **kwargs):
+            seen.update(kwargs)
+            return FakeProcess()
+        started = []
+        with mock.patch.object(recording_agent.subprocess, "Popen", fake_popen):
+            recording_agent.run_process(mock.Mock(), self.job, "recording", ["ffmpeg"], self.cfg,
+                                        self.temp / "l.log", detach=True, on_start=started.append)
+        self.assertEqual(started, [4242])
+        self.assertTrue(seen["start_new_session"])
+        self.assertEqual(seen["stdin"], subprocess.DEVNULL)
+
+    def test_other_processes_are_not_detached(self):
+        seen = {}
+
+        class FakeProcess:
+            pid = 1
+            returncode = 0
+            def poll(self): return 0
+        with mock.patch.object(recording_agent.subprocess, "Popen", lambda cmd, **kw: seen.update(kw) or FakeProcess()):
+            recording_agent.run_process(mock.Mock(), self.job, "converting", ["ffmpeg"], self.cfg, self.temp / "l.log")
+        self.assertNotIn("start_new_session", seen)
+
+    def test_following_a_running_ffmpeg_keeps_the_lease_alive_until_it_ends(self):
+        out = self.temp / "film.ts"
+        proc = self._fake_ffmpeg(0.6, out)
+        api = mock.Mock()
+        api.heartbeat.return_value = {}
+        time.sleep(0.1)
+        self.assertEqual(recording_agent.monitor_orphan(api, self.job, self.cfg, proc.pid, out), 0)
+        self.assertGreaterEqual(api.heartbeat.call_count, 2)
+        self.assertEqual(api.heartbeat.call_args.args[:2], ("job1", "recording"))
+
+    def test_a_recording_cancelled_while_it_was_being_followed_is_stopped(self):
+        out = self.temp / "film.ts"
+        proc = self._fake_ffmpeg(30, out)
+        time.sleep(0.2)
+        api = mock.Mock()
+        api.heartbeat.return_value = {"cancel_requested": True}
+        self.assertIsNone(recording_agent.monitor_orphan(api, self.job, self.cfg, proc.pid, out))
+        deadline = time.time() + 5
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(proc.poll())
+
+    def test_record_with_resume_follows_the_ffmpeg_that_kept_running(self):
+        ts = self.temp / "film.ts"
+        ts.write_bytes(b"x" * 100)
+        proc = self._fake_ffmpeg(0.5, ts)
+        time.sleep(0.1)
+        adopt = {"pid": proc.pid, "segment": str(ts), "segments": [], "attempt": 0}
+        api = mock.Mock()
+        api.heartbeat.return_value = {}
+        with mock.patch.object(recording_agent, "ProgrammeWatchdog", return_value=lambda: None), \
+             mock.patch.object(recording_agent, "run_process", side_effect=AssertionError("must not start a new ffmpeg")):
+            rc = recording_agent.record_with_resume(api, self.job, self.cfg, "u", ts, self.temp / "l.log",
+                                                    time.time() + 10, adopt=adopt)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ts.read_bytes(), b"x" * 100)
+
+    def test_when_the_ffmpeg_ended_during_the_restart_and_time_remains_a_new_segment_resumes_it(self):
+        ts = self.temp / "film.ts"
+        ts.write_bytes(b"a" * 10)
+        clock = [1000.0]
+        calls = []
+
+        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None, detach=False, on_start=None):
+            calls.append((cmd[-1], detach))
+            Path(cmd[-1]).write_bytes(b"b" * 5)
+            clock[0] += 30
+            return 0
+        adopt = {"pid": 999999, "segment": str(ts), "segments": [], "attempt": 0}
+        with mock.patch.object(recording_agent.time, "time", lambda: clock[0]), \
+             mock.patch.object(recording_agent, "ProgrammeWatchdog", return_value=lambda: None), \
+             mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
+             mock.patch.object(recording_agent, "run_process", fake_run_process):
+            rc = recording_agent.record_with_resume(mock.Mock(), self.job, self.cfg, "u", ts, self.temp / "l.log",
+                                                    clock[0] + 95, adopt=adopt)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1])                                   # the new ffmpeg is detached too
+        self.assertTrue(calls[0][0].endswith("film.part1.ts"))
+        self.assertEqual(ts.read_bytes(), b"a" * 10 + b"b" * 5)        # the segments were joined
+
+    def _adopted_run(self, adopt, api=None, **patches):
+        api = api or mock.Mock()
+        api.patient_heartbeat.return_value = {}
+        probe = {"duration": 3100, "height": 720, "width": 1280, "fps": 30.0}
+        names = {"probe_incoming_stream": AssertionError("no preflight when adopting"),
+                 "heartbeat_sleep": True, "run_process": 0, "plex_mount_available": True,
+                 "count_decode_errors": 0, "tail_decode_errors": 0, "find_plex_candidates": [],
+                 "best_existing_copy": (None, None)}
+        with mock.patch.object(recording_agent, "probe_media", return_value=probe), \
+             mock.patch.object(recording_agent, "ProgrammeWatchdog", return_value=lambda: None), \
+             mock.patch.object(recording_agent, "archive_terminal_result") as archive, \
+             mock.patch.object(recording_agent, "discard_failed_media") as discard, \
+             mock.patch.object(recording_agent, "verified_transfer", return_value=self.temp / "x.mp4") as transfer, \
+             mock.patch.object(recording_agent, "record_with_resume", **patches.pop("record", {"return_value": 0})) as record:
+            stack = [mock.patch.object(recording_agent, name, **({"side_effect": v} if isinstance(v, Exception) else {"return_value": v}))
+                     for name, v in names.items()]
+            for p in stack:
+                p.start()
+            try:
+                recording_agent.process_job(api, self.job, self.cfg, adopt=adopt)
+            finally:
+                for p in stack:
+                    p.stop()
+        return api, archive, discard, transfer, record
+
+    def _adopt_state(self, stage, **extra):
+        state = {"job": self.job, "stage": stage, "end_time": time.time() - 10, "capture_began": time.time() - 3100,
+                 "decision": "recording because Plex has no copy",
+                 "quality": {"decision": "recording because Plex has no copy", "incoming": {"height": 720}, "existing": None,
+                             "existing_path": ""}}
+        state.update(extra)
+        return state
+
+    def test_a_recording_that_had_finished_capturing_goes_straight_to_filing(self):
+        api, archive, _discard, transfer, record = self._adopted_run(self._adopt_state("processing"))
+        record.assert_not_called()
+        transfer.assert_called_once()
+        self.assertEqual(archive.call_args.args[2], "done")
+
+    def test_a_recording_still_being_captured_is_followed_and_then_filed(self):
+        state = self._adopt_state("recording", pid=77, segment=str(self.temp / "x.ts"), segments=[], attempt=0)
+        api, archive, _discard, transfer, record = self._adopted_run(state)
+        record.assert_called_once()
+        self.assertIs(record.call_args.kwargs["adopt"], state)
+        transfer.assert_called_once()
+        self.assertEqual(archive.call_args.args[2], "done")
+
+    def test_the_server_cancelling_an_adopted_recording_stops_its_ffmpeg_and_files_nothing(self):
+        out = self.temp / ("Show_Film_%d.ts" % int(self.job["start_ts"]))
+        proc = self._fake_ffmpeg(30, out)
+        time.sleep(0.2)
+        api = mock.Mock()
+        api.patient_heartbeat.return_value = {"cancel_requested": True}
+        state = self._adopt_state("recording", pid=proc.pid, segment=str(out), segments=[], attempt=0)
+        with mock.patch.object(recording_agent, "record_with_resume", side_effect=AssertionError("cancelled")), \
+             mock.patch.object(recording_agent, "archive_terminal_result") as archive, \
+             mock.patch.object(recording_agent, "discard_failed_media"):
+            recording_agent.process_job(api, self.job, self.cfg, adopt=state)
+        deadline = time.time() + 5
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(proc.poll())
+        archive.assert_not_called()
+
+    def test_an_adopted_job_the_server_no_longer_knows_is_stopped_and_dropped(self):
+        out = self.temp / ("Show_Film_%d.ts" % int(self.job["start_ts"]))
+        proc = self._fake_ffmpeg(30, out)
+        time.sleep(0.2)
+        api = mock.Mock()
+        api.patient_heartbeat.side_effect = RuntimeError("EPG API HTTP 404: Recording job not found")
+        state = self._adopt_state("recording", pid=proc.pid, segment=str(out), segments=[], attempt=0)
+        with mock.patch.object(recording_agent, "record_with_resume", side_effect=AssertionError("gone")), \
+             mock.patch.object(recording_agent, "discard_failed_media"):
+            recording_agent.process_job(api, self.job, self.cfg, adopt=state)
+        deadline = time.time() + 5
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(proc.poll())
+
+    def test_a_normal_recording_keeps_a_note_that_says_where_it_has_got_to(self):
+        api = mock.Mock()
+        probe = {"duration": 3100, "height": 720, "width": 1280, "fps": 30.0}
+        seen = {}
+
+        def fake_record(api_, job, cfg, url, ts_path, log_path, end_time, adopt=None, on_segment=None):
+            on_segment(4321, ts_path, 0, [])
+            seen["note"] = recording_agent.load_state(cfg, job["id"])
+            return 0
+        with mock.patch.object(recording_agent, "probe_incoming_stream", return_value=dict(probe)), \
+             mock.patch.object(recording_agent, "probe_media", return_value=probe), \
+             mock.patch.object(recording_agent, "best_existing_copy", return_value=(None, None)), \
+             mock.patch.object(recording_agent, "find_movie_candidates", return_value=[]), \
+             mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
+             mock.patch.object(recording_agent, "run_process", return_value=0), \
+             mock.patch.object(recording_agent, "plex_mount_available", return_value=True), \
+             mock.patch.object(recording_agent, "count_decode_errors", return_value=0), \
+             mock.patch.object(recording_agent, "archive_terminal_result"), \
+             mock.patch.object(recording_agent, "discard_failed_media"), \
+             mock.patch.object(recording_agent, "verified_transfer", return_value=self.temp / "x.mp4"), \
+             mock.patch.object(recording_agent, "record_with_resume", fake_record):
+            recording_agent.process_job(api, self.job, self.cfg)
+        self.assertEqual((seen["note"]["stage"], seen["note"]["pid"]), ("recording", 4321))
+        self.assertIn("end_time", seen["note"])
+        self.assertEqual(recording_agent.load_state(self.cfg, "job1")["stage"], "processing")     # capture finished
+
+    def test_the_note_is_removed_when_the_job_ends_whether_it_worked_or_not(self):
+        recording_agent.save_state(self.cfg, self.job, stage="processing")
+        with mock.patch.object(recording_agent, "process_job"):
+            recording_agent._run_claimed_job(mock.Mock(), self.job, self.cfg)
+        self.assertIsNone(recording_agent.load_state(self.cfg, "job1"))
+        recording_agent.save_state(self.cfg, self.job, stage="processing")
+        with mock.patch.object(recording_agent, "process_job", side_effect=RuntimeError("boom")):
+            recording_agent._run_claimed_job(mock.Mock(), self.job, self.cfg)
+        self.assertIsNone(recording_agent.load_state(self.cfg, "job1"))
+
+    def test_the_recorder_takes_over_only_the_recordings_that_are_really_left_over(self):
+        def note(job_id, **fields):
+            job = dict(self.job, id=job_id)
+            recording_agent.save_state(self.cfg, job, **fields)
+        note("good", stage="recording", end_time=time.time() + 100, pid=5)
+        note("done_capturing", stage="processing", end_time=time.time() - 50)
+        note("busy", stage="recording", end_time=time.time() + 100)               # already running here
+        note("noend", stage="recording")                                          # unusable
+        note("old", stage="recording", end_time=1.0, saved_at=1.0)
+        data = recording_agent.load_state(self.cfg, "old")
+        data["saved_at"] = time.time() - 40 * 3600
+        (recording_agent.state_dir(self.cfg) / "old.json").write_text(json.dumps(data))
+        started = []
+
+        class FakeThread:
+            def __init__(self, target=None, args=(), **kw):
+                self.args = args
+            def start(self): started.append(self.args[1]["id"])
+            def is_alive(self): return True
+        active = {"busy": FakeThread()}
+        adopted = recording_agent.adopt_orphans(mock.Mock(), self.cfg, active, thread_factory=FakeThread)
+        self.assertEqual(sorted(started), ["done_capturing", "good"])
+        self.assertEqual(adopted, 2)
+        self.assertIsNone(recording_agent.load_state(self.cfg, "noend"))
+        self.assertIsNone(recording_agent.load_state(self.cfg, "old"))
+        self.assertIsNotNone(recording_agent.load_state(self.cfg, "busy"))
