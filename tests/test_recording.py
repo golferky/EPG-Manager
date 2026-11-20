@@ -4957,3 +4957,40 @@ class SeriesWhyTests(SeriesNoDuplicateBookingTests):
         self.assertIn("already in Plex", why(plex={"show|1|2"}))
         self.assertIn("no usable stream: boom", why(stream_error="boom"))
         self.assertEqual([e["episode"] for e in self._why()[0]].count("S1E1"), 2)             # both S1E1 rows are explained
+
+
+class SeriesCommercialFreeFirstTests(SeriesNoDuplicateBookingTests):
+    """A series is recorded from any channel that carries the episode; a commercial-free one wins."""
+
+    def _book(self, channels):
+        with mock.patch.object(server, "_guide_db_path", return_value=self.guide_db), \
+                mock.patch.object(server, "load_config", return_value={}), \
+                mock.patch.object(server, "get_recordable_channel_ids", return_value=set(channels)), \
+                mock.patch.object(server, "_plex_episode_keys", return_value=set()), \
+                mock.patch.object(server, "_plex_tv_path", return_value=self.temp.name), \
+                mock.patch.object(server, "_recording_backend", return_value="agent"), \
+                mock.patch.object(server, "_db_upsert_rec", return_value=True), \
+                mock.patch.object(server, "_recent_same_source_failure", return_value=False), \
+                mock.patch.object(server, "_resolve_recording_source",
+                                  return_value=("u", None, {"stream_id": "1", "provider": "primestreams"})):
+            server._schedule_series_airings("Show", self.guide_db, "movies.db")
+        with server._rec_lock:
+            return sorted((r["channel_id"], r["season_num"], r["episode_num"]) for r in server._recs.values())
+
+    def test_a_commercial_free_airing_beats_an_ad_supported_hd_one_even_when_it_is_later(self):
+        self._guide([("adhd", "Antenna TV HD", self.base, "Pilot", 1, 1), ("hbo", "HBO Drama", self.base + 7200, "Pilot", 1, 1)])
+        self.assertEqual(self._book({"adhd", "hbo"}), [("hbo", 1, 1)])
+
+    def test_an_episode_only_on_an_ad_supported_channel_is_still_recorded(self):
+        self._guide([("adhd", "Antenna TV HD", self.base, "Pilot", 1, 1), ("hbo", "HBO Drama", self.base + 7200, "Two", 1, 2)])
+        self.assertEqual(self._book({"adhd", "hbo"}), [("adhd", 1, 1), ("hbo", 1, 2)])
+
+    def test_picture_quality_still_breaks_a_tie_between_ad_supported_channels(self):
+        self._guide([("plain", "Antenna TV", self.base, "Pilot", 1, 1), ("adhd", "Antenna TV HD", self.base + 7200, "Pilot", 1, 1)])
+        self.assertEqual(self._book({"plain", "adhd"}), [("adhd", 1, 1)])
+
+    def test_the_page_main_series_button_records_all_episodes_and_weekly_is_for_sports(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("function recordMainSeriesButton()", html)
+        self.assertIn("weeklyBtn.textContent = sportsEvent ? '📅 Record weekly' : '📺 Record series';", html)
+        self.assertIn("recordSeries('pm-weekly-btn')", html)
