@@ -15,6 +15,7 @@ import record_247 as rec  # noqa: E402
 
 FAKE_FFMPEG = """#!/bin/sh
 for last; do :; done
+echo "$@" >> "$(dirname "$0")/args"
 n=0; [ -f "$(dirname "$0")/count" ] && n=$(cat "$(dirname "$0")/count"); n=$((n+1)); echo $n > "$(dirname "$0")/count"
 if [ "$n" = 1 ]; then s=1; else s=2; fi
 printf 'part%s;' "$n" > "$last"
@@ -69,6 +70,9 @@ class Record247Tests(unittest.TestCase):
             self.assertTrue(data.startswith(b"part1;"))
             self.assertIn(b"part2;", data)                                     # the second segment was joined on
             self.assertFalse(any(name.startswith("out.part") for name in os.listdir(temp)))   # no leftover pieces
+            arguments = open(os.path.join(temp, "args"), encoding="utf-8").read()
+            self.assertNotIn("reconnect", arguments)                           # no ffmpeg reconnect: it repeats a minute
+            self.assertIn("-nostdin", arguments)
             logged = open(out + ".log", encoding="utf-8").read()
             for text in messages + [logged]:
                 self.assertNotIn("SECRET", text)
