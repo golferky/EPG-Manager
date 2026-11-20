@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -30,7 +31,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261120a"
+AGENT_VERSION = "v20261120b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -692,9 +693,148 @@ class ProgrammeWatchdog:
         return None
 
 
-def run_process(api, job, status, cmd, cfg, log_path, file_path='', watchdog=None):
+# ── Recordings that survive a recorder restart ───────────────────────────────
+#
+# Each recording's ffmpeg runs in its own session, so restarting the recorder does not stop it.  While a
+# recording is under way a small note about it (never the stream address) is kept in the state folder.  When
+# the recorder starts it reads the notes, follows each ffmpeg that is still running until it ends, and then
+# carries on with conversion, checking, filing and reporting exactly as if it had never been away.
+
+STATE_DIRNAME = '.recorder_state'
+STATE_MAX_AGE_SECONDS = 36 * 3600
+
+
+def state_dir(cfg):
+    return Path(os.path.expanduser(cfg['local_recordings'])) / STATE_DIRNAME
+
+
+def _state_path(cfg, job_id):
+    return state_dir(cfg) / (re.sub(r'[^A-Za-z0-9_.-]', '_', str(job_id)) + '.json')
+
+
+def load_state(cfg, job_id):
+    try:
+        with open(_state_path(cfg, job_id), encoding='utf-8') as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(cfg, job, **fields):
+    """Add ``fields`` to this job's note, creating it (with the job) the first time."""
+    path = _state_path(cfg, job['id'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = load_state(cfg, job['id']) or {'job': job, 'saved_at': time.time()}
+    data.update(fields)
+    data['updated_at'] = time.time()
+    temp = path.with_suffix('.tmp')
+    with open(temp, 'w', encoding='utf-8') as handle:
+        json.dump(data, handle)
+    os.replace(temp, path)
+
+
+def clear_state(cfg, job_id):
+    try:
+        _state_path(cfg, job_id).unlink()
+    except OSError:
+        pass
+
+
+def load_all_states(cfg):
+    states = []
+    try:
+        names = sorted(state_dir(cfg).glob('*.json'))
+    except OSError:
+        return states
+    for path in names:
+        try:
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            states.append(data)
+    return states
+
+
+def process_matches(pid, needle):
+    """True when ``pid`` is a live ffmpeg whose command line mentions ``needle`` (its output file).
+
+    The check on the command line guards against a process id that has since been given to something else,
+    and a finished process that has not been cleaned up yet no longer shows its arguments.
+    """
+    try:
+        pid = int(pid)
+        out = subprocess.run(['ps', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True,
+                             timeout=10, stdin=subprocess.DEVNULL).stdout
+    except (TypeError, ValueError, OSError, subprocess.SubprocessError):
+        return False
+    return 'ffmpeg' in out and str(needle) in out
+
+
+def _process_gone(pid):
+    """True when no such process is running (one that has finished but not been cleaned up counts as gone)."""
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return True
+    try:
+        state = subprocess.run(['ps', '-o', 'stat=', '-p', str(int(pid))], capture_output=True, text=True,
+                               timeout=10, stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return not state or state.startswith('Z')
+
+
+def terminate_pid(pid, wait=10):
+    """Stop a process that is not our child: ask politely, then insist."""
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except (OSError, ValueError):
+        return
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _process_gone(pid):
+            return
+        time.sleep(0.2)
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def monitor_orphan(api, job, cfg, pid, segment, file_path='', watchdog=None):
+    """Follow an ffmpeg that kept running through a recorder restart until it ends.
+
+    Returns 0 when it has ended, None if the recording was cancelled, or the watchdog's problem.
+    """
+    while process_matches(pid, segment):
+        try:
+            response = api.heartbeat(job['id'], 'recording', file=file_path)
+        except Exception as exc:
+            print(f'[heartbeat] server unavailable: {exc}', file=sys.stderr, flush=True)
+            response = {}
+        if response.get('cancel_requested'):
+            terminate_pid(pid)
+            return None
+        if watchdog is not None:
+            problem = watchdog()
+            if problem:
+                terminate_pid(pid)
+                return problem
+        time.sleep(float(cfg['heartbeat_seconds']))
+    return 0
+
+
+def run_process(api, job, status, cmd, cfg, log_path, file_path='', watchdog=None, detach=False, on_start=None):
+    """Run ``cmd`` and keep the job's lease alive.  ``detach`` starts it in its own session, so it survives
+    a restart of this recorder; ``on_start`` is told its process id."""
     with open(log_path, 'a', encoding='utf-8') as log:
-        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log, text=True)
+        extra = {'start_new_session': True, 'stdin': subprocess.DEVNULL} if detach else {}
+        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log, text=True, **extra)
+        if on_start is not None:
+            on_start(process.pid)
         while process.poll() is None:
             try:
                 response = api.heartbeat(job['id'], status, file=file_path)
@@ -1034,14 +1174,14 @@ def segment_path(ts_path, attempt):
 
 def build_record_command(cfg, url, remaining, segment):
     return [
-        cfg['ffmpeg'], '-y',
+        cfg['ffmpeg'], '-nostdin', '-y',
         '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_at_eof', '1',
         '-reconnect_delay_max', '30', '-rw_timeout', '15000000',
         '-i', url, '-t', str(remaining), '-c', 'copy', '-f', 'mpegts', str(segment)
     ]
 
 
-def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
+def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time, adopt=None, on_segment=None):
     """Record a live stream to ``ts_path``, resuming if the provider cuts it early.
 
     FFmpeg's own reconnect gives up after about half a minute, and providers
@@ -1049,6 +1189,10 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
     When FFmpeg stops before ``end_time``, wait, start it again on a new segment
     and, at the end, append the segments to ``ts_path`` (MPEG-TS joins by
     concatenation).  Returns FFmpeg's last exit code, or None if cancelled.
+
+    ``adopt`` is the saved note of a recording whose ffmpeg kept running through a recorder restart: the first
+    pass follows that process (or notices it has ended) instead of starting a new one.  ``on_segment`` is told
+    (process id, segment, attempt, finished segments) each time a new ffmpeg is started, to keep that note.
     """
     ts_path = Path(ts_path)
     segments = []
@@ -1056,12 +1200,27 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time):
     attempt = 0
     rc = 0
     watchdog = ProgrammeWatchdog(cfg, job)
+    orphan = adopt
+    if adopt:
+        segments = [Path(p) for p in adopt.get('segments', [])]
+        attempt = int(adopt.get('attempt', 0))
     while True:
         segment = segment_path(ts_path, attempt)
-        remaining = int(end_time - time.time())
-        record_cmd = build_record_command(cfg, url, remaining, segment)
-        rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path),
-                         watchdog=watchdog)
+        if orphan:
+            pid, orphan = orphan.get('pid'), None
+            if pid and process_matches(pid, segment):
+                print(f'[adopt] {job["title"]}: following the ffmpeg that kept running (process {pid})', flush=True)
+                rc = monitor_orphan(api, job, cfg, pid, segment, str(ts_path), watchdog=watchdog)
+            else:
+                rc = 0          # it finished while the recorder was down; what it captured is on disk
+        else:
+            remaining = int(end_time - time.time())
+            record_cmd = build_record_command(cfg, url, remaining, segment)
+            started = None
+            if on_segment is not None:
+                started = lambda pid, segment=segment, attempt=attempt: on_segment(pid, segment, attempt, list(segments))
+            rc = run_process(api, job, 'recording', record_cmd, cfg, log_path, str(ts_path),
+                             watchdog=watchdog, detach=True, on_start=started)
         if isinstance(rc, WrongProgramme):
             for extra in segments[1:] + [segment]:
                 if extra != ts_path:
@@ -1126,7 +1285,7 @@ def probe_incoming_stream(api, job, cfg, url, sleep=None):
                 return None
 
 
-def process_job(api, job, cfg):
+def process_job(api, job, cfg, adopt=None):
     local_dir = Path(os.path.expanduser(cfg['local_recordings']))
     local_dir.mkdir(parents=True, exist_ok=True)
     title_slug = safe_filename(job['title']).replace(' ', '_')
@@ -1148,64 +1307,104 @@ def process_job(api, job, cfg):
     library_root = (cfg['plex_tv_path'] if (episode or is_series) else
                     str(ensure_private_root(cfg)) if private_film else cfg['plex_path'])
 
-    api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
-    candidates = (find_tv_episode_candidates(
-        library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
-        if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
-    existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
-    try:
-        incoming_probe = probe_incoming_stream(api, job, cfg, url)
-    except Exception as exc:
-        api.patient_heartbeat(job['id'], 'failed', message=f'Incoming stream probe failed: {exc}')
-        return
-    if incoming_probe is None:        # cancelled while waiting to try again
-        return
-    api.note_stream_info(job['id'], incoming_probe)
-
-    incomplete_copy = bool(existing_probe and incomplete_for_scheduled_window(
-        existing_probe, job['start_ts'], job['stop_ts']
-    ))
-    if incomplete_copy:
-        should_record, decision = True, (
-            f'replacing incomplete Plex copy ({existing_probe["duration"] / 60:.0f} min '
-            f'of {((job["stop_ts"] - job["start_ts"]) / 60):.0f} min scheduled)'
-        )
-    elif existing_probe:
-        replacement = commercial_free_replacement(job, episode, existing_probe, incoming_probe)
-        if replacement:
-            should_record, decision = replacement
-        else:
-            should_record, decision = quality_decision(existing_probe, incoming_probe)
-            should_record, decision = replace_if_existing_is_damaged(should_record, decision, existing_path, cfg)
+    if adopt is not None:
+        # This recording was under way when the recorder was restarted: pick it up where it was left.
+        quality = dict(adopt.get('quality') or {})
+        decision = adopt.get('decision') or quality.get('decision', '')
+        capture_began = float(adopt.get('capture_began') or time.time())
+        existing_path = Path(quality['existing_path']) if quality.get('existing_path') else None
+        if quality.get('incoming'):
+            api.note_stream_info(job['id'], quality['incoming'])
+        orphan_pid = adopt.get('pid')
+        try:
+            response = api.patient_heartbeat(job['id'], 'recording' if adopt.get('stage') == 'recording' else 'converting',
+                                             file=str(ts_path))
+        except RuntimeError as exc:
+            # The server no longer has this job for us (gone, or leased elsewhere): stop what it was recording.
+            print(f'[adopt] {job["title"]}: the server no longer wants it ({exc}); stopping it', flush=True)
+            if orphan_pid and process_matches(orphan_pid, adopt.get('segment') or ts_path):
+                terminate_pid(orphan_pid)
+            discard_failed_media(ts_path, mp4_path)
+            return
+        if response.get('cancel_requested'):
+            if orphan_pid and process_matches(orphan_pid, adopt.get('segment') or ts_path):
+                terminate_pid(orphan_pid)
+            discard_failed_media(ts_path, mp4_path)
+            return
+        remaining = max(60, int(float(adopt.get('end_time') or 0) - time.time()))
     else:
-        should_record, decision = True, 'recording because Plex has no copy'
-    quality = {
-        'decision': decision, 'incoming': incoming_probe,
-        'existing': existing_probe, 'existing_path': str(existing_path or ''),
-    }
-    if series_safeguard:
-        quality['series_safeguard'] = 'title matches a show in the TV library; held, not filed under Movies'
-    if not should_record:
-        api.patient_heartbeat(job['id'], 'skipped_existing_better',
-                      quality_decision=decision, result=quality)
-        print(f'[skip] {job["title"]}: {decision}', flush=True)
-        return
+        api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
+        candidates = (find_tv_episode_candidates(
+            library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
+            if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
+        existing_path, existing_probe = best_existing_copy(candidates, cfg['ffprobe'])
+        try:
+            incoming_probe = probe_incoming_stream(api, job, cfg, url)
+        except Exception as exc:
+            api.patient_heartbeat(job['id'], 'failed', message=f'Incoming stream probe failed: {exc}')
+            return
+        if incoming_probe is None:        # cancelled while waiting to try again
+            return
+        api.note_stream_info(job['id'], incoming_probe)
 
-    wait = job['start_ts'] - time.time() - 5
-    if wait > 0 and not heartbeat_sleep(
-            api, job, 'waiting', wait, cfg, quality_decision=decision):
-        return
-    remaining = int(job['stop_ts'] - time.time()) + cfg['recording_tail_seconds']
-    if remaining < 60:
-        api.patient_heartbeat(job['id'], 'skipped_too_short',
-                      message='Recording window has already passed', result=quality)
-        return
+        incomplete_copy = bool(existing_probe and incomplete_for_scheduled_window(
+            existing_probe, job['start_ts'], job['stop_ts']
+        ))
+        if incomplete_copy:
+            should_record, decision = True, (
+                f'replacing incomplete Plex copy ({existing_probe["duration"] / 60:.0f} min '
+                f'of {((job["stop_ts"] - job["start_ts"]) / 60):.0f} min scheduled)'
+            )
+        elif existing_probe:
+            replacement = commercial_free_replacement(job, episode, existing_probe, incoming_probe)
+            if replacement:
+                should_record, decision = replacement
+            else:
+                should_record, decision = quality_decision(existing_probe, incoming_probe)
+                should_record, decision = replace_if_existing_is_damaged(should_record, decision, existing_path, cfg)
+        else:
+            should_record, decision = True, 'recording because Plex has no copy'
+        quality = {
+            'decision': decision, 'incoming': incoming_probe,
+            'existing': existing_probe, 'existing_path': str(existing_path or ''),
+        }
+        if series_safeguard:
+            quality['series_safeguard'] = 'title matches a show in the TV library; held, not filed under Movies'
+        if not should_record:
+            api.patient_heartbeat(job['id'], 'skipped_existing_better',
+                          quality_decision=decision, result=quality)
+            print(f'[skip] {job["title"]}: {decision}', flush=True)
+            return
+
+        wait = job['start_ts'] - time.time() - 5
+        if wait > 0 and not heartbeat_sleep(
+                api, job, 'waiting', wait, cfg, quality_decision=decision):
+            return
+        remaining = int(job['stop_ts'] - time.time()) + cfg['recording_tail_seconds']
+        if remaining < 60:
+            api.patient_heartbeat(job['id'], 'skipped_too_short',
+                          message='Recording window has already passed', result=quality)
+            return
 
     # IPTV providers close long-lived connections; resume so a dropped stream
     # continues instead of ending the recording early.
-    capture_began = time.time()
-    rc = record_with_resume(api, job, cfg, url, ts_path, log_path,
-                            time.time() + remaining)
+    if adopt is None:
+        capture_began = time.time()
+        end_time = capture_began + remaining
+        save_state(cfg, job, stage='recording', quality=quality, decision=decision,
+                   capture_began=capture_began, end_time=end_time, ts_path=str(ts_path))
+    else:
+        end_time = float(adopt.get('end_time') or time.time() + remaining)
+
+    def note_segment(pid, segment, attempt, segments):
+        save_state(cfg, job, stage='recording', pid=pid, segment=str(segment), attempt=attempt,
+                   segments=[str(s) for s in segments])
+
+    if adopt is not None and adopt.get('stage') == 'processing':
+        rc = 0          # the recording had already finished; carry on from the conversion
+    else:
+        rc = record_with_resume(api, job, cfg, url, ts_path, log_path, end_time,
+                                adopt=adopt, on_segment=note_segment)
     quality['record_log_tail'] = _log_excerpt(log_path, 3000)
     if isinstance(rc, WrongProgramme):
         message = f'Wrong programme on stream: {rc}'
@@ -1224,8 +1423,9 @@ def process_job(api, job, cfg):
         discard_failed_media(ts_path, mp4_path)
         return
 
+    save_state(cfg, job, stage='processing')       # the capture is complete; only filing is left
     convert_cmd = [
-        cfg['ffmpeg'], '-y', '-i', str(ts_path), '-c:v', 'copy', '-c:a', 'aac', str(mp4_path)
+        cfg['ffmpeg'], '-nostdin', '-y', '-i', str(ts_path), '-c:v', 'copy', '-c:a', 'aac', str(mp4_path)
     ]
     rc = run_process(api, job, 'converting', convert_cmd, cfg, log_path, str(ts_path))
     if rc is None:
@@ -1459,16 +1659,54 @@ def process_job(api, job, cfg):
     print(f'[done] {job["title"]} → {destination}', flush=True)
 
 
-def _run_claimed_job(api, job, cfg):
-    """Run one independent recording lifecycle in its own worker thread."""
+def _run_claimed_job(api, job, cfg, adopt=None):
+    """Run one independent recording lifecycle in its own worker thread.
+
+    The job's note in the state folder is removed once the job has reached an end (done, failed, skipped,
+    cancelled).  If the recorder is stopped mid-way the note stays, so the next start can pick the job up.
+    """
     try:
-        process_job(api, job, cfg)
+        if adopt is not None:
+            process_job(api, job, cfg, adopt=adopt)
+        else:
+            process_job(api, job, cfg)
+        clear_state(cfg, job['id'])
     except Exception as exc:
         try:
             api.heartbeat(job['id'], 'failed', message=str(exc))
         except Exception:
             pass
+        clear_state(cfg, job['id'])
         print(f'[error] {job["title"]}: {exc}', file=sys.stderr, flush=True)
+
+
+def adopt_orphans(api, cfg, active, thread_factory=threading.Thread):
+    """Start a worker for each recording the previous recorder left under way (see "survive a restart").
+
+    Returns how many were adopted.  A note that is too old, or has no usable job, is dropped.
+    """
+    adopted = 0
+    for state in load_all_states(cfg):
+        job = state.get('job') or {}
+        job_id = job.get('id')
+        if not job_id or state.get('stage') not in ('recording', 'processing') or 'end_time' not in state:
+            if job_id:
+                clear_state(cfg, job_id)
+            continue
+        if time.time() - float(state.get('saved_at') or 0) > STATE_MAX_AGE_SECONDS:
+            clear_state(cfg, job_id)
+            continue
+        existing = active.get(job_id)
+        if existing is not None and existing.is_alive():
+            continue
+        print(f'[adopt] {job.get("title", job_id)} ({job_id}): taking over a recording the last recorder left '
+              f'({state.get("stage")})', flush=True)
+        worker = thread_factory(target=_run_claimed_job, args=(api, job, cfg, state), daemon=True,
+                                name=f'epg-record-{job_id}')
+        active[job_id] = worker
+        worker.start()
+        adopted += 1
+    return adopted
 
 
 def start_job_once(api, job, cfg, active, thread_factory=threading.Thread):
@@ -1500,6 +1738,10 @@ def run_agent(cfg, once=False):
     print(f'[agent] connected; version {AGENT_VERSION}; server backend={health.get("recording_backend")}; '
           f'max recordings={max_workers}', flush=True)
     active = {}
+    try:
+        adopt_orphans(api, cfg, active)       # recordings still running from before this start
+    except Exception as exc:
+        print(f'[agent] could not adopt earlier recordings: {exc}', file=sys.stderr, flush=True)
     while True:
         try:
             # Drop completed workers, then fill every available recording slot.
