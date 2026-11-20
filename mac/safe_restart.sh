@@ -39,11 +39,11 @@ recorder_ffmpeg_running() {
 }
 
 busy_reason() {
-  if recorder_ffmpeg_running; then echo "the recorder has an ffmpeg running (a recording or its finishing step)"; return 0; fi
-  local body
+  local proc="" body detail
+  if recorder_ffmpeg_running; then proc="the recorder has an ffmpeg running (a recording or its finishing step)"; fi
   body="$(curl -fsS -m 15 "$SERVER/epg-web/api/recordings/overview" 2>/dev/null)" \
-    || { echo "dashboard server not reachable (state unknown)"; return 0; }
-  printf '%s' "$body" | "$PY" -c '
+    || { echo "${proc:-dashboard server not reachable (state unknown)}"; return 0; }
+  if detail="$(printf '%s' "$body" | "$PY" -c '
 import sys, json, time, os
 try:
     d = json.load(sys.stdin)
@@ -74,7 +74,10 @@ soon = [e for e in upcoming if e["start_ts"] - now < limit]
 if soon:
     print("starts within %d s: " % limit + "" + ", ".join(e["title"] for e in soon)); sys.exit(0)
 sys.exit(1)
-' && return 0
+')"; then
+    echo "$detail"; return 0
+  fi
+  if [ -n "$proc" ]; then echo "$proc"; return 0; fi
   return 1
 }
 
