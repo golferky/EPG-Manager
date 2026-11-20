@@ -4994,3 +4994,67 @@ class SeriesCommercialFreeFirstTests(SeriesNoDuplicateBookingTests):
         self.assertIn("function recordMainSeriesButton()", html)
         self.assertIn("weeklyBtn.textContent = sportsEvent ? '📅 Record weekly' : '📺 Record series';", html)
         self.assertIn("recordSeries('pm-weekly-btn')", html)
+
+
+class SeriesReplaceAdCopyTests(SeriesCommercialFreeFirstTests):
+    """An episode in Plex that was recorded with commercials is recorded again from a commercial-free airing."""
+
+    def _recorded(self, channel, season=1, episode=1, status="done"):
+        conn = sqlite3.connect(self.guide_db)
+        conn.execute("INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,season_num,episode_num) "
+                     "VALUES (?,?,?,?,?,?,?,?,?)",
+                     (f"r{channel}{season}{episode}", "Show", channel, "x", 1.0, 2.0, status, season, episode))
+        conn.commit(); conn.close()
+
+    def _book_in_plex(self, channels):
+        with mock.patch.object(server, "_plex_episode_keys", return_value={"show|1|1"}):
+            return self._book_with_plex(channels)
+
+    def _book_with_plex(self, channels):
+        with mock.patch.object(server, "_guide_db_path", return_value=self.guide_db), \
+                mock.patch.object(server, "load_config", return_value={}), \
+                mock.patch.object(server, "get_recordable_channel_ids", return_value=set(channels)), \
+                mock.patch.object(server, "_plex_episode_keys", return_value={"show|1|1"}), \
+                mock.patch.object(server, "_plex_tv_path", return_value=self.temp.name), \
+                mock.patch.object(server, "_recording_backend", return_value="agent"), \
+                mock.patch.object(server, "_db_upsert_rec", return_value=True), \
+                mock.patch.object(server, "_recent_same_source_failure", return_value=False), \
+                mock.patch.object(server, "_resolve_recording_source",
+                                  return_value=("u", None, {"stream_id": "1", "provider": "primestreams"})):
+            server._schedule_series_airings("Show", self.guide_db, "movies.db")
+        with server._rec_lock:
+            return sorted((r["channel_id"], r["season_num"], r["episode_num"], bool(r.get("auto_upgrade")))
+                          for r in server._recs.values())
+
+    def test_a_commercial_free_airing_replaces_a_copy_recorded_with_commercials(self):
+        self._recorded("Antenna TV HD")
+        self._guide([("hbo", "HBO Drama", self.base, "Pilot", 1, 1)])
+        self.assertEqual(self._book_with_plex({"hbo"}), [("hbo", 1, 1, True)])
+
+    def test_nothing_is_booked_when_the_copy_is_already_commercial_free_or_of_unknown_origin(self):
+        self._guide([("hbo", "HBO Drama", self.base, "Pilot", 1, 1)])
+        self.assertEqual(self._book_with_plex({"hbo"}), [])                     # no recording of ours: unknown, leave it
+        self._recorded("HBO Drama")
+        self.assertEqual(self._book_with_plex({"hbo"}), [])                     # already commercial-free
+
+    def test_an_ad_supported_airing_never_replaces_an_ad_supported_copy(self):
+        self._recorded("Antenna TV HD")
+        self._guide([("adhd", "Antenna TV HD", self.base, "Pilot", 1, 1)])
+        self.assertEqual(self._book_with_plex({"adhd"}), [])
+
+    def test_only_a_few_replacements_are_booked_at_once(self):
+        for episode in range(1, 6):
+            self._recorded("Antenna TV HD", 1, episode)
+        self._guide([("hbo", "HBO Drama", self.base + n * 3600, "Ep", 1, n) for n in range(1, 6)])
+        with mock.patch.object(server, "_plex_episode_keys", return_value={f"show|1|{n}" for n in range(1, 6)}):
+            with mock.patch.object(server, "_guide_db_path", return_value=self.guide_db), \
+                    mock.patch.object(server, "load_config", return_value={}), \
+                    mock.patch.object(server, "get_recordable_channel_ids", return_value={"hbo"}), \
+                    mock.patch.object(server, "_plex_tv_path", return_value=self.temp.name), \
+                    mock.patch.object(server, "_recording_backend", return_value="agent"), \
+                    mock.patch.object(server, "_db_upsert_rec", return_value=True), \
+                    mock.patch.object(server, "_recent_same_source_failure", return_value=False), \
+                    mock.patch.object(server, "_resolve_recording_source",
+                                      return_value=("u", None, {"stream_id": "1", "provider": "primestreams"})):
+                booked = server._schedule_series_airings("Show", self.guide_db, "movies.db")
+        self.assertEqual(booked, server.MAX_SERIES_UPGRADES_AT_ONCE)

@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261120a"
+VERSION = "v20261120b"
 
 app = Flask(__name__)
 
@@ -8768,6 +8768,30 @@ def api_play_status():
 
 # ── Series Recordings ────────────────────────────────────────────────────────
 
+MAX_SERIES_UPGRADES_AT_ONCE = 3
+
+
+def _ad_supported_episode_keys(guide_db_path, plain_title):
+    """{(season, episode)} of this show whose recorded copies all came from ad-supported channels.
+
+    Only episodes we recorded ourselves are known; an episode with no finished recording is not listed, and one
+    that was ever recorded from a commercial-free channel is left out.
+    """
+    ad, free = set(), set()
+    try:
+        conn = sqlite3.connect(guide_db_path, timeout=10)
+        rows = conn.execute("""SELECT title, channel, season_num, episode_num FROM recordings
+                               WHERE status IN ('done','done_ts') AND season_num IS NOT NULL AND episode_num IS NOT NULL""").fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return set()
+    for title, channel, season, episode in rows:
+        if re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip().lower() != plain_title:
+            continue
+        (free if _is_commercial_free_channel(channel or '') else ad).add((int(season), int(episode)))
+    return ad - free
+
+
 def _series_channel_rank(channel_name, quality):
     """Sort key for choosing which channel's airing of an episode to record: commercial-free first, then quality."""
     return (1 if _is_commercial_free_channel(channel_name) else 0, quality(channel_name))
@@ -8915,10 +8939,22 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     # eligible because they cannot be matched safely to a Plex filename.
     plex_episode_keys = _plex_episode_keys(_plex_tv_path(load_config()))
     show_key = _norm_plex_show(clean_title)
+    # An episode already in Plex that we recorded WITH commercials is recorded again when a commercial-free
+    # airing is coming (a few at a time); the recorder then replaces the old copy.
+    ad_only = _ad_supported_episode_keys(guide_db_path, re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip().lower())
+    with _rec_lock:
+        upgrade_slots = max(0, MAX_SERIES_UPGRADES_AT_ONCE - sum(
+            1 for rec in _recs.values()
+            if rec.get('auto_upgrade') and rec.get('is_series') and _rec_is_active(rec)))
     not_in_plex = []
     for r in best_rows:
         if (r['season_num'] is None or r['episode_num'] is None or
                 f"{show_key}|{int(r['season_num'])}|{int(r['episode_num'])}" not in plex_episode_keys):
+            not_in_plex.append(r)
+        elif ((int(r['season_num']), int(r['episode_num'])) in ad_only
+              and _is_commercial_free_channel(r['channel_name']) and upgrade_slots > 0):
+            r['_upgrade'] = True
+            upgrade_slots -= 1
             not_in_plex.append(r)
         else:
             note(r, 'this episode is already in Plex')
@@ -8990,7 +9026,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                     _resolve_recording_source._no_stream_warned.add(r['channel_id'])
                 continue
             if dry_run:
-                note(r, 'would be booked')
+                note(r, 'would replace a copy recorded with commercials' if r.get('_upgrade') else 'would be booked')
                 continue
             backend = _recording_backend()
             rec = {
@@ -9005,6 +9041,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 'season_num': r.get('season_num'),
                 'episode_num': r.get('episode_num'),
                 'is_series': True,
+                'auto_upgrade': bool(r.get('_upgrade')),
             }
             if not _db_upsert_rec(rec_id, rec):
                 print(f'[series] could not persist recording {rec_id}; not scheduling')

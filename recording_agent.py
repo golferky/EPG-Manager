@@ -30,7 +30,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261119c"
+AGENT_VERSION = "v20261120a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -284,6 +284,22 @@ def quality_decision(existing, incoming):
     if existing_rate and incoming_rate >= existing_rate * 1.20:
         return True, f'upgrade bitrate {existing_rate // 1000} → {incoming_rate // 1000} kbps'
     return False, 'existing Plex copy is equal or better quality'
+
+
+def commercial_free_replacement(job, episode, existing, incoming):
+    """For a TV episode booked to replace a copy recorded with commercials: (record, why), else None.
+
+    The dashboard books such a recording only from a commercial-free channel, so the new copy replaces the old
+    one unless its picture is clearly smaller.  Films are not handled here: they keep the resolution rules.
+    """
+    if not (episode and job.get('auto_upgrade')):
+        return None
+    existing_pixels = existing.get('width', 0) * existing.get('height', 0)
+    incoming_pixels = incoming.get('width', 0) * incoming.get('height', 0)
+    if incoming_pixels >= existing_pixels * 0.9:
+        return True, 'replacing a copy recorded with commercials by a commercial-free one'
+    return False, (f'Plex is {existing.get("height", 0)}p; the commercial-free copy is only '
+                   f'{incoming.get("height", 0)}p')
 
 
 def incomplete_for_scheduled_window(existing, start_ts, stop_ts):
@@ -1155,8 +1171,12 @@ def process_job(api, job, cfg):
             f'of {((job["stop_ts"] - job["start_ts"]) / 60):.0f} min scheduled)'
         )
     elif existing_probe:
-        should_record, decision = quality_decision(existing_probe, incoming_probe)
-        should_record, decision = replace_if_existing_is_damaged(should_record, decision, existing_path, cfg)
+        replacement = commercial_free_replacement(job, episode, existing_probe, incoming_probe)
+        if replacement:
+            should_record, decision = replacement
+        else:
+            should_record, decision = quality_decision(existing_probe, incoming_probe)
+            should_record, decision = replace_if_existing_is_damaged(should_record, decision, existing_path, cfg)
     else:
         should_record, decision = True, 'recording because Plex has no copy'
     quality = {
@@ -1339,12 +1359,16 @@ def process_job(api, job, cfg):
         decision = final_decision
         existing_path = final_existing_path
     elif final_existing_probe:
-        should_transfer, final_decision = quality_decision(
-            final_existing_probe, recorded_probe
-        )
-        should_transfer, final_decision = replace_if_existing_is_damaged(
-            should_transfer, final_decision, final_existing_path, cfg
-        )
+        replacement = commercial_free_replacement(job, episode, final_existing_probe, recorded_probe)
+        if replacement:
+            should_transfer, final_decision = replacement
+        else:
+            should_transfer, final_decision = quality_decision(
+                final_existing_probe, recorded_probe
+            )
+            should_transfer, final_decision = replace_if_existing_is_damaged(
+                should_transfer, final_decision, final_existing_path, cfg
+            )
         quality.update({
             'decision': final_decision,
             'existing': final_existing_probe,
