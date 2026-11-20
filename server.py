@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261119k"
+VERSION = "v20261120b"
 
 app = Flask(__name__)
 
@@ -8768,6 +8768,35 @@ def api_play_status():
 
 # ── Series Recordings ────────────────────────────────────────────────────────
 
+MAX_SERIES_UPGRADES_AT_ONCE = 3
+
+
+def _ad_supported_episode_keys(guide_db_path, plain_title):
+    """{(season, episode)} of this show whose recorded copies all came from ad-supported channels.
+
+    Only episodes we recorded ourselves are known; an episode with no finished recording is not listed, and one
+    that was ever recorded from a commercial-free channel is left out.
+    """
+    ad, free = set(), set()
+    try:
+        conn = sqlite3.connect(guide_db_path, timeout=10)
+        rows = conn.execute("""SELECT title, channel, season_num, episode_num FROM recordings
+                               WHERE status IN ('done','done_ts') AND season_num IS NOT NULL AND episode_num IS NOT NULL""").fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return set()
+    for title, channel, season, episode in rows:
+        if re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip().lower() != plain_title:
+            continue
+        (free if _is_commercial_free_channel(channel or '') else ad).add((int(season), int(episode)))
+    return ad - free
+
+
+def _series_channel_rank(channel_name, quality):
+    """Sort key for choosing which channel's airing of an episode to record: commercial-free first, then quality."""
+    return (1 if _is_commercial_free_channel(channel_name) else 0, quality(channel_name))
+
+
 def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='America/New_York', explain=None, dry_run=False):
     """Queue recordings for all future primestreams airings of title. Returns count scheduled.
 
@@ -8890,7 +8919,9 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         sn, en = r['season_num'], r['episode_num']
         if sn is not None and en is not None:
             key = (sn, en)
-            if key not in ep_best or _ch_quality(r['channel_name']) > _ch_quality(ep_best[key]['channel_name']):
+            # Any channel that carries the episode will do; a commercial-free one is preferred, then picture quality.
+            if key not in ep_best or _series_channel_rank(r['channel_name'], _ch_quality) > _series_channel_rank(
+                    ep_best[key]['channel_name'], _ch_quality):
                 ep_best[key] = r
         else:
             # Keep unknown episodes distinct by the actual airing. They go to
@@ -8908,10 +8939,22 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
     # eligible because they cannot be matched safely to a Plex filename.
     plex_episode_keys = _plex_episode_keys(_plex_tv_path(load_config()))
     show_key = _norm_plex_show(clean_title)
+    # An episode already in Plex that we recorded WITH commercials is recorded again when a commercial-free
+    # airing is coming (a few at a time); the recorder then replaces the old copy.
+    ad_only = _ad_supported_episode_keys(guide_db_path, re.sub(r'\s*\(\d{4}\)\s*$', '', title or '').strip().lower())
+    with _rec_lock:
+        upgrade_slots = max(0, MAX_SERIES_UPGRADES_AT_ONCE - sum(
+            1 for rec in _recs.values()
+            if rec.get('auto_upgrade') and rec.get('is_series') and _rec_is_active(rec)))
     not_in_plex = []
     for r in best_rows:
         if (r['season_num'] is None or r['episode_num'] is None or
                 f"{show_key}|{int(r['season_num'])}|{int(r['episode_num'])}" not in plex_episode_keys):
+            not_in_plex.append(r)
+        elif ((int(r['season_num']), int(r['episode_num'])) in ad_only
+              and _is_commercial_free_channel(r['channel_name']) and upgrade_slots > 0):
+            r['_upgrade'] = True
+            upgrade_slots -= 1
             not_in_plex.append(r)
         else:
             note(r, 'this episode is already in Plex')
@@ -8983,7 +9026,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                     _resolve_recording_source._no_stream_warned.add(r['channel_id'])
                 continue
             if dry_run:
-                note(r, 'would be booked')
+                note(r, 'would replace a copy recorded with commercials' if r.get('_upgrade') else 'would be booked')
                 continue
             backend = _recording_backend()
             rec = {
@@ -8998,6 +9041,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
                 'season_num': r.get('season_num'),
                 'episode_num': r.get('episode_num'),
                 'is_series': True,
+                'auto_upgrade': bool(r.get('_upgrade')),
             }
             if not _db_upsert_rec(rec_id, rec):
                 print(f'[series] could not persist recording {rec_id}; not scheduling')
@@ -10751,7 +10795,7 @@ tr:hover td{background:#141414;}
           <button id="pm-play-btn" class="btn btn-ghost" onclick="playStream()" style="border-color:#22c55e;color:#22c55e;">▶ Play</button>
           <span id="pm-play-busy" style="display:none;color:#fbbf24;font-size:13px;margin-left:8px;"></span>
           <button id="pm-rec-next-btn" class="btn btn-primary" onclick="recordNext()">⏱ Record</button>
-          <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordWeekly()" style="display:none;border-color:#f59e0b;color:#fbbf24;">📅 Record series</button>
+          <button id="pm-weekly-btn" class="btn btn-ghost" onclick="recordMainSeriesButton()" title="Record every upcoming episode that is not in Plex yet, on any channel; commercial-free channels first" style="display:none;border-color:#f59e0b;color:#fbbf24;">📺 Record series</button>
         </div>
         <div id="pm-reliability" style="display:none;font-size:12px;margin-top:8px;"></div>
       </div>
@@ -10760,7 +10804,7 @@ tr:hover td{background:#141414;}
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
           <span id="pm-airings-heading" style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📡 Available Airings</span>
           <label id="pm-private-wrap" title="Record this film into the private folder, never into Plex" style="display:flex;align-items:center;gap:4px;font-size:11px;color:#c4b5fd;cursor:pointer;white-space:nowrap;"><input id="pm-private" type="checkbox"> 🔒 Private (keep out of Plex)</label>
-          <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;">📺 Record Identified Episodes</button>
+          <button id="pm-series-btn" class="btn btn-ghost btn-sm" onclick="recordSeries()" style="font-size:11px;padding:3px 10px;" title="Record every upcoming episode that is not in Plex yet, on any channel; commercial-free channels first">📺 Record all episodes</button>
           <button id="pm-unrecorded-btn" class="btn btn-ghost btn-sm" onclick="toggleUnrecorded()" style="font-size:11px;padding:3px 10px;display:none;">🔲 Unscheduled Only</button>
         </div>
         <div id="pm-airings-list" style="max-height:160px;overflow-y:auto;"></div>
@@ -12791,6 +12835,9 @@ async function openProg(p) {
   // lookup confirms that this is a series.
   weeklyBtn.style.display = (sportsEvent || p.prog_type === 'EP' ||
     p.prog_type === 'SH' || p.season_num != null || p.episode_num != null) ? '' : 'none';
+  // A sports event repeats weekly at one slot; any other series is recorded episode by episode, on any channel.
+  weeklyBtn.disabled = false;
+  weeklyBtn.textContent = sportsEvent ? '📅 Record weekly' : '📺 Record series';
   const displayTitle = p.display_title || p.title || '';
   document.getElementById('pm-title').textContent = displayTitle;
   document.getElementById('pm-air').textContent =
@@ -13445,6 +13492,11 @@ async function recordNext() {
   await recordAiring(_nextAiring, _nextAiring._title);
 }
 
+function recordMainSeriesButton() {
+  if (_currentProg && _currentProg.sports_event) return recordWeekly();
+  return recordSeries('pm-weekly-btn');
+}
+
 async function recordWeekly() {
   if (!_nextAiring || !_currentProg) return;
   const btn = document.getElementById('pm-weekly-btn');
@@ -13472,27 +13524,28 @@ async function recordWeekly() {
   }
 }
 
-async function recordSeries() {
+async function recordSeries(buttonId) {
   const title = _currentProg && _currentProg.title;
   if (!title) return;
-  const btn = document.getElementById('pm-series-btn');
+  const btn = document.getElementById(buttonId || 'pm-series-btn');
+  const idleLabel = btn.id === 'pm-weekly-btn' ? '📺 Record series' : '📺 Record all episodes';
   btn.disabled = true; btn.textContent = '⏳ Scheduling…';
   try {
     const r = await post('/epg-web/api/record/series', {title});
     if (r.ok) {
-      btn.textContent = `✅ Episodes (${r.scheduled})`;
+      btn.textContent = btn.id === 'pm-weekly-btn' ? `✅ Recording series (${r.scheduled})` : `✅ Episodes (${r.scheduled})`;
       document.getElementById('pm-status').textContent = r.scheduled
         ? `📺 Recurring recording set for "${title}" — ${r.scheduled} missing episode${r.scheduled === 1 ? '' : 's'} queued`
         : `📺 Recurring recording set for "${title}" — no new missing episodes are in the guide yet; future ones will be added automatically`;
       document.getElementById('pm-status').className = 'status-msg ok';
       loadSeriesRecordings();
     } else {
-      btn.disabled = false; btn.textContent = '📺 Record Identified Episodes';
+      btn.disabled = false; btn.textContent = idleLabel;
       document.getElementById('pm-status').textContent = '❌ ' + (r.error || 'Failed');
       document.getElementById('pm-status').className = 'status-msg err';
     }
   } catch (e) {
-    btn.disabled = false; btn.textContent = '📺 Record Identified Episodes';
+    btn.disabled = false; btn.textContent = idleLabel;
     document.getElementById('pm-status').textContent = '❌ Scheduling failed: ' + e.message;
     document.getElementById('pm-status').className = 'status-msg err';
   }

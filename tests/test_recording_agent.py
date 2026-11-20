@@ -3202,3 +3202,61 @@ class PrivateShareGuardTests(unittest.TestCase):
             with mock.patch.object(recording_agent, "plex_mount_available", return_value=True):
                 root = recording_agent.ensure_private_root(cfg)
             self.assertTrue(root.is_dir())
+
+
+class CommercialFreeReplacementTests(unittest.TestCase):
+    EP = {"season": 1, "episode": 1, "title": "Pilot"}
+    old = {"width": 1280, "height": 720}
+
+    def test_it_applies_only_to_an_episode_booked_as_an_upgrade(self):
+        fn = recording_agent.commercial_free_replacement
+        same = {"width": 1280, "height": 720}
+        self.assertEqual(fn({"auto_upgrade": True}, self.EP, self.old, same)[0], True)
+        self.assertIsNone(fn({"auto_upgrade": False}, self.EP, self.old, same))       # a normal booking
+        self.assertIsNone(fn({"auto_upgrade": True}, None, self.old, same))           # a film keeps the resolution rules
+
+    def test_a_clearly_smaller_picture_does_not_replace_the_old_copy(self):
+        fn = recording_agent.commercial_free_replacement
+        self.assertEqual(fn({"auto_upgrade": True}, self.EP, {"width": 1920, "height": 1080}, {"width": 1280, "height": 720})[0], False)
+        self.assertEqual(fn({"auto_upgrade": True}, self.EP, {"width": 1280, "height": 720}, {"width": 1920, "height": 1080})[0], True)
+        self.assertEqual(fn({"auto_upgrade": True}, self.EP, {"width": 1280, "height": 720}, {"width": 1216, "height": 684})[0], True)   # near equal
+
+
+class CommercialFreeReplacementFlowTests(unittest.TestCase):
+    def _run(self, auto_upgrade):
+        now = time.time()
+        job = {"id": "e1", "title": "Show", "stream_id": "1", "start_ts": now - 2, "stop_ts": now - 2 + 58 * 60,
+               "stream_provider": "primestreams", "stream_extension": "ts", "season_num": 1, "episode_num": 1,
+               "episode_title": "Pilot", "is_series": 1, "auto_upgrade": auto_upgrade}
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = {"local_recordings": temp, "plex_path": temp + "/Movies", "plex_tv_path": temp + "/TV",
+                   "ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "recording_tail_seconds": 45,
+                   "epg_url": "http://x.test", "epg_user": "u", "epg_pass": "p", "heartbeat_seconds": 1,
+                   "transfer_wait_timeout": 5, "transfer_retry_seconds": 1}
+            old = Path(temp) / "TV" / "Show" / "Season 01" / "Show - S01E01.mp4"
+            same = {"width": 1280, "height": 720, "fps": 30.0, "duration": 58 * 60 + 30, "video_bitrate": 3_000_000,
+                    "total_bitrate": 3_100_000}
+            with mock.patch.object(recording_agent, "find_tv_episode_candidates", return_value=[old]), \
+                 mock.patch.object(recording_agent, "best_existing_copy", return_value=(old, dict(same))), \
+                 mock.patch.object(recording_agent, "probe_incoming_stream", return_value=dict(same)), \
+                 mock.patch.object(recording_agent, "probe_media", return_value=dict(same)), \
+                 mock.patch.object(recording_agent, "tail_decode_errors", return_value=0), \
+                 mock.patch.object(recording_agent, "heartbeat_sleep", return_value=True), \
+                 mock.patch.object(recording_agent, "record_with_resume", return_value=0), \
+                 mock.patch.object(recording_agent, "run_process", return_value=0), \
+                 mock.patch.object(recording_agent, "plex_mount_available", return_value=True), \
+                 mock.patch.object(recording_agent, "count_decode_errors", return_value=0), \
+                 mock.patch.object(recording_agent, "archive_terminal_result") as archive, \
+                 mock.patch.object(recording_agent, "discard_failed_media"), \
+                 mock.patch.object(recording_agent, "verified_episode_transfer", return_value=Path(temp) / "x.mp4") as transfer:
+                recording_agent.process_job(mock.Mock(), job, cfg)
+            return archive, transfer
+
+    def test_an_upgrade_booking_replaces_an_equal_quality_copy(self):
+        archive, transfer = self._run(True)
+        transfer.assert_called_once()
+        self.assertEqual(archive.call_args.args[2], "done")
+
+    def test_a_normal_booking_leaves_an_equal_quality_copy_alone(self):
+        archive, transfer = self._run(False)
+        transfer.assert_not_called()
