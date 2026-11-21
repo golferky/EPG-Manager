@@ -5058,3 +5058,78 @@ class SeriesReplaceAdCopyTests(SeriesCommercialFreeFirstTests):
                                       return_value=("u", None, {"stream_id": "1", "provider": "primestreams"})):
                 booked = server._schedule_series_airings("Show", self.guide_db, "movies.db")
         self.assertEqual(booked, server.MAX_SERIES_UPGRADES_AT_ONCE)
+
+
+class SyncStreamsLoginRefusedTests(unittest.TestCase):
+    def test_a_panel_that_answers_with_an_object_instead_of_a_channel_list_gets_a_plain_message(self):
+        import io
+        from urllib import request as urlreq
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+        deadline = time.time() + 10          # the startup guide load must not see this test's patched urlopen
+        while time.time() < deadline and (server._startup_status.get("loading") or server._startup_status.get("background_loading")):
+            time.sleep(0.05)
+        cfg = {"epg_url": "http://panel.invalid:80", "epg_user": "u", "epg_pass": "p", "db_path": "x.db"}
+        reply = Response(json.dumps({"user_info": {"auth": 0}}).encode())
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(urlreq, "urlopen", return_value=reply):
+            response = server.app.test_client().post("/epg-web/api/sync-streams")
+        self.assertEqual(response.status_code, 502)
+        message = response.get_json()["error"]
+        self.assertIn("did not accept the saved login", message)
+        self.assertIn("auth=0", message)
+        self.assertNotIn("panel.invalid", message)
+
+
+class PrimeStreamsSwitchTests(unittest.TestCase):
+    def test_switched_off_blocks_primestreams_but_not_eaglecast(self):
+        cfg = {"primestreams_enabled": False}
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(server, "_stream_url_unchecked",
+                               return_value=("http://x/1.ts", None, {"provider": "primestreams"})):
+            url, error, _ = server._stream_url("c1")
+            self.assertIsNone(url)
+            self.assertIn("switched off", error)
+            self.assertIn("switched off", server._stream_url("c1", "primestreams")[1])
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(server, "_stream_url_unchecked",
+                               return_value=("http://x/1.ts", None, {"provider": "eaglecast"})):
+            self.assertIsNotNone(server._stream_url("c1", "eaglecast")[0])
+
+    def test_on_by_default(self):
+        with mock.patch.object(server, "load_config", return_value={}), \
+             mock.patch.object(server, "_stream_url_unchecked",
+                               return_value=("http://x/1.ts", None, {"provider": "primestreams"})):
+            self.assertIsNotNone(server._stream_url("c1")[0])
+
+    def test_move_to_eaglecast_moves_one_of_two_overlapping_and_lists_the_rest(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, channel_id, start_ts, stop_ts, status, "
+                     "stream_provider, stream_id, stream_extension)")
+        t = time.time() + 86400
+        for rid, ch, a, b in (("a", "c1", t, t + 3600), ("b", "c2", t + 600, t + 4200), ("c", "c3", t, t + 3600)):
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?,?,'queued','primestreams','9','ts')",
+                         (rid, rid, ch, ch, a, b))
+        conn.commit()
+        conn.close()
+        carried = {"c1": ("11", "n", "ts"), "c2": ("12", "n", "ts")}
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_eaglecast_enabled", return_value=True), \
+             mock.patch.object(server, "_eaglecast_expiry", return_value=(None, "")), \
+             mock.patch.object(server, "_is_quarantined_eaglecast_stream", return_value=False), \
+             mock.patch.object(server, "_eaglecast_stream_for_channel", side_effect=lambda c: carried.get(c)):
+            report = server._move_primestreams_bookings(False)
+            self.assertEqual([e["id"] for e in report["can_move"]], ["a"])
+            self.assertEqual({e["id"] for e in report["cannot_move"]}, {"b", "c"})
+            self.assertEqual(report["moved"], 0)
+            done = server._move_primestreams_bookings(True)
+        self.assertEqual(done["moved"], 1)
+        row = sq.connect(db).execute("SELECT stream_provider, stream_id FROM recordings WHERE rec_id='a'").fetchone()
+        self.assertEqual(row, ("eaglecast", "11"))
