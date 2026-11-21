@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261120b"
+VERSION = "v20261121a"
 
 app = Flask(__name__)
 
@@ -4653,6 +4653,14 @@ def api_sync_streams():
             ps_streams = json.loads(r.read())
     except Exception as e:
         return jsonify({'error': f'PrimeStreams API error: {e}'}), 500
+    if not isinstance(ps_streams, list):
+        # A panel that refuses a login can answer with a normal-looking object (and no HTTP error) instead of
+        # the channel list.  Say so, rather than failing on the first channel.
+        info = ps_streams.get('user_info') if isinstance(ps_streams, dict) else None
+        auth = info.get('auth') if isinstance(info, dict) else None
+        return jsonify({'error': 'PrimeStreams did not accept the saved login (it answered without a channel list'
+                                 + (f', auth={auth}' if auth is not None else '') + '). Check the username, password'
+                                 ' and server address in the dashboard and in the recorder.'}), 502
 
     # Keep the provider's XMLTV identity separate from display-name matching.
     # Display labels can be inaccurate (e.g. a stream labelled Cinemax

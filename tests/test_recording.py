@@ -5058,3 +5058,29 @@ class SeriesReplaceAdCopyTests(SeriesCommercialFreeFirstTests):
                                       return_value=("u", None, {"stream_id": "1", "provider": "primestreams"})):
                 booked = server._schedule_series_airings("Show", self.guide_db, "movies.db")
         self.assertEqual(booked, server.MAX_SERIES_UPGRADES_AT_ONCE)
+
+
+class SyncStreamsLoginRefusedTests(unittest.TestCase):
+    def test_a_panel_that_answers_with_an_object_instead_of_a_channel_list_gets_a_plain_message(self):
+        import io
+        from urllib import request as urlreq
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+        deadline = time.time() + 10          # the startup guide load must not see this test's patched urlopen
+        while time.time() < deadline and (server._startup_status.get("loading") or server._startup_status.get("background_loading")):
+            time.sleep(0.05)
+        cfg = {"epg_url": "http://panel.invalid:80", "epg_user": "u", "epg_pass": "p", "db_path": "x.db"}
+        reply = Response(json.dumps({"user_info": {"auth": 0}}).encode())
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(urlreq, "urlopen", return_value=reply):
+            response = server.app.test_client().post("/epg-web/api/sync-streams")
+        self.assertEqual(response.status_code, 502)
+        message = response.get_json()["error"]
+        self.assertIn("did not accept the saved login", message)
+        self.assertIn("auth=0", message)
+        self.assertNotIn("panel.invalid", message)
