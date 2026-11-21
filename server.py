@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261121c"
+VERSION = "v20261121d"
 
 app = Flask(__name__)
 
@@ -3183,9 +3183,59 @@ def api_eaglecast_switch():
                     'days_left': round((expiry - time.time()) / 86400, 1) if expiry else None})
 
 
+PRIMESTREAMS_HEALTH_SECONDS = 300
+_ps_health = {'at': 0.0, 'result': None}
+_ps_health_lock = threading.Lock()
+
+
+def _check_primestreams():
+    """Ask the PrimeStreams panel whether the saved login works: {state, message, status}.
+
+    ``state`` is ok, inactive (the panel knows the login but the account is not active), refused (the panel did
+    not accept the login), unreachable (no answer) or not_set_up (no address or login saved).  Neither the
+    address nor the login ever appears in the result.
+    """
+    from urllib import request as urlreq
+    cfg = load_config()
+    base = str(cfg.get('epg_url', '') or '').rstrip('/')
+    user, passwd = cfg.get('epg_user', ''), cfg.get('epg_pass', '')
+    if not (base and user and passwd):
+        return {'state': 'not_set_up', 'status': '', 'message': 'No PrimeStreams address or login is saved.'}
+    try:
+        from urllib.parse import quote
+        url = f"{base}/player_api.php?username={quote(str(user), safe='')}&password={quote(str(passwd), safe='')}"
+        with urlreq.urlopen(url, timeout=10) as reply:
+            data = json.loads(reply.read())
+    except Exception:
+        return {'state': 'unreachable', 'status': '',
+                'message': 'PrimeStreams did not answer (the server may be down or the address changed).'}
+    info = data.get('user_info') if isinstance(data, dict) else None
+    if not isinstance(info, dict) or str(info.get('auth', '')) != '1':
+        return {'state': 'refused', 'status': '',
+                'message': 'PrimeStreams did not accept the saved login. Check the address, username and password.'}
+    status = str(info.get('status', '') or '')
+    if status and status.lower() != 'active':
+        return {'state': 'inactive', 'status': status,
+                'message': 'PrimeStreams knows the login but the account is not active, so it will refuse streams.'}
+    return {'state': 'ok', 'status': status, 'message': 'PrimeStreams is working.'}
+
+
+def _primestreams_health(max_age=PRIMESTREAMS_HEALTH_SECONDS):
+    """The last PrimeStreams check, repeated if it is older than ``max_age`` seconds."""
+    with _ps_health_lock:
+        if _ps_health['result'] is None or time.time() - _ps_health['at'] > max_age:
+            _ps_health['result'] = _check_primestreams()
+            _ps_health['at'] = time.time()
+        return dict(_ps_health['result'], checked_at=_ps_health['at'])
+
+
 @app.route('/epg-web/api/primestreams', methods=['GET', 'POST'])
 def api_primestreams_switch():
-    """Read or set the PrimeStreams switch.  POST {"enabled": false} stops the dashboard choosing PrimeStreams."""
+    """Read or set the PrimeStreams switch, with a health check of the account.
+
+    POST {"enabled": false} stops the dashboard choosing PrimeStreams.  GET ?fresh=1 repeats the check now
+    instead of using the answer from the last five minutes.
+    """
     if request.method == 'POST':
         body = request.json or {}
         if not isinstance(body.get('enabled'), bool):
@@ -3193,7 +3243,8 @@ def api_primestreams_switch():
         cfg = load_config()
         cfg['primestreams_enabled'] = body['enabled']
         save_config(cfg)
-    return jsonify({'enabled': _primestreams_enabled()})
+    fresh = request.method == 'GET' and request.args.get('fresh') == '1'
+    return jsonify({'enabled': _primestreams_enabled(), 'health': _primestreams_health(0 if fresh else PRIMESTREAMS_HEALTH_SECONDS)})
 
 
 def _move_primestreams_bookings(apply_it):
@@ -10698,6 +10749,10 @@ tr:hover td{background:#141414;}
   <button class="btn btn-ghost btn-sm" style="margin-left:12px;" onclick="dismissReminders()">Dismiss for today</button>
 </div>
 
+<div id="ps-bar" style="display:none;background:#7f1d1d;color:#fecaca;padding:6px 16px;font-size:13px;border-bottom:1px solid #b91c1c;">
+  <span id="ps-text"></span>
+</div>
+
 <div id="health-bar" style="display:none;padding:6px 16px;font-size:13px;border-bottom:1px solid #2d2d2d;">
   <span id="health-text"></span>
   <button class="btn btn-ghost btn-sm" style="margin-left:12px;" onclick="switchTab('health')">Open Recording Health</button>
@@ -12139,6 +12194,26 @@ function dismissReminders() {
   document.getElementById('reminder-bar').style.display = 'none';
 }
 document.addEventListener('DOMContentLoaded', loadReminders);
+
+// PrimeStreams check: a red bar while it is not working, an amber one when it works but is switched off.
+async function loadPrimeStreamsBar() {
+  try {
+    const d = await (await fetch('/epg-web/api/primestreams')).json();
+    const bar = document.getElementById('ps-bar');
+    const h = d.health || {};
+    if (h.state === 'ok' && d.enabled) { bar.style.display = 'none'; return; }
+    if (h.state === 'ok') {
+      bar.style.background = '#78350f'; bar.style.color = '#fde68a'; bar.style.borderBottomColor = '#b45309';
+      document.getElementById('ps-text').textContent = 'PrimeStreams is working again but is switched off in the dashboard.';
+    } else {
+      bar.style.background = '#7f1d1d'; bar.style.color = '#fecaca'; bar.style.borderBottomColor = '#b91c1c';
+      document.getElementById('ps-text').textContent = '⚠ ' + (h.message || 'PrimeStreams is not working.') + (d.enabled ? '' : ' (It is switched off in the dashboard.)');
+    }
+    bar.style.display = '';
+  } catch (e) { /* a status bar is never worth an error */ }
+}
+document.addEventListener('DOMContentLoaded', loadPrimeStreamsBar);
+setInterval(loadPrimeStreamsBar, 600000);
 
 // Daily recording check: the last 24 hours at a glance.  Hidden for the rest of the day once dismissed, unless more recordings have failed since.
 async function loadHealthBar() {

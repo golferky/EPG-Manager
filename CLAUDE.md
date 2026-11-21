@@ -39,6 +39,7 @@ Read this first. It records how the owner's machines are set up and how changes 
 
 ## PrimeStreams on/off (provider trouble)
 - Status / switch off / switch on: `curl -s http://192.168.1.176:5001/epg-web/api/primestreams`, and `-X POST -H 'Content-Type: application/json' -d '{"enabled": false}'` (or `true`). Off means the dashboard refuses PrimeStreams as a source (setting `primestreams_enabled`); bookings that would need it fail to resolve, and the recorder is never handed a queued PrimeStreams booking (it stays queued; switching back on releases it). Eaglecast allows one connection, so overlapping bookings cannot all use it.
+- Health check: the same `/epg-web/api/primestreams` reply carries `health` (`state` ok / inactive / refused / unreachable / not_set_up, with a plain message and never the address or login), cached 5 minutes (`?fresh=1` repeats it). The dashboard shows a red bar when PrimeStreams is not working and an amber one when it works but is switched off. The server address and login live in the dashboard config (`epg_url`, `epg_user`, `epg_pass`, changed with POST `/api/config`) and in the recorder's `recording_agent.json`; both must match when the provider changes them. Current address host: pl9245637.com port 826.
 - Move queued PrimeStreams bookings to Eaglecast: POST `{}` then `{"apply": true}` to `/epg-web/api/primestreams/move-to-eaglecast`; what cannot move is listed with a reason (channel not carried, past the end date, Eaglecast busy) and left alone.
 
 ## Guide filters
