@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261121b"
+VERSION = "v20261121c"
 
 app = Flask(__name__)
 
@@ -10291,6 +10291,9 @@ def api_agent_claim():
     lease_seconds = max(30, min(int(data.get('lease_seconds', 90)), 300))
     claim_ahead = max(30, min(int(data.get('claim_ahead_seconds', 300)), 1800))
     now = time.time()
+    # While PrimeStreams is switched off its bookings are left queued: the recorder is never handed one.
+    skip_primestreams = "AND COALESCE(candidate.stream_provider,'primestreams') = 'eaglecast'" \
+        if not _primestreams_enabled() else ''
     conn = sqlite3.connect(_guide_db_path(), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
@@ -10312,6 +10315,7 @@ def api_agent_claim():
                               WHERE COALESCE(candidate.backend,'local')='agent'
                               AND candidate.status IN ('queued','scheduled')
                               AND candidate.stop_ts > ? AND candidate.start_ts <= ?
+                              ''' + skip_primestreams + '''
                               AND (COALESCE(candidate.stream_provider,'primestreams') != 'eaglecast'
                                    OR NOT EXISTS (
                                       SELECT 1 FROM recordings AS other
