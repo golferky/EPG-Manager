@@ -38,7 +38,7 @@ Read this first. It records how the owner's machines are set up and how changes 
 - Reminders: the dashboard shows a banner when Schedules Direct is within 30 days of its end date (Eaglecast within 7). Set the date with POST `{"key": "schedules_direct", "expires": "YYYY-MM-DD"}` to `/epg-web/api/reminders`. Schedules Direct currently ends 2027-05-05. PrimeStreams is deliberately not tracked: the owner renews it monthly.
 
 ## PrimeStreams on/off (provider trouble)
-- Status / switch off / switch on: `curl -s http://192.168.1.176:5001/epg-web/api/primestreams`, and `-X POST -H 'Content-Type: application/json' -d '{"enabled": false}'` (or `true`). Off means the dashboard refuses PrimeStreams as a source (setting `primestreams_enabled`); bookings that would need it fail to resolve instead of being sent to a dead stream. Eaglecast allows one connection, so overlapping bookings cannot all use it.
+- Status / switch off / switch on: `curl -s http://192.168.1.176:5001/epg-web/api/primestreams`, and `-X POST -H 'Content-Type: application/json' -d '{"enabled": false}'` (or `true`). Off means the dashboard refuses PrimeStreams as a source (setting `primestreams_enabled`); bookings that would need it fail to resolve, and the recorder is never handed a queued PrimeStreams booking (it stays queued; switching back on releases it). Eaglecast allows one connection, so overlapping bookings cannot all use it.
 - Move queued PrimeStreams bookings to Eaglecast: POST `{}` then `{"apply": true}` to `/epg-web/api/primestreams/move-to-eaglecast`; what cannot move is listed with a reason (channel not carried, past the end date, Eaglecast busy) and left alone.
 
 ## Guide filters

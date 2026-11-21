@@ -600,6 +600,24 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(statuses["resume"], "queued")
 
     @mock.patch.object(server, "load_config")
+    def test_agent_claim_skips_primestreams_bookings_while_switched_off(self, load_config):
+        load_config.return_value = {
+            "guide_db_path": self.db_path, "recording_backend": "agent",
+            "recording_agent_token": "test-secret", "primestreams_enabled": False,
+        }
+        rec = {"title": "PS Test", "channel": "Test", "channel_id": "t", "stream_id": "1",
+               "start_ts": time.time() + 60, "stop_ts": time.time() + 3600, "status": "queued",
+               "backend": "agent", "file": "", "stream_provider": "primestreams"}
+        self.assertTrue(server._db_upsert_rec("psjob", rec))
+        client = server.app.test_client()
+        body = {"agent_id": "mac-test", "claim_ahead_seconds": 300, "lease_seconds": 90}
+        headers = {"Authorization": "Bearer test-secret"}
+        self.assertIsNone(client.post("/epg-web/api/agent/jobs/claim", headers=headers, json=body).get_json()["job"])
+        load_config.return_value["primestreams_enabled"] = True
+        job = client.post("/epg-web/api/agent/jobs/claim", headers=headers, json=body).get_json()["job"]
+        self.assertEqual(job["id"], "psjob")
+
+    @mock.patch.object(server, "load_config")
     def test_agent_claim_and_heartbeat(self, load_config):
         load_config.return_value = {
             "guide_db_path": self.db_path,
