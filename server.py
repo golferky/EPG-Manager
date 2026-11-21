@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261121a"
+VERSION = "v20261121b"
 
 app = Flask(__name__)
 
@@ -2372,7 +2372,29 @@ def _is_bad_primestream_channel(channel_id):
     except Exception:
         return False
 
+PRIMESTREAMS_OFF_MESSAGE = 'PrimeStreams is switched off in the dashboard, and Eaglecast cannot carry this channel or time.'
+
+
+def _primestreams_enabled():
+    """False while the owner has switched PrimeStreams off (config ``primestreams_enabled``)."""
+    try:
+        return load_config().get('primestreams_enabled', True) is not False
+    except Exception:
+        return True
+
+
 def _stream_url(channel_id, preferred_provider=None):
+    """Stream address for a channel, or an error while PrimeStreams is switched off and it would be the source.
+    Returns (url, error, debug_info) where debug_info is a dict."""
+    if preferred_provider == 'primestreams' and not _primestreams_enabled():
+        return None, PRIMESTREAMS_OFF_MESSAGE, {'channel_id': channel_id, 'provider': 'primestreams'}
+    url, error, debug = _stream_url_unchecked(channel_id, preferred_provider)
+    if url and not error and (debug or {}).get('provider') != 'eaglecast' and not _primestreams_enabled():
+        return None, PRIMESTREAMS_OFF_MESSAGE, debug
+    return url, error, debug
+
+
+def _stream_url_unchecked(channel_id, preferred_provider=None):
     """Look up stream_id from Movies.db and build the stream URL.
     Returns (url, error, debug_info) where debug_info is a dict."""
     import re as _re2
@@ -3159,6 +3181,86 @@ def api_eaglecast_switch():
     expiry, source = _eaglecast_expiry()
     return jsonify({'enabled': _eaglecast_enabled(), 'expires': _expiry_text(expiry), 'expiry_from': source,
                     'days_left': round((expiry - time.time()) / 86400, 1) if expiry else None})
+
+
+@app.route('/epg-web/api/primestreams', methods=['GET', 'POST'])
+def api_primestreams_switch():
+    """Read or set the PrimeStreams switch.  POST {"enabled": false} stops the dashboard choosing PrimeStreams."""
+    if request.method == 'POST':
+        body = request.json or {}
+        if not isinstance(body.get('enabled'), bool):
+            return jsonify({'error': 'send {"enabled": true} or {"enabled": false}'}), 400
+        cfg = load_config()
+        cfg['primestreams_enabled'] = body['enabled']
+        save_config(cfg)
+    return jsonify({'enabled': _primestreams_enabled()})
+
+
+def _move_primestreams_bookings(apply_it):
+    """Move queued PrimeStreams bookings to Eaglecast where it carries the channel.
+
+    Eaglecast allows one connection at a time, so bookings that overlap each other (or an Eaglecast booking
+    already queued) cannot all move: the earlier one moves and the rest are listed in ``cannot_move`` with a reason.
+    Nothing is moved unless ``apply_it``; anything that cannot move is left exactly as it is.
+    """
+    now = time.time()
+    if not _eaglecast_enabled():
+        return {'error': 'Eaglecast is switched off or has run out, so nothing can move to it.'}
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        rows = conn.execute(
+            "SELECT rec_id, title, channel, channel_id, start_ts, stop_ts FROM recordings "
+            "WHERE status IN ('queued','scheduled') AND COALESCE(stream_provider,'primestreams')='primestreams' "
+            "AND start_ts>? ORDER BY start_ts", (now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS,)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return {'error': str(exc)}
+    expiry, _source = _eaglecast_expiry()
+    movable, stuck, taken = [], [], []
+    for rec_id, title, channel, channel_id, start_ts, stop_ts in rows:
+        entry = {'id': rec_id, 'title': title, 'channel': channel, 'start_ts': start_ts}
+        stream = _eaglecast_stream_for_channel(channel_id)
+        if not stream or _is_quarantined_eaglecast_stream(stream):
+            entry['why'] = 'Eaglecast does not carry this channel'
+            stuck.append(entry)
+        elif expiry and stop_ts and float(stop_ts) > expiry:
+            entry['why'] = 'runs past the Eaglecast end date'
+            stuck.append(entry)
+        elif _eaglecast_overlap(start_ts, stop_ts, rec_id) or any(
+                float(start_ts) < b and float(stop_ts) > a for a, b in taken):
+            entry['why'] = 'Eaglecast is busy with another recording at that time'
+            stuck.append(entry)
+        else:
+            entry['stream_id'], entry['stream_extension'] = str(stream[0]), str(stream[2] or 'ts')
+            movable.append(entry)
+            taken.append((float(start_ts), float(stop_ts)))
+    moved = 0
+    if apply_it and movable:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.execute('PRAGMA busy_timeout=10000')
+        for entry in movable:
+            conn.execute("UPDATE recordings SET stream_provider='eaglecast', stream_id=?, stream_extension=? "
+                         "WHERE rec_id=? AND status IN ('queued','scheduled')",
+                         (entry['stream_id'], entry['stream_extension'], entry['id']))
+            moved += 1
+        conn.commit()
+        conn.close()
+        with _rec_lock:
+            for entry in movable:
+                rec = _recs.get(entry['id'])
+                if rec:
+                    rec.update({'stream_provider': 'eaglecast', 'stream_id': entry['stream_id'],
+                                'stream_extension': entry['stream_extension']})
+    keep = ('id', 'title', 'channel', 'start_ts', 'why')
+    strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
+    return {'applied': bool(apply_it), 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)}
+
+
+@app.route('/epg-web/api/primestreams/move-to-eaglecast', methods=['POST'])
+def api_primestreams_move_to_eaglecast():
+    """Report, or with {"apply": true} perform, the move of queued PrimeStreams bookings to Eaglecast."""
+    result = _move_primestreams_bookings((request.json or {}).get('apply') is True)
+    return jsonify(result), (400 if 'error' in result else 200)
 
 
 # ── Adult-content lock ──────────────────────────────────────────────────────
