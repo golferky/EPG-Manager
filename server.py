@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122b"
+VERSION = "v20261122d"
 
 app = Flask(__name__)
 
@@ -3370,6 +3370,140 @@ def _move_primestreams_bookings(apply_it):
     keep = ('id', 'title', 'channel', 'start_ts', 'why')
     strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
     return {'applied': bool(apply_it), 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)}
+
+
+SLOT_PROVIDERS = ('eaglecast', 'primestreams')
+SLOT_RUNNING = ('agent_claimed', 'preflight', 'waiting', 'recording')
+
+
+def _is_film_booking(row):
+    """A film (not an episode of a show): no season or episode number and not part of a series."""
+    return not (row.get('is_series') or row.get('season_num') or row.get('episode_num'))
+
+
+def _slot_source(provider, channel_id, stop_ts, expiry):
+    """(stream_id, extension) when ``provider`` can carry this channel for this window, else None."""
+    if provider == 'eaglecast':
+        stream = _eaglecast_stream_for_channel(channel_id)
+        if not stream or _is_quarantined_eaglecast_stream(stream):
+            return None
+        if expiry and stop_ts and float(stop_ts) > expiry:
+            return None
+        return str(stream[0]), str(stream[2] or 'ts')
+    url, error, debug = _stream_url(channel_id, 'primestreams')
+    if error or not url:
+        return None
+    return str((debug or {}).get('stream_id') or ''), str((debug or {}).get('stream_extension') or 'ts')
+
+
+def _rebalance_slots(apply_it):
+    """Give the scarce streaming connections to films first.
+
+    Eaglecast carries one recording at a time, and PrimeStreams as many as its account allows (one).  Queued
+    bookings are placed highest priority first (a film before an episode, then earlier first), each on Eaglecast
+    if it can carry the channel and a connection is free, otherwise on PrimeStreams.  A booking that now sits on
+    the other provider is switched.  An episode that cannot be placed because a film holds the connection it
+    needed is not recorded (it is marked failed with that reason, so Recording Health offers a re-record); every
+    other booking that cannot be placed is left exactly as it is and listed.  Nothing changes unless ``apply_it``.
+    Bookings already recording, or about to start, are never touched.
+    """
+    now = time.time()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,stream_id,"
+            "stream_extension,season_num,episode_num,is_series FROM recordings "
+            "WHERE stop_ts>? AND status IN ('queued','scheduled','agent_claimed','preflight','waiting','recording')",
+            (now,)).fetchall()]
+    except sqlite3.Error as exc:
+        return {'error': str(exc)}
+    expiry, _src = _eaglecast_expiry()
+    health_state = _primestreams_health().get('state')
+    available = {'eaglecast': _eaglecast_enabled(),
+                 'primestreams': _primestreams_enabled() and health_state not in ('inactive', 'refused')}
+    capacity = {'eaglecast': 1, 'primestreams': _primestreams_max_connections()}
+    placed = {p: [] for p in SLOT_PROVIDERS}
+    movable = []
+    for row in rows:
+        provider = row['stream_provider'] or 'primestreams'
+        fixed = row['status'] in SLOT_RUNNING or float(row['start_ts']) <= now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS
+        if fixed and provider in placed:
+            placed[provider].append((float(row['start_ts']), float(row['stop_ts']), row))
+        elif not fixed:
+            movable.append(row)
+
+    def busy(provider, row):
+        return sum(1 for a, b, _r in placed[provider]
+                   if a < float(row['stop_ts']) and b > float(row['start_ts'])) >= capacity[provider]
+
+    def blocked_by_film(row):
+        """True when every provider that could carry this booking is held, in its window, by a film."""
+        carriers = [p for p in SLOT_PROVIDERS
+                    if available[p] and _slot_source(p, row['channel_id'], row['stop_ts'], expiry)]
+        return bool(carriers) and all(
+            any(a < float(row['stop_ts']) and b > float(row['start_ts']) and _is_film_booking(r)
+                for a, b, r in placed[p]) for p in carriers)
+
+    moves, bumps, unplaced = [], [], []
+    for row in sorted(movable, key=lambda r: (0 if _is_film_booking(r) else 1, float(r['start_ts']))):
+        chosen = None
+        current = row['stream_provider'] or 'primestreams'
+        # A film tries Eaglecast first; an episode stays where it is unless that connection is needed.
+        order = SLOT_PROVIDERS if _is_film_booking(row) else (current,) + tuple(p for p in SLOT_PROVIDERS if p != current)
+        for provider in order:
+            if provider not in placed or not available[provider] or busy(provider, row):
+                continue
+            source = _slot_source(provider, row['channel_id'], row['stop_ts'], expiry)
+            if source and source[0]:
+                chosen = (provider, source)
+                break
+        entry = {'id': row['rec_id'], 'title': row['title'], 'channel': row['channel'], 'start_ts': row['start_ts']}
+        if chosen:
+            provider, (stream_id, extension) = chosen
+            placed[provider].append((float(row['start_ts']), float(row['stop_ts']), row))
+            if provider != (row['stream_provider'] or 'primestreams'):
+                moves.append(dict(entry, to=provider, stream_id=stream_id, stream_extension=extension))
+        else:
+            # Keep it where it is, so later (lower priority) bookings see its connection as taken.
+            provider = row['stream_provider'] or 'primestreams'
+            if provider in placed:
+                placed[provider].append((float(row['start_ts']), float(row['stop_ts']), row))
+            if not _is_film_booking(row) and blocked_by_film(row):
+                bumps.append(entry)
+            else:
+                unplaced.append(entry)
+    if apply_it and (moves or bumps):
+        for entry in moves:
+            conn.execute("UPDATE recordings SET stream_provider=?, stream_id=?, stream_extension=? WHERE rec_id=? "
+                         "AND status IN ('queued','scheduled')",
+                         (entry['to'], entry['stream_id'], entry['stream_extension'], entry['id']))
+        reason = 'Not recorded: a film needed the only free streaming connection at this time'
+        for entry in bumps:
+            conn.execute("UPDATE recordings SET status='failed', failure_reason=? WHERE rec_id=? "
+                         "AND status IN ('queued','scheduled')", (reason, entry['id']))
+        conn.commit()
+        with _rec_lock:
+            for entry in moves:
+                rec = _recs.get(entry['id'])
+                if rec:
+                    rec.update({'stream_provider': entry['to'], 'stream_id': entry['stream_id'],
+                                'stream_extension': entry['stream_extension']})
+            for entry in bumps:
+                rec = _recs.get(entry['id'])
+                if rec:
+                    rec.update({'status': 'failed', 'failure_reason': reason})
+    conn.close()
+    keep = ('id', 'title', 'channel', 'start_ts', 'to')
+    strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
+    return {'applied': bool(apply_it), 'moves': strip(moves), 'not_recorded': strip(bumps), 'left_alone': strip(unplaced)}
+
+
+@app.route('/epg-web/api/recording-slots/rebalance', methods=['POST'])
+def api_rebalance_slots():
+    """Report, or with {"apply": true} perform, the film-first placement of queued bookings."""
+    result = _rebalance_slots((request.json or {}).get('apply') is True)
+    return jsonify(result), (400 if 'error' in result else 200)
 
 
 def _refresh_queued_stream_ids(apply_it):
@@ -6878,6 +7012,13 @@ def _auto_record_wanted_loop():
             _auto_record_wanted()
         except Exception as exc:
             print(f'[auto-wanted] loop error: {exc}')
+        try:
+            result = _rebalance_slots(True)
+            if result.get('moves') or result.get('not_recorded'):
+                print(f"[slots] moved {len(result['moves'])} booking(s), {len(result['not_recorded'])} not recorded "
+                      f"because a film needed the connection")
+        except Exception as exc:
+            print(f'[slots] rebalance error: {exc}')
         time.sleep(1800)
 
 
@@ -10222,6 +10363,48 @@ def _group_recordings(rows, now, upcoming_limit=20, recent_limit=8):
             'upcoming': upcoming[:upcoming_limit], 'upcoming_total': len(upcoming),
             'recent': recent[:recent_limit]}
 
+@app.route('/epg-web/api/recording-plan')
+def api_recording_plan():
+    """One day of recordings, for the planner grid: ?date=YYYY-MM-DD (default today, in the dashboard's time zone)."""
+    cfg = load_config()
+    zone = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+    text = str(request.args.get('date', '') or '').strip()
+    try:
+        day = datetime.strptime(text, '%Y-%m-%d').date() if text else datetime.now(zone).date()
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'date must be YYYY-MM-DD'}), 400
+    day_start = datetime(day.year, day.month, day.day, tzinfo=zone).timestamp()
+    nxt = day + timedelta(days=1)
+    day_end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=zone).timestamp()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT rec_id,title,channel,start_ts,stop_ts,status,stream_provider,season_num,episode_num,is_series,"
+            "failure_reason FROM recordings WHERE stop_ts>? AND start_ts<? AND status!='cancelled' "
+            "ORDER BY start_ts", (day_start, day_end)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    live = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+    items = []
+    for row in rows:
+        r = dict(row)
+        items.append({'id': r['rec_id'], 'title': r['title'], 'channel': r['channel'],
+                      'start_ts': r['start_ts'], 'stop_ts': r['stop_ts'], 'status': _rec_status_base(r['status']),
+                      'provider': r['stream_provider'] or 'primestreams', 'film': _is_film_booking(r),
+                      'reason': r['failure_reason'] or ''})
+    capacity = {'eaglecast': 1, 'primestreams': _primestreams_max_connections()}
+    for item in items:
+        item['conflict'] = False
+        if item['status'] in live:
+            overlapping = [o for o in items if o['status'] in live and o['provider'] == item['provider']
+                           and o['start_ts'] < item['stop_ts'] and o['stop_ts'] > item['start_ts']]
+            item['conflict'] = len(overlapping) > capacity.get(item['provider'], 1)
+    return jsonify({'ok': True, 'date': day.isoformat(), 'day_start': day_start, 'day_end': day_end,
+                    'capacity': capacity, 'items': items})
+
+
 @app.route('/epg-web/api/recordings/overview')
 def api_recordings_overview():
     """Everything the Recordings window needs in one call."""
@@ -10897,6 +11080,7 @@ tr:hover td{background:#141414;}
   <div class="tab" onclick="switchTab('health')">🔎 Recording Health</div>
   <div class="tab" onclick="switchTab('conversions')">🔄 Conversions</div>
   <div class="tab" onclick="switchTab('storage')">💾 Storage</div>
+  <div class="tab" onclick="switchTab('planner')">🗓 Planner</div>
 </nav>
 
 <!-- GUIDE -->
@@ -11379,6 +11563,24 @@ tr:hover td{background:#141414;}
 </div>
 
 <!-- STORAGE -->
+<div id="pane-planner" class="pane">
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
+      <h2 style="margin:0;">Recording planner</h2>
+      <button class="btn btn-ghost btn-sm" onclick="plannerMove(-1)">◀ Day</button>
+      <button class="btn btn-ghost btn-sm" onclick="plannerToday()">Today</button>
+      <button class="btn btn-ghost btn-sm" onclick="plannerMove(1)">Day ▶</button>
+      <input type="date" id="planner-date" onchange="loadPlanner()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:5px 8px;font-size:13px;">
+      <span id="planner-note" style="font-size:12px;color:#64748b;"></span>
+    </div>
+    <div id="planner-grid" style="overflow-x:auto;"></div>
+    <div style="font-size:11px;color:#64748b;margin-top:10px;">
+      Each row is one streaming connection. Gold = film, blue = episode or other; green = recording now, grey = done, red = failed.
+      A red outline means two recordings want the same connection at the same time. Click a block for details.
+    </div>
+  </div>
+</div>
+
 <div id="pane-storage" class="pane">
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
@@ -11542,7 +11744,7 @@ setInterval(loadStorageBar, 5 * 60 * 1000); // refresh every 5 min
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  const names = ['guide','recommendations','channels','247','schedule','plex-series','health','conversions','storage'];
+  const names = ['guide','recommendations','channels','247','schedule','plex-series','health','conversions','storage','planner'];
   document.querySelectorAll('.tab').forEach((t,i) =>
     t.classList.toggle('active', names[i] === name));
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
@@ -11555,6 +11757,7 @@ function switchTab(name) {
   if (name === 'health') { loadRecordingHealth(); loadChannelReport(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
+  if (name === 'planner') loadPlanner();
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -12304,6 +12507,73 @@ async function openInVlc(params) {
   } catch (e) { alert('Could not open VLC: ' + e.message); }
 }
 document.addEventListener('DOMContentLoaded', updatePlayerPrefBtn);
+
+// Recording planner: one day, one row per streaming connection, blocks placed by time.
+function plannerDate() {
+  const el = document.getElementById('planner-date');
+  if (!el.value) el.value = new Date().toLocaleDateString('en-CA');
+  return el.value;
+}
+function plannerToday() { document.getElementById('planner-date').value = new Date().toLocaleDateString('en-CA'); loadPlanner(); }
+function plannerMove(days) {
+  const d = new Date(plannerDate() + 'T12:00:00');
+  d.setDate(d.getDate() + days);
+  document.getElementById('planner-date').value = d.toLocaleDateString('en-CA');
+  loadPlanner();
+}
+function plannerColor(it) {
+  if (it.status === 'failed' || it.status === 'error') return '#7f1d1d';
+  if (it.status === 'done' || it.status === 'done_ts') return '#374151';
+  if (['recording', 'converting', 'awaiting_transfer', 'transferring'].indexOf(it.status) >= 0) return '#166534';
+  return it.film ? '#92400e' : '#1e3a8a';
+}
+function plannerPack(items) {
+  const rows = [];
+  items.forEach(it => {
+    let r = 0;
+    while (rows[r] && rows[r] > it.start_ts) r++;
+    rows[r] = it.stop_ts;
+    it.row = r;
+  });
+  return Math.max(1, rows.length);
+}
+async function loadPlanner() {
+  const box = document.getElementById('planner-grid');
+  box.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-plan?date=' + plannerDate())).json();
+    if (!d.ok) { box.innerHTML = '<div class="empty">' + esc(d.error || 'Could not load') + '</div>'; return; }
+    const span = d.day_end - d.day_start;
+    const lanes = [['eaglecast', 'Eaglecast'], ['primestreams', 'PrimeStreams']];
+    let head = '<div style="display:flex;margin-left:120px;min-width:1100px;">';
+    for (let h = 0; h < 24; h++) head += '<div style="flex:1;font-size:10px;color:#64748b;border-left:1px solid #2d2d2d;padding-left:2px;">' + (h % 12 === 0 ? 12 : h % 12) + (h < 12 ? 'a' : 'p') + '</div>';
+    head += '</div>';
+    let html = head;
+    let conflicts = 0;
+    lanes.forEach(lane => {
+      const items = d.items.filter(i => i.provider === lane[0]);
+      const rows = plannerPack(items);
+      html += '<div style="display:flex;align-items:stretch;margin-top:6px;min-width:1220px;">';
+      html += '<div style="width:120px;flex:none;font-size:12px;color:#cbd5e1;padding-top:4px;">' + lane[1] + '<div style="font-size:10px;color:#64748b;">' + d.capacity[lane[0]] + ' at a time</div></div>';
+      html += '<div style="position:relative;flex:1;min-width:1100px;height:' + (rows * 42 + 4) + 'px;background:#141414;border:1px solid #2d2d2d;border-radius:6px;">';
+      for (let h = 1; h < 24; h++) html += '<div style="position:absolute;top:0;bottom:0;left:' + (h * 100 / 24) + '%;border-left:1px solid #1f1f1f;"></div>';
+      items.forEach(it => {
+        const a = Math.max(it.start_ts, d.day_start), b = Math.min(it.stop_ts, d.day_end);
+        const left = (a - d.day_start) / span * 100, width = Math.max(0.4, (b - a) / span * 100);
+        const t0 = new Date(it.start_ts * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+        const t1 = new Date(it.stop_ts * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+        if (it.conflict) conflicts++;
+        const tip = it.title + ' · ' + it.channel + ' · ' + t0 + ' to ' + t1 + ' · ' + it.status + (it.reason ? ' · ' + it.reason : '');
+        html += '<div title="' + esc(tip) + '" style="position:absolute;top:' + (2 + it.row * 42) + 'px;height:38px;left:' + left + '%;width:' + width + '%;overflow:hidden;box-sizing:border-box;'
+          + 'background:' + plannerColor(it) + ';border:' + (it.conflict ? '2px solid #f87171' : '1px solid #00000066') + ';border-radius:4px;padding:2px 4px;font-size:10px;line-height:1.25;color:#f1f5f9;white-space:nowrap;cursor:default;">'
+          + '<b>' + esc(it.title) + '</b><br>' + esc(it.channel) + ' ' + t0 + '</div>';
+      });
+      html += '</div></div>';
+    });
+    box.innerHTML = html;
+    document.getElementById('planner-note').textContent = d.items.length + ' recording' + (d.items.length === 1 ? '' : 's') + (conflicts ? ' · ' + conflicts + ' clash' + (conflicts === 1 ? '' : 'es') : '');
+  } catch (e) { box.innerHTML = '<div class="empty">Could not load the planner.</div>'; }
+}
 
 // Account end-date reminder (Schedules Direct, Eaglecast): shown only when one is close, hidden for the rest of the day once dismissed.
 async function loadReminders() {
