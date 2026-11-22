@@ -5186,6 +5186,7 @@ class PrimeStreamsHealthTests(unittest.TestCase):
     def test_no_answer_is_unreachable_and_leaks_nothing(self):
         result = self._check(error=OSError("could not reach panel.invalid with secret"))
         self.assertEqual(result["state"], "unreachable")
+        self.assertEqual(result["detail"], "OSError")
         for text in ("panel.invalid", "someone", "secret"):
             self.assertNotIn(text, json.dumps(result))
 
@@ -5211,3 +5212,52 @@ class PrimeStreamsHealthTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn('id="ps-bar"', html)
         server._ps_health.update({"at": 0.0, "result": None})
+
+
+class PrimeStreamsBookingRulesTests(unittest.TestCase):
+    def tearDown(self):
+        server._ps_health.update({"at": 0.0, "result": None})
+
+    def _health(self, state, **extra):
+        server._ps_health.update({"at": time.time(), "result": dict({"state": state, "status": "", "message": "m"}, **extra)})
+
+    def test_an_offline_account_is_not_booked(self):
+        for state in ("inactive", "refused"):
+            self._health(state)
+            url, error, _ = server._primestreams_source("c1", 1000.0, 2000.0)
+            self.assertIsNone(url)
+            self.assertIn("not working right now", error)
+
+    def test_no_answer_from_the_nas_does_not_block_a_booking(self):
+        self._health("unreachable")
+        with mock.patch.object(server, "_primestreams_conflict", return_value=None), \
+             mock.patch.object(server, "_stream_url", return_value=("http://x/1.ts", None, {})):
+            self.assertIsNone(server._primestreams_source("c1", 1000.0, 2000.0)[1])
+
+    def test_a_working_account_is_booked_unless_it_is_already_full(self):
+        self._health("ok", max_connections=1)
+        with mock.patch.object(server, "_primestreams_conflict", return_value=None), \
+             mock.patch.object(server, "_stream_url", return_value=("http://x/1.ts", None, {})):
+            self.assertEqual(server._primestreams_source("c1", 1000.0, 2000.0)[1], None)
+        with mock.patch.object(server, "_primestreams_conflict", return_value=("Other Film", "ch", 1.0, 2.0)):
+            url, error, _ = server._primestreams_source("c1", 1000.0, 2000.0)
+        self.assertIsNone(url)
+        self.assertIn('overlapping "Other Film"', error)
+        self.assertEqual(server._play_blocked_note(error), 'PrimeStreams has one connection and it is busy with "Other Film"')
+
+    def test_overlap_counts_only_primestreams_bookings_up_to_the_limit(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, start_ts, stop_ts, status, stream_provider)")
+        conn.execute("INSERT INTO recordings VALUES ('a','Held','c',1000,3000,'queued','primestreams')")
+        conn.execute("INSERT INTO recordings VALUES ('b','Eagle','c',1000,3000,'queued','eaglecast')")
+        conn.commit()
+        conn.close()
+        with mock.patch.object(server, "_guide_db_path", return_value=db):
+            self._health("ok", max_connections=1)
+            self.assertEqual(server._primestreams_conflict(2000.0, 4000.0)[0], "Held")
+            self.assertIsNone(server._primestreams_conflict(3000.0, 4000.0))
+            self.assertIsNone(server._primestreams_conflict(2000.0, 4000.0, exclude_rec_id="a"))
+            self._health("ok", max_connections=2)
+            self.assertIsNone(server._primestreams_conflict(2000.0, 4000.0))

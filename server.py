@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261121d"
+VERSION = "v20261122a"
 
 app = Flask(__name__)
 
@@ -2533,11 +2533,47 @@ def _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id=''):
     except Exception:
         return None
 
+def _primestreams_conflict(start_ts, stop_ts, exclude_rec_id=''):
+    """One booking that already holds the PrimeStreams account in this window, when it is full (else None).
+
+    The account allows ``max_connections`` streams at once (one, for this account); a second stream makes the
+    provider cut the new one after a few seconds.  Only bookings that stream from PrimeStreams count.
+    """
+    active = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+    limit = _primestreams_max_connections()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=1)
+        conn.execute('PRAGMA busy_timeout=1000')
+        rows = conn.execute('''SELECT title, channel, start_ts, stop_ts FROM recordings
+                              WHERE COALESCE(stream_provider,'primestreams')='primestreams'
+                                AND status IN ({}) AND start_ts < ? AND stop_ts > ?
+                                AND rec_id != ? ORDER BY start_ts'''.format(','.join('?' * len(active))),
+                            list(active) + [stop_ts, start_ts, exclude_rec_id]).fetchall()
+        conn.close()
+    except Exception:
+        return None
+    return rows[0] if len(rows) >= limit else None
+
+
+def _primestreams_source(channel_id, start_ts, stop_ts, exclude_rec_id=''):
+    """PrimeStreams as a recording source, unless its connection is already booked for an overlapping airing."""
+    health = _primestreams_health()
+    # Only a definite answer from the panel blocks a booking.  "No answer" is the dashboard's own view from the NAS,
+    # which can differ from the recorder's, so it is shown but never blocks.
+    if health.get('state') in ('inactive', 'refused'):
+        return None, f"PrimeStreams is not working right now: {health.get('message', '')}", {}
+    conflict = _primestreams_conflict(start_ts, stop_ts, exclude_rec_id)
+    if conflict:
+        return None, (f'PrimeStreams is already scheduled for overlapping "{conflict[0]}" '
+                      f'and its account allows only that many streams at once.'), {}
+    return _stream_url(channel_id, 'primestreams')
+
+
 def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
                               preferred_provider=None):
     """Resolve a recording source, honoring a source explicitly chosen in the UI."""
     if preferred_provider == 'primestreams':
-        return _stream_url(channel_id, 'primestreams')
+        return _primestreams_source(channel_id, start_ts, stop_ts, exclude_rec_id)
     eaglecast_stream = _eaglecast_stream_for_channel(channel_id)
     eaglecast_exists = bool(eaglecast_stream)
     if eaglecast_exists:
@@ -2552,7 +2588,7 @@ def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
         # The single Eaglecast connection is occupied—or its provider mapping
         # has been quarantined after a verified wrong-program capture.
         # PrimeStreams becomes the safe fallback for this recording window.
-        url, error, debug = _stream_url(channel_id, 'primestreams')
+        url, error, debug = _primestreams_source(channel_id, start_ts, stop_ts, exclude_rec_id)
         if not error:
             if lapsed:
                 debug['fallback_reason'] = ('The Eaglecast subscription ends before this airing. '
@@ -2577,15 +2613,21 @@ def _resolve_recording_source(channel_id, start_ts, stop_ts, exclude_rec_id='',
             return None, ('Eaglecast mapping is quarantined after a verified wrong-program '
                           'capture, and PrimeStreams has no usable stream for this channel.'), {}
         title = conflict[0] if conflict else 'another recording'
+        if error and 'PrimeStreams is already scheduled' in str(error):
+            return None, (f'Eaglecast is already scheduled for overlapping "{title}", '
+                          f'and {error}'), {}
         return None, (f'Eaglecast is already scheduled for overlapping "{title}", '
                       'and PrimeStreams has no usable stream for this channel.'), {}
-    return _stream_url(channel_id, 'primestreams')
+    return _primestreams_source(channel_id, start_ts, stop_ts, exclude_rec_id)
 
 def _play_blocked_note(error):
     """Plain-words reason a live airing cannot be played or recorded right now."""
     error = str(error or '')
     if not error:
         return ''
+    if error.startswith('PrimeStreams is already scheduled for overlapping'):
+        parts = error.split('"')
+        return f'PrimeStreams has one connection and it is busy with "{parts[1] if len(parts) >= 3 else "another recording"}"'
     if 'already scheduled for overlapping' in error:
         parts = error.split('"')
         title = parts[1] if len(parts) >= 3 else 'another recording'
@@ -3206,9 +3248,14 @@ def _check_primestreams():
         url = f"{base}/player_api.php?username={quote(str(user), safe='')}&password={quote(str(passwd), safe='')}"
         with urlreq.urlopen(url, timeout=10) as reply:
             data = json.loads(reply.read())
-    except Exception:
-        return {'state': 'unreachable', 'status': '',
-                'message': 'PrimeStreams did not answer (the server may be down or the address changed).'}
+    except Exception as exc:
+        # Only the kind of failure, never its text (the text can contain the address).
+        reason = getattr(exc, 'reason', None)
+        kind = type(exc).__name__ + (f' / {type(reason).__name__}' if reason is not None else '')
+        code = getattr(exc, 'code', None)
+        return {'state': 'unreachable', 'status': '', 'detail': kind + (f' / HTTP {code}' if code else ''),
+                'message': 'PrimeStreams did not answer this dashboard (the server may be down, the address changed, '
+                           'or the NAS cannot reach it).'}
     info = data.get('user_info') if isinstance(data, dict) else None
     if not isinstance(info, dict) or str(info.get('auth', '')) != '1':
         return {'state': 'refused', 'status': '',
@@ -3217,7 +3264,21 @@ def _check_primestreams():
     if status and status.lower() != 'active':
         return {'state': 'inactive', 'status': status,
                 'message': 'PrimeStreams knows the login but the account is not active, so it will refuse streams.'}
-    return {'state': 'ok', 'status': status, 'message': 'PrimeStreams is working.'}
+    result = {'state': 'ok', 'status': status, 'message': 'PrimeStreams is working.'}
+    try:
+        result['max_connections'] = int(info.get('max_connections'))
+    except (TypeError, ValueError):
+        pass
+    return result
+
+
+def _primestreams_max_connections():
+    """How many connections the PrimeStreams account allows (from the last check); 1 when it is not known."""
+    try:
+        value = int(_primestreams_health().get('max_connections') or 1)
+    except Exception:
+        value = 1
+    return max(1, value)
 
 
 def _primestreams_health(max_age=PRIMESTREAMS_HEALTH_SECONDS):
@@ -10345,6 +10406,14 @@ def api_agent_claim():
     # While PrimeStreams is switched off its bookings are left queued: the recorder is never handed one.
     skip_primestreams = "AND COALESCE(candidate.stream_provider,'primestreams') = 'eaglecast'" \
         if not _primestreams_enabled() else ''
+    if _primestreams_max_connections() <= 1:
+        # One PrimeStreams stream at a time: a PrimeStreams booking is not handed out while another is under way.
+        skip_primestreams += """ AND (COALESCE(candidate.stream_provider,'primestreams') != 'primestreams'
+                OR NOT EXISTS (SELECT 1 FROM recordings AS busy
+                               WHERE busy.rec_id != candidate.rec_id
+                                 AND COALESCE(busy.stream_provider,'primestreams')='primestreams'
+                                 AND busy.status IN ('agent_claimed','preflight','waiting','recording')
+                                 AND busy.start_ts < candidate.stop_ts AND busy.stop_ts > candidate.start_ts))"""
     conn = sqlite3.connect(_guide_db_path(), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:

@@ -3595,8 +3595,18 @@ class PrimeStreamsConnectionCheckTests(unittest.TestCase):
             with mock.patch.object(recording_agent, "provider_connections", return_value=counts):
                 self.assertTrue(recording_agent.wait_for_free_connection(api, self._job(), self.CFG))
         with mock.patch.object(recording_agent, "provider_connections") as check:
-            self.assertTrue(recording_agent.wait_for_free_connection(api, self._job(provider="eaglecast"), self.CFG))
+            self.assertTrue(recording_agent.wait_for_free_connection(api, self._job(provider="other"), self.CFG))
             check.assert_not_called()
+
+    def test_eaglecast_is_checked_the_same_way_and_named_in_the_reason(self):
+        api = mock.Mock()
+        job = self._job(start=1000.0, provider="eaglecast")
+        with mock.patch.object(recording_agent, "provider_connections", return_value=(1, 1)) as check:
+            ok = recording_agent.wait_for_free_connection(
+                api, job, self.CFG, sleep=lambda *a, **k: True, now=lambda: 1000.0 + 121)
+        self.assertFalse(ok)
+        self.assertEqual(check.call_args[0][1], "eaglecast")
+        self.assertIn("Eaglecast already had 1 of 1", api.patient_heartbeat.call_args[1]["message"])
 
     def test_it_waits_until_the_connection_is_free(self):
         api, sleeps = mock.Mock(), []
