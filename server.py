@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122g"
+VERSION = "v20261122h"
 
 app = Flask(__name__)
 
@@ -8705,6 +8705,8 @@ def api_airings():
                 r['channel_id'], su.timestamp(), eu.timestamp()
             )
             stream_quality = _saved_stream_quality(r['channel_id']) or {}
+            on_now = su.timestamp() <= now_ts < eu.timestamp()
+            can_play, play_note = _airing_play_state(r['channel_id'], r['channel_name'], on_now, stream_error)
             airings.append({
                 'channel_id':   r['channel_id'],
                 'channel_name': r['channel_name'],
@@ -8712,7 +8714,7 @@ def api_airings():
                 'stop_ts':      eu.timestamp(),
                 'start_fmt':    sl.strftime('%a %b %-d, %-I:%M %p'),
                 'stop_fmt':     el.strftime('%-I:%M %p'),
-                'can_play':     not stream_error and not _is_foreign_recording_feed(r['channel_name']),
+                'can_play':     can_play,
                 'can_record':   not stream_error and not _is_foreign_recording_feed(r['channel_name']),
                 'stream_provider': str(stream_debug.get('provider') or ''),
                 'stream_quality': {
@@ -8724,8 +8726,8 @@ def api_airings():
                 'reliability': reliability_by_channel.get(r['channel_id'], {}),
                 'commercial_free': _is_commercial_free_channel(r['channel_name']),
                 'stream_channel': stream_debug.get('matched_guide_channel') or '',
-                'play_note':    _play_blocked_note(stream_error),
-                'on_now':       su.timestamp() <= now_ts < eu.timestamp(),
+                'play_note':    play_note,
+                'on_now':       on_now,
                 'prog_type':    r['prog_type'] or '',
                 'category':     r['category'] or '',
                 'episode_title': r['episode_title'] or '',
@@ -9021,6 +9023,19 @@ def _busy_eaglecast_titles(recs):
     return sorted({str(r.get('title', '')) for r in recs
                    if (r.get('stream_provider') or 'primestreams') == 'eaglecast'
                    and _rec_status_base(r.get('status')) in _PROVIDER_CONNECTION_STATES})
+
+def _airing_play_state(channel_id, channel_name, on_now, record_error):
+    """(can_play, why not) for one airing in the programme window.
+
+    An airing that is on NOW is played live, so it is judged like live viewing (a recording that is actually using
+    the connection blocks it), not by the whole recording window: a booking later in the airing would otherwise hide
+    Play although nothing is recording.  Other airings keep the recording check.
+    """
+    error = record_error
+    if on_now:
+        _url, error, _dbg = _live_stream_url(channel_id)
+    return (not error and not _is_foreign_recording_feed(channel_name)), _play_blocked_note(error)
+
 
 def _live_stream_url(channel_id):
     """Stream for watching a channel live now: Eaglecast first when it is mapped, but PrimeStreams when a recording

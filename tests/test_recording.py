@@ -5541,3 +5541,24 @@ class CancelOutsideMemoryTests(unittest.TestCase):
         self.assertEqual(calls, [("old", "cancelled", "Cancelled by user")])
         self.assertEqual(refused.status_code, 409)
         self.assertEqual(missing.status_code, 404)
+
+
+class AiringPlayStateTests(unittest.TestCase):
+    def test_a_live_airing_is_judged_as_live_viewing_not_by_its_whole_recording_window(self):
+        busy_later = 'Eaglecast is already scheduled for overlapping "The Hunger Games", and PrimeStreams has no usable stream for this channel.'
+        with mock.patch.object(server, "_live_stream_url", return_value=("http://x/1.ts", None, {"provider": "eaglecast"})), \
+             mock.patch.object(server, "_is_foreign_recording_feed", return_value=False):
+            ok, note = server._airing_play_state("c1", "NFL RedZone HD", True, busy_later)
+            self.assertTrue(ok)
+            self.assertEqual(note, "")
+            # a later airing is not live, so it keeps the recording check
+            later_ok, later_note = server._airing_play_state("c1", "NFL RedZone HD", False, busy_later)
+            self.assertFalse(later_ok)
+            self.assertIn("busy with", later_note)
+
+    def test_a_live_airing_with_no_live_source_says_why(self):
+        with mock.patch.object(server, "_live_stream_url", return_value=(None, "PrimeStreams is switched off, no.", {})), \
+             mock.patch.object(server, "_is_foreign_recording_feed", return_value=False):
+            ok, note = server._airing_play_state("c1", "X", True, None)
+        self.assertFalse(ok)
+        self.assertTrue(note)
