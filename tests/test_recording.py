@@ -5485,3 +5485,34 @@ class PlannerActionsTests(unittest.TestCase):
             done = client.post("/epg-web/api/recording-plan/cancel-copies", json={"id": "keep", "apply": True}).get_json()
         self.assertEqual(done["cancelled"], 2)
         self.assertEqual(set(cancelled), {"dup1", "dup2"})
+
+
+class PlannerMissedTests(unittest.TestCase):
+    def test_a_queued_booking_whose_time_has_passed_is_missed_and_hidden_not_a_clash(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, start_ts, stop_ts, status, stream_provider, "
+                     "season_num, episode_num, is_series, failure_reason)")
+        now = time.time()
+        for rid, a, b in (("old1", now - 7200, now - 600), ("old2", now - 5000, now - 300), ("next", now + 3600, now + 7200)):
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?,'queued','primestreams',NULL,NULL,0,NULL)", (rid, rid, "ch", a, b))
+        conn.commit()
+        conn.close()
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "load_config", return_value={"timezone": "UTC"}), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+            client = server.app.test_client()
+            from datetime import datetime, timezone
+            day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+            default = client.get("/epg-web/api/recording-plan?date=" + day).get_json()
+            everything = client.get("/epg-web/api/recording-plan?date=" + day + "&all=1").get_json()
+        ids = {i["id"] for i in default["items"]}
+        self.assertNotIn("old1", ids)
+        self.assertNotIn("old2", ids)
+        self.assertFalse(any(i["conflict"] for i in default["items"]))
+        by = {i["id"]: i for i in everything["items"]}
+        for rid in ("old1", "old2"):
+            if rid in by:
+                self.assertEqual(by[rid]["status"], "missed")
+                self.assertFalse(by[rid]["conflict"])
