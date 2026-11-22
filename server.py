@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122e"
+VERSION = "v20261122g"
 
 app = Flask(__name__)
 
@@ -10392,10 +10392,13 @@ def api_recording_plan():
     items = []
     for row in rows:
         r = dict(row)
-        if not show_all and _rec_status_base(r['status']) not in planned:
-            continue            # the planner shows what is planned; finished and failed ones only on request
+        status = _rec_status_base(r['status'])
+        if status in ('queued', 'scheduled') and float(r['stop_ts'] or 0) <= time.time():
+            status = 'missed'       # its time came and went without it being recorded
+        if not show_all and status not in planned:
+            continue            # the planner shows what is planned; finished, failed and missed ones only on request
         items.append({'id': r['rec_id'], 'title': r['title'], 'channel': r['channel'],
-                      'start_ts': r['start_ts'], 'stop_ts': r['stop_ts'], 'status': _rec_status_base(r['status']),
+                      'start_ts': r['start_ts'], 'stop_ts': r['stop_ts'], 'status': status,
                       'provider': r['stream_provider'] or 'primestreams', 'film': _is_film_booking(r),
                       'reason': r['failure_reason'] or ''})
     capacity = {'eaglecast': 1, 'primestreams': _primestreams_max_connections()}
@@ -10626,7 +10629,15 @@ def api_rec_cancel():
     with _rec_lock:
         r = _recs.get(rec_id)
         if not r:
-            return jsonify({'ok': False, 'error': 'Recording not found'}), 404
+            # Not held in memory (an old or already-passed booking): cancel it straight in the database.
+            row = _plan_booking(rec_id)
+            if not row:
+                return jsonify({'ok': False, 'error': 'Recording not found'}), 404
+            status = _rec_status_base(row['status'])
+            if status not in ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting'):
+                return jsonify({'ok': False, 'error': f'Recording cannot be cancelled while {status}'}), 409
+            _db_update_rec_status(rec_id, 'cancelled', 'Cancelled by user')
+            return jsonify({'ok': True, 'cancelled': True, 'id': rec_id})
         status = _rec_status_base(r.get('status'))
         if status not in ('queued', 'scheduled', 'agent_claimed', 'preflight',
                           'waiting', 'recording', 'awaiting_transfer', 'transferring'):
@@ -12609,6 +12620,7 @@ function plannerMove(days) {
 }
 function plannerColor(it) {
   if (it.status === 'failed' || it.status === 'error') return '#7f1d1d';
+  if (it.status === 'missed') return '#52525b';
   if (it.status === 'done' || it.status === 'done_ts') return '#374151';
   if (['recording', 'converting', 'awaiting_transfer', 'transferring'].indexOf(it.status) >= 0) return '#166534';
   return it.film ? '#92400e' : '#1e3a8a';
@@ -12639,7 +12651,7 @@ async function plannerSelect(id) {
   plannerCurrent = it || null;
   if (!it) { box.style.display = 'none'; return; }
   const queued = it.status === 'queued' || it.status === 'scheduled';
-  const failed = it.status === 'failed' || it.status === 'error';
+  const failed = it.status === 'failed' || it.status === 'error' || it.status === 'missed';
   const here = it.provider === 'eaglecast' ? 'Eaglecast' : 'PrimeStreams';
   const there = it.provider === 'eaglecast' ? 'PrimeStreams' : 'Eaglecast';
   let h = '<div style="font-size:15px;font-weight:700;">' + esc(it.title) + '</div>';
