@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122f"
+VERSION = "v20261122g"
 
 app = Flask(__name__)
 
@@ -10629,7 +10629,15 @@ def api_rec_cancel():
     with _rec_lock:
         r = _recs.get(rec_id)
         if not r:
-            return jsonify({'ok': False, 'error': 'Recording not found'}), 404
+            # Not held in memory (an old or already-passed booking): cancel it straight in the database.
+            row = _plan_booking(rec_id)
+            if not row:
+                return jsonify({'ok': False, 'error': 'Recording not found'}), 404
+            status = _rec_status_base(row['status'])
+            if status not in ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting'):
+                return jsonify({'ok': False, 'error': f'Recording cannot be cancelled while {status}'}), 409
+            _db_update_rec_status(rec_id, 'cancelled', 'Cancelled by user')
+            return jsonify({'ok': True, 'cancelled': True, 'id': rec_id})
         status = _rec_status_base(r.get('status'))
         if status not in ('queued', 'scheduled', 'agent_claimed', 'preflight',
                           'waiting', 'recording', 'awaiting_transfer', 'transferring'):

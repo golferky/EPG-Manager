@@ -5516,3 +5516,28 @@ class PlannerMissedTests(unittest.TestCase):
             if rid in by:
                 self.assertEqual(by[rid]["status"], "missed")
                 self.assertFalse(by[rid]["conflict"])
+
+
+class CancelOutsideMemoryTests(unittest.TestCase):
+    def test_a_booking_not_held_in_memory_is_cancelled_in_the_database(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, channel_id, start_ts, stop_ts, status, "
+                     "stream_provider, season_num, episode_num, failure_reason)")
+        conn.execute("INSERT INTO recordings VALUES ('old','Old','c','c',1,2,'queued','primestreams',NULL,NULL,NULL)")
+        conn.execute("INSERT INTO recordings VALUES ('busy','Busy','c','c',1,2,'recording','primestreams',NULL,NULL,NULL)")
+        conn.commit()
+        conn.close()
+        server._recs.pop("old", None)
+        calls = []
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_db_update_rec_status", side_effect=lambda *a, **k: calls.append(a)):
+            client = server.app.test_client()
+            ok = client.post("/epg-web/api/record/cancel", json={"id": "old"})
+            refused = client.post("/epg-web/api/record/cancel", json={"id": "busy"})
+            missing = client.post("/epg-web/api/record/cancel", json={"id": "nope"})
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(calls, [("old", "cancelled", "Cancelled by user")])
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(missing.status_code, 404)
