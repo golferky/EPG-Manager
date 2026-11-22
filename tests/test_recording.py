@@ -5151,3 +5151,63 @@ class PrimeStreamsSwitchTests(unittest.TestCase):
         self.assertEqual(done["moved"], 1)
         row = sq.connect(db).execute("SELECT stream_provider, stream_id FROM recordings WHERE rec_id='a'").fetchone()
         self.assertEqual(row, ("eaglecast", "11"))
+
+
+class PrimeStreamsHealthTests(unittest.TestCase):
+    CFG = {"epg_url": "http://panel.invalid:826", "epg_user": "someone", "epg_pass": "secret"}
+
+    def _check(self, payload=None, error=None, cfg=None):
+        import io
+        from urllib import request as urlreq
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+        patch = mock.patch.object(urlreq, "urlopen", side_effect=error) if error else \
+            mock.patch.object(urlreq, "urlopen", return_value=Response(json.dumps(payload).encode()))
+        with mock.patch.object(server, "load_config", return_value=self.CFG if cfg is None else cfg), patch:
+            return server._check_primestreams()
+
+    def test_working_account_is_ok(self):
+        self.assertEqual(self._check({"user_info": {"auth": 1, "status": "Active"}})["state"], "ok")
+
+    def test_known_login_but_account_not_active(self):
+        result = self._check({"user_info": {"auth": 1, "status": "Expired"}})
+        self.assertEqual(result["state"], "inactive")
+        self.assertIn("not active", result["message"])
+
+    def test_login_not_accepted(self):
+        self.assertEqual(self._check({"user_info": {"auth": 0}})["state"], "refused")
+        self.assertEqual(self._check({"something": "else"})["state"], "refused")
+
+    def test_no_answer_is_unreachable_and_leaks_nothing(self):
+        result = self._check(error=OSError("could not reach panel.invalid with secret"))
+        self.assertEqual(result["state"], "unreachable")
+        for text in ("panel.invalid", "someone", "secret"):
+            self.assertNotIn(text, json.dumps(result))
+
+    def test_nothing_saved(self):
+        self.assertEqual(self._check({}, cfg={})["state"], "not_set_up")
+
+    def test_the_answer_is_reused_for_a_few_minutes_and_fresh_repeats_it(self):
+        server._ps_health.update({"at": 0.0, "result": None})
+        with mock.patch.object(server, "_check_primestreams",
+                               return_value={"state": "ok", "status": "Active", "message": "x"}) as check:
+            server._primestreams_health()
+            server._primestreams_health()
+            self.assertEqual(check.call_count, 1)
+            server._primestreams_health(0)
+            self.assertEqual(check.call_count, 2)
+        server._ps_health.update({"at": 0.0, "result": None})
+
+    def test_the_status_endpoint_reports_health_and_the_page_has_the_bar(self):
+        server._ps_health.update({"at": time.time(), "result": {"state": "inactive", "status": "", "message": "m"}})
+        data = server.app.test_client().get("/epg-web/api/primestreams").get_json()
+        self.assertEqual(data["health"]["state"], "inactive")
+        self.assertIn("enabled", data)
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="ps-bar"', html)
+        server._ps_health.update({"at": 0.0, "result": None})
