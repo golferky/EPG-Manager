@@ -26,7 +26,7 @@ Read this first. It records how the owner's machines are set up and how changes 
 - Keep iPhone/iPad Safari and Windows working. VLC is the default player.
 - The dashboard's HTML/JS lives in a non-raw Python triple-quoted string, so use no backslashes in the JS. Validate with a Jinja render and `node --check` on the extracted scripts.
 - FFmpeg runs with `-nostdin` and `stdin=DEVNULL` (otherwise it wrecks the user's Terminal).
-- 24/7-channel recording is tabled; do not revisit unless asked.
+- 24/7-channel recording is tabled; do not revisit unless asked. (The owner asked again on Nov 22 and it works: `mac/record_247.py` and `mac/split_247.py`. Raymond: capture only when nothing else uses the PrimeStreams connection (1 drop in 150 min that way), repair a capture that has a drop with `ffmpeg -nostdin -i X.ts -c copy Y.ts` before splitting (ffprobe's length is wrong after a join), and split with `--skip-start 36.0 --keep-after 15.5` because each Raymond break is a 12 s black of credits, a logo, a bumper and a 2.7 s black before the episode. Andy Griffith needs neither option.)
 - **Never put a partial or damaged movie into Plex**, even one that is only missing opening credits or a few minutes. Only complete, clean recordings go in `Movies`. Partials stay in `Incomplete Recordings` (or are deleted on request) and the film stays on Wanted so it is re-recorded.
 - Tests: `python3 -m unittest discover -s tests` (needs `pip install flask`).
 

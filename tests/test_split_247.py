@@ -106,3 +106,13 @@ class CutCheckTests(unittest.TestCase):
                 sp.probe_duration = original
         finally:
             os.remove(path)
+
+
+class TrimTests(unittest.TestCase):
+    def test_by_default_a_cut_starts_one_second_into_the_black_and_ends_at_the_next_marker(self):
+        self.assertEqual(sp.trim_episodes([(100.0, 1400.0, 1300.0)]), [(101.0, 1400.0)])
+
+    def test_the_lead_in_is_skipped_and_the_closing_credits_are_kept(self):
+        cuts = sp.trim_episodes([(878.44, 2169.22, 1290.78)], skip_start=36.0, keep_after=15.5)
+        self.assertAlmostEqual(cuts[0][0], 914.44, places=2)
+        self.assertAlmostEqual(cuts[0][1], 2184.72, places=2)
