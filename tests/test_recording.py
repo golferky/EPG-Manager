@@ -5190,6 +5190,12 @@ class PrimeStreamsHealthTests(unittest.TestCase):
         for text in ("panel.invalid", "someone", "secret"):
             self.assertNotIn(text, json.dumps(result))
 
+    def test_an_http_401_from_the_panel_means_the_login_was_refused(self):
+        from urllib import error as urlerr
+        result = self._check(error=urlerr.HTTPError("http://panel.invalid/x", 401, "Unauthorized", {}, None))
+        self.assertEqual(result["state"], "refused")
+        self.assertNotIn("panel.invalid", json.dumps(result))
+
     def test_nothing_saved(self):
         self.assertEqual(self._check({}, cfg={})["state"], "not_set_up")
 

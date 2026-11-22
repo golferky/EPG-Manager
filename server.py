@@ -3249,6 +3249,10 @@ def _check_primestreams():
         with urlreq.urlopen(url, timeout=10) as reply:
             data = json.loads(reply.read())
     except Exception as exc:
+        if getattr(exc, 'code', None) in (401, 403):
+            # The panel answered and said no: a login it does not accept, not a missing server.
+            return {'state': 'refused', 'status': '', 'detail': f'HTTP {exc.code}',
+                    'message': 'PrimeStreams did not accept the saved login. Check the address, username and password.'}
         # Only the kind of failure, never its text (the text can contain the address).
         reason = getattr(exc, 'reason', None)
         kind = type(exc).__name__ + (f' / {type(reason).__name__}' if reason is not None else '')
