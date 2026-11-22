@@ -5300,3 +5300,76 @@ class RefreshBookingStreamsTests(unittest.TestCase):
         self.assertEqual(done["changed"], 1)
         rows = dict(sq.connect(db).execute("SELECT rec_id, stream_id FROM recordings"))
         self.assertEqual(rows, {"a": "111", "b": "200", "c": "300", "d": "400"})
+
+
+class FilmFirstSlotsTests(unittest.TestCase):
+    CARRIED = {"eaglecast": {"c1", "c2", "c3"}, "primestreams": {"c1", "c2", "c3"}}
+
+    def _db(self, rows):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, channel_id, start_ts, stop_ts, status, "
+                     "stream_provider, stream_id, stream_extension, season_num, episode_num, is_series, failure_reason)")
+        for r in rows:
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?,?,'queued',?,'9','ts',?,?,?,NULL)", r)
+        conn.commit()
+        conn.close()
+        return db
+
+    def _run(self, db, carried=None, apply_it=True, primestreams_slots=1):
+        carried = self.CARRIED if carried is None else carried
+        source = lambda provider, cid, stop, expiry: ("77", "ts") if cid in carried[provider] else None
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_eaglecast_enabled", return_value=True), \
+             mock.patch.object(server, "_primestreams_enabled", return_value=True), \
+             mock.patch.object(server, "_eaglecast_expiry", return_value=(None, "")), \
+             mock.patch.object(server, "_primestreams_health", return_value={"state": "ok"}), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=primestreams_slots), \
+             mock.patch.object(server, "_slot_source", side_effect=source):
+            return server._rebalance_slots(apply_it)
+
+    def _state(self, db):
+        import sqlite3 as sq
+        return {r[0]: (r[1], r[2]) for r in sq.connect(db).execute("SELECT rec_id, stream_provider, status FROM recordings")}
+
+    def test_a_film_takes_eaglecast_and_the_episode_moves_to_primestreams(self):
+        t = time.time() + 86400
+        db = self._db([("ep", "A Rerun", "c1", "c1", t, t + 3600, "eaglecast", 2, 5, 1),
+                       ("film", "A Film", "c2", "c2", t + 600, t + 4200, "primestreams", None, None, 0)])
+        result = self._run(db)
+        self.assertEqual({m["id"]: m["to"] for m in result["moves"]}, {"film": "eaglecast", "ep": "primestreams"})
+        self.assertEqual(self._state(db), {"ep": ("primestreams", "queued"), "film": ("eaglecast", "queued")})
+
+    def test_an_episode_that_only_the_film_s_connection_could_carry_is_not_recorded(self):
+        t = time.time() + 86400
+        carried = {"eaglecast": {"c1", "c2"}, "primestreams": set()}
+        db = self._db([("ep", "A Rerun", "c1", "c1", t, t + 3600, "eaglecast", 2, 5, 1),
+                       ("film", "A Film", "c2", "c2", t + 600, t + 4200, "eaglecast", None, None, 0)])
+        result = self._run(db, carried=carried)
+        self.assertEqual([e["id"] for e in result["not_recorded"]], ["ep"])
+        self.assertEqual(self._state(db)["ep"][1], "failed")
+        self.assertEqual(self._state(db)["film"], ("eaglecast", "queued"))
+
+    def test_report_only_changes_nothing_and_non_overlapping_bookings_are_left_alone(self):
+        t = time.time() + 86400
+        db = self._db([("ep", "A Rerun", "c1", "c1", t, t + 3600, "eaglecast", 2, 5, 1),
+                       ("film", "A Film", "c2", "c2", t + 600, t + 4200, "primestreams", None, None, 0),
+                       ("late", "Later", "c3", "c3", t + 9000, t + 12000, "primestreams", 2, 6, 1)])
+        before = self._state(db)
+        result = self._run(db, apply_it=False)
+        self.assertTrue(result["moves"])
+        self.assertEqual(self._state(db), before)
+        self.assertNotIn("late", [m["id"] for m in result["moves"]] + [e["id"] for e in result["not_recorded"]])
+
+    def test_two_episodes_that_clash_are_left_alone_and_a_channel_nobody_carries_is_never_dropped(self):
+        t = time.time() + 86400
+        carried = {"eaglecast": {"c1"}, "primestreams": {"c1"}}
+        db = self._db([("e1", "Show", "c1", "c1", t, t + 3600, "eaglecast", 1, 1, 1),
+                       ("e2", "Show", "c1", "c1", t + 60, t + 3700, "primestreams", 1, 2, 1),
+                       ("e3", "Show", "c1", "c1", t + 120, t + 3800, "primestreams", 1, 3, 1),
+                       ("x", "Odd", "c9", "c9", t, t + 3600, "primestreams", 1, 4, 1)])
+        result = self._run(db, carried=carried)
+        self.assertEqual(result["not_recorded"], [])
+        self.assertTrue({"e3", "x"} <= {e["id"] for e in result["left_alone"]})
+        self.assertEqual({v[1] for v in self._state(db).values()}, {"queued"})

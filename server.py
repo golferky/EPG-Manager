@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122b"
+VERSION = "v20261122c"
 
 app = Flask(__name__)
 
@@ -3370,6 +3370,140 @@ def _move_primestreams_bookings(apply_it):
     keep = ('id', 'title', 'channel', 'start_ts', 'why')
     strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
     return {'applied': bool(apply_it), 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)}
+
+
+SLOT_PROVIDERS = ('eaglecast', 'primestreams')
+SLOT_RUNNING = ('agent_claimed', 'preflight', 'waiting', 'recording')
+
+
+def _is_film_booking(row):
+    """A film (not an episode of a show): no season or episode number and not part of a series."""
+    return not (row.get('is_series') or row.get('season_num') or row.get('episode_num'))
+
+
+def _slot_source(provider, channel_id, stop_ts, expiry):
+    """(stream_id, extension) when ``provider`` can carry this channel for this window, else None."""
+    if provider == 'eaglecast':
+        stream = _eaglecast_stream_for_channel(channel_id)
+        if not stream or _is_quarantined_eaglecast_stream(stream):
+            return None
+        if expiry and stop_ts and float(stop_ts) > expiry:
+            return None
+        return str(stream[0]), str(stream[2] or 'ts')
+    url, error, debug = _stream_url(channel_id, 'primestreams')
+    if error or not url:
+        return None
+    return str((debug or {}).get('stream_id') or ''), str((debug or {}).get('stream_extension') or 'ts')
+
+
+def _rebalance_slots(apply_it):
+    """Give the scarce streaming connections to films first.
+
+    Eaglecast carries one recording at a time, and PrimeStreams as many as its account allows (one).  Queued
+    bookings are placed highest priority first (a film before an episode, then earlier first), each on Eaglecast
+    if it can carry the channel and a connection is free, otherwise on PrimeStreams.  A booking that now sits on
+    the other provider is switched.  An episode that cannot be placed because a film holds the connection it
+    needed is not recorded (it is marked failed with that reason, so Recording Health offers a re-record); every
+    other booking that cannot be placed is left exactly as it is and listed.  Nothing changes unless ``apply_it``.
+    Bookings already recording, or about to start, are never touched.
+    """
+    now = time.time()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,stream_id,"
+            "stream_extension,season_num,episode_num,is_series FROM recordings "
+            "WHERE stop_ts>? AND status IN ('queued','scheduled','agent_claimed','preflight','waiting','recording')",
+            (now,)).fetchall()]
+    except sqlite3.Error as exc:
+        return {'error': str(exc)}
+    expiry, _src = _eaglecast_expiry()
+    health_state = _primestreams_health().get('state')
+    available = {'eaglecast': _eaglecast_enabled(),
+                 'primestreams': _primestreams_enabled() and health_state not in ('inactive', 'refused')}
+    capacity = {'eaglecast': 1, 'primestreams': _primestreams_max_connections()}
+    placed = {p: [] for p in SLOT_PROVIDERS}
+    movable = []
+    for row in rows:
+        provider = row['stream_provider'] or 'primestreams'
+        fixed = row['status'] in SLOT_RUNNING or float(row['start_ts']) <= now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS
+        if fixed and provider in placed:
+            placed[provider].append((float(row['start_ts']), float(row['stop_ts']), row))
+        elif not fixed:
+            movable.append(row)
+
+    def busy(provider, row):
+        return sum(1 for a, b, _r in placed[provider]
+                   if a < float(row['stop_ts']) and b > float(row['start_ts'])) >= capacity[provider]
+
+    def blocked_by_film(row):
+        """True when every provider that could carry this booking is held, in its window, by a film."""
+        carriers = [p for p in SLOT_PROVIDERS
+                    if available[p] and _slot_source(p, row['channel_id'], row['stop_ts'], expiry)]
+        return bool(carriers) and all(
+            any(a < float(row['stop_ts']) and b > float(row['start_ts']) and _is_film_booking(r)
+                for a, b, r in placed[p]) for p in carriers)
+
+    moves, bumps, unplaced = [], [], []
+    for row in sorted(movable, key=lambda r: (0 if _is_film_booking(r) else 1, float(r['start_ts']))):
+        chosen = None
+        current = row['stream_provider'] or 'primestreams'
+        # A film tries Eaglecast first; an episode stays where it is unless that connection is needed.
+        order = SLOT_PROVIDERS if _is_film_booking(row) else (current,) + tuple(p for p in SLOT_PROVIDERS if p != current)
+        for provider in order:
+            if provider not in placed or not available[provider] or busy(provider, row):
+                continue
+            source = _slot_source(provider, row['channel_id'], row['stop_ts'], expiry)
+            if source and source[0]:
+                chosen = (provider, source)
+                break
+        entry = {'id': row['rec_id'], 'title': row['title'], 'channel': row['channel'], 'start_ts': row['start_ts']}
+        if chosen:
+            provider, (stream_id, extension) = chosen
+            placed[provider].append((float(row['start_ts']), float(row['stop_ts']), row))
+            if provider != (row['stream_provider'] or 'primestreams'):
+                moves.append(dict(entry, to=provider, stream_id=stream_id, stream_extension=extension))
+        else:
+            # Keep it where it is, so later (lower priority) bookings see its connection as taken.
+            provider = row['stream_provider'] or 'primestreams'
+            if provider in placed:
+                placed[provider].append((float(row['start_ts']), float(row['stop_ts']), row))
+            if not _is_film_booking(row) and blocked_by_film(row):
+                bumps.append(entry)
+            else:
+                unplaced.append(entry)
+    if apply_it and (moves or bumps):
+        for entry in moves:
+            conn.execute("UPDATE recordings SET stream_provider=?, stream_id=?, stream_extension=? WHERE rec_id=? "
+                         "AND status IN ('queued','scheduled')",
+                         (entry['to'], entry['stream_id'], entry['stream_extension'], entry['id']))
+        reason = 'Not recorded: a film needed the only free streaming connection at this time'
+        for entry in bumps:
+            conn.execute("UPDATE recordings SET status='failed', failure_reason=? WHERE rec_id=? "
+                         "AND status IN ('queued','scheduled')", (reason, entry['id']))
+        conn.commit()
+        with _rec_lock:
+            for entry in moves:
+                rec = _recs.get(entry['id'])
+                if rec:
+                    rec.update({'stream_provider': entry['to'], 'stream_id': entry['stream_id'],
+                                'stream_extension': entry['stream_extension']})
+            for entry in bumps:
+                rec = _recs.get(entry['id'])
+                if rec:
+                    rec.update({'status': 'failed', 'failure_reason': reason})
+    conn.close()
+    keep = ('id', 'title', 'channel', 'start_ts', 'to')
+    strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
+    return {'applied': bool(apply_it), 'moves': strip(moves), 'not_recorded': strip(bumps), 'left_alone': strip(unplaced)}
+
+
+@app.route('/epg-web/api/recording-slots/rebalance', methods=['POST'])
+def api_rebalance_slots():
+    """Report, or with {"apply": true} perform, the film-first placement of queued bookings."""
+    result = _rebalance_slots((request.json or {}).get('apply') is True)
+    return jsonify(result), (400 if 'error' in result else 200)
 
 
 def _refresh_queued_stream_ids(apply_it):
@@ -6878,6 +7012,13 @@ def _auto_record_wanted_loop():
             _auto_record_wanted()
         except Exception as exc:
             print(f'[auto-wanted] loop error: {exc}')
+        try:
+            result = _rebalance_slots(True)
+            if result.get('moves') or result.get('not_recorded'):
+                print(f"[slots] moved {len(result['moves'])} booking(s), {len(result['not_recorded'])} not recorded "
+                      f"because a film needed the connection")
+        except Exception as exc:
+            print(f'[slots] rebalance error: {exc}')
         time.sleep(1800)
 
 
