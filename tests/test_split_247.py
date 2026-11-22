@@ -60,3 +60,21 @@ class SplitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JoinedCaptureLengthTests(unittest.TestCase):
+    def test_the_length_comes_from_the_last_progress_line(self):
+        log = "frame= 100 time=00:00:04.00 bitrate=1\nframe= 999 time=02:24:10.52 bitrate=2\nvideo:1kB"
+        self.assertAlmostEqual(sp.parse_total_seconds(log), 2 * 3600 + 24 * 60 + 10.52, places=2)
+        self.assertEqual(sp.parse_total_seconds("no progress here"), 0.0)
+
+    def test_the_start_is_the_creation_time_when_the_system_keeps_one(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            path = handle.name
+        try:
+            began = sp.recording_began(path, 600)
+            stat = os.stat(path)
+            expected = getattr(stat, "st_birthtime", 0) or stat.st_mtime - 600
+            self.assertAlmostEqual(began, expected, places=2)
+        finally:
+            os.remove(path)

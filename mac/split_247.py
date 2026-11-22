@@ -29,6 +29,22 @@ import time
 BLACK_LINE = re.compile(r'black_start:([0-9.]+) black_end:([0-9.]+)')
 
 
+TIME_LINE = re.compile(r'time=(\d+):(\d\d):(\d\d(?:\.\d+)?)')
+
+
+def parse_total_seconds(log):
+    """The length FFmpeg actually read, from its last progress line (0.0 if it printed none).
+
+    ffprobe's length is wrong for a capture that was joined after a drop: the clock restarts at the join, so it
+    reports only the part after it.  FFmpeg's own pass over the file corrects the join.
+    """
+    found = TIME_LINE.findall(log)
+    if not found:
+        return 0.0
+    hours, minutes, seconds = found[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
 def parse_blacks(log):
     """[(start, end)] of every black moment in FFmpeg's blackdetect output."""
     return [(float(a), float(b)) for a, b in BLACK_LINE.findall(log)]
@@ -82,10 +98,18 @@ def probe_duration(path):
 
 
 def find_blacks(path):
+    """([(start, end)] of every black moment, the length FFmpeg read in seconds)."""
     print('looking for black moments (this takes a few minutes for a long recording) ...', flush=True)
     log = subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-i', path, '-vf', 'blackdetect=d=0.2:pix_th=0.10',
                           '-an', '-f', 'null', '-'], capture_output=True, text=True, stdin=subprocess.DEVNULL).stderr
-    return parse_blacks(log)
+    return parse_blacks(log), parse_total_seconds(log)
+
+
+def recording_began(path, total):
+    """When the recording began: the file's creation time where the system keeps one, else its end minus its length."""
+    stat = os.stat(path)
+    born = getattr(stat, 'st_birthtime', 0)
+    return born if born else stat.st_mtime - total
 
 
 def main(argv=None):
@@ -104,12 +128,12 @@ def main(argv=None):
     if not os.path.isfile(path):
         print('no such file:', path)
         return 2
-    total = probe_duration(path)
+    blacks, read_length = find_blacks(path)
+    total = max(probe_duration(path), read_length)
     if args.start:
         recording_start = time.mktime(time.strptime(args.start, '%Y-%m-%d %H:%M'))
     else:
-        recording_start = os.stat(path).st_mtime - total       # the file was last written when the recording ended
-    blacks = find_blacks(path)
+        recording_start = recording_began(path, total)
     episodes, skipped = episodes_from_blacks(blacks, total, args.min_black,
                                              args.min_minutes * 60, args.max_minutes * 60)
     long_blacks = [b for b in blacks if b[1] - b[0] >= args.min_black]
