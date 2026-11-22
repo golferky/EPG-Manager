@@ -145,10 +145,13 @@ def main(argv=None):
         ep = row['episode']
         label = f"S{int(ep['season']):02d}E{int(ep['number']):02d} {ep.get('name', '')}" if ep else ''
         print(f"{row['status'].upper()[:9]:9}  {row['name']}  {label}  (match {row['score']:.2f})")
-        if row['status'] == 'unsure':
-            for score, cand in row['ranked'][:max(0, args.top)]:
-                print(f"             - S{int(cand['season']):02d}E{int(cand['number']):02d} {cand.get('name', '')} ({score:.2f}): "
-                      f"{clean_summary(cand.get('summary'))[:90]}")
+        if ep:
+            print(f"             plot: {clean_summary(ep.get('summary'))[:160]}")
+        # The runner-up shows how clear the win is; an unsure video lists the closest few to choose from.
+        close = row['ranked'][1:2] if row['status'] == 'ok' else row['ranked'][:max(0, args.top)]
+        for score, cand in close:
+            print(f"             - S{int(cand['season']):02d}E{int(cand['number']):02d} {cand.get('name', '')} ({score:.2f}): "
+                  f"{clean_summary(cand.get('summary'))[:90]}")
     ready = [r for r in rows if r['status'] == 'ok']
     print(f'\n{len(ready)} confident, {sum(r["status"] == "unsure" for r in rows)} unsure, '
           f'{sum(r["status"].startswith(("no ", "duplicate")) for r in rows)} left alone.')
