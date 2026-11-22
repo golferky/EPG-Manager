@@ -14,6 +14,8 @@ Options:
     --out FOLDER                      where the episodes go (default: a folder next to the recording)
     --min-black 4                     seconds of black that mark the start of an episode
     --min-minutes 15 --max-minutes 45 an episode outside this length is reported and skipped
+    --skip-start 36.0                 seconds after each marker where the next episode really begins (Raymond)
+    --keep-after 15.5                 seconds kept past the next marker so the closing credits are not cut off (Raymond)
     --start "2026-11-20 07:00"        when the recording began (default: worked out from the file's time)
 
 The recording is only read.  Nothing is deleted or overwritten.  Cuts are made without re-encoding, starting inside
@@ -27,6 +29,22 @@ import sys
 import time
 
 BLACK_LINE = re.compile(r'black_start:([0-9.]+) black_end:([0-9.]+)')
+
+
+TIME_LINE = re.compile(r'time=(\d+):(\d\d):(\d\d(?:\.\d+)?)')
+
+
+def parse_total_seconds(log):
+    """The length FFmpeg actually read, from its last progress line (0.0 if it printed none).
+
+    ffprobe's length is wrong for a capture that was joined after a drop: the clock restarts at the join, so it
+    reports only the part after it.  FFmpeg's own pass over the file corrects the join.
+    """
+    found = TIME_LINE.findall(log)
+    if not found:
+        return 0.0
+    hours, minutes, seconds = found[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def parse_blacks(log):
@@ -52,6 +70,21 @@ def episodes_from_blacks(blacks, total, min_black=4.0, min_len=15 * 60, max_len=
         else:
             episodes.append((here, there, length))
     return episodes, skipped
+
+
+def trim_episodes(episodes, skip_start=0.0, keep_after=0.0):
+    """Move each episode's cut points off the marker: ``[(cut_start, cut_end)]``.
+
+    The marker is where a long black begins.  On a channel whose episodes open with a few seconds of the previous
+    episode's credits and a bumper, ``skip_start`` seconds are skipped after the marker; where the credits of an
+    episode sit on the black that is the marker, ``keep_after`` seconds past the next marker are kept so they are
+    not cut off.  With both 0 a cut starts one second into the black, as before.
+    """
+    cuts = []
+    for start, end, _length in episodes:
+        cut_start = start + (skip_start if skip_start else 1.0)
+        cuts.append((cut_start, end + keep_after))
+    return cuts
 
 
 def clock(seconds):
@@ -82,10 +115,28 @@ def probe_duration(path):
 
 
 def find_blacks(path):
+    """([(start, end)] of every black moment, the length FFmpeg read in seconds)."""
     print('looking for black moments (this takes a few minutes for a long recording) ...', flush=True)
     log = subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-i', path, '-vf', 'blackdetect=d=0.2:pix_th=0.10',
                           '-an', '-f', 'null', '-'], capture_output=True, text=True, stdin=subprocess.DEVNULL).stderr
-    return parse_blacks(log)
+    return parse_blacks(log), parse_total_seconds(log)
+
+
+def cut_is_good(target, expected_seconds):
+    """True when the cut file exists and is about as long as it should be (an empty cut is a failure)."""
+    try:
+        if os.path.getsize(target) < 1000000:
+            return False
+        return abs(probe_duration(target) - expected_seconds) <= max(30.0, expected_seconds * 0.05)
+    except (OSError, ValueError):
+        return False
+
+
+def recording_began(path, total):
+    """When the recording began: the file's creation time where the system keeps one, else its end minus its length."""
+    stat = os.stat(path)
+    born = getattr(stat, 'st_birthtime', 0)
+    return born if born else stat.st_mtime - total
 
 
 def main(argv=None):
@@ -96,6 +147,8 @@ def main(argv=None):
     parser.add_argument('--min-black', type=float, default=4.0)
     parser.add_argument('--min-minutes', type=float, default=15.0)
     parser.add_argument('--max-minutes', type=float, default=45.0)
+    parser.add_argument('--skip-start', type=float, default=0.0)
+    parser.add_argument('--keep-after', type=float, default=0.0)
     parser.add_argument('--start', default='')
     parser.add_argument('--cut', action='store_true', help='actually cut the episodes (otherwise only show the plan)')
     args = parser.parse_args(argv)
@@ -104,12 +157,12 @@ def main(argv=None):
     if not os.path.isfile(path):
         print('no such file:', path)
         return 2
-    total = probe_duration(path)
+    blacks, read_length = find_blacks(path)
+    total = max(probe_duration(path), read_length)
     if args.start:
         recording_start = time.mktime(time.strptime(args.start, '%Y-%m-%d %H:%M'))
     else:
-        recording_start = os.stat(path).st_mtime - total       # the file was last written when the recording ended
-    blacks = find_blacks(path)
+        recording_start = recording_began(path, total)
     episodes, skipped = episodes_from_blacks(blacks, total, args.min_black,
                                              args.min_minutes * 60, args.max_minutes * 60)
     long_blacks = [b for b in blacks if b[1] - b[0] >= args.min_black]
@@ -117,9 +170,10 @@ def main(argv=None):
           % (clock(total), len(blacks), len(long_blacks), args.min_black))
     print('recording began about', time.strftime('%Y-%m-%d %H:%M', time.localtime(recording_start)))
     print('complete episodes: %d' % len(episodes))
-    for start, end, length in episodes:
-        print('  %s to %s  (%.1f min)  ->  %s' % (clock(start), clock(end), length / 60,
-                                                   episode_filename(args.name, recording_start, start)))
+    cuts = trim_episodes(episodes, args.skip_start, args.keep_after)
+    for (start, end, length), (cut_start, cut_end) in zip(episodes, cuts):
+        print('  %s to %s  (%.1f min)  ->  %s' % (clock(cut_start), clock(cut_end), (cut_end - cut_start) / 60,
+                                                   episode_filename(args.name, recording_start, cut_start)))
     for start, end, why in skipped:
         print('  skipped %s to %s: %s' % (clock(start), clock(end), why))
     if long_blacks:
@@ -133,15 +187,18 @@ def main(argv=None):
         return 1
     out = os.path.expanduser(args.out) if args.out else os.path.splitext(path)[0] + ' episodes'
     os.makedirs(out, exist_ok=True)
-    for start, end, length in episodes:
-        target = unique_path(os.path.join(out, episode_filename(args.name, recording_start, start)))
+    for (cut_start, cut_end) in cuts:
+        length = cut_end - cut_start
+        target = unique_path(os.path.join(out, episode_filename(args.name, recording_start, cut_start)))
         print('cutting', os.path.basename(target), flush=True)
-        # Start one second into the black so the cut never catches the end of the previous episode.
-        result = subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-ss', '%.2f' % (start + 1.0),
-                                 '-i', path, '-t', '%.2f' % (length - 1.0), '-c:v', 'copy', '-c:a', 'aac', target],
-                                stdin=subprocess.DEVNULL)
-        if result.returncode != 0:
-            print('  FFmpeg could not cut it; removing the unfinished file')
+        # The start is given AFTER the input (read through to it): a capture joined after a drop has a broken clock,
+        # and jumping straight to a late position then lands past what FFmpeg believes is the end and writes an
+        # empty file.
+        result = subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-i', path,
+                                 '-ss', '%.2f' % cut_start, '-t', '%.2f' % length,
+                                 '-c:v', 'copy', '-c:a', 'aac', target], stdin=subprocess.DEVNULL)
+        if result.returncode != 0 or not cut_is_good(target, length):
+            print('  that cut did not come out right (empty or the wrong length); removing the unfinished file')
             try:
                 os.remove(target)
             except OSError:
