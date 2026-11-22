@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122c"
+VERSION = "v20261122d"
 
 app = Flask(__name__)
 
@@ -10363,6 +10363,48 @@ def _group_recordings(rows, now, upcoming_limit=20, recent_limit=8):
             'upcoming': upcoming[:upcoming_limit], 'upcoming_total': len(upcoming),
             'recent': recent[:recent_limit]}
 
+@app.route('/epg-web/api/recording-plan')
+def api_recording_plan():
+    """One day of recordings, for the planner grid: ?date=YYYY-MM-DD (default today, in the dashboard's time zone)."""
+    cfg = load_config()
+    zone = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+    text = str(request.args.get('date', '') or '').strip()
+    try:
+        day = datetime.strptime(text, '%Y-%m-%d').date() if text else datetime.now(zone).date()
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'date must be YYYY-MM-DD'}), 400
+    day_start = datetime(day.year, day.month, day.day, tzinfo=zone).timestamp()
+    nxt = day + timedelta(days=1)
+    day_end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=zone).timestamp()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT rec_id,title,channel,start_ts,stop_ts,status,stream_provider,season_num,episode_num,is_series,"
+            "failure_reason FROM recordings WHERE stop_ts>? AND start_ts<? AND status!='cancelled' "
+            "ORDER BY start_ts", (day_start, day_end)).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    live = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+    items = []
+    for row in rows:
+        r = dict(row)
+        items.append({'id': r['rec_id'], 'title': r['title'], 'channel': r['channel'],
+                      'start_ts': r['start_ts'], 'stop_ts': r['stop_ts'], 'status': _rec_status_base(r['status']),
+                      'provider': r['stream_provider'] or 'primestreams', 'film': _is_film_booking(r),
+                      'reason': r['failure_reason'] or ''})
+    capacity = {'eaglecast': 1, 'primestreams': _primestreams_max_connections()}
+    for item in items:
+        item['conflict'] = False
+        if item['status'] in live:
+            overlapping = [o for o in items if o['status'] in live and o['provider'] == item['provider']
+                           and o['start_ts'] < item['stop_ts'] and o['stop_ts'] > item['start_ts']]
+            item['conflict'] = len(overlapping) > capacity.get(item['provider'], 1)
+    return jsonify({'ok': True, 'date': day.isoformat(), 'day_start': day_start, 'day_end': day_end,
+                    'capacity': capacity, 'items': items})
+
+
 @app.route('/epg-web/api/recordings/overview')
 def api_recordings_overview():
     """Everything the Recordings window needs in one call."""
@@ -11038,6 +11080,7 @@ tr:hover td{background:#141414;}
   <div class="tab" onclick="switchTab('health')">🔎 Recording Health</div>
   <div class="tab" onclick="switchTab('conversions')">🔄 Conversions</div>
   <div class="tab" onclick="switchTab('storage')">💾 Storage</div>
+  <div class="tab" onclick="switchTab('planner')">🗓 Planner</div>
 </nav>
 
 <!-- GUIDE -->
@@ -11520,6 +11563,24 @@ tr:hover td{background:#141414;}
 </div>
 
 <!-- STORAGE -->
+<div id="pane-planner" class="pane">
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
+      <h2 style="margin:0;">Recording planner</h2>
+      <button class="btn btn-ghost btn-sm" onclick="plannerMove(-1)">◀ Day</button>
+      <button class="btn btn-ghost btn-sm" onclick="plannerToday()">Today</button>
+      <button class="btn btn-ghost btn-sm" onclick="plannerMove(1)">Day ▶</button>
+      <input type="date" id="planner-date" onchange="loadPlanner()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:5px 8px;font-size:13px;">
+      <span id="planner-note" style="font-size:12px;color:#64748b;"></span>
+    </div>
+    <div id="planner-grid" style="overflow-x:auto;"></div>
+    <div style="font-size:11px;color:#64748b;margin-top:10px;">
+      Each row is one streaming connection. Gold = film, blue = episode or other; green = recording now, grey = done, red = failed.
+      A red outline means two recordings want the same connection at the same time. Click a block for details.
+    </div>
+  </div>
+</div>
+
 <div id="pane-storage" class="pane">
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
@@ -11683,7 +11744,7 @@ setInterval(loadStorageBar, 5 * 60 * 1000); // refresh every 5 min
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  const names = ['guide','recommendations','channels','247','schedule','plex-series','health','conversions','storage'];
+  const names = ['guide','recommendations','channels','247','schedule','plex-series','health','conversions','storage','planner'];
   document.querySelectorAll('.tab').forEach((t,i) =>
     t.classList.toggle('active', names[i] === name));
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
@@ -11696,6 +11757,7 @@ function switchTab(name) {
   if (name === 'health') { loadRecordingHealth(); loadChannelReport(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
+  if (name === 'planner') loadPlanner();
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -12445,6 +12507,73 @@ async function openInVlc(params) {
   } catch (e) { alert('Could not open VLC: ' + e.message); }
 }
 document.addEventListener('DOMContentLoaded', updatePlayerPrefBtn);
+
+// Recording planner: one day, one row per streaming connection, blocks placed by time.
+function plannerDate() {
+  const el = document.getElementById('planner-date');
+  if (!el.value) el.value = new Date().toLocaleDateString('en-CA');
+  return el.value;
+}
+function plannerToday() { document.getElementById('planner-date').value = new Date().toLocaleDateString('en-CA'); loadPlanner(); }
+function plannerMove(days) {
+  const d = new Date(plannerDate() + 'T12:00:00');
+  d.setDate(d.getDate() + days);
+  document.getElementById('planner-date').value = d.toLocaleDateString('en-CA');
+  loadPlanner();
+}
+function plannerColor(it) {
+  if (it.status === 'failed' || it.status === 'error') return '#7f1d1d';
+  if (it.status === 'done' || it.status === 'done_ts') return '#374151';
+  if (['recording', 'converting', 'awaiting_transfer', 'transferring'].indexOf(it.status) >= 0) return '#166534';
+  return it.film ? '#92400e' : '#1e3a8a';
+}
+function plannerPack(items) {
+  const rows = [];
+  items.forEach(it => {
+    let r = 0;
+    while (rows[r] && rows[r] > it.start_ts) r++;
+    rows[r] = it.stop_ts;
+    it.row = r;
+  });
+  return Math.max(1, rows.length);
+}
+async function loadPlanner() {
+  const box = document.getElementById('planner-grid');
+  box.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await (await fetch('/epg-web/api/recording-plan?date=' + plannerDate())).json();
+    if (!d.ok) { box.innerHTML = '<div class="empty">' + esc(d.error || 'Could not load') + '</div>'; return; }
+    const span = d.day_end - d.day_start;
+    const lanes = [['eaglecast', 'Eaglecast'], ['primestreams', 'PrimeStreams']];
+    let head = '<div style="display:flex;margin-left:120px;min-width:1100px;">';
+    for (let h = 0; h < 24; h++) head += '<div style="flex:1;font-size:10px;color:#64748b;border-left:1px solid #2d2d2d;padding-left:2px;">' + (h % 12 === 0 ? 12 : h % 12) + (h < 12 ? 'a' : 'p') + '</div>';
+    head += '</div>';
+    let html = head;
+    let conflicts = 0;
+    lanes.forEach(lane => {
+      const items = d.items.filter(i => i.provider === lane[0]);
+      const rows = plannerPack(items);
+      html += '<div style="display:flex;align-items:stretch;margin-top:6px;min-width:1220px;">';
+      html += '<div style="width:120px;flex:none;font-size:12px;color:#cbd5e1;padding-top:4px;">' + lane[1] + '<div style="font-size:10px;color:#64748b;">' + d.capacity[lane[0]] + ' at a time</div></div>';
+      html += '<div style="position:relative;flex:1;min-width:1100px;height:' + (rows * 42 + 4) + 'px;background:#141414;border:1px solid #2d2d2d;border-radius:6px;">';
+      for (let h = 1; h < 24; h++) html += '<div style="position:absolute;top:0;bottom:0;left:' + (h * 100 / 24) + '%;border-left:1px solid #1f1f1f;"></div>';
+      items.forEach(it => {
+        const a = Math.max(it.start_ts, d.day_start), b = Math.min(it.stop_ts, d.day_end);
+        const left = (a - d.day_start) / span * 100, width = Math.max(0.4, (b - a) / span * 100);
+        const t0 = new Date(it.start_ts * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+        const t1 = new Date(it.stop_ts * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+        if (it.conflict) conflicts++;
+        const tip = it.title + ' · ' + it.channel + ' · ' + t0 + ' to ' + t1 + ' · ' + it.status + (it.reason ? ' · ' + it.reason : '');
+        html += '<div title="' + esc(tip) + '" style="position:absolute;top:' + (2 + it.row * 42) + 'px;height:38px;left:' + left + '%;width:' + width + '%;overflow:hidden;box-sizing:border-box;'
+          + 'background:' + plannerColor(it) + ';border:' + (it.conflict ? '2px solid #f87171' : '1px solid #00000066') + ';border-radius:4px;padding:2px 4px;font-size:10px;line-height:1.25;color:#f1f5f9;white-space:nowrap;cursor:default;">'
+          + '<b>' + esc(it.title) + '</b><br>' + esc(it.channel) + ' ' + t0 + '</div>';
+      });
+      html += '</div></div>';
+    });
+    box.innerHTML = html;
+    document.getElementById('planner-note').textContent = d.items.length + ' recording' + (d.items.length === 1 ? '' : 's') + (conflicts ? ' · ' + conflicts + ' clash' + (conflicts === 1 ? '' : 'es') : '');
+  } catch (e) { box.innerHTML = '<div class="empty">Could not load the planner.</div>'; }
+}
 
 // Account end-date reminder (Schedules Direct, Eaglecast): shown only when one is close, hidden for the rest of the day once dismissed.
 async function loadReminders() {

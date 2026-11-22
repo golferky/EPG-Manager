@@ -5373,3 +5373,44 @@ class FilmFirstSlotsTests(unittest.TestCase):
         self.assertEqual(result["not_recorded"], [])
         self.assertTrue({"e3", "x"} <= {e["id"] for e in result["left_alone"]})
         self.assertEqual({v[1] for v in self._state(db).values()}, {"queued"})
+
+
+class RecordingPlannerTests(unittest.TestCase):
+    def _db(self, rows):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, start_ts, stop_ts, status, stream_provider, "
+                     "season_num, episode_num, is_series, failure_reason)")
+        for r in rows:
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?,?,?,?,?,?,NULL)", r)
+        conn.commit()
+        conn.close()
+        return db
+
+    def _get(self, db, date):
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "load_config", return_value={"timezone": "UTC"}), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+            return server.app.test_client().get("/epg-web/api/recording-plan?date=" + date)
+
+    def test_the_day_lists_its_recordings_marks_films_and_flags_clashes(self):
+        from datetime import datetime, timezone
+        noon = datetime(2027, 1, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+        db = self._db([("a", "A Film", "ch", noon, noon + 7200, "queued", "eaglecast", None, None, 0),
+                       ("b", "A Rerun", "ch", noon + 3600, noon + 7200, "queued", "eaglecast", 2, 5, 1),
+                       ("c", "Other Day", "ch", noon + 86400, noon + 90000, "queued", "eaglecast", None, None, 0),
+                       ("d", "Gone", "ch", noon, noon + 100, "cancelled", "eaglecast", None, None, 0)])
+        data = self._get(db, "2027-01-05").get_json()
+        self.assertEqual({i["id"] for i in data["items"]}, {"a", "b"})
+        by = {i["id"]: i for i in data["items"]}
+        self.assertTrue(by["a"]["film"])
+        self.assertFalse(by["b"]["film"])
+        self.assertTrue(by["a"]["conflict"] and by["b"]["conflict"])
+        self.assertEqual(data["capacity"], {"eaglecast": 1, "primestreams": 1})
+
+    def test_a_bad_date_is_refused_and_the_page_has_the_planner(self):
+        self.assertEqual(self._get(self._db([]), "nope").status_code, 400)
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("switchTab('planner')", html)
+        self.assertIn("'planner'", html)
