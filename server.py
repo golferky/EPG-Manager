@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122d"
+VERSION = "v20261122e"
 
 app = Flask(__name__)
 
@@ -10387,9 +10387,13 @@ def api_recording_plan():
     except sqlite3.Error as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 503
     live = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+    planned = live + ('converting', 'awaiting_transfer', 'transferring')
+    show_all = request.args.get('all') == '1'
     items = []
     for row in rows:
         r = dict(row)
+        if not show_all and _rec_status_base(r['status']) not in planned:
+            continue            # the planner shows what is planned; finished and failed ones only on request
         items.append({'id': r['rec_id'], 'title': r['title'], 'channel': r['channel'],
                       'start_ts': r['start_ts'], 'stop_ts': r['stop_ts'], 'status': _rec_status_base(r['status']),
                       'provider': r['stream_provider'] or 'primestreams', 'film': _is_film_booking(r),
@@ -10403,6 +10407,86 @@ def api_recording_plan():
             item['conflict'] = len(overlapping) > capacity.get(item['provider'], 1)
     return jsonify({'ok': True, 'date': day.isoformat(), 'day_start': day_start, 'day_end': day_end,
                     'capacity': capacity, 'items': items})
+
+
+def _plan_booking(rec_id):
+    """One recording row as a dict, or None."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,'
+                           'season_num,episode_num FROM recordings WHERE rec_id=?', (rec_id,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except sqlite3.Error:
+        return None
+
+
+@app.route('/epg-web/api/recording-plan/switch-source', methods=['POST'])
+def api_plan_switch_source():
+    """Move one queued booking to the other streaming connection, if it carries the channel and is free then."""
+    body = request.json or {}
+    rec_id, provider = str(body.get('id', '')), str(body.get('provider', ''))
+    if provider not in SLOT_PROVIDERS:
+        return jsonify({'ok': False, 'error': 'provider must be eaglecast or primestreams'}), 400
+    row = _plan_booking(rec_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'That recording no longer exists.'}), 404
+    if row['status'] not in ('queued', 'scheduled'):
+        return jsonify({'ok': False, 'error': 'Only a queued recording can change source.'}), 409
+    if float(row['start_ts']) <= time.time() + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS:
+        return jsonify({'ok': False, 'error': 'It starts too soon to change.'}), 409
+    name = 'Eaglecast' if provider == 'eaglecast' else 'PrimeStreams'
+    if provider == 'eaglecast' and not _eaglecast_enabled():
+        return jsonify({'ok': False, 'error': 'Eaglecast is switched off or has run out.'}), 409
+    if provider == 'primestreams' and not _primestreams_enabled():
+        return jsonify({'ok': False, 'error': 'PrimeStreams is switched off.'}), 409
+    source = _slot_source(provider, row['channel_id'], row['stop_ts'], _eaglecast_expiry()[0])
+    if not source or not source[0]:
+        return jsonify({'ok': False, 'error': f'{name} does not carry this channel.'}), 409
+    clash = (_eaglecast_overlap(row['start_ts'], row['stop_ts'], rec_id) if provider == 'eaglecast'
+             else _primestreams_conflict(row['start_ts'], row['stop_ts'], rec_id))
+    if clash:
+        return jsonify({'ok': False, 'error': f'{name} is already booked for "{clash[0]}" at that time.'}), 409
+    conn = sqlite3.connect(_guide_db_path(), timeout=10)
+    conn.execute("UPDATE recordings SET stream_provider=?, stream_id=?, stream_extension=? WHERE rec_id=? "
+                 "AND status IN ('queued','scheduled')", (provider, source[0], source[1], rec_id))
+    conn.commit()
+    conn.close()
+    with _rec_lock:
+        rec = _recs.get(rec_id)
+        if rec:
+            rec.update({'stream_provider': provider, 'stream_id': source[0], 'stream_extension': source[1]})
+    return jsonify({'ok': True, 'provider': provider})
+
+
+@app.route('/epg-web/api/recording-plan/cancel-copies', methods=['POST'])
+def api_plan_cancel_copies():
+    """The OTHER queued bookings of the same title (and episode): listed, or with {"apply": true} cancelled."""
+    body = request.json or {}
+    row = _plan_booking(str(body.get('id', '')))
+    if not row:
+        return jsonify({'ok': False, 'error': 'That recording no longer exists.'}), 404
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.row_factory = sqlite3.Row
+        copies = [dict(r) for r in conn.execute(
+            "SELECT rec_id,title,channel,start_ts FROM recordings WHERE title=? AND rec_id!=? "
+            "AND status IN ('queued','scheduled') AND stop_ts>? AND COALESCE(season_num,'')=COALESCE(?,'') "
+            "AND COALESCE(episode_num,'')=COALESCE(?,'') ORDER BY start_ts",
+            (row['title'], row['rec_id'], time.time(), row['season_num'], row['episode_num'])).fetchall()]
+        conn.close()
+    except sqlite3.Error as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    cancelled = 0
+    if body.get('apply') is True:
+        for copy in copies:
+            with app.test_request_context('/epg-web/api/record/cancel', method='POST', json={'id': copy['rec_id']}):
+                response = api_rec_cancel()
+            status = response[1] if isinstance(response, tuple) else 200
+            cancelled += 1 if status == 200 else 0
+    return jsonify({'ok': True, 'applied': body.get('apply') is True, 'cancelled': cancelled,
+                    'copies': [{'id': c['rec_id'], 'channel': c['channel'], 'start_ts': c['start_ts']} for c in copies]})
 
 
 @app.route('/epg-web/api/recordings/overview')
@@ -11571,9 +11655,11 @@ tr:hover td{background:#141414;}
       <button class="btn btn-ghost btn-sm" onclick="plannerToday()">Today</button>
       <button class="btn btn-ghost btn-sm" onclick="plannerMove(1)">Day ▶</button>
       <input type="date" id="planner-date" onchange="loadPlanner()" style="background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;color:#e2e8f0;padding:5px 8px;font-size:13px;">
+      <label style="font-size:12px;color:#94a3b8;"><input type="checkbox" id="planner-all" onchange="loadPlanner()"> Show finished and failed too</label>
       <span id="planner-note" style="font-size:12px;color:#64748b;"></span>
     </div>
     <div id="planner-grid" style="overflow-x:auto;"></div>
+    <div id="planner-detail" style="display:none;margin-top:12px;padding:12px;background:#141414;border:1px solid #2d2d2d;border-radius:8px;font-size:13px;"></div>
     <div style="font-size:11px;color:#64748b;margin-top:10px;">
       Each row is one streaming connection. Gold = film, blue = episode or other; green = recording now, grey = done, red = failed.
       A red outline means two recordings want the same connection at the same time. Click a block for details.
@@ -12537,11 +12623,94 @@ function plannerPack(items) {
   });
   return Math.max(1, rows.length);
 }
+let plannerItems = [];
+let plannerCurrent = null;
+async function plannerCall(url, body) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  return r.json();
+}
+function plannerWhen(it) {
+  const o = {weekday: 'short', hour: 'numeric', minute: '2-digit'};
+  return new Date(it.start_ts * 1000).toLocaleString([], o);
+}
+async function plannerSelect(id) {
+  const box = document.getElementById('planner-detail');
+  const it = plannerItems.find(x => x.id === id);
+  plannerCurrent = it || null;
+  if (!it) { box.style.display = 'none'; return; }
+  const queued = it.status === 'queued' || it.status === 'scheduled';
+  const failed = it.status === 'failed' || it.status === 'error';
+  const here = it.provider === 'eaglecast' ? 'Eaglecast' : 'PrimeStreams';
+  const there = it.provider === 'eaglecast' ? 'PrimeStreams' : 'Eaglecast';
+  let h = '<div style="font-size:15px;font-weight:700;">' + esc(it.title) + '</div>';
+  h += '<div style="color:#94a3b8;margin:3px 0 8px;">' + esc(it.channel) + ' · ' + esc(plannerWhen(it)) + ' · on ' + here + ' · ' + esc(it.status) + '</div>';
+  if (it.conflict) h += '<div style="color:#f87171;margin-bottom:8px;">This clashes with another recording on the same connection.</div>';
+  if (it.reason) h += '<div style="color:#fca5a5;margin-bottom:8px;">' + esc(it.reason) + '</div>';
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">';
+  if (queued) {
+    h += '<button class="btn btn-sm" style="background:#7f1d1d;color:#fecaca;" onclick="plannerCancel()">Cancel this recording</button>';
+    h += '<button class="btn btn-ghost btn-sm" onclick="plannerSwitch()">Move to ' + there + '</button>';
+    h += '<button class="btn btn-ghost btn-sm" id="planner-copies-btn" style="display:none;" onclick="plannerCancelCopies()"></button>';
+  }
+  if (failed) h += '<button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;" onclick="plannerRerecord()">Find re-record</button>';
+  h += '<button class="btn btn-ghost btn-sm" onclick="plannerClose()">Close</button></div>';
+  box.innerHTML = h;
+  box.style.display = '';
+  if (queued) {
+    try {
+      const d = await plannerCall('/epg-web/api/recording-plan/cancel-copies', {id: it.id});
+      const btn = document.getElementById('planner-copies-btn');
+      if (btn && plannerCurrent && plannerCurrent.id === it.id && d.ok && d.copies.length) {
+        btn.textContent = 'Cancel the other ' + d.copies.length + ' booking' + (d.copies.length === 1 ? '' : 's') + ' of this';
+        btn.style.display = '';
+      }
+    } catch (e) { /* the button just stays hidden */ }
+  }
+}
+function plannerClose() { plannerCurrent = null; document.getElementById('planner-detail').style.display = 'none'; }
+async function plannerCancel() {
+  const it = plannerCurrent;
+  if (!it || !confirm('Cancel "' + it.title + '" on ' + it.channel + ' (' + plannerWhen(it) + ')?')) return;
+  const d = await plannerCall('/epg-web/api/record/cancel', {id: it.id});
+  if (!d.ok) alert(d.error || 'Could not cancel it.');
+  plannerClose();
+  loadPlanner();
+}
+async function plannerSwitch() {
+  const it = plannerCurrent;
+  if (!it) return;
+  const d = await plannerCall('/epg-web/api/recording-plan/switch-source', {id: it.id, provider: it.provider === 'eaglecast' ? 'primestreams' : 'eaglecast'});
+  if (!d.ok) { alert(d.error || 'Could not move it.'); return; }
+  plannerClose();
+  loadPlanner();
+}
+async function plannerCancelCopies() {
+  const it = plannerCurrent;
+  if (!it) return;
+  const d = await plannerCall('/epg-web/api/recording-plan/cancel-copies', {id: it.id});
+  if (!d.ok || !d.copies.length) { alert(d.error || 'There are no other bookings of this.'); return; }
+  const list = d.copies.map(c => c.channel + ' ' + new Date(c.start_ts * 1000).toLocaleString([], {weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'})).join(' | ');
+  if (!confirm('Cancel ' + d.copies.length + ' other booking(s) of "' + it.title + '" and keep this one?  ' + list)) return;
+  const done = await plannerCall('/epg-web/api/recording-plan/cancel-copies', {id: it.id, apply: true});
+  alert('Cancelled ' + done.cancelled + '.');
+  plannerClose();
+  loadPlanner();
+}
+async function plannerRerecord() {
+  const it = plannerCurrent;
+  if (!it) return;
+  const d = await plannerCall('/epg-web/api/recording-health/rerecord', {rec_id: it.id});
+  alert(d.message || (d.ok ? 'Re-recording scheduled.' : (d.error || 'Could not find one.')));
+  plannerClose();
+  loadPlanner();
+}
+
 async function loadPlanner() {
   const box = document.getElementById('planner-grid');
   box.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const d = await (await fetch('/epg-web/api/recording-plan?date=' + plannerDate())).json();
+    const d = await (await fetch('/epg-web/api/recording-plan?date=' + plannerDate() + (document.getElementById('planner-all').checked ? '&all=1' : ''))).json();
+    plannerItems = d.items || [];
     if (!d.ok) { box.innerHTML = '<div class="empty">' + esc(d.error || 'Could not load') + '</div>'; return; }
     const span = d.day_end - d.day_start;
     const lanes = [['eaglecast', 'Eaglecast'], ['primestreams', 'PrimeStreams']];
@@ -12564,14 +12733,18 @@ async function loadPlanner() {
         const t1 = new Date(it.stop_ts * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
         if (it.conflict) conflicts++;
         const tip = it.title + ' · ' + it.channel + ' · ' + t0 + ' to ' + t1 + ' · ' + it.status + (it.reason ? ' · ' + it.reason : '');
-        html += '<div title="' + esc(tip) + '" style="position:absolute;top:' + (2 + it.row * 42) + 'px;height:38px;left:' + left + '%;width:' + width + '%;overflow:hidden;box-sizing:border-box;'
-          + 'background:' + plannerColor(it) + ';border:' + (it.conflict ? '2px solid #f87171' : '1px solid #00000066') + ';border-radius:4px;padding:2px 4px;font-size:10px;line-height:1.25;color:#f1f5f9;white-space:nowrap;cursor:default;">'
+        html += '<div title="' + esc(tip) + '" data-id="' + esc(it.id) + '" style="position:absolute;top:' + (2 + it.row * 42) + 'px;height:38px;left:' + left + '%;width:' + width + '%;overflow:hidden;box-sizing:border-box;'
+          + 'background:' + plannerColor(it) + ';cursor:pointer;border:' + (it.conflict ? '2px solid #f87171' : '1px solid #00000066') + ';border-radius:4px;padding:2px 4px;font-size:10px;line-height:1.25;color:#f1f5f9;white-space:nowrap;cursor:default;">'
           + '<b>' + esc(it.title) + '</b><br>' + esc(it.channel) + ' ' + t0 + '</div>';
       });
       html += '</div></div>';
     });
     box.innerHTML = html;
-    document.getElementById('planner-note').textContent = d.items.length + ' recording' + (d.items.length === 1 ? '' : 's') + (conflicts ? ' · ' + conflicts + ' clash' + (conflicts === 1 ? '' : 'es') : '');
+    box.onclick = function (e) {
+      const el = e.target.closest('[data-id]');
+      if (el) plannerSelect(el.getAttribute('data-id'));
+    };
+    document.getElementById('planner-note').textContent = d.items.length + ' planned recording' + (d.items.length === 1 ? '' : 's') + (conflicts ? ' · ' + conflicts + ' clash' + (conflicts === 1 ? '' : 'es') : '');
   } catch (e) { box.innerHTML = '<div class="empty">Could not load the planner.</div>'; }
 }
 
