@@ -5186,8 +5186,15 @@ class PrimeStreamsHealthTests(unittest.TestCase):
     def test_no_answer_is_unreachable_and_leaks_nothing(self):
         result = self._check(error=OSError("could not reach panel.invalid with secret"))
         self.assertEqual(result["state"], "unreachable")
+        self.assertEqual(result["detail"], "OSError")
         for text in ("panel.invalid", "someone", "secret"):
             self.assertNotIn(text, json.dumps(result))
+
+    def test_an_http_401_from_the_panel_means_the_login_was_refused(self):
+        from urllib import error as urlerr
+        result = self._check(error=urlerr.HTTPError("http://panel.invalid/x", 401, "Unauthorized", {}, None))
+        self.assertEqual(result["state"], "refused")
+        self.assertNotIn("panel.invalid", json.dumps(result))
 
     def test_nothing_saved(self):
         self.assertEqual(self._check({}, cfg={})["state"], "not_set_up")
@@ -5211,3 +5218,85 @@ class PrimeStreamsHealthTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn('id="ps-bar"', html)
         server._ps_health.update({"at": 0.0, "result": None})
+
+
+class PrimeStreamsBookingRulesTests(unittest.TestCase):
+    def tearDown(self):
+        server._ps_health.update({"at": 0.0, "result": None})
+
+    def _health(self, state, **extra):
+        server._ps_health.update({"at": time.time(), "result": dict({"state": state, "status": "", "message": "m"}, **extra)})
+
+    def test_an_offline_account_is_not_booked(self):
+        for state in ("inactive", "refused"):
+            self._health(state)
+            url, error, _ = server._primestreams_source("c1", 1000.0, 2000.0)
+            self.assertIsNone(url)
+            self.assertIn("not working right now", error)
+
+    def test_no_answer_from_the_nas_does_not_block_a_booking(self):
+        self._health("unreachable")
+        with mock.patch.object(server, "_primestreams_conflict", return_value=None), \
+             mock.patch.object(server, "_stream_url", return_value=("http://x/1.ts", None, {})):
+            self.assertIsNone(server._primestreams_source("c1", 1000.0, 2000.0)[1])
+
+    def test_a_working_account_is_booked_unless_it_is_already_full(self):
+        self._health("ok", max_connections=1)
+        with mock.patch.object(server, "_primestreams_conflict", return_value=None), \
+             mock.patch.object(server, "_stream_url", return_value=("http://x/1.ts", None, {})):
+            self.assertEqual(server._primestreams_source("c1", 1000.0, 2000.0)[1], None)
+        with mock.patch.object(server, "_primestreams_conflict", return_value=("Other Film", "ch", 1.0, 2.0)):
+            url, error, _ = server._primestreams_source("c1", 1000.0, 2000.0)
+        self.assertIsNone(url)
+        self.assertIn('overlapping "Other Film"', error)
+        self.assertEqual(server._play_blocked_note(error), 'PrimeStreams has one connection and it is busy with "Other Film"')
+
+    def test_overlap_counts_only_primestreams_bookings_up_to_the_limit(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, start_ts, stop_ts, status, stream_provider)")
+        conn.execute("INSERT INTO recordings VALUES ('a','Held','c',1000,3000,'queued','primestreams')")
+        conn.execute("INSERT INTO recordings VALUES ('b','Eagle','c',1000,3000,'queued','eaglecast')")
+        conn.commit()
+        conn.close()
+        with mock.patch.object(server, "_guide_db_path", return_value=db):
+            self._health("ok", max_connections=1)
+            self.assertEqual(server._primestreams_conflict(2000.0, 4000.0)[0], "Held")
+            self.assertIsNone(server._primestreams_conflict(3000.0, 4000.0))
+            self.assertIsNone(server._primestreams_conflict(2000.0, 4000.0, exclude_rec_id="a"))
+            self._health("ok", max_connections=2)
+            self.assertIsNone(server._primestreams_conflict(2000.0, 4000.0))
+
+
+class RefreshBookingStreamsTests(unittest.TestCase):
+    def _db(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, channel_id, stream_id, stream_extension, "
+                     "stop_ts, status, stream_provider)")
+        t = time.time() + 3600
+        for rid, ch, sid, prov in (("a", "c1", "100", "primestreams"), ("b", "c2", "200", "primestreams"),
+                                    ("c", "c3", "300", "primestreams"), ("d", "c4", "400", "eaglecast")):
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?, 'ts', ?, 'queued', ?)", (rid, rid, ch, ch, sid, t, prov))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_stale_numbers_are_replaced_and_the_rest_left_alone(self):
+        import sqlite3 as sq
+        db = self._db()
+        current = {"c1": ("http://x", None, {"stream_id": "111", "stream_extension": "ts"}),
+                   "c2": ("http://x", None, {"stream_id": "200", "stream_extension": "ts"}),
+                   "c3": (None, "no channel", {})}
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_stream_url", side_effect=lambda cid, prov=None: current[cid]):
+            report = server._refresh_queued_stream_ids(False)
+            self.assertEqual([e["id"] for e in report["would_change"]], ["a"])
+            self.assertEqual([e["id"] for e in report["unresolved"]], ["c"])
+            self.assertEqual(report["changed"], 0)
+            done = server._refresh_queued_stream_ids(True)
+        self.assertEqual(done["changed"], 1)
+        rows = dict(sq.connect(db).execute("SELECT rec_id, stream_id FROM recordings"))
+        self.assertEqual(rows, {"a": "111", "b": "200", "c": "300", "d": "400"})

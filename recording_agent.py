@@ -31,7 +31,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261122a"
+AGENT_VERSION = "v20261122b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -1283,8 +1283,11 @@ def provider_connections(cfg, provider, timeout=10):
         return None
 
 
+PROVIDER_NAMES = {'primestreams': 'PrimeStreams', 'eaglecast': 'Eaglecast'}
+
+
 def wait_for_free_connection(api, job, cfg, sleep=None, now=time.time):
-    """For a PrimeStreams recording, wait while the account has no free connection.
+    """For a PrimeStreams or Eaglecast recording, wait while the account has no free connection.
 
     Another player (a phone, the Firestick) or another recording holding the account makes the provider cut the
     new stream after a few seconds, which would spoil the recording.  This waits, keeping the job alive, until a
@@ -1292,23 +1295,25 @@ def wait_for_free_connection(api, job, cfg, sleep=None, now=time.time):
     reason.  When the panel does not say how many are open, the recording goes ahead.  Returns True to go on,
     False if the job was cancelled or given up.
     """
-    if job.get('stream_provider', 'primestreams') != 'primestreams':
+    provider = job.get('stream_provider', 'primestreams')
+    if provider not in PROVIDER_NAMES:
         return True
+    name = PROVIDER_NAMES[provider]
     sleep = sleep or heartbeat_sleep
     deadline = float(job['start_ts']) + CONNECTION_WAIT_PAST_START_SECONDS
     while True:
-        counts = provider_connections(cfg, 'primestreams')
+        counts = provider_connections(cfg, provider)
         if counts is None or counts[0] < counts[1]:
             return True
         if now() >= deadline:
             api.patient_heartbeat(job['id'], 'failed', message=(
-                f'PrimeStreams already had {counts[0]} of {counts[1]} connection(s) open (another player or '
+                f'{name} already had {counts[0]} of {counts[1]} connection(s) open (another player or '
                 f'recording was using the account), so this was not recorded.'))
             return False
-        print(f'[connections] {job["title"]}: PrimeStreams has {counts[0]} of {counts[1]} connection(s) open; '
+        print(f'[connections] {job["title"]}: {name} has {counts[0]} of {counts[1]} connection(s) open; '
               f'waiting', flush=True)
         if not sleep(api, job, 'preflight', CONNECTION_CHECK_PAUSE_SECONDS, cfg,
-                     message='Waiting for a free PrimeStreams connection'):
+                     message=f'Waiting for a free {name} connection'):
             return False
 
 
