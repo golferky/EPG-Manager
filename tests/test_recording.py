@@ -826,16 +826,26 @@ class DuplicateRecordingTests(unittest.TestCase):
 
 
 class PlaylistRouteTests(unittest.TestCase):
-    def test_playlist_is_a_downloadable_m3u_with_the_stream_address(self):
+    def test_playlist_is_a_downloadable_m3u_pointing_at_the_relay_not_the_provider(self):
         url = "http://provider.test/live/u/p/1.ts"
-        with mock.patch.object(server, "_stream_url", return_value=(url, None, {})):
+        with mock.patch.object(server, "_stream_url", return_value=(url, None, {})), \
+             mock.patch.object(server, "load_config", return_value={}):
             resp = server.app.test_client().get(
                 "/epg-web/api/play/playlist.m3u",
                 query_string={"channel_id": "18086", "title": "Paycheck\nextra"})
         self.assertEqual(resp.status_code, 200)
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         body = resp.get_data(as_text=True)
-        self.assertEqual(body.splitlines(), ["#EXTM3U", "#EXTINF:-1,Paycheck extra", url])
+        self.assertEqual(body.splitlines(), ["#EXTM3U", "#EXTINF:-1,Paycheck extra",
+                                             "http://localhost/epg-web/api/play/proxy?channel_id=18086"])
+        self.assertNotIn("provider.test", body)
+
+    def test_playlist_gives_the_provider_address_directly_when_the_relay_is_switched_off(self):
+        url = "http://provider.test/live/u/p/1.ts"
+        with mock.patch.object(server, "_stream_url", return_value=(url, None, {})), \
+             mock.patch.object(server, "load_config", return_value={"play_relay": False}):
+            resp = server.app.test_client().get("/epg-web/api/play/playlist.m3u", query_string={"channel_id": "1", "title": "T"})
+        self.assertEqual(resp.get_data(as_text=True).splitlines()[-1], url)
 
     def test_playlist_reports_a_stream_error(self):
         with mock.patch.object(server, "_stream_url", return_value=(None, "no stream", {})):
@@ -5562,3 +5572,64 @@ class AiringPlayStateTests(unittest.TestCase):
             ok, note = server._airing_play_state("c1", "X", True, None)
         self.assertFalse(ok)
         self.assertTrue(note)
+
+
+class RecordingPriorityOverViewingTests(unittest.TestCase):
+    def _db(self, provider, start_in, length=3600, status="queued"):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, start_ts, stop_ts, status, stream_provider)")
+        now = time.time()
+        conn.execute("INSERT INTO recordings VALUES ('a','Hunger Games',?,?,?,?)", (now + start_in, now + start_in + length, status, provider))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_watching_stops_two_minutes_before_a_recording_on_the_same_connection(self):
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db("eaglecast", 60)):
+            blocked = server._viewing_blocked_by_recording("eaglecast")
+            self.assertEqual(blocked[0], "Hunger Games")
+            self.assertIn("starts recording at", server._recording_priority_message(blocked))
+            self.assertIsNone(server._viewing_blocked_by_recording("primestreams"))
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db("eaglecast", 900)):
+            self.assertIsNone(server._viewing_blocked_by_recording("eaglecast"))
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db("eaglecast", -600, 3600, "recording")):
+            self.assertIn("recording on this connection now",
+                          server._recording_priority_message(server._viewing_blocked_by_recording("eaglecast")))
+
+    def test_a_provider_with_spare_connections_is_not_blocked_by_one_recording(self):
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db("primestreams", 30)), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=2):
+            self.assertIsNone(server._viewing_blocked_by_recording("primestreams"))
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db("primestreams", 30)), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+            self.assertIsNotNone(server._viewing_blocked_by_recording("primestreams"))
+
+    def test_the_relay_refuses_when_a_recording_is_due_and_stops_itself_when_one_becomes_due(self):
+        import io
+
+        class Upstream(io.BytesIO):
+            closed_by_relay = False
+
+            def close(self):
+                Upstream.closed_by_relay = True
+                super().close()
+        with mock.patch.object(server, "_viewing_blocked_by_recording", return_value=("Film", time.time() + 30)):
+            with server.app.test_request_context("/x"):
+                refused = server._relay_live_stream("http://x/1.ts", "eaglecast")
+        self.assertEqual(refused[1], 409)
+        answers = iter([None, None, ("Film", time.time() + 30), ("Film", time.time() + 30)])
+        data = Upstream(b"a" * 65536 * 10)
+        original = server.PLAY_GUARD_CHECK_SECONDS
+        server.PLAY_GUARD_CHECK_SECONDS = 0
+        try:
+            with mock.patch.object(server, "_viewing_blocked_by_recording", side_effect=lambda p: next(answers)), \
+                 mock.patch("urllib.request.urlopen", return_value=data):
+                with server.app.test_request_context("/x"):
+                    response = server._relay_live_stream("http://x/1.ts", "eaglecast")
+                    chunks = list(response.response)
+        finally:
+            server.PLAY_GUARD_CHECK_SECONDS = original
+        self.assertLess(len(chunks), 10)
+        self.assertTrue(Upstream.closed_by_relay)

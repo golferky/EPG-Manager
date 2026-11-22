@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122h"
+VERSION = "v20261122i"
 
 app = Flask(__name__)
 
@@ -8936,22 +8936,94 @@ def api_play():
         return jsonify({'error': start_error}), 500
     return jsonify(_streams_payload(streams_snapshot))
 
-def _relay_live_stream(url):
-    """Relay a provider live stream to the requesting browser (same-origin)."""
+PLAY_CUTOFF_SECONDS = 120
+PLAY_GUARD_CHECK_SECONDS = 5
+
+
+def _recordings_due_on(provider):
+    """Recordings on this connection that are running now or start within the cutoff: [(title, start_ts)]."""
+    now = time.time()
+    statuses = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=2)
+        conn.execute('PRAGMA busy_timeout=2000')
+        rows = conn.execute(
+            "SELECT title, start_ts FROM recordings WHERE COALESCE(stream_provider,'primestreams')=? "
+            "AND status IN ({}) AND start_ts<=? AND stop_ts>? ORDER BY start_ts".format(','.join('?' * len(statuses))),
+            [provider] + list(statuses) + [now + PLAY_CUTOFF_SECONDS, now]).fetchall()
+        conn.close()
+        return rows
+    except sqlite3.Error:
+        return []
+
+
+def _viewing_blocked_by_recording(provider):
+    """(title, start_ts) of a recording that needs this connection, when watching would take it from the recording.
+
+    Watching is cut off, and refused, from two minutes before a recording starts on the same connection: a recording
+    always wins.  A provider that allows more than one connection only blocks when its connections are all due.
+    """
+    if not provider:
+        return None
+    capacity = 1 if provider == 'eaglecast' else _primestreams_max_connections()
+    due = _recordings_due_on(provider)
+    return due[0] if len(due) >= capacity else None
+
+
+def _recording_priority_message(blocked):
+    title, start_ts = blocked
+    if float(start_ts) <= time.time():
+        return f'"{title}" is recording on this connection now, so it cannot be watched.'
+    return (f'"{title}" starts recording at {_local_dt(float(start_ts)).strftime("%-I:%M %p")} on this connection, '
+            f'so watching stops two minutes before then.')
+
+
+def _play_target(channel_id):
+    """(address for the player, error, debug) for watching a channel live.
+
+    The player is given a relay through this dashboard instead of the provider's address, so the dashboard can end
+    the viewing when a recording needs the connection, and the player never receives the provider address or login.
+    ``play_relay: false`` in the dashboard config gives the provider's address directly, as before.
+    """
+    from urllib.parse import quote
+    url, err, dbg = _live_stream_url(channel_id)
+    if err:
+        return None, err, dbg
+    if not load_config().get('play_relay', True):
+        return url, None, dbg
+    blocked = _viewing_blocked_by_recording((dbg or {}).get('provider') or '')
+    if blocked:
+        return None, _recording_priority_message(blocked), dbg
+    return request.host_url.rstrip('/') + '/epg-web/api/play/proxy?channel_id=' + quote(channel_id), None, dbg
+
+
+def _relay_live_stream(url, provider=''):
+    """Relay a provider live stream to the requesting player (same-origin).
+
+    With a ``provider`` the relay ends by itself when a recording needs that connection.
+    """
     import urllib.request as _ureq
     from flask import Response, stream_with_context
+    blocked = _viewing_blocked_by_recording(provider)
+    if blocked:
+        return jsonify({"error": _recording_priority_message(blocked)}), 409
     try:
         upstream = _ureq.urlopen(_ureq.Request(url, headers={"User-Agent": "VLC/3.0"}), timeout=15)
     except Exception:
         return jsonify({"error": "Could not open the live stream"}), 502
 
     def _relay():
+        last_check = time.time()
         try:
             while True:
                 chunk = upstream.read(65536)
                 if not chunk:
                     break
                 yield chunk
+                if provider and time.time() - last_check >= PLAY_GUARD_CHECK_SECONDS:
+                    last_check = time.time()
+                    if _viewing_blocked_by_recording(provider):
+                        break           # a recording needs this connection: let go of it
         finally:
             upstream.close()
 
@@ -8966,10 +9038,10 @@ def api_play_proxy():
     signed URL embeds credentials), so the stream is relayed same-origin and
     the credentials never reach the page.
     """
-    url, err, dbg = _stream_url(request.args.get("channel_id", ""))
+    url, err, dbg = _live_stream_url(request.args.get("channel_id", ""))
     if err:
         return jsonify({"error": err}), 400
-    return _relay_live_stream(url)
+    return _relay_live_stream(url, (dbg or {}).get('provider') or '')
 
 @app.route("/epg-web/api/play/eaglecast-proxy")
 def api_play_eaglecast_proxy():
@@ -8981,7 +9053,7 @@ def api_play_eaglecast_proxy():
     url = _eaglecast_stream_url(item["stream_id"], item["extension"])
     if not url:
         return jsonify({"error": "Eaglecast playback is not configured on this Mac."}), 503
-    return _relay_live_stream(url)
+    return _relay_live_stream(url, 'eaglecast')
 
 @app.route("/epg-web/api/play/playlist.m3u")
 def api_play_playlist():
@@ -9007,7 +9079,7 @@ def api_play_playlist():
         if not url:
             return jsonify({"error": "That Eaglecast sports feed is not available."}), 404
     else:
-        url, err, dbg = _live_stream_url(channel_id)
+        url, err, dbg = _play_target(channel_id)
         if err:
             return jsonify({"error": err}), 400
     body = f"#EXTM3U\n#EXTINF:-1,{title}\n{url}\n"
@@ -9065,7 +9137,7 @@ def api_play_provider():
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
-    url, err, dbg = _live_stream_url(channel_id)
+    url, err, dbg = _play_target(channel_id)
     if err:
         return jsonify({"error": err, "debug": dbg}), 400
     return jsonify({"ok": True, "url": url})
