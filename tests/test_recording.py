@@ -5267,3 +5267,36 @@ class PrimeStreamsBookingRulesTests(unittest.TestCase):
             self.assertIsNone(server._primestreams_conflict(2000.0, 4000.0, exclude_rec_id="a"))
             self._health("ok", max_connections=2)
             self.assertIsNone(server._primestreams_conflict(2000.0, 4000.0))
+
+
+class RefreshBookingStreamsTests(unittest.TestCase):
+    def _db(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, channel_id, stream_id, stream_extension, "
+                     "stop_ts, status, stream_provider)")
+        t = time.time() + 3600
+        for rid, ch, sid, prov in (("a", "c1", "100", "primestreams"), ("b", "c2", "200", "primestreams"),
+                                    ("c", "c3", "300", "primestreams"), ("d", "c4", "400", "eaglecast")):
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?, 'ts', ?, 'queued', ?)", (rid, rid, ch, ch, sid, t, prov))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_stale_numbers_are_replaced_and_the_rest_left_alone(self):
+        import sqlite3 as sq
+        db = self._db()
+        current = {"c1": ("http://x", None, {"stream_id": "111", "stream_extension": "ts"}),
+                   "c2": ("http://x", None, {"stream_id": "200", "stream_extension": "ts"}),
+                   "c3": (None, "no channel", {})}
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_stream_url", side_effect=lambda cid, prov=None: current[cid]):
+            report = server._refresh_queued_stream_ids(False)
+            self.assertEqual([e["id"] for e in report["would_change"]], ["a"])
+            self.assertEqual([e["id"] for e in report["unresolved"]], ["c"])
+            self.assertEqual(report["changed"], 0)
+            done = server._refresh_queued_stream_ids(True)
+        self.assertEqual(done["changed"], 1)
+        rows = dict(sq.connect(db).execute("SELECT rec_id, stream_id FROM recordings"))
+        self.assertEqual(rows, {"a": "111", "b": "200", "c": "300", "d": "400"})

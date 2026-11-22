@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122a"
+VERSION = "v20261122b"
 
 app = Flask(__name__)
 
@@ -3372,6 +3372,58 @@ def _move_primestreams_bookings(apply_it):
     return {'applied': bool(apply_it), 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)}
 
 
+def _refresh_queued_stream_ids(apply_it):
+    """Give queued PrimeStreams bookings the CURRENT stream number for their channel.
+
+    A booking saves its stream number when it is made.  When the provider renumbers its channels (a new panel),
+    the saved number would record the wrong channel, so each queued booking is looked up again.  A booking whose
+    channel cannot be found any more is listed in ``unresolved`` and left exactly as it is.  Nothing changes unless
+    ``apply_it``.
+    """
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        rows = conn.execute(
+            "SELECT rec_id, title, channel, channel_id, stream_id, stream_extension FROM recordings "
+            "WHERE status IN ('queued','scheduled') AND COALESCE(stream_provider,'primestreams')='primestreams' "
+            "AND stop_ts>?", (time.time(),)).fetchall()
+    except sqlite3.Error as exc:
+        return {'error': str(exc)}
+    changes, unresolved = [], []
+    for rec_id, title, channel, channel_id, old_id, old_ext in rows:
+        url, error, debug = _stream_url(channel_id, 'primestreams')
+        new_id = str((debug or {}).get('stream_id') or '')
+        entry = {'id': rec_id, 'title': title, 'channel': channel}
+        if error or not new_id:
+            unresolved.append(entry)
+        elif new_id != str(old_id or ''):
+            entry['stream_id'] = new_id
+            entry['stream_extension'] = str((debug or {}).get('stream_extension') or old_ext or 'ts')
+            changes.append(entry)
+    if apply_it and changes:
+        for entry in changes:
+            conn.execute("UPDATE recordings SET stream_id=?, stream_extension=? WHERE rec_id=? "
+                         "AND status IN ('queued','scheduled')",
+                         (entry['stream_id'], entry['stream_extension'], entry['id']))
+        conn.commit()
+        with _rec_lock:
+            for entry in changes:
+                rec = _recs.get(entry['id'])
+                if rec:
+                    rec.update({'stream_id': entry['stream_id'], 'stream_extension': entry['stream_extension']})
+    conn.close()
+    keep = ('id', 'title', 'channel')
+    strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
+    return {'applied': bool(apply_it), 'changed': len(changes) if apply_it else 0,
+            'would_change': strip(changes), 'unresolved': strip(unresolved)}
+
+
+@app.route('/epg-web/api/primestreams/refresh-booking-streams', methods=['POST'])
+def api_primestreams_refresh_booking_streams():
+    """Report, or with {"apply": true} perform, the refresh of queued bookings' saved stream numbers."""
+    result = _refresh_queued_stream_ids((request.json or {}).get('apply') is True)
+    return jsonify(result), (400 if 'error' in result else 200)
+
+
 @app.route('/epg-web/api/primestreams/move-to-eaglecast', methods=['POST'])
 def api_primestreams_move_to_eaglecast():
     """Report, or with {"apply": true} perform, the move of queued PrimeStreams bookings to Eaglecast."""
@@ -5002,9 +5054,12 @@ def api_sync_streams():
         mconn.commit()
         mconn.close()
     _ps_channel_cache['loaded_at'] = 0
+    # Bookings made before this refresh saved the old stream numbers: bring them up to date.
+    restamp = _refresh_queued_stream_ids(True)
     return jsonify({'ok': True, 'updated': updated, 'unchanged': len(unchanged),
                     'not_found': len(not_found), 'discovered': discovered,
                     'unmatched_guide': len(unmatched_guide),
+                    'bookings_restamped': restamp.get('changed', 0),
                     'legacy_error': legacy_error})
 
 @app.route('/epg-web/api/247channels')
