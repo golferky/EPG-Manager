@@ -105,6 +105,16 @@ def find_blacks(path):
     return parse_blacks(log), parse_total_seconds(log)
 
 
+def cut_is_good(target, expected_seconds):
+    """True when the cut file exists and is about as long as it should be (an empty cut is a failure)."""
+    try:
+        if os.path.getsize(target) < 1000000:
+            return False
+        return abs(probe_duration(target) - expected_seconds) <= max(30.0, expected_seconds * 0.05)
+    except (OSError, ValueError):
+        return False
+
+
 def recording_began(path, total):
     """When the recording began: the file's creation time where the system keeps one, else its end minus its length."""
     stat = os.stat(path)
@@ -160,12 +170,14 @@ def main(argv=None):
     for start, end, length in episodes:
         target = unique_path(os.path.join(out, episode_filename(args.name, recording_start, start)))
         print('cutting', os.path.basename(target), flush=True)
-        # Start one second into the black so the cut never catches the end of the previous episode.
-        result = subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-ss', '%.2f' % (start + 1.0),
-                                 '-i', path, '-t', '%.2f' % (length - 1.0), '-c:v', 'copy', '-c:a', 'aac', target],
-                                stdin=subprocess.DEVNULL)
-        if result.returncode != 0:
-            print('  FFmpeg could not cut it; removing the unfinished file')
+        # Start one second into the black so the cut never catches the end of the previous episode.  The start is
+        # given AFTER the input (read through to it): a capture joined after a drop has a broken clock, and jumping
+        # straight to a late position then lands past what FFmpeg believes is the end and writes an empty file.
+        result = subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-i', path,
+                                 '-ss', '%.2f' % (start + 1.0), '-t', '%.2f' % (length - 1.0),
+                                 '-c:v', 'copy', '-c:a', 'aac', target], stdin=subprocess.DEVNULL)
+        if result.returncode != 0 or not cut_is_good(target, length - 1.0):
+            print('  that cut did not come out right (empty or the wrong length); removing the unfinished file')
             try:
                 os.remove(target)
             except OSError:

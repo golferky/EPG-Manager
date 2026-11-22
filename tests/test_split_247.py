@@ -78,3 +78,31 @@ class JoinedCaptureLengthTests(unittest.TestCase):
             self.assertAlmostEqual(began, expected, places=2)
         finally:
             os.remove(path)
+
+
+class CutCheckTests(unittest.TestCase):
+    def test_a_missing_or_tiny_cut_is_not_good(self):
+        self.assertFalse(sp.cut_is_good("/no/such/file.mp4", 1200))
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"x" * 2048)
+            path = handle.name
+        try:
+            self.assertFalse(sp.cut_is_good(path, 1200))
+        finally:
+            os.remove(path)
+
+    def test_a_cut_of_about_the_right_length_is_good(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"x" * 2000000)
+            path = handle.name
+        try:
+            original = sp.probe_duration
+            sp.probe_duration = lambda _p: 1195.0
+            try:
+                self.assertTrue(sp.cut_is_good(path, 1200))
+                sp.probe_duration = lambda _p: 100.0
+                self.assertFalse(sp.cut_is_good(path, 1200))
+            finally:
+                sp.probe_duration = original
+        finally:
+            os.remove(path)
