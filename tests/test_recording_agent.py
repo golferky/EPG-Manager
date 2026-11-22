@@ -11,6 +11,17 @@ from unittest import mock
 
 import recording_agent
 
+_REAL_PROVIDER_CONNECTIONS = recording_agent.provider_connections
+
+
+def setUpModule():
+    # No test should reach a real PrimeStreams panel to count connections.
+    recording_agent.provider_connections = lambda *args, **kwargs: None
+
+
+def tearDownModule():
+    recording_agent.provider_connections = _REAL_PROVIDER_CONNECTIONS
+
 
 class QualityDecisionTests(unittest.TestCase):
     def test_recording_tail_defaults_to_45_seconds(self):
@@ -3554,3 +3565,63 @@ class SurviveRestartTests(unittest.TestCase):
         self.assertIsNone(recording_agent.load_state(self.cfg, "noend"))
         self.assertIsNone(recording_agent.load_state(self.cfg, "old"))
         self.assertIsNotNone(recording_agent.load_state(self.cfg, "busy"))
+
+
+class PrimeStreamsConnectionCheckTests(unittest.TestCase):
+    CFG = {"epg_url": "http://panel.invalid:826", "epg_user": "u", "epg_pass": "p", "heartbeat_seconds": 1}
+
+    def _job(self, start=None, provider="primestreams"):
+        return {"id": "j1", "title": "A Film", "stream_provider": provider,
+                "start_ts": time.time() if start is None else start}
+
+    def test_counts_come_from_the_panel_and_unknown_is_none(self):
+        import io
+
+        class Reply(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+        body = json.dumps({"user_info": {"active_cons": "1", "max_connections": "1"}}).encode()
+        with mock.patch.object(recording_agent.urllib.request, "urlopen", return_value=Reply(body)):
+            self.assertEqual(_REAL_PROVIDER_CONNECTIONS(self.CFG, "primestreams"), (1, 1))
+        with mock.patch.object(recording_agent.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertIsNone(_REAL_PROVIDER_CONNECTIONS(self.CFG, "primestreams"))
+
+    def test_a_free_unknown_or_other_provider_goes_straight_on(self):
+        api = mock.Mock()
+        for counts in ((0, 1), None):
+            with mock.patch.object(recording_agent, "provider_connections", return_value=counts):
+                self.assertTrue(recording_agent.wait_for_free_connection(api, self._job(), self.CFG))
+        with mock.patch.object(recording_agent, "provider_connections") as check:
+            self.assertTrue(recording_agent.wait_for_free_connection(api, self._job(provider="eaglecast"), self.CFG))
+            check.assert_not_called()
+
+    def test_it_waits_until_the_connection_is_free(self):
+        api, sleeps = mock.Mock(), []
+        with mock.patch.object(recording_agent, "provider_connections", side_effect=[(1, 1), (1, 1), (0, 1)]):
+            ok = recording_agent.wait_for_free_connection(
+                api, self._job(), self.CFG, sleep=lambda *a, **k: sleeps.append(a[3]) or True)
+        self.assertTrue(ok)
+        self.assertEqual(len(sleeps), 2)
+        api.patient_heartbeat.assert_not_called()
+
+    def test_it_gives_up_two_minutes_past_the_start_and_says_why(self):
+        api = mock.Mock()
+        job = self._job(start=1000.0)
+        with mock.patch.object(recording_agent, "provider_connections", return_value=(1, 1)):
+            ok = recording_agent.wait_for_free_connection(
+                api, job, self.CFG, sleep=lambda *a, **k: True, now=lambda: 1000.0 + 121)
+        self.assertFalse(ok)
+        args, kwargs = api.patient_heartbeat.call_args
+        self.assertEqual(args[1], "failed")
+        self.assertIn("1 of 1 connection", kwargs["message"])
+        self.assertNotIn("panel.invalid", kwargs["message"])
+
+    def test_a_cancel_while_waiting_stops_it(self):
+        api = mock.Mock()
+        with mock.patch.object(recording_agent, "provider_connections", return_value=(1, 1)):
+            self.assertFalse(recording_agent.wait_for_free_connection(
+                api, self._job(), self.CFG, sleep=lambda *a, **k: False))
+        api.patient_heartbeat.assert_not_called()

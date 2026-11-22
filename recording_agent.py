@@ -31,7 +31,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261120b"
+AGENT_VERSION = "v20261122a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -1263,6 +1263,53 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time, adopt=No
 
 PROBE_ATTEMPTS = 3
 PROBE_PAUSE_SECONDS = 20
+CONNECTION_CHECK_PAUSE_SECONDS = 15
+CONNECTION_WAIT_PAST_START_SECONDS = 120
+
+
+def provider_connections(cfg, provider, timeout=10):
+    """(connections open now, connections allowed) on an Xtream account, or None if the panel does not say."""
+    api = provider_api(cfg, provider)
+    if not api:
+        return None
+    base, user, password = api
+    url = (f'{base}/player_api.php?username={urllib.parse.quote(str(user), safe="")}'
+           f'&password={urllib.parse.quote(str(password), safe="")}')
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as reply:
+            info = json.loads(reply.read()).get('user_info') or {}
+        return int(info['active_cons']), int(info['max_connections'])
+    except Exception:
+        return None
+
+
+def wait_for_free_connection(api, job, cfg, sleep=None, now=time.time):
+    """For a PrimeStreams recording, wait while the account has no free connection.
+
+    Another player (a phone, the Firestick) or another recording holding the account makes the provider cut the
+    new stream after a few seconds, which would spoil the recording.  This waits, keeping the job alive, until a
+    connection is free; if none frees up by two minutes after the start time the recording is not made, with the
+    reason.  When the panel does not say how many are open, the recording goes ahead.  Returns True to go on,
+    False if the job was cancelled or given up.
+    """
+    if job.get('stream_provider', 'primestreams') != 'primestreams':
+        return True
+    sleep = sleep or heartbeat_sleep
+    deadline = float(job['start_ts']) + CONNECTION_WAIT_PAST_START_SECONDS
+    while True:
+        counts = provider_connections(cfg, 'primestreams')
+        if counts is None or counts[0] < counts[1]:
+            return True
+        if now() >= deadline:
+            api.patient_heartbeat(job['id'], 'failed', message=(
+                f'PrimeStreams already had {counts[0]} of {counts[1]} connection(s) open (another player or '
+                f'recording was using the account), so this was not recorded.'))
+            return False
+        print(f'[connections] {job["title"]}: PrimeStreams has {counts[0]} of {counts[1]} connection(s) open; '
+              f'waiting', flush=True)
+        if not sleep(api, job, 'preflight', CONNECTION_CHECK_PAUSE_SECONDS, cfg,
+                     message='Waiting for a free PrimeStreams connection'):
+            return False
 
 
 def probe_incoming_stream(api, job, cfg, url, sleep=None):
@@ -1334,6 +1381,8 @@ def process_job(api, job, cfg, adopt=None):
         remaining = max(60, int(float(adopt.get('end_time') or 0) - time.time()))
     else:
         api.patient_heartbeat(job['id'], 'preflight', message='Checking Plex and incoming stream quality')
+        if not wait_for_free_connection(api, job, cfg):
+            return
         candidates = (find_tv_episode_candidates(
             library_root, job['title'], episode['season'], episode['episode'], job.get('year', ''))
             if episode else ([] if is_series else find_movie_candidates(cfg, library_root, job['title'], job.get('year', ''))))
