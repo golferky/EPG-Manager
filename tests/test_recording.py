@@ -5414,3 +5414,74 @@ class RecordingPlannerTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("switchTab('planner')", html)
         self.assertIn("'planner'", html)
+
+
+class PlannerActionsTests(unittest.TestCase):
+    def _db(self, rows):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, channel_id, start_ts, stop_ts, status, "
+                     "stream_provider, stream_id, stream_extension, season_num, episode_num, is_series, failure_reason)")
+        for r in rows:
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?,?,?,?,'9','ts',?,?,?,NULL)", r)
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_the_planner_shows_only_what_is_planned_unless_asked(self):
+        from datetime import datetime, timezone
+        noon = datetime(2027, 1, 5, 12, 0, tzinfo=timezone.utc).timestamp()
+        db = self._db([("q", "Planned", "c", "c", noon, noon + 3600, "queued", "eaglecast", None, None, 0),
+                       ("f", "Failed", "c", "c", noon + 4000, noon + 5000, "failed", "primestreams", None, None, 0),
+                       ("d", "Done", "c", "c", noon + 6000, noon + 7000, "done", "primestreams", None, None, 0)])
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "load_config", return_value={"timezone": "UTC"}):
+            client = server.app.test_client()
+            planned = client.get("/epg-web/api/recording-plan?date=2027-01-05").get_json()
+            everything = client.get("/epg-web/api/recording-plan?date=2027-01-05&all=1").get_json()
+        self.assertEqual([i["id"] for i in planned["items"]], ["q"])
+        self.assertEqual({i["id"] for i in everything["items"]}, {"q", "f", "d"})
+
+    def test_switching_source_checks_the_channel_and_the_connection(self):
+        t = time.time() + 86400
+        db = self._db([("a", "Film", "c1", "c1", t, t + 3600, "queued", "primestreams", None, None, 0),
+                       ("b", "Other", "c2", "c2", t, t + 3600, "queued", "eaglecast", 2, 1, 1)])
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_eaglecast_enabled", return_value=True), \
+             mock.patch.object(server, "_eaglecast_expiry", return_value=(None, "")), \
+             mock.patch.object(server, "_slot_source", return_value=("77", "ts")):
+            client = server.app.test_client()
+            busy = client.post("/epg-web/api/recording-plan/switch-source", json={"id": "a", "provider": "eaglecast"})
+            self.assertEqual(busy.status_code, 409)
+            self.assertIn("already booked", busy.get_json()["error"])
+            with mock.patch.object(server, "_eaglecast_overlap", return_value=None):
+                moved = client.post("/epg-web/api/recording-plan/switch-source", json={"id": "a", "provider": "eaglecast"})
+            self.assertEqual(moved.status_code, 200)
+            bad = client.post("/epg-web/api/recording-plan/switch-source", json={"id": "a", "provider": "x"})
+            self.assertEqual(bad.status_code, 400)
+        import sqlite3 as sq
+        self.assertEqual(sq.connect(db).execute("SELECT stream_provider, stream_id FROM recordings WHERE rec_id='a'").fetchone(),
+                         ("eaglecast", "77"))
+
+    def test_cancelling_other_copies_lists_them_first_and_keeps_the_chosen_one(self):
+        t = time.time() + 86400
+        db = self._db([("keep", "The Film", "c1", "c1", t, t + 3600, "queued", "eaglecast", None, None, 0),
+                       ("dup1", "The Film", "c2", "c2", t + 9000, t + 12000, "queued", "primestreams", None, None, 0),
+                       ("dup2", "The Film", "c3", "c3", t + 20000, t + 23000, "scheduled", "primestreams", None, None, 0),
+                       ("ep", "The Film", "c4", "c4", t + 30000, t + 33000, "queued", "primestreams", 1, 2, 1),
+                       ("other", "Different", "c5", "c5", t, t + 3600, "queued", "primestreams", None, None, 0)])
+        cancelled = []
+
+        def fake_cancel():
+            cancelled.append(server.request.json["id"])
+            return server.jsonify({"ok": True})
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "api_rec_cancel", side_effect=fake_cancel):
+            client = server.app.test_client()
+            report = client.post("/epg-web/api/recording-plan/cancel-copies", json={"id": "keep"}).get_json()
+            self.assertEqual({c["id"] for c in report["copies"]}, {"dup1", "dup2"})
+            self.assertEqual(cancelled, [])
+            done = client.post("/epg-web/api/recording-plan/cancel-copies", json={"id": "keep", "apply": True}).get_json()
+        self.assertEqual(done["cancelled"], 2)
+        self.assertEqual(set(cancelled), {"dup1", "dup2"})
