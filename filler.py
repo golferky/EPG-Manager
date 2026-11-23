@@ -17,6 +17,7 @@ from pathlib import Path
 import recording_agent
 
 CAPTURE_DIRNAME = '247 captures'
+ACTIVE_CAPTURES = set()         # capture files being written right now by this recorder
 STATUS_POLL_SECONDS = 5
 STALL_TIMEOUT_MICROSECONDS = str(120 * 1000000)
 DROP_PAUSE_SECONDS = 15
@@ -66,6 +67,7 @@ def capture(cfg, api, info, popen=subprocess.Popen, now=time.time, sleep=time.sl
     stem = folder / ('%s_%d' % (re.sub(r'[^A-Za-z0-9]+', '_', info.get('show') or info.get('channel') or 'channel').strip('_'),
                                 int(info['start_ts'])))
     joined = Path(str(stem) + '.ts')
+    ACTIVE_CAPTURES.add(str(joined))
     until = float(info['until_ts'])
     segments, drops, empty, attempt, began, stopped = [], 0, 0, 0, now(), False
     while until - now() > 30 and not stopped:
@@ -103,6 +105,7 @@ def capture(cfg, api, info, popen=subprocess.Popen, now=time.time, sleep=time.sl
         log('[filler] the stream stopped early (drop %d); starting again in %d s' % (drops, DROP_PAUSE_SECONDS))
         sleep(DROP_PAUSE_SECONDS)
         attempt += 1
+    ACTIVE_CAPTURES.discard(str(joined))
     seconds = now() - began
     existing = [Path(s) for s in segments if os.path.exists(s) and os.path.getsize(s) > 0]
     for empty_segment in segments:
@@ -262,6 +265,69 @@ def prune_old_captures(cfg, keep_days, now=time.time):
     return removed
 
 
+PROCESSED_SUFFIX = '.processed'
+SETTLE_SECONDS = 600            # a capture file not written to for this long is finished (or was cut off)
+RECOVER_MIN_BYTES = 90 * 1000 * 1000       # about 20 minutes of a 24/7 channel
+
+
+def _slug(text):
+    return re.sub(r'[^A-Za-z0-9]+', '_', text or '').strip('_')
+
+
+def leftover_captures(cfg, now=time.time):
+    """Raw captures nobody processed: (path, slug, start_ts).  A capture counts once it has not been written to for
+    ``SETTLE_SECONDS``, which covers a recorder restart that cut one off.  Repaired copies (``.clean.ts``) and ones
+    already handled (marked ``.processed``) are skipped."""
+    found = []
+    for path in sorted(captures_dir(cfg).glob('*.ts')):
+        if path.name.endswith('.clean.ts') or Path(str(path) + PROCESSED_SUFFIX).exists() or str(path) in ACTIVE_CAPTURES:
+            continue
+        try:
+            if now() - path.stat().st_mtime < SETTLE_SECONDS:
+                continue
+        except OSError:
+            continue
+        match = re.fullmatch(r'(.+)_(\d{9,11})\.ts', path.name)
+        if match:
+            found.append((path, match.group(1), int(match.group(2))))
+    return found
+
+
+def recover_leftovers(cfg, api, channels, log=print, now=time.time):
+    """Process captures a restart cut off: repair, cut, identify and file them like a finished capture.
+
+    ``channels`` is the dashboard's chosen-channel list (each with its show and cut settings); a capture is matched to
+    its channel by the show name in its file name.  A capture that is too small, or that matches no chosen channel,
+    is marked handled and left where it is.  Returns how many were processed.
+    """
+    by_slug = {_slug(c.get('show') or c.get('channel')): c for c in channels}
+    done = 0
+    for path, slug, started in leftover_captures(cfg, now):
+        marker = Path(str(path) + PROCESSED_SUFFIX)
+        entry = by_slug.get(slug)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if entry is None or size < RECOVER_MIN_BYTES:
+            marker.write_text('skipped: ' + ('no matching channel' if entry is None else 'too small'))
+            continue
+        profile = {k: entry.get(k) for k in ('skip_start', 'keep_after', 'min_minutes', 'max_minutes') if entry.get(k) is not None}
+        info = {'show': entry.get('show', ''), 'channel': entry.get('channel', ''), 'start_ts': float(started),
+                'profile': profile}
+        log('[filler] recovering the capture %s (%.0f MB)' % (path.name, size / 1e6))
+        try:
+            clean = repair(cfg, path)
+            files = cut_episodes(cfg, clean, info, log=log)
+            filed, held, notes = identify_and_file(cfg, files, info, log=log) if files else (0, 0, [])
+            marker.write_text('processed: %d episode(s), %d filed, %d held %s' % (len(files), filed, held, '; '.join(notes)))
+            log('[filler] recovered %s: %d episode(s), %d in Plex, %d held' % (path.name, len(files), filed, held))
+            done += 1
+        except Exception as exc:
+            log('[filler] could not recover %s: %s' % (path.name, exc))
+    return done
+
+
 def run_capture(cfg, api, info, log=print):
     """One whole capture: record, repair, cut, identify, file.  Reports the outcome to the dashboard."""
     report = {'status': 'failed', 'file': '', 'seconds': 0, 'drops': 0, 'episodes': 0, 'filed': 0, 'held': 0, 'note': ''}
@@ -279,6 +345,13 @@ def run_capture(cfg, api, info, log=print):
             report['episodes'] = len(files)
             filed, held, notes = identify_and_file(cfg, files, info, log=log) if files else (0, 0, [])
             report.update({'status': 'done', 'filed': filed, 'held': held, 'note': '; '.join(notes)})
+        if report['status'] in ('done', 'too_short') and report['file']:
+            try:
+                raw = Path(report['file'])
+                raw = raw.with_name(raw.name.replace('.clean.ts', '.ts'))
+                Path(str(raw) + PROCESSED_SUFFIX).write_text('processed by the capture itself')
+            except OSError:
+                pass
         prune_old_captures(cfg, info.get('keep_days', 7))
     except Exception as exc:
         report['note'] = str(exc)[:300]

@@ -31,7 +31,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261123b"
+AGENT_VERSION = "v20261123c"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -1801,6 +1801,26 @@ def start_job_once(api, job, cfg, active, thread_factory=threading.Thread):
 
 
 FILLER_ASK_SECONDS = 60
+FILLER_RECOVER_SECONDS = 600
+
+
+def start_filler_recovery(api, cfg, thread_factory=threading.Thread):
+    """In the background, process any 24/7 capture a restart cut off.  Returns the thread, or None."""
+    try:
+        import json as _json
+        with urllib.request.urlopen(urllib.request.Request(
+                api.base + '/epg-web/api/filler', headers={'Authorization': f'Bearer {api.token}'}), timeout=15) as reply:
+            channels = _json.loads(reply.read()).get('channels') or []
+    except Exception as exc:
+        print(f'[filler] could not read the chosen channels for recovery: {exc}', file=sys.stderr, flush=True)
+        return None
+    if not channels:
+        return None
+    import filler
+    worker = thread_factory(target=filler.recover_leftovers, args=(cfg, api, channels), daemon=True,
+                            name='epg-filler-recover')
+    worker.start()
+    return worker
 
 
 def maybe_start_filler(api, cfg, thread_factory=threading.Thread):
@@ -1831,6 +1851,7 @@ def run_agent(cfg, once=False):
           f'max recordings={max_workers}', flush=True)
     active = {}
     filler_worker, filler_asked = None, 0.0
+    recovery_worker, recovery_asked = None, 0.0
     try:
         adopt_orphans(api, cfg, active)       # recordings still running from before this start
     except Exception as exc:
@@ -1845,6 +1866,10 @@ def run_agent(cfg, once=False):
                 if not job:
                     break
                 start_job_once(api, job, cfg, active)
+            if not once and (recovery_worker is None or not recovery_worker.is_alive()) \
+                    and time.time() - recovery_asked >= FILLER_RECOVER_SECONDS:
+                recovery_asked = time.time()
+                recovery_worker = start_filler_recovery(api, cfg)
             if not once and not active and (filler_worker is None or not filler_worker.is_alive()) \
                     and time.time() - filler_asked >= FILLER_ASK_SECONDS:
                 filler_asked = time.time()

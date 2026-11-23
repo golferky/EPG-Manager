@@ -5732,6 +5732,27 @@ class AutomaticCaptureServerTests(unittest.TestCase):
             self.assertTrue(client.post("/epg-web/api/agent/filler/77/status", json={}).get_json()["stop"])   # never existed
         server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
 
+    def test_a_row_left_running_by_a_cut_off_capture_is_marked_interrupted_when_the_next_starts(self):
+        import sqlite3 as sq
+        db = self._db()
+        conn = sq.connect(db)
+        conn.execute("INSERT INTO filler_captures (id, channel_id, start_ts, until_ts, status) VALUES (3,'a',?,?,'running')",
+                     (time.time() - 2400, time.time() + 3000))
+        conn.commit()
+        conn.close()
+        fcfg = dict(self.FCFG, filler_channels=[{"channel_id": "a", "channel": "A", "show": "A"}])
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_filler_config", return_value=fcfg), \
+             mock.patch.object(server, "_filler_blocked_now", return_value=""), \
+             mock.patch.object(server, "_filler_stream_id", return_value="9"):
+            capture = server.app.test_client().post("/epg-web/api/agent/filler/next", json={}).get_json()["capture"]
+        rows = dict(sq.connect(db).execute("SELECT id, status FROM filler_captures"))
+        self.assertEqual(rows[3], "interrupted")
+        self.assertEqual(rows[capture["id"]], "running")
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
+
     def test_no_capture_is_offered_when_it_is_off_or_blocked(self):
         db = self._db()
         server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})

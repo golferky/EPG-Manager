@@ -3748,8 +3748,10 @@ def api_agent_filler_next():
         if not entry:
             return jsonify({'ok': True, 'capture': None})
         conn = sqlite3.connect(_guide_db_path(), timeout=10)
-        conn.execute("UPDATE filler_captures SET status='failed', note='the recorder never reported' "
-                     "WHERE status='running' AND until_ts<?", (now - FILLER_STALE_SECONDS,))
+        # Only one capture runs at a time and none is running now, so any row still marked running was cut off
+        # (a recorder restart, or the recorder stopped reporting).
+        conn.execute("UPDATE filler_captures SET status='interrupted', finished_ts=?, "
+                     "note='cut off: the recorder was restarted or stopped reporting' WHERE status='running'", (now,))
         cursor = conn.execute(
             "INSERT INTO filler_captures (channel_id, channel, stream_id, show, start_ts, until_ts, status) "
             "VALUES (?,?,?,?,?,?,'running')", (entry['channel_id'], entry.get('channel', ''), stream_id,

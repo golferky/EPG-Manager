@@ -259,3 +259,69 @@ class AgentLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = make_cfg(self.tmp)
+        self.folder = filler.captures_dir(self.cfg)
+        self.channels = [{"channel_id": "r", "channel": "EVERYBODY LOVES RAYMOND", "show": "Everybody Loves Raymond",
+                          "skip_start": 36.0, "keep_after": 15.5, "max_minutes": 22}]
+
+    def _capture(self, name, megabytes, age_seconds):
+        path = self.folder / name
+        path.write_bytes(b"x" * int(megabytes * 1e6))
+        old = time.time() - age_seconds
+        os.utime(path, (old, old))
+        return path
+
+    def test_only_settled_unprocessed_raw_captures_are_leftovers(self):
+        settled = self._capture("Everybody_Loves_Raymond_1795434240.ts", 1, 3600)
+        self._capture("Everybody_Loves_Raymond_1795440000.ts", 1, 30)                    # still being written
+        done = self._capture("Everybody_Loves_Raymond_1795430000.ts", 1, 7200)
+        Path(str(done) + filler.PROCESSED_SUFFIX).write_text("x")
+        self._capture("Everybody_Loves_Raymond_1795434240.clean.ts", 1, 3600)             # a repaired copy
+        active = self._capture("Everybody_Loves_Raymond_1795441111.ts", 1, 3600)
+        filler.ACTIVE_CAPTURES.add(str(active))
+        try:
+            found = filler.leftover_captures(self.cfg)
+        finally:
+            filler.ACTIVE_CAPTURES.discard(str(active))
+        self.assertEqual([(p.name, slug, ts) for p, slug, ts in found],
+                         [(settled.name, "Everybody_Loves_Raymond", 1795434240)])
+
+    def test_a_cut_off_capture_is_cut_identified_filed_and_marked_handled(self):
+        raw = self._capture("Everybody_Loves_Raymond_1795434240.ts", 120, 3600)
+        calls = []
+        with mock.patch.object(filler, "repair", side_effect=lambda cfg, p, run=None: calls.append("repair") or p), \
+             mock.patch.object(filler, "cut_episodes", side_effect=lambda *a, **k: calls.append("cut") or ["e1"]), \
+             mock.patch.object(filler, "identify_and_file", return_value=(1, 0, [])) as ident:
+            done = filler.recover_leftovers(self.cfg, mock.Mock(), self.channels, log=lambda *a: None)
+        self.assertEqual((done, calls), (1, ["repair", "cut"]))
+        self.assertEqual(ident.call_args[0][2]["profile"]["skip_start"], 36.0)
+        self.assertTrue(Path(str(raw) + filler.PROCESSED_SUFFIX).exists())
+        with mock.patch.object(filler, "cut_episodes") as cut:
+            self.assertEqual(filler.recover_leftovers(self.cfg, mock.Mock(), self.channels, log=lambda *a: None), 0)
+        cut.assert_not_called()                   # not processed twice
+
+    def test_a_tiny_capture_or_one_for_an_unchosen_channel_is_marked_and_left_alone(self):
+        small = self._capture("Everybody_Loves_Raymond_1795434089.ts", 13, 3600)
+        other = self._capture("Some_Other_Show_1795434300.ts", 200, 3600)
+        with mock.patch.object(filler, "cut_episodes") as cut:
+            self.assertEqual(filler.recover_leftovers(self.cfg, mock.Mock(), self.channels, log=lambda *a: None), 0)
+        cut.assert_not_called()
+        self.assertTrue(small.exists() and other.exists())
+        self.assertTrue(Path(str(small) + filler.PROCESSED_SUFFIX).exists())
+        self.assertTrue(Path(str(other) + filler.PROCESSED_SUFFIX).exists())
+
+    def test_a_capture_that_ran_to_its_end_marks_itself_handled(self):
+        api = mock.Mock()
+        raw = self.folder / "Show_1795440000.ts"
+        raw.write_bytes(b"x" * 10)
+        info = {"id": 4, "show": "S", "channel": "C", "stream_id": "1", "start_ts": 1795440000.0, "until_ts": 2.0}
+        with mock.patch.object(filler, "capture", return_value=(raw, 3000, 0)), \
+             mock.patch.object(filler, "repair", return_value=Path(str(raw)[:-3] + ".clean.ts")), \
+             mock.patch.object(filler, "cut_episodes", return_value=[]):
+            filler.run_capture(self.cfg, api, info, log=lambda *a: None)
+        self.assertTrue(Path(str(raw) + filler.PROCESSED_SUFFIX).exists())
