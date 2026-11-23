@@ -221,6 +221,17 @@ def _write_candidates(cfg, show, name, row, count=3):
         pass
 
 
+def _keep_transcript(cfg, show, name, text):
+    """Save what was said in an episode beside the held episodes (``.transcripts``, the same place the identify tool
+    uses), so repeats can be found by comparing speech and later guesses can use it."""
+    try:
+        store = holding_folder(cfg, show) / '.transcripts'
+        store.mkdir(parents=True, exist_ok=True)
+        (store / (name + '.txt')).write_text(text, encoding='utf-8')
+    except Exception:
+        pass
+
+
 def identify_and_file(cfg, files, info, log=print):
     """Listen to each episode, file the confident ones in Plex, hold the rest.  Returns (filed, held, notes)."""
     _tools_on_path()
@@ -248,6 +259,7 @@ def identify_and_file(cfg, files, info, log=print):
         for path in files:
             text, model = ident.transcribe(str(path), cfg.get('whisper_model', 'small.en'), model)
             transcripts[Path(path).name] = text
+            _keep_transcript(cfg, show, Path(path).name, text)
         # Transcripts kept from earlier captures show which words every episode of the show says.
         background = ident.saved_transcripts([str(holding_folder(cfg, show))])
         rows = ident.plan(names, transcripts, episodes, background=background)

@@ -207,6 +207,8 @@ class AfterwardsTests(unittest.TestCase):
         self.assertEqual(list(Path(self.cfg["plex_tv_path"]).rglob("*.mp4")), [])
         note = (filler.holding_folder(self.cfg, "Everybody Loves Raymond") / "Candidates.txt").read_text()
         self.assertIn("2026-11-22_0808.mp4: S02E05 The Sculpture", note)
+        kept = filler.holding_folder(self.cfg, "Everybody Loves Raymond") / ".transcripts" / (path.name + ".txt")
+        self.assertEqual(kept.read_text(), speech)               # the speech is kept for comparing repeats
 
     def test_without_the_speech_package_everything_is_held_and_nothing_is_lost(self):
         import identify_episodes as ident
