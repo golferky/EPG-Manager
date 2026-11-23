@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261122i"
+VERSION = "v20261123b"
 
 app = Flask(__name__)
 
@@ -1980,6 +1980,10 @@ def _init_recordings_table():
             except sqlite3.OperationalError as e:
                 if 'duplicate column name' not in str(e).lower():
                     raise
+        conn.execute('''CREATE TABLE IF NOT EXISTS filler_captures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT, channel TEXT, stream_id TEXT, show TEXT,
+            start_ts REAL, until_ts REAL, status TEXT, seconds INTEGER, drops INTEGER, episodes INTEGER,
+            filed INTEGER, held INTEGER, file TEXT, note TEXT, finished_ts REAL)''')
         conn.commit()
         conn.close()
     except Exception as e:
@@ -3556,6 +3560,264 @@ def api_primestreams_refresh_booking_streams():
     """Report, or with {"apply": true} perform, the refresh of queued bookings' saved stream numbers."""
     result = _refresh_queued_stream_ids((request.json or {}).get('apply') is True)
     return jsonify(result), (400 if 'error' in result else 200)
+
+
+# ── Automatic 24/7 capture ───────────────────────────────────────────────────
+# When the PrimeStreams connection is idle (nothing booked soon, nobody watching) the recorder captures a 24/7
+# channel the owner chose, then cuts it into episodes, identifies them and files the confident ones in Plex.
+# A capture is the lowest priority of all: the dashboard ends it the moment a recording or a viewer needs the
+# connection.
+FILLER_DEFAULTS = {'filler_enabled': False, 'filler_channels': [], 'filler_min_minutes': 50,
+                   'filler_max_minutes': 150, 'filler_margin_minutes': 8, 'filler_keep_days': 7}
+FILLER_YIELD_WAIT_SECONDS = 20
+FILLER_STALE_SECONDS = 600
+_filler_state = {'id': None, 'stop': False, 'max_until': 0.0}
+_filler_lock = threading.Lock()
+_relays_open = 0
+_relays_lock = threading.Lock()
+
+
+def _filler_config():
+    cfg = load_config()
+    out = {k: cfg.get(k, v) for k, v in FILLER_DEFAULTS.items()}
+    out['filler_channels'] = [c for c in (out['filler_channels'] or []) if isinstance(c, dict) and c.get('channel_id')]
+    return out
+
+
+def _filler_preset(name):
+    """Starting cut settings for a channel name (the owner can change them)."""
+    low = str(name or '').lower()
+    if 'raymond' in low:
+        return {'show': 'Everybody Loves Raymond', 'skip_start': 36.0, 'keep_after': 15.5, 'min_minutes': 15, 'max_minutes': 22}
+    if 'griffith' in low:
+        return {'show': 'The Andy Griffith Show', 'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 15, 'max_minutes': 45}
+    return {'show': str(name or '').title(), 'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 15, 'max_minutes': 45}
+
+
+def _filler_stream_id(channel_id):
+    """The channel's CURRENT stream number (the provider renumbers its channels), or ''."""
+    try:
+        conn = sqlite3.connect(load_config().get('db_path', '/Volumes/EPG/Movies.db'), timeout=5)
+        row = conn.execute('SELECT stream_id FROM channels WHERE channel_id=?', (channel_id,)).fetchone()
+        conn.close()
+        return str(row[0]) if row and row[0] else ''
+    except sqlite3.Error:
+        return ''
+
+
+def _filler_window(now, fcfg, db_path=None):
+    """The end of the opening that starts now (a time), or None when the PrimeStreams connection is not free.
+
+    Not free: a PrimeStreams recording is running or starts within the margin.  Otherwise the opening lasts until
+    the margin before the next PrimeStreams booking, at most ``filler_max_minutes``, and must be long enough to be
+    worth a capture.
+    """
+    margin = float(fcfg['filler_margin_minutes']) * 60
+    live = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+    try:
+        conn = sqlite3.connect(db_path or _guide_db_path(), timeout=3)
+        rows = conn.execute(
+            "SELECT start_ts FROM recordings WHERE COALESCE(stream_provider,'primestreams')='primestreams' "
+            "AND status IN ({}) AND stop_ts>?".format(','.join('?' * len(live))), list(live) + [now]).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return None
+    starts = [float(r[0]) for r in rows]
+    if any(a <= now + margin for a in starts):
+        return None
+    until = min([a - margin for a in starts] + [now + float(fcfg['filler_max_minutes']) * 60])
+    return until if until - now >= float(fcfg['filler_min_minutes']) * 60 else None
+
+
+def _filler_blocked_now():
+    """A reason a capture cannot run at all right now, or ''."""
+    if not _primestreams_enabled():
+        return 'PrimeStreams is switched off'
+    if _primestreams_health().get('state') in ('inactive', 'refused'):
+        return 'PrimeStreams is not working'
+    with _relays_lock:
+        if _relays_open:
+            return 'someone is watching'
+    return ''
+
+
+def _filler_pick_channel(fcfg, db_path=None):
+    """The chosen channel captured longest ago (never captured first), with its current stream number."""
+    last = {}
+    try:
+        conn = sqlite3.connect(db_path or _guide_db_path(), timeout=3)
+        for channel_id, started in conn.execute('SELECT channel_id, MAX(start_ts) FROM filler_captures GROUP BY channel_id'):
+            last[channel_id] = float(started or 0)
+        conn.close()
+    except sqlite3.Error:
+        pass
+    for entry in sorted(fcfg['filler_channels'], key=lambda c: last.get(c['channel_id'], 0.0)):
+        stream_id = _filler_stream_id(entry['channel_id'])
+        if stream_id:
+            return entry, stream_id
+    return None, ''
+
+
+@app.route('/epg-web/api/agent/filler/next', methods=['POST'])
+def api_agent_filler_next():
+    """The recorder asks, when it is idle, for an opening to capture a 24/7 channel in."""
+    if not _agent_authorized():
+        return _agent_auth_failure()
+    fcfg = _filler_config()
+    now = time.time()
+    if not fcfg['filler_enabled'] or not fcfg['filler_channels'] or _filler_blocked_now():
+        return jsonify({'ok': True, 'capture': None})
+    with _filler_lock:
+        if _filler_state['id'] is not None:
+            return jsonify({'ok': True, 'capture': None})
+        until = _filler_window(now, fcfg)
+        if not until:
+            return jsonify({'ok': True, 'capture': None})
+        entry, stream_id = _filler_pick_channel(fcfg)
+        if not entry:
+            return jsonify({'ok': True, 'capture': None})
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.execute("UPDATE filler_captures SET status='failed', note='the recorder never reported' "
+                     "WHERE status='running' AND until_ts<?", (now - FILLER_STALE_SECONDS,))
+        cursor = conn.execute(
+            "INSERT INTO filler_captures (channel_id, channel, stream_id, show, start_ts, until_ts, status) "
+            "VALUES (?,?,?,?,?,?,'running')", (entry['channel_id'], entry.get('channel', ''), stream_id,
+                                               entry.get('show', ''), now, until))
+        capture_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        _filler_state.update({'id': capture_id, 'stop': False, 'max_until': until})
+    profile = {k: entry.get(k) for k in ('skip_start', 'keep_after', 'min_minutes', 'max_minutes') if entry.get(k) is not None}
+    return jsonify({'ok': True, 'capture': {
+        'id': capture_id, 'channel': entry.get('channel', ''), 'show': entry.get('show', ''), 'stream_id': stream_id,
+        'start_ts': now, 'until_ts': until, 'profile': profile, 'keep_days': fcfg['filler_keep_days']}})
+
+
+@app.route('/epg-web/api/agent/filler/<int:capture_id>/status', methods=['POST'])
+def api_agent_filler_status(capture_id):
+    """While capturing, the recorder asks every few seconds whether to stop, and when the opening now ends."""
+    if not _agent_authorized():
+        return _agent_auth_failure()
+    fcfg = _filler_config()
+    now = time.time()
+    with _filler_lock:
+        mine = _filler_state['id'] == capture_id
+        stop = (not mine) or _filler_state['stop'] or not fcfg['filler_enabled']
+        max_until = _filler_state['max_until']
+    if not stop and _filler_blocked_now() in ('PrimeStreams is switched off', 'PrimeStreams is not working'):
+        stop = True
+    until = max_until
+    if not stop:
+        margin = float(fcfg['filler_margin_minutes']) * 60
+        live = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+        try:
+            conn = sqlite3.connect(_guide_db_path(), timeout=3)
+            starts = [float(r[0]) for r in conn.execute(
+                "SELECT start_ts FROM recordings WHERE COALESCE(stream_provider,'primestreams')='primestreams' "
+                "AND status IN ({}) AND stop_ts>?".format(','.join('?' * len(live))), list(live) + [now])]
+            conn.close()
+            until = min([max_until] + [a - margin for a in starts])
+        except sqlite3.Error:
+            pass
+    return jsonify({'ok': True, 'stop': bool(stop), 'until_ts': until})
+
+
+@app.route('/epg-web/api/agent/filler/<int:capture_id>/finish', methods=['POST'])
+def api_agent_filler_finish(capture_id):
+    """The recorder reports how a capture ended."""
+    if not _agent_authorized():
+        return _agent_auth_failure()
+    body = request.json or {}
+    conn = sqlite3.connect(_guide_db_path(), timeout=10)
+    conn.execute("UPDATE filler_captures SET status=?, seconds=?, drops=?, episodes=?, filed=?, held=?, file=?, "
+                 "note=?, finished_ts=? WHERE id=?",
+                 (str(body.get('status') or 'done')[:20], int(body.get('seconds') or 0), int(body.get('drops') or 0),
+                  int(body.get('episodes') or 0), int(body.get('filed') or 0), int(body.get('held') or 0),
+                  str(body.get('file') or '')[:300], str(body.get('note') or '')[:300], time.time(), capture_id))
+    conn.commit()
+    conn.close()
+    with _filler_lock:
+        if _filler_state['id'] == capture_id:
+            _filler_state.update({'id': None, 'stop': False, 'max_until': 0.0})
+    return jsonify({'ok': True})
+
+
+def _filler_yield_for_viewer():
+    """Someone wants to watch PrimeStreams: have any automatic capture let go of the connection first."""
+    with _filler_lock:
+        if _filler_state['id'] is None:
+            return
+        _filler_state['stop'] = True
+    deadline = time.time() + FILLER_YIELD_WAIT_SECONDS
+    while time.time() < deadline:
+        with _filler_lock:
+            if _filler_state['id'] is None:
+                break
+        time.sleep(1)
+    time.sleep(3)           # the provider takes a moment to release the connection
+
+
+@app.route('/epg-web/api/filler', methods=['GET', 'POST'])
+def api_filler_settings():
+    """Read or change the automatic capture settings and see the last captures.
+
+    POST: {"enabled": true}, {"add": {"channel_id": "...", "channel": "..."}} (cut settings start from a preset for
+    known channels), {"remove": "channel_id"}, {"update": {"channel_id": "...", "show": "...", "skip_start": 36}},
+    {"keep_days": 7}.
+    """
+    if request.method == 'POST':
+        body = request.json or {}
+        cfg = load_config()
+        channels = list(cfg.get('filler_channels') or [])
+        if 'enabled' in body:
+            if not isinstance(body['enabled'], bool):
+                return jsonify({'error': 'enabled must be true or false'}), 400
+            cfg['filler_enabled'] = body['enabled']
+        if 'keep_days' in body:
+            try:
+                cfg['filler_keep_days'] = max(0, int(body['keep_days']))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'keep_days must be a number'}), 400
+        add = body.get('add')
+        if add:
+            cid = str(add.get('channel_id') or '').strip()
+            if not cid:
+                return jsonify({'error': 'channel_id is required'}), 400
+            if not any(c.get('channel_id') == cid for c in channels):
+                entry = {'channel_id': cid, 'channel': str(add.get('channel') or cid)}
+                entry.update(_filler_preset(entry['channel']))
+                channels.append(entry)
+        if body.get('remove'):
+            channels = [c for c in channels if c.get('channel_id') != str(body['remove'])]
+        update = body.get('update')
+        if update:
+            for entry in channels:
+                if entry.get('channel_id') == str(update.get('channel_id')):
+                    for key in ('show',):
+                        if update.get(key):
+                            entry[key] = str(update[key])[:100]
+                    for key in ('skip_start', 'keep_after', 'min_minutes', 'max_minutes'):
+                        if key in update:
+                            try:
+                                entry[key] = float(update[key])
+                            except (TypeError, ValueError):
+                                return jsonify({'error': f'{key} must be a number'}), 400
+        cfg['filler_channels'] = channels
+        save_config(cfg)
+    fcfg = _filler_config()
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        conn.row_factory = sqlite3.Row
+        history = [dict(r) for r in conn.execute(
+            'SELECT id, channel, show, start_ts, status, seconds, drops, episodes, filed, held, note '
+            'FROM filler_captures ORDER BY id DESC LIMIT 15')]
+        conn.close()
+    except sqlite3.Error:
+        history = []
+    with _filler_lock:
+        running = _filler_state['id']
+    return jsonify({'enabled': fcfg['filler_enabled'], 'channels': fcfg['filler_channels'],
+                    'keep_days': fcfg['filler_keep_days'], 'running': running, 'history': history})
 
 
 @app.route('/epg-web/api/primestreams/move-to-eaglecast', methods=['POST'])
@@ -9007,12 +9269,17 @@ def _relay_live_stream(url, provider=''):
     blocked = _viewing_blocked_by_recording(provider)
     if blocked:
         return jsonify({"error": _recording_priority_message(blocked)}), 409
+    if provider == 'primestreams':
+        _filler_yield_for_viewer()          # an automatic 24/7 capture lets go of the connection first
     try:
         upstream = _ureq.urlopen(_ureq.Request(url, headers={"User-Agent": "VLC/3.0"}), timeout=15)
     except Exception:
         return jsonify({"error": "Could not open the live stream"}), 502
 
     def _relay():
+        global _relays_open
+        with _relays_lock:
+            _relays_open += 1
         last_check = time.time()
         try:
             while True:
@@ -9026,6 +9293,8 @@ def _relay_live_stream(url, provider=''):
                         break           # a recording needs this connection: let go of it
         finally:
             upstream.close()
+            with _relays_lock:
+                _relays_open -= 1
 
     return Response(stream_with_context(_relay()), mimetype="video/mp2t",
                     headers={"Cache-Control": "no-store"})
@@ -11220,6 +11489,30 @@ tr:hover td{background:#141414;}
 .search-row input{flex:1;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;
                   color:#e2e8f0;padding:7px 10px;font-size:13px;}
 .search-row input:focus{outline:none;border-color:#3b5bdb;}
+
+/* Small screens (iPhone, iPad portrait, foldables) */
+#prog-modal-overlay{overflow-y:auto;-webkit-overflow-scrolling:touch;align-items:flex-start!important;
+  padding:max(10px,env(safe-area-inset-top)) 10px max(24px,env(safe-area-inset-bottom));}
+#prog-modal-overlay > div{margin:auto;}
+@media (max-width:820px){
+  header{padding:8px 10px;gap:6px;}
+  nav{padding:0 6px;}
+  .tab{padding:10px 12px;}
+  .pane{padding:10px;}
+  .card{padding:12px;}
+  .btn{padding:8px 12px;}
+  .btn-sm{padding:7px 10px;}
+  .modal{width:96%;max-width:96vw;}
+  #prog-modal-overlay > div{width:100%!important;}
+  #pm-content > div:first-child{flex-direction:column!important;}
+  #pm-poster-wrap{width:100%!important;display:flex;justify-content:center;}
+  #pm-poster{height:180px!important;width:auto!important;max-width:100%;}
+  #planner-grid{-webkit-overflow-scrolling:touch;}
+}
+@media (max-width:480px){
+  .badge-live,#clock{display:none;}
+  .brand{font-size:14px;}
+}
 </style>
 </head>
 <body>
@@ -11566,6 +11859,19 @@ tr:hover td{background:#141414;}
 <div id="pane-247" class="pane">
   <div class="card">
     <h2>🔁 24/7 Channels</h2>
+    <div id="filler-card" style="background:#141414;border:1px solid #2d2d2d;border-radius:8px;padding:12px;margin-bottom:14px;">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#e2e8f0;cursor:pointer;">
+        <input type="checkbox" id="filler-enabled" onchange="fillerSetEnabled(this.checked)">
+        <b>Capture chosen channels automatically</b> when the PrimeStreams connection is free
+      </label>
+      <div style="font-size:12px;color:#64748b;margin:4px 0 8px 24px;">
+        Pick channels with the ⏺ on a tile below. A capture ends the moment a recording or someone watching needs the connection.
+        Each capture is cut into episodes, identified from what is said, and the confident ones are filed in Plex; the rest wait in
+        TV Needing Episode Info.
+      </div>
+      <div id="filler-channels"></div>
+      <div id="filler-history" style="margin-top:10px;"></div>
+    </div>
     <div class="search-row">
       <input id="c247-search" placeholder="Search 24/7 channels…" oninput="load247()">
       <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#f59e0b;white-space:nowrap;cursor:pointer;">
@@ -12675,7 +12981,13 @@ function vlcLaunchUrl(mediaUrl) {
   return isAppleMobile() ? 'vlc://' + mediaUrl : 'epgvlc://play/' + encodeURIComponent(mediaUrl);
 }
 let _vlcNavigate = u => { window.location.href = u; };
+function relayUrl(channelId) {
+  return window.location.origin + '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId);
+}
 async function openInVlc(params) {
+  // On an iPhone or iPad the app must be opened straight from the tap (Chrome ignores it after a network wait),
+  // and from the address this browser is already using.
+  if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }
   try {
     const r = await fetch('/epg-web/api/play/playlist.m3u?' + new URLSearchParams(params).toString());
     const text = await r.text();
@@ -14279,11 +14591,7 @@ async function playStream() {
   document.getElementById('pm-status').className = 'status-msg';
   const isIOS = isAppleMobile();
   if (isIOS && _nextAiring) {
-    const r = await fetch(`/epg-web/api/play/stream-url?channel_id=${encodeURIComponent(_nextAiring.channel_id)}`);
-    const d = await r.json();
-    if (d.ok) { window.location.href = 'vlc://' + d.url; return; }
-    document.getElementById('pm-status').textContent = '❌ ' + (d.error || 'Could not get stream');
-    document.getElementById('pm-status').className = 'status-msg err';
+    window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);      // straight from the tap
     return;
   }
   if (!_nextAiring) return;
@@ -15316,7 +15624,58 @@ async function loadChannels() {
 }
 
 // ── 24/7 Channels ─────────────────────────────────────────────────────────────
+// Automatic 24/7 capture: the card at the top of the 24/7 tab.
+let fillerChosen = {};
+async function fillerPost(body) {
+  const r = await fetch('/epg-web/api/filler', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  return r.json();
+}
+function fillerWhen(ts) {
+  return new Date(ts * 1000).toLocaleString([], {weekday: 'short', hour: 'numeric', minute: '2-digit'});
+}
+function fillerRender(d) {
+  fillerChosen = {};
+  (d.channels || []).forEach(c => { fillerChosen[c.channel_id] = true; });
+  document.getElementById('filler-enabled').checked = !!d.enabled;
+  const box = document.getElementById('filler-channels');
+  const num = 'width:60px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:4px;color:#e2e8f0;padding:2px 4px;font-size:12px;';
+  box.innerHTML = (d.channels || []).map(c => {
+    const id = esc(c.channel_id);
+    return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0;font-size:12px;color:#94a3b8;">'
+      + '<b style="color:#e2e8f0;">' + esc(c.channel) + '</b> filed as'
+      + '<input value="' + esc(c.show || '') + '" style="width:200px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:4px;color:#e2e8f0;padding:2px 4px;font-size:12px;" data-cid="' + id + '" data-field="show" onchange="fillerField(this)">'
+      + ' skip <input value="' + esc(c.skip_start) + '" style="' + num + '" data-cid="' + id + '" data-field="skip_start" onchange="fillerField(this)">s'
+      + ' keep <input value="' + esc(c.keep_after) + '" style="' + num + '" data-cid="' + id + '" data-field="keep_after" onchange="fillerField(this)">s after'
+      + ' longest <input value="' + esc(c.max_minutes) + '" style="' + num + '" data-cid="' + id + '" data-field="max_minutes" onchange="fillerField(this)">min'
+      + ' <span style="cursor:pointer;color:#f87171;" data-cid="' + id + '" onclick="fillerRemove(this.getAttribute(' + "'" + 'data-cid' + "'" + '))">remove</span></div>';
+  }).join('') || '<div style="font-size:12px;color:#64748b;">No channels chosen yet.</div>';
+  const hist = (d.history || []);
+  document.getElementById('filler-history').innerHTML = hist.length
+    ? '<div style="font-size:11px;color:#64748b;margin-bottom:3px;">Recent automatic captures' + (d.running ? ' (one is running now)' : '') + '</div>'
+      + hist.map(h => '<div style="font-size:11px;color:#94a3b8;">' + esc(fillerWhen(h.start_ts)) + ' · ' + esc(h.channel || '') + ' · ' + esc(h.status || '')
+        + (h.seconds ? ' · ' + Math.round(h.seconds / 60) + ' min' : '') + (h.drops ? ' · ' + h.drops + ' drop(s)' : '')
+        + (h.episodes ? ' · ' + h.episodes + ' episode(s): ' + (h.filed || 0) + ' in Plex, ' + (h.held || 0) + ' held' : '')
+        + (h.note ? ' · ' + esc(h.note) : '') + '</div>').join('')
+    : '';
+}
+async function loadFiller() {
+  try { fillerRender(await (await fetch('/epg-web/api/filler')).json()); } catch (e) { /* the card just stays empty */ }
+}
+async function fillerSetEnabled(on) { fillerRender(await fillerPost({enabled: on})); }
+async function fillerToggle(channelId, name) {
+  fillerRender(await fillerPost(fillerChosen[channelId] ? {remove: channelId} : {add: {channel_id: channelId, channel: name}}));
+  load247();
+}
+async function fillerRemove(channelId) { fillerRender(await fillerPost({remove: channelId})); load247(); }
+async function fillerField(el) {
+  const update = {channel_id: el.getAttribute('data-cid')};
+  update[el.getAttribute('data-field')] = el.value;
+  const d = await fillerPost({update: update});
+  if (d.error) alert(d.error); else fillerRender(d);
+}
+
 async function load247() {
+  await loadFiller();
   const q          = document.getElementById('c247-search').value.trim();
   const showFav    = document.getElementById('c247-show-fav').checked;
   const showTV     = document.getElementById('c247-show-tv').checked;
@@ -15345,6 +15704,7 @@ async function load247() {
           ? `<span onclick='event.stopPropagation();hide247(${JSON.stringify(c.id)},false,this)' title="Restore" style="font-size:13px;cursor:pointer;color:#22c55e;flex-shrink:0;">↩</span>`
           : `<span onclick='event.stopPropagation();toggle247Fav(${JSON.stringify(c.id)},this)' title="Toggle favorite" style="font-size:16px;cursor:pointer;color:${c.fav?'#f59e0b':'#475569'};flex-shrink:0;">${c.fav?'★':'☆'}</span>
              <span onclick='event.stopPropagation();hide247(${JSON.stringify(c.id)},true,this)' title="Hide" style="font-size:13px;cursor:pointer;color:#475569;flex-shrink:0;">✕</span>
+             <span onclick='event.stopPropagation();fillerToggle(${JSON.stringify(c.id)},${JSON.stringify(c.name)})' title="Capture this channel automatically" style="font-size:15px;cursor:pointer;flex-shrink:0;color:${fillerChosen[c.id] ? '#ef4444' : '#475569'};">⏺</span>
              <span style="font-size:18px;flex-shrink:0;" title="Play">▶</span>`
         }
       </div>`).join('');

@@ -5633,3 +5633,142 @@ class RecordingPriorityOverViewingTests(unittest.TestCase):
             server.PLAY_GUARD_CHECK_SECONDS = original
         self.assertLess(len(chunks), 10)
         self.assertTrue(Upstream.closed_by_relay)
+
+
+class AutomaticCaptureServerTests(unittest.TestCase):
+    FCFG = {"filler_enabled": True, "filler_channels": [], "filler_min_minutes": 50, "filler_max_minutes": 150,
+            "filler_margin_minutes": 5, "filler_keep_days": 7}
+
+    def _db(self, starts=(), provider="primestreams", captures=()):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, start_ts, stop_ts, status, stream_provider)")
+        conn.execute("CREATE TABLE filler_captures (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id, channel, stream_id, "
+                     "show, start_ts, until_ts, status, seconds, drops, episodes, filed, held, file, note, finished_ts)")
+        now = time.time()
+        for i, a in enumerate(starts):
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?)", (f"r{i}", now + a, now + a + 3600, "queued", provider))
+        for channel_id, started in captures:
+            conn.execute("INSERT INTO filler_captures (channel_id, start_ts, status) VALUES (?,?,'done')", (channel_id, now - started))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_the_opening_lasts_until_the_margin_before_the_next_booking_and_must_be_long_enough(self):
+        now = time.time()
+        for starts, expect in (((), now + 150 * 60), ((3 * 3600,), now + 150 * 60), ((100 * 60,), now + 95 * 60),
+                               ((10 * 60,), None), ((2 * 60,), None), ((-600,), None)):
+            until = server._filler_window(now, self.FCFG, self._db(starts))
+            if expect is None:
+                self.assertIsNone(until, starts)
+            else:
+                self.assertAlmostEqual(until, expect, delta=2)
+
+    def test_an_eaglecast_booking_does_not_take_the_primestreams_opening(self):
+        now = time.time()
+        self.assertIsNotNone(server._filler_window(now, self.FCFG, self._db((60,), provider="eaglecast")))
+
+    def test_the_channel_captured_longest_ago_goes_next(self):
+        fcfg = dict(self.FCFG, filler_channels=[{"channel_id": "a"}, {"channel_id": "b"}])
+        db = self._db(captures=(("a", 3600), ("b", 7200)))
+        with mock.patch.object(server, "_filler_stream_id", side_effect=lambda cid: "99"):
+            entry, stream = server._filler_pick_channel(fcfg, db)
+        self.assertEqual((entry["channel_id"], stream), ("b", "99"))
+        db2 = self._db(captures=(("a", 3600),))
+        with mock.patch.object(server, "_filler_stream_id", side_effect=lambda cid: "99"):
+            self.assertEqual(server._filler_pick_channel(fcfg, db2)[0]["channel_id"], "b")
+
+    def test_next_status_and_finish_make_one_capture_at_a_time(self):
+        db = self._db()
+        fcfg = dict(self.FCFG, filler_channels=[{"channel_id": "raymond", "channel": "Raymond", "show": "Everybody Loves Raymond",
+                                                  "skip_start": 36.0}])
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_filler_config", return_value=fcfg), \
+             mock.patch.object(server, "_filler_blocked_now", return_value=""), \
+             mock.patch.object(server, "_filler_stream_id", return_value="555"):
+            client = server.app.test_client()
+            first = client.post("/epg-web/api/agent/filler/next", json={}).get_json()["capture"]
+            self.assertEqual((first["stream_id"], first["show"]), ("555", "Everybody Loves Raymond"))
+            self.assertEqual(first["profile"]["skip_start"], 36.0)
+            self.assertIsNone(client.post("/epg-web/api/agent/filler/next", json={}).get_json()["capture"])
+            status = client.post(f"/epg-web/api/agent/filler/{first['id']}/status", json={}).get_json()
+            self.assertFalse(status["stop"])
+            server._filler_state["stop"] = True
+            self.assertTrue(client.post(f"/epg-web/api/agent/filler/{first['id']}/status", json={}).get_json()["stop"])
+            client.post(f"/epg-web/api/agent/filler/{first['id']}/finish",
+                        json={"status": "done", "seconds": 5000, "episodes": 5, "filed": 3, "held": 2})
+            self.assertIsNone(server._filler_state["id"])
+        import sqlite3 as sq
+        row = sq.connect(db).execute("SELECT status, episodes, filed, held FROM filler_captures").fetchone()
+        self.assertEqual(row, ("done", 5, 3, 2))
+
+    def test_no_capture_is_offered_when_it_is_off_or_blocked(self):
+        db = self._db()
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
+        for cfg, blocked in ((dict(self.FCFG, filler_enabled=False, filler_channels=[{"channel_id": "a"}]), ""),
+                             (dict(self.FCFG, filler_channels=[]), ""),
+                             (dict(self.FCFG, filler_channels=[{"channel_id": "a"}]), "someone is watching")):
+            with mock.patch.object(server, "_guide_db_path", return_value=db), \
+                 mock.patch.object(server, "_agent_authorized", return_value=True), \
+                 mock.patch.object(server, "_filler_config", return_value=cfg), \
+                 mock.patch.object(server, "_filler_blocked_now", return_value=blocked), \
+                 mock.patch.object(server, "_filler_stream_id", return_value="1"):
+                self.assertIsNone(server.app.test_client().post("/epg-web/api/agent/filler/next", json={}).get_json()["capture"])
+
+    def test_a_viewer_makes_a_running_capture_stop_and_waits_for_it_to_let_go(self):
+        server._filler_state.update({"id": 7, "stop": False, "max_until": time.time() + 3600})
+
+        real_sleep_for_worker = time.sleep
+
+        def recorder_lets_go():
+            real_sleep_for_worker(0.3)
+            server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
+        import threading
+        real_sleep = time.sleep
+        worker = threading.Thread(target=recorder_lets_go)
+        worker.start()
+        began = time.time()
+        with mock.patch.object(server.time, "sleep", side_effect=lambda s: real_sleep(0.05 if s < 3 else 0)):
+            server._filler_yield_for_viewer()
+        worker.join()
+        self.assertLess(time.time() - began, 5)
+        self.assertIsNone(server._filler_state["id"])
+
+    def test_settings_add_remove_update_with_a_preset(self):
+        cfg = {}
+        saved = {}
+
+        def fake_save(value):
+            saved.update(value)
+        with mock.patch.object(server, "load_config", side_effect=lambda: dict(cfg, **saved)), \
+             mock.patch.object(server, "save_config", side_effect=fake_save), \
+             mock.patch.object(server, "_guide_db_path", return_value=self._db()):
+            client = server.app.test_client()
+            client.post("/epg-web/api/filler", json={"add": {"channel_id": "c1", "channel": "EVERYBODY LOVES RAYMOND"}, "enabled": True})
+            data = client.get("/epg-web/api/filler").get_json()
+            self.assertTrue(data["enabled"])
+            self.assertEqual(data["channels"][0]["show"], "Everybody Loves Raymond")
+            self.assertEqual(data["channels"][0]["skip_start"], 36.0)
+            client.post("/epg-web/api/filler", json={"update": {"channel_id": "c1", "skip_start": 30, "show": "Raymond"}})
+            self.assertEqual(client.get("/epg-web/api/filler").get_json()["channels"][0]["skip_start"], 30.0)
+            client.post("/epg-web/api/filler", json={"remove": "c1"})
+            self.assertEqual(client.get("/epg-web/api/filler").get_json()["channels"], [])
+
+
+class MobileFriendlyPageTests(unittest.TestCase):
+    def setUp(self):
+        self.html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+
+    def test_play_opens_vlc_straight_from_the_tap_on_an_iphone_or_ipad(self):
+        self.assertIn("function relayUrl(channelId)", self.html)
+        self.assertIn("window.location.origin + '/epg-web/api/play/proxy?channel_id='", self.html)
+        self.assertIn("window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);", self.html)
+        self.assertIn("if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }", self.html)
+
+    def test_the_programme_window_scrolls_and_the_page_has_small_screen_rules(self):
+        self.assertIn("#prog-modal-overlay{overflow-y:auto;", self.html)
+        self.assertIn("@media (max-width:820px)", self.html)
+        self.assertIn("#pm-content > div:first-child{flex-direction:column!important;}", self.html)
