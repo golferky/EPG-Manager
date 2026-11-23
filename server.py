@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123b"
+VERSION = "v20261123c"
 
 app = Flask(__name__)
 
@@ -13906,6 +13906,9 @@ const _plexInfoCache = {};
 const _streamInfoCache = {};
 const _imdbCache     = {};
 function showTip(e, p) {
+  // On a touch device the first tap counts as a hover; showing the tooltip then makes iOS hold back the click that
+  // opens the programme window (so Play needed a second tap).  Touch devices open the window at once instead.
+  if (isAppleMobile() || (window.matchMedia && window.matchMedia('(hover: none)').matches)) return;
   const tt      = document.getElementById('tooltip');
   const ttPlex  = document.getElementById('tt-plex');
   const ttImdb  = document.getElementById('tt-imdb');

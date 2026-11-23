@@ -5768,6 +5768,11 @@ class MobileFriendlyPageTests(unittest.TestCase):
         self.assertIn("window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);", self.html)
         self.assertIn("if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }", self.html)
 
+    def test_a_tap_opens_the_programme_window_at_once_because_touch_devices_get_no_hover_tooltip(self):
+        self.assertIn("if (isAppleMobile() || (window.matchMedia && window.matchMedia('(hover: none)').matches)) return;", self.html)
+        self.assertLess(self.html.index("function showTip(e, p) {"),
+                        self.html.index("const tt      = document.getElementById('tooltip');"))
+
     def test_the_programme_window_scrolls_and_the_page_has_small_screen_rules(self):
         self.assertIn("#prog-modal-overlay{overflow-y:auto;", self.html)
         self.assertIn("@media (max-width:820px)", self.html)
