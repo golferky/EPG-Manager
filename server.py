@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123j"
+VERSION = "v20261123k"
 
 app = Flask(__name__)
 
@@ -75,7 +75,8 @@ def _bootstrap():
                 ('stream_extension', "TEXT DEFAULT 'ts'"),
                 ('guide_stop_ts', 'REAL'),
                 ('overtime_cushion_seconds', 'INTEGER DEFAULT 0'),
-                ('private', 'INTEGER DEFAULT 0')]:
+                ('private', 'INTEGER DEFAULT 0'),
+            ('origin', 'TEXT'), ('origin', 'TEXT')]:
             try:
                 _c.execute(f'ALTER TABLE recordings ADD COLUMN {_col} {_typedef}')
             except _sq3.OperationalError as _e:
@@ -7103,7 +7104,7 @@ def _auto_schedule_movie_upgrades():
                 'title': option['title'], 'channel_id': option['candidate']['channel_id'],
                 'channel_name': option['candidate']['channel_name'],
                 'start_ts': option['start'].timestamp(), 'stop_ts': option['stop'].timestamp(),
-                'auto_upgrade': True, 'year': option.get('year', ''),
+                'auto_upgrade': True, 'year': option.get('year', ''), 'origin': 'upgrade',
             }):
                 queued = api_record().get_json()
             if queued.get('ok') and not queued.get('dup'):
@@ -7260,7 +7261,7 @@ def _auto_record_wanted_movies(max_new=60):
                     with app.test_request_context('/epg-web/api/record', method='POST', json={
                             'title': row['title'], 'channel_id': row['channel_id'],
                             'channel_name': row['channel_name'], 'start_ts': start.timestamp(),
-                            'stop_ts': stop.timestamp(), 'year': year}):
+                            'stop_ts': stop.timestamp(), 'year': year, 'origin': 'wanted'}):
                         answer = api_record()
                     response = answer[0] if isinstance(answer, tuple) else answer
                     result = response.get_json() or {}
@@ -9987,6 +9988,23 @@ def _schedule_active_series(guide_db_path=None):
     return total
 
 
+def _weeks_cancelled_by_user(conn, title, channel_id, tz):
+    """ISO weeks (year, week) in which the owner cancelled a booking of this rule's title on its channel.
+
+    A weekly rule books one airing a week; once the owner has stopped that week's, a replay is not booked instead.
+    """
+    weeks = set()
+    try:
+        for (start_ts,) in conn.execute(
+                "SELECT start_ts FROM recordings WHERE lower(title)=lower(?) AND channel_id=? AND status='cancelled' "
+                "AND failure_reason='Cancelled by user' AND stop_ts>?", (title, channel_id, time.time() - 8 * 86400)):
+            if start_ts:
+                weeks.add(datetime.fromtimestamp(float(start_ts), tz).isocalendar()[:2])
+    except sqlite3.Error:
+        pass
+    return weeks
+
+
 def _schedule_active_weekly_recordings(guide_db_path=None):
     """Queue one matching guide airing per week for each weekly rule.
 
@@ -10030,9 +10048,10 @@ def _schedule_active_weekly_recordings(guide_db_path=None):
                 key = local.isocalendar()[:2]
                 if key not in by_week or diff < by_week[key][0]:
                     by_week[key] = (diff, row, start)
-            for _diff, row, start in by_week.values():
-                if _is_cancelled_by_user(cancelled, row['channel_id'], start.timestamp()):
-                    continue            # the owner cancelled this airing: it is not booked again
+            cancelled_weeks = _weeks_cancelled_by_user(conn, rule['title'], rule['channel_id'], tz)
+            for week, (_diff, row, start) in by_week.items():
+                if week in cancelled_weeks or _is_cancelled_by_user(cancelled, row['channel_id'], start.timestamp()):
+                    continue            # the owner cancelled this week's airing: neither it nor a replay is booked
                 end = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
                 # Reuse the normal recording path: it resolves the verified
                 # source, deduplicates, and applies sports overtime protection.
@@ -10040,7 +10059,7 @@ def _schedule_active_weekly_recordings(guide_db_path=None):
                     'title': row['title'], 'channel_id': row['channel_id'],
                     'channel_name': row['channel_name'], 'start_ts': start.timestamp(),
                     'stop_ts': end.timestamp(), 'episode_title': row['episode_title'] or '',
-                    'season_num': row['season_num'], 'episode_num': row['episode_num'],
+                    'season_num': row['season_num'], 'episode_num': row['episode_num'], 'origin': 'weekly',
                 }):
                     response = api_record()
                 if getattr(response, 'status_code', 500) < 300:
@@ -10555,6 +10574,12 @@ def api_record():
         known = _exact_episode_for_airing(_guide_db_path(), channel_id, title, start_ts)
         if known:
             season_num, episode_num, episode_title = known['season'], known['number'], known['name']
+    # Automatic bookers (weekly rule, Wanted pass, upgrades) say so in ``origin`` and never book an airing the owner
+    # cancelled by hand; a booking pressed by hand (no origin) always goes through.
+    origin = str(data.get('origin') or 'manual')[:20]
+    if origin != 'manual' and _is_cancelled_by_user(_user_cancelled_airings(), channel_id, start_ts):
+        return jsonify({'ok': False, 'cancelled_by_user': True,
+                        'error': 'You cancelled this airing, so automatic booking skips it.'}), 409
     rec_id     = str(uuid.uuid4())[:8]
     cfg2        = load_config()
     guide_db    = cfg2.get('guide_db_path', os.path.join(BASE_DIR, 'guide.db'))
@@ -10779,6 +10804,15 @@ def api_record():
     with _rec_lock:
         _recs[rec_id] = rec
         _rec_cancel_events[rec_id] = threading.Event()
+    if origin != 'manual':
+        print(f'[{origin}] booked "{title}" on {channel_name} for {_local_dt(start_ts).strftime("%a %-I:%M %p")}', flush=True)
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        conn.execute('UPDATE recordings SET origin=? WHERE rec_id=?', (origin, rec_id))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        pass
     if rec['backend'] == 'local':
         t = threading.Thread(target=_run_recording, args=(rec_id,), daemon=True)
         t.start()

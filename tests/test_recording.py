@@ -5999,3 +5999,37 @@ class CaptureProgressTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("recorder reported", html)
         self.assertIn("}, 15000);", html)
+
+
+class AutomaticBookingsRespectACancelTests(unittest.TestCase):
+    def test_an_automatic_booking_of_a_cancelled_airing_is_refused_but_a_manual_one_is_not(self):
+        now = time.time()
+        with mock.patch.object(server, "_user_cancelled_airings", return_value={("ch1", int(now) + 600)}):
+            client = server.app.test_client()
+            body = {"title": "NFL GameDay Final", "channel_id": "ch1", "channel_name": "NFL Network",
+                    "start_ts": now + 600, "stop_ts": now + 9600}
+            automatic = client.post("/epg-web/api/record", json=dict(body, origin="weekly"))
+            self.assertEqual(automatic.status_code, 409)
+            self.assertTrue(automatic.get_json()["cancelled_by_user"])
+            manual = client.post("/epg-web/api/record", json=body)
+            self.assertNotIn("cancelled_by_user", manual.get_json() or {})
+
+    def test_a_week_in_which_the_owner_cancelled_the_rules_airing_is_skipped_entirely(self):
+        import sqlite3 as sq, tempfile
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("UTC")
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (title, channel_id, start_ts, stop_ts, status, failure_reason)")
+        now = time.time()
+        conn.execute("INSERT INTO recordings VALUES ('NFL GameDay Final','ch1',?,?,'cancelled','Cancelled by user')",
+                     (now - 3600, now + 3600))
+        conn.execute("INSERT INTO recordings VALUES ('NFL GameDay Final','ch2',?,?,'cancelled','Cancelled by user')",
+                     (now - 3600, now + 3600))
+        conn.execute("INSERT INTO recordings VALUES ('NFL GameDay Final','ch1',?,?,'cancelled','something else')",
+                     (now - 3600, now + 3600))
+        conn.commit()
+        weeks = server._weeks_cancelled_by_user(conn, "nfl gameday final", "ch1", tz)
+        conn.close()
+        self.assertEqual(weeks, {datetime.fromtimestamp(now - 3600, tz).isocalendar()[:2]})
