@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123e"
+VERSION = "v20261123f"
 
 app = Flask(__name__)
 
@@ -2206,16 +2206,25 @@ def _recent_same_source_failure(title, channel_id, days=14, season=None, episode
         return False
 
 def _user_cancelled_airings():
-    """Airings (channel id, start second) the owner cancelled by hand, so automation does not book them again."""
+    """Airings (channel id, start second) the owner cancelled by hand, so automation does not book them again.
+
+    A cancel is remembered while the airing is still on, and for an hour after it ends (not for an hour after it
+    STARTED: a long show would be booked again while still airing).
+    """
     try:
         conn = sqlite3.connect(_guide_db_path(), timeout=5)
         rows = conn.execute("""SELECT channel_id, start_ts FROM recordings
                                WHERE status='cancelled' AND failure_reason='Cancelled by user'
-                                 AND start_ts>?""", (time.time() - 3600,)).fetchall()
+                                 AND stop_ts>?""", (time.time() - 3600,)).fetchall()
         conn.close()
         return {(str(cid), int(ts)) for cid, ts in rows if ts is not None}
     except Exception:
         return set()
+
+
+def _is_cancelled_by_user(cancelled, channel_id, start_ts):
+    """True when this airing (within a few seconds of the same start) is one the owner cancelled."""
+    return any(cid == str(channel_id) and abs(ts - float(start_ts)) <= 5 for cid, ts in cancelled)
 
 
 def _reconcile_stale_recordings():
@@ -9781,7 +9790,7 @@ def _schedule_series_airings(title, guide_db_path, movies_db_path, tz_str='Ameri
         # An airing the owner cancelled by hand is not booked again.
         db_cancelled = conn.execute("""SELECT channel_id, start_ts FROM recordings
             WHERE status='cancelled' AND failure_reason='Cancelled by user'
-              AND start_ts>?""", (time.time() - 3600,)).fetchall()
+              AND stop_ts>?""", (time.time() - 3600,)).fetchall()
         conn.close()
         existing_keys.update((row[0], row[1]) for row in db_existing)
         existing_keys.update((row[0], row[1]) for row in db_cancelled)
@@ -9914,6 +9923,7 @@ def _schedule_active_weekly_recordings(guide_db_path=None):
         rules = conn.execute('''SELECT title, channel_id, weekday, minute_of_day
                                 FROM weekly_recordings WHERE active=1''').fetchall()
         queued = 0
+        cancelled = _user_cancelled_airings()
         for rule in rules:
             rows = conn.execute('''SELECT title, channel_id, channel_name, start_utc, end_utc,
                                           episode_title, season_num, episode_num
@@ -9939,6 +9949,8 @@ def _schedule_active_weekly_recordings(guide_db_path=None):
                 if key not in by_week or diff < by_week[key][0]:
                     by_week[key] = (diff, row, start)
             for _diff, row, start in by_week.values():
+                if _is_cancelled_by_user(cancelled, row['channel_id'], start.timestamp()):
+                    continue            # the owner cancelled this airing: it is not booked again
                 end = datetime.strptime(row['end_utc'], '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
                 # Reuse the normal recording path: it resolves the verified
                 # source, deduplicates, and applies sports overtime protection.

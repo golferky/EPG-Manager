@@ -5809,3 +5809,67 @@ class LiveFallbackReasonTests(unittest.TestCase):
     def test_the_close_button_is_above_the_content_and_finger_sized(self):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn('aria-label="Close" style="position:absolute;top:4px;right:4px;z-index:20;min-width:44px;min-height:44px;', html)
+
+
+class CancelledAiringNotBookedAgainTests(unittest.TestCase):
+    def _db(self):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, channel_id, start_ts, stop_ts, status, failure_reason)")
+        conn.execute("CREATE TABLE weekly_recordings (title, channel_id, weekday, minute_of_day, active)")
+        conn.execute("CREATE TABLE guide (title, channel_id, channel_name, start_utc, end_utc, episode_title, season_num, episode_num)")
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_a_cancel_is_remembered_while_the_airing_is_on_not_just_for_an_hour_after_it_starts(self):
+        db = self._db()
+        import sqlite3 as sq
+        now = time.time()
+        conn = sq.connect(db)
+        conn.execute("INSERT INTO recordings VALUES ('a','ch1',?,?,'cancelled','Cancelled by user')", (now - 7200, now + 3600))
+        conn.execute("INSERT INTO recordings VALUES ('b','ch2',?,?,'cancelled','Cancelled by user')", (now - 20000, now - 18000))
+        conn.execute("INSERT INTO recordings VALUES ('c','ch3',?,?,'cancelled','something else')", (now - 100, now + 3600))
+        conn.commit()
+        conn.close()
+        with mock.patch.object(server, "_guide_db_path", return_value=db):
+            cancelled = server._user_cancelled_airings()
+        self.assertEqual({c for c, _ in cancelled}, {"ch1"})
+        self.assertTrue(server._is_cancelled_by_user(cancelled, "ch1", now - 7200 + 3))
+        self.assertFalse(server._is_cancelled_by_user(cancelled, "ch1", now - 7000))
+        self.assertFalse(server._is_cancelled_by_user(cancelled, "other", now - 7200))
+
+    def test_the_weekly_pass_does_not_book_an_airing_the_owner_cancelled(self):
+        from datetime import datetime, timezone
+        db = self._db()
+        import sqlite3 as sq
+        now = datetime.now(timezone.utc)
+        start = now.replace(microsecond=0)
+        stop = start.timestamp() + 7200
+        local = start.astimezone(__import__("zoneinfo").ZoneInfo("UTC"))
+        conn = sq.connect(db)
+        conn.execute("INSERT INTO weekly_recordings VALUES ('NFL GameDay Final','ch1',?,?,1)",
+                     (local.weekday(), local.hour * 60 + local.minute))
+        conn.execute("INSERT INTO guide VALUES ('NFL GameDay Final','ch1','NFL Network',?,?,'',NULL,NULL)",
+                     (start.strftime("%Y%m%d%H%M%S"),
+                      datetime.fromtimestamp(stop, timezone.utc).strftime("%Y%m%d%H%M%S")))
+        conn.commit()
+        conn.close()
+        booked = []
+
+        def fake_record():
+            booked.append(1)
+            return server.jsonify({"ok": True})
+        cfg = {"guide_db_path": db, "timezone": "UTC"}
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(server, "api_record", side_effect=fake_record), \
+             mock.patch.object(server, "_user_cancelled_airings", return_value=set()):
+            self.assertEqual(server._schedule_active_weekly_recordings(db), 1)
+        self.assertEqual(booked, [1])
+        with mock.patch.object(server, "load_config", return_value=cfg), \
+             mock.patch.object(server, "api_record", side_effect=fake_record), \
+             mock.patch.object(server, "_user_cancelled_airings",
+                               return_value={("ch1", int(start.timestamp()))}):
+            self.assertEqual(server._schedule_active_weekly_recordings(db), 0)
+        self.assertEqual(booked, [1])           # not booked a second time
