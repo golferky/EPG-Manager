@@ -15,6 +15,7 @@ Options:
     --min-black 4                     seconds of black that mark the start of an episode
     --min-minutes 15 --max-minutes 45 an episode outside this length is reported and skipped
     --skip-start 36.0                 seconds after each marker where the next episode really begins (Raymond)
+    --chain-gap 22                    start each episode where the run of black screens after its marker ends (breaks of any layout)
     --keep-after 15.5                 seconds kept past the next marker so the closing credits are not cut off (Raymond)
     --start "2026-11-20 07:00"        when the recording began (default: worked out from the file's time)
 
@@ -72,17 +73,45 @@ def episodes_from_blacks(blacks, total, min_black=4.0, min_len=15 * 60, max_len=
     return episodes, skipped
 
 
-def trim_episodes(episodes, skip_start=0.0, keep_after=0.0):
+def chain_end(blacks, marker_start, gap):
+    """Where the run of black screens that follows a marker ends.
+
+    A break between episodes can be one black or several close together (credits, a logo, a bumper, then a short
+    black).  Starting at the marker's black, each following black that begins within ``gap`` seconds of the last one's
+    end belongs to the same break.  The episode starts where the run ends.
+    """
+    ordered = sorted(blacks)
+    end = None
+    for start, finish in ordered:
+        if end is None:
+            if abs(start - marker_start) < 0.5:
+                end = finish
+            continue
+        if start - end <= gap:
+            end = max(end, finish)
+        elif start > end:
+            break
+    return end
+
+
+def trim_episodes(episodes, skip_start=0.0, keep_after=0.0, blacks=None, chain_gap=0.0):
     """Move each episode's cut points off the marker: ``[(cut_start, cut_end)]``.
 
-    The marker is where a long black begins.  On a channel whose episodes open with a few seconds of the previous
-    episode's credits and a bumper, ``skip_start`` seconds are skipped after the marker; where the credits of an
-    episode sit on the black that is the marker, ``keep_after`` seconds past the next marker are kept so they are
-    not cut off.  With both 0 a cut starts one second into the black, as before.
+    The marker is where a long black begins.  With ``chain_gap`` and the list of black screens, an episode starts where
+    the run of close-together blacks after its marker ends (so a break of any layout is handled); otherwise
+    ``skip_start`` seconds are skipped after the marker.  Where the credits of an episode sit on the black that is the
+    marker, ``keep_after`` seconds past the next marker are kept so they are not cut off.  With none of these set a
+    cut starts one second into the black, as before.
     """
     cuts = []
     for start, end, _length in episodes:
-        cut_start = start + (skip_start if skip_start else 1.0)
+        cut_start = None
+        if chain_gap and blacks:
+            found = chain_end(blacks, start, chain_gap)
+            if found:
+                cut_start = found - 0.5               # half a second inside the last black, so no frame is missed
+        if cut_start is None:
+            cut_start = start + (skip_start if skip_start else 1.0)
         cuts.append((cut_start, end + keep_after))
     return cuts
 
@@ -149,6 +178,7 @@ def main(argv=None):
     parser.add_argument('--max-minutes', type=float, default=45.0)
     parser.add_argument('--skip-start', type=float, default=0.0)
     parser.add_argument('--keep-after', type=float, default=0.0)
+    parser.add_argument('--chain-gap', type=float, default=0.0)
     parser.add_argument('--start', default='')
     parser.add_argument('--cut', action='store_true', help='actually cut the episodes (otherwise only show the plan)')
     args = parser.parse_args(argv)
@@ -170,7 +200,7 @@ def main(argv=None):
           % (clock(total), len(blacks), len(long_blacks), args.min_black))
     print('recording began about', time.strftime('%Y-%m-%d %H:%M', time.localtime(recording_start)))
     print('complete episodes: %d' % len(episodes))
-    cuts = trim_episodes(episodes, args.skip_start, args.keep_after)
+    cuts = trim_episodes(episodes, args.skip_start, args.keep_after, blacks, args.chain_gap)
     for (start, end, length), (cut_start, cut_end) in zip(episodes, cuts):
         print('  %s to %s  (%.1f min)  ->  %s' % (clock(cut_start), clock(cut_end), (cut_end - cut_start) / 60,
                                                    episode_filename(args.name, recording_start, cut_start)))

@@ -116,3 +116,26 @@ class TrimTests(unittest.TestCase):
         cuts = sp.trim_episodes([(878.44, 2169.22, 1290.78)], skip_start=36.0, keep_after=15.5)
         self.assertAlmostEqual(cuts[0][0], 914.44, places=2)
         self.assertAlmostEqual(cuts[0][1], 2184.72, places=2)
+
+
+class ChainTests(unittest.TestCase):
+    # The two break layouts seen on the Raymond channel.
+    LONG_BREAK = [(878.4, 890.6), (894.6, 895.6), (913.4, 916.1), (1161.0, 1164.0)]     # credits, logo, bumper, short black
+    SHORT_BREAK = [(2498.4, 2500.0), (2503.2, 2504.5), (2526.6, 2530.6), (2530.6, 2532.6), (3100.0, 3103.0)]
+
+    def test_the_chain_ends_where_the_close_together_blacks_stop(self):
+        self.assertAlmostEqual(sp.chain_end(self.LONG_BREAK, 878.4, 22.0), 916.1, places=1)
+        self.assertAlmostEqual(sp.chain_end(self.SHORT_BREAK, 2526.6, 22.0), 2532.6, places=1)
+
+    def test_an_episode_starts_at_the_end_of_its_break_whatever_the_layout(self):
+        long_cut = sp.trim_episodes([(878.4, 2169.2, 1290.8)], skip_start=36.0, keep_after=15.5,
+                                    blacks=self.LONG_BREAK, chain_gap=22.0)
+        short_cut = sp.trim_episodes([(2526.6, 3500.0, 973.4)], skip_start=36.0, keep_after=15.5,
+                                     blacks=self.SHORT_BREAK, chain_gap=22.0)
+        self.assertAlmostEqual(long_cut[0][0], 915.6, places=1)         # not 36 s after the marker by luck
+        self.assertAlmostEqual(short_cut[0][0], 2532.1, places=1)       # about 5.5 s after the marker, not 36 s
+        self.assertAlmostEqual(short_cut[0][1], 3515.5, places=1)
+
+    def test_without_a_chain_gap_or_blacks_the_fixed_skip_is_used(self):
+        self.assertEqual(sp.trim_episodes([(100.0, 1400.0, 1300.0)], skip_start=36.0)[0][0], 136.0)
+        self.assertEqual(sp.trim_episodes([(100.0, 1400.0, 1300.0)], skip_start=36.0, chain_gap=22.0)[0][0], 136.0)
