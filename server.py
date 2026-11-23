@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123h"
+VERSION = "v20261123i"
 
 app = Flask(__name__)
 
@@ -3582,8 +3582,17 @@ FILLER_YIELD_WAIT_SECONDS = 20
 FILLER_STALE_SECONDS = 600
 _filler_state = {'id': None, 'stop': False, 'max_until': 0.0, 'last_ask': 0.0}
 _filler_lock = threading.Lock()
-_relays_open = 0
+RELAY_ALIVE_SECONDS = 30
+_relays = {}                  # relay id -> when it last delivered video to its player
 _relays_lock = threading.Lock()
+_relay_counter = [0]
+
+
+def _relays_active(now=None):
+    """How many players are really watching: a relay that has delivered video in the last 30 seconds."""
+    now = time.time() if now is None else now
+    with _relays_lock:
+        return sum(1 for last in _relays.values() if now - last < RELAY_ALIVE_SECONDS)
 
 
 def _filler_config():
@@ -3644,9 +3653,8 @@ def _filler_blocked_now():
         return 'PrimeStreams is switched off'
     if _primestreams_health().get('state') in ('inactive', 'refused'):
         return 'PrimeStreams is not working'
-    with _relays_lock:
-        if _relays_open:
-            return 'someone is watching'
+    if _relays_active():
+        return 'someone is watching'
     return ''
 
 
@@ -9322,15 +9330,18 @@ def _relay_live_stream(url, provider=''):
         return jsonify({"error": "Could not open the live stream"}), 502
 
     def _relay():
-        global _relays_open
         with _relays_lock:
-            _relays_open += 1
+            _relay_counter[0] += 1
+            relay_id = _relay_counter[0]
+            _relays[relay_id] = time.time()
         last_check = time.time()
         try:
             while True:
                 chunk = upstream.read(65536)
                 if not chunk:
                     break
+                with _relays_lock:
+                    _relays[relay_id] = time.time()
                 yield chunk
                 if provider and time.time() - last_check >= PLAY_GUARD_CHECK_SECONDS:
                     last_check = time.time()
@@ -9339,7 +9350,7 @@ def _relay_live_stream(url, provider=''):
         finally:
             upstream.close()
             with _relays_lock:
-                _relays_open -= 1
+                _relays.pop(relay_id, None)
 
     return Response(stream_with_context(_relay()), mimetype="video/mp2t",
                     headers={"Cache-Control": "no-store"})

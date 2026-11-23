@@ -5926,3 +5926,32 @@ class AutomaticCaptureExplainTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn('id="filler-explain"', html)
         self.assertIn("outline:2px solid #ef4444", html)
+
+
+class ViewerCountTests(unittest.TestCase):
+    def test_only_a_relay_that_delivered_video_recently_counts_as_someone_watching(self):
+        now = time.time()
+        with server._relays_lock:
+            server._relays.clear()
+            server._relays.update({1: now - 5, 2: now - 120})
+        self.assertEqual(server._relays_active(now), 1)
+        with server._relays_lock:
+            server._relays.clear()
+        self.assertEqual(server._relays_active(now), 0)
+
+    def test_a_running_relay_shows_as_a_viewer_and_disappears_when_it_ends(self):
+        import io
+        seen = []
+
+        class Upstream(io.BytesIO):
+            pass
+        with mock.patch("urllib.request.urlopen", return_value=Upstream(b"a" * 65536 * 2)), \
+             mock.patch.object(server, "_viewing_blocked_by_recording", return_value=None):
+            with server.app.test_request_context("/x"):
+                response = server._relay_live_stream("http://x/1.ts", "primestreams")
+                with mock.patch.object(server, "_filler_yield_for_viewer"):
+                    pass
+                for chunk in response.response:
+                    seen.append(server._relays_active())
+        self.assertTrue(seen and all(n == 1 for n in seen))
+        self.assertEqual(server._relays_active(), 0)
