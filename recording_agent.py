@@ -31,7 +31,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261122b"
+AGENT_VERSION = "v20261123a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -110,6 +110,18 @@ class AgentAPI:
             'lease_seconds': self.lease_seconds,
             'claim_ahead_seconds': int(claim_ahead_seconds),
         }).get('job')
+
+    def filler_next(self):
+        """An opening for a 24/7 capture, as the dashboard describes it, or None."""
+        return self._request('POST', '/epg-web/api/agent/filler/next', {
+            'agent_id': self.agent_id, 'agent_version': AGENT_VERSION}).get('capture')
+
+    def filler_status(self, capture_id):
+        return self._request('POST', f'/epg-web/api/agent/filler/{capture_id}/status', {'agent_id': self.agent_id})
+
+    def filler_finish(self, capture_id, report):
+        return self._request('POST', f'/epg-web/api/agent/filler/{capture_id}/finish',
+                             dict(report, agent_id=self.agent_id))
 
     def note_stream_info(self, job_id, probe):
         """Remember what the incoming stream looks like, so every heartbeat can report it."""
@@ -1785,6 +1797,29 @@ def start_job_once(api, job, cfg, active, thread_factory=threading.Thread):
     return True
 
 
+FILLER_ASK_SECONDS = 60
+
+
+def maybe_start_filler(api, cfg, thread_factory=threading.Thread):
+    """When nothing is recording, ask the dashboard for an opening and capture a 24/7 channel in it.
+
+    Returns the worker thread, or None when there is no opening (or the dashboard has no such feature).
+    """
+    try:
+        info = api.filler_next()
+    except Exception as exc:
+        print(f'[filler] could not ask for an opening: {exc}', file=sys.stderr, flush=True)
+        return None
+    if not info:
+        return None
+    import filler
+    print(f'[filler] capturing {info.get("channel")} until {time.strftime("%H:%M", time.localtime(float(info["until_ts"])))}',
+          flush=True)
+    worker = thread_factory(target=filler.run_capture, args=(cfg, api, info), daemon=True, name='epg-filler')
+    worker.start()
+    return worker
+
+
 def run_agent(cfg, once=False):
     api = AgentAPI(cfg)
     health = api.health()
@@ -1792,6 +1827,7 @@ def run_agent(cfg, once=False):
     print(f'[agent] connected; version {AGENT_VERSION}; server backend={health.get("recording_backend")}; '
           f'max recordings={max_workers}', flush=True)
     active = {}
+    filler_worker, filler_asked = None, 0.0
     try:
         adopt_orphans(api, cfg, active)       # recordings still running from before this start
     except Exception as exc:
@@ -1806,6 +1842,10 @@ def run_agent(cfg, once=False):
                 if not job:
                     break
                 start_job_once(api, job, cfg, active)
+            if not once and not active and (filler_worker is None or not filler_worker.is_alive()) \
+                    and time.time() - filler_asked >= FILLER_ASK_SECONDS:
+                filler_asked = time.time()
+                filler_worker = maybe_start_filler(api, cfg)
             if once:
                 for worker in list(active.values()):
                     worker.join()
