@@ -30,7 +30,7 @@ from episode_match import clean_summary, episode_texts, merge_episodes, similari
 import name_episodes as ne  # noqa: E402
 
 CONFIDENT_SCORE = 0.40      # share of an episode summary's telling words that are spoken in the video
-CONFIDENT_MARGIN = 0.08     # how far ahead of the runner-up
+CONFIDENT_MARGIN = 0.20     # how far ahead of the runner-up (0.15 filed a wrong episode: a short plot of common words scores high)
 VIDEO_TYPES = ('.mp4', '.mkv', '.m4v')
 
 
