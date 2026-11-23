@@ -5873,3 +5873,30 @@ class CancelledAiringNotBookedAgainTests(unittest.TestCase):
                                return_value={("ch1", int(start.timestamp()))}):
             self.assertEqual(server._schedule_active_weekly_recordings(db), 0)
         self.assertEqual(booked, [1])           # not booked a second time
+
+
+class AutomaticCaptureExplainTests(unittest.TestCase):
+    FCFG = AutomaticCaptureServerTests.FCFG
+
+    def _explain(self, fcfg, blocked="", window=True, last_ask=None, running=None):
+        server._filler_state.update({"id": running, "stop": False, "max_until": 0.0,
+                                     "last_ask": time.time() if last_ask is None else last_ask})
+        with mock.patch.object(server, "_filler_blocked_now", return_value=blocked), \
+             mock.patch.object(server, "_filler_window", return_value=(time.time() + 3600) if window else None):
+            return server._filler_explain(fcfg)
+
+    def test_each_state_has_a_plain_sentence(self):
+        on = dict(self.FCFG, filler_channels=[{"channel_id": "a"}])
+        self.assertIn("Off", self._explain(dict(on, filler_enabled=False)))
+        self.assertIn("No channels", self._explain(dict(self.FCFG, filler_channels=[])))
+        self.assertIn("Capturing now", self._explain(on, running=5))
+        self.assertIn("someone is watching", self._explain(on, blocked="someone is watching"))
+        self.assertIn("No opening", self._explain(on, window=False))
+        self.assertIn("restart the recorder", self._explain(on, last_ask=0.0))
+        self.assertIn("within a minute", self._explain(on))
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0, "last_ask": 0.0})
+
+    def test_the_card_shows_the_explanation_and_marks_chosen_tiles(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="filler-explain"', html)
+        self.assertIn("outline:2px solid #ef4444", html)
