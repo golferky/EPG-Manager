@@ -206,6 +206,21 @@ def cut_episodes(cfg, clean_path, info, log=print):
     return made
 
 
+def _write_candidates(cfg, show, name, row, count=3):
+    """Note an episode's closest guesses in the holding folder, so it can be confirmed by eye and filed by hand."""
+    try:
+        guesses = []
+        for score, episode in (row.get('ranked') or [])[:count]:
+            guesses.append('S%02dE%02d %s (%.2f)' % (int(episode['season']), int(episode['number']),
+                                                    episode.get('name', ''), score))
+        folder = holding_folder(cfg, show)
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / 'Candidates.txt', 'a', encoding='utf-8') as handle:
+            handle.write('%s: %s\n' % (name, '; '.join(guesses) if guesses else 'no guess'))
+    except Exception:
+        pass
+
+
 def identify_and_file(cfg, files, info, log=print):
     """Listen to each episode, file the confident ones in Plex, hold the rest.  Returns (filed, held, notes)."""
     _tools_on_path()
@@ -213,6 +228,9 @@ def identify_and_file(cfg, files, info, log=print):
     filed, held, notes = 0, 0, []
     tv_root = cfg.get('plex_tv_path', '/Volumes/Plex/TV Shows')
     plex_ready = recording_agent.plex_mount_available(Path(tv_root), cfg.get('plex_mount_marker', ''))
+    # Matching a plot to speech is a guess that was wrong on Nov 23 with scores of 1.00, so by default nothing is filed
+    # by itself: every episode is held with its closest guesses written beside it (``Candidates.txt``).
+    auto_file = bool(cfg.get('auto_file_matches', False))
     rows, year = [], ''
     try:
         import identify_episodes as ident
@@ -230,7 +248,9 @@ def identify_and_file(cfg, files, info, log=print):
         for path in files:
             text, model = ident.transcribe(str(path), cfg.get('whisper_model', 'small.en'), model)
             transcripts[Path(path).name] = text
-        rows = ident.plan(names, transcripts, episodes)
+        # Transcripts kept from earlier captures show which words every episode of the show says.
+        background = ident.saved_transcripts([str(holding_folder(cfg, show))])
+        rows = ident.plan(names, transcripts, episodes, background=background)
     except SystemExit as exc:               # the speech package could not be imported
         import sys as _sys
         notes.append('%s [python: %s]' % (exc, _sys.executable))
@@ -240,7 +260,9 @@ def identify_and_file(cfg, files, info, log=print):
     for path in files:
         row = by_name.get(Path(path).name)
         episode = row['episode'] if row and row['status'] == 'ok' else None
-        if episode and plex_ready:
+        if row and not (episode and plex_ready and auto_file):
+            _write_candidates(cfg, show, Path(path).name, row)
+        if episode and plex_ready and auto_file:
             show_dir = recording_agent.resolve_show_dir(tv_root, show, year)
             dest = Path(show_dir) / ('Season %02d' % int(episode['season'])) / ne.target_name(show, episode)
             if dest.exists():

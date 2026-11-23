@@ -152,6 +152,7 @@ class AfterwardsTests(unittest.TestCase):
         self.assertTrue(new.exists() and episode.exists())
 
     def test_confident_episodes_are_filed_in_plex_and_the_rest_are_held(self):
+        self.cfg["auto_file_matches"] = True
         import identify_episodes as ident
         import name_episodes as ne
         episodes = [
@@ -182,6 +183,30 @@ class AfterwardsTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("S02E05", found[0].name)
         self.assertEqual(len(list(filler.holding_folder(self.cfg, "Everybody Loves Raymond").glob("*.mp4"))), 1)
+
+    def test_by_default_nothing_is_filed_by_itself_and_the_guesses_are_written_beside_it(self):
+        import identify_episodes as ident
+        import name_episodes as ne
+        episodes = [
+            {"season": 2, "number": 5, "name": "The Sculpture", "summary": "Marie unveils a giant marble sculpture of Robert in the living room and everyone pretends to admire it."},
+            {"season": 3, "number": 9, "name": "Golf Weekend", "summary": "Ray sneaks away for a golf tournament while Frank hides the car keys in the garage."},
+        ]
+        speech = ("so marie brought over the sculpture and it is huge marble robert looks like a giant in the living room "
+                  "everyone says it is beautiful and admire it but nobody wants it in the house ") * 6
+        folder = Path(self.tmp) / "eps"
+        folder.mkdir()
+        path = folder / "Everybody Loves Raymond - 2026-11-22_0808.mp4"
+        path.write_bytes(b"x" * 100)
+        Path(self.cfg["plex_tv_path"]).mkdir(parents=True)
+        with mock.patch.object(ne, "load_tmdb", return_value=("1996", episodes)), \
+             mock.patch.object(ne, "load_omdb", return_value=("1996", [])), \
+             mock.patch.object(ident, "transcribe", return_value=(speech, "model")):
+            filed, held, _notes = filler.identify_and_file(self.cfg, [path], {"show": "Everybody Loves Raymond"},
+                                                            log=lambda *a: None)
+        self.assertEqual((filed, held), (0, 1))
+        self.assertEqual(list(Path(self.cfg["plex_tv_path"]).rglob("*.mp4")), [])
+        note = (filler.holding_folder(self.cfg, "Everybody Loves Raymond") / "Candidates.txt").read_text()
+        self.assertIn("2026-11-22_0808.mp4: S02E05 The Sculpture", note)
 
     def test_without_the_speech_package_everything_is_held_and_nothing_is_lost(self):
         import identify_episodes as ident

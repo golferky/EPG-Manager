@@ -18,6 +18,7 @@ Needs a free speech-to-text package, once:   pip3 install faster-whisper
 The first run downloads the speech model (about 500 MB for small.en; --model base.en is smaller and quicker).
 """
 import argparse
+import math
 import os
 import re
 import shutil
@@ -40,20 +41,39 @@ def episode_story_texts(episode):
     return [f'{name} {text}'.strip() for text in episode_texts(episode)] or ([name] if name else [])
 
 
-def rank_by_transcript(transcript, episodes):
-    """[(score, episode)] best first: how much of each episode's story is found in the spoken words."""
+def spoken_weights(others):
+    """How telling each word is in SPEECH, from the OTHER transcripts we hold: a word said in all of them ("Ray",
+    "Debra", "life") weighs 0.3, one said in none weighs 1.0.  With no other transcript every word weighs the same."""
+    docs = [set(words(text)) for text in (others or []) if text]
+    total = len(docs)
+    count = {}
+    for doc in docs:
+        for word in doc:
+            count[word] = count.get(word, 0) + 1
+    if not total:
+        return lambda word: 1.0
+    return lambda word: 0.3 + 0.7 * (1.0 - count.get(word, 0) / total)
+
+
+def rank_by_transcript(transcript, episodes, background=None):
+    """[(score, episode)] best first: how much of each episode's story is found in the spoken words.
+
+    A story word counts by how rare it is in the plots (``word_weights``) times how rare it is in speech
+    (``spoken_weights``): a plot of common sitcom words that every episode's dialogue contains no longer scores 1.00."""
     weights = word_weights(episodes)
     spoken = ' '.join(words(transcript))
+    heard = spoken_weights(background)
+    combined = {w: weight * heard(w) for w, weight in weights.items()}
     ranked = []
     for episode in episodes:
-        score = max([similarity(text, spoken, weights) for text in episode_story_texts(episode)] or [0.0])
+        score = max([similarity(text, spoken, combined) for text in episode_story_texts(episode)] or [0.0])
         ranked.append((score, episode))
     return sorted(ranked, key=lambda pair: pair[0], reverse=True)
 
 
-def pick_by_transcript(transcript, episodes, min_score=CONFIDENT_SCORE, margin=CONFIDENT_MARGIN):
+def pick_by_transcript(transcript, episodes, min_score=CONFIDENT_SCORE, margin=CONFIDENT_MARGIN, background=None):
     """(episode, score, confident, ranked)."""
-    ranked = rank_by_transcript(transcript, episodes)
+    ranked = rank_by_transcript(transcript, episodes, background)
     if not ranked or ranked[0][0] <= 0:
         return None, 0.0, False, ranked
     best_score, best = ranked[0]
@@ -61,16 +81,20 @@ def pick_by_transcript(transcript, episodes, min_score=CONFIDENT_SCORE, margin=C
     return best, best_score, (best_score >= min_score and best_score - second >= margin), ranked
 
 
-def plan(files, transcripts, episodes, min_score=CONFIDENT_SCORE, margin=CONFIDENT_MARGIN):
-    """Decide each file.  files: [name]; transcripts: {name: text}.  Returns a list of dicts."""
+def plan(files, transcripts, episodes, min_score=CONFIDENT_SCORE, margin=CONFIDENT_MARGIN, background=None):
+    """Decide each file.  files: [name]; transcripts: {name: text}; background: other transcripts that show which
+    words are common in this show's speech.  Returns a list of dicts."""
     rows = []
+    # Every transcript in the batch is background for the others (a word said in all of them tells nothing).
+    background = list(dict.fromkeys(list(background or []) + [t for n, t in transcripts.items() if n in files]))
     for name in files:
         row = {'name': name, 'status': '', 'episode': None, 'score': 0.0, 'ranked': []}
         text = transcripts.get(name, '')
         if len(words(text)) < 50:
             row['status'] = 'no speech found: check by hand'
         else:
-            episode, score, confident, ranked = pick_by_transcript(text, episodes, min_score, margin)
+            episode, score, confident, ranked = pick_by_transcript(
+                text, episodes, min_score, margin, [b for b in background if b != text])
             row['episode'], row['score'], row['ranked'] = episode, score, ranked
             row['status'] = 'ok' if confident else 'unsure'
         rows.append(row)
@@ -113,6 +137,23 @@ def transcribe(path, model_name='small.en', model=None):
     return ' '.join(segment.text.strip() for segment in segments), model
 
 
+def saved_transcripts(folders, limit=60):
+    """The transcripts kept in ``<folder>/.transcripts`` of each folder: background for telling common words apart."""
+    found = []
+    for folder in folders or []:
+        store = os.path.join(os.path.expanduser(str(folder)), '.transcripts')
+        if not os.path.isdir(store):
+            continue
+        for name in sorted(os.listdir(store)):
+            if name.endswith('.txt') and len(found) < limit:
+                try:
+                    with open(os.path.join(store, name), encoding='utf-8') as handle:
+                        found.append(handle.read())
+                except OSError:
+                    pass
+    return found
+
+
 def load_transcripts(folder, files, model_name):
     """Transcripts for each file, reusing ones saved by an earlier run (in the folder's .transcripts)."""
     store = os.path.join(folder, '.transcripts')
@@ -145,6 +186,9 @@ def main(argv=None):
     parser.add_argument('--clue', action='append', default=[], metavar='STAMP=WORDS',
                         help='a clue for one video: only episodes whose plot mentions these words are ranked, e.g. '
                              '2026-11-22_0808=amy break (repeat for more videos)')
+    parser.add_argument('--background', action='append', default=[], metavar='FOLDER',
+                        help='another folder whose .transcripts show which words are common in the show (repeat); '
+                             'the folder itself is always used')
     parser.add_argument('--accept', default='', help='matches you checked by eye, e.g. 2026-11-22_0808=S02E15')
     parser.add_argument('--apply', action='store_true', help='move the confident matches into Plex')
     args = parser.parse_args(argv)
@@ -163,7 +207,8 @@ def main(argv=None):
     episodes = merge_episodes(tmdb_eps, omdb_eps)
     print(f'{len(episodes)} episodes of {args.show} to choose from.')
     transcripts = load_transcripts(folder, files, args.model)
-    rows = plan(files, transcripts, episodes, args.min_score, args.margin)
+    background = saved_transcripts([folder] + list(args.background))
+    rows = plan(files, transcripts, episodes, args.min_score, args.margin, background)
     for message in ne.apply_accepted(rows, ne.parse_accept(args.accept), episodes) if args.accept else []:
         print('NOTE:', message)
 
@@ -174,7 +219,7 @@ def main(argv=None):
             continue
         pool = episodes_with_clue(episodes, clue_words)
         print(f'\nClue "{" ".join(clue_words)}" for {name}: {len(pool)} episode(s) mention it.')
-        for score, cand in rank_by_transcript(transcripts[name], pool)[:max(1, args.top)]:
+        for score, cand in rank_by_transcript(transcripts[name], pool, background)[:max(1, args.top)]:
             print(f"   - S{int(cand['season']):02d}E{int(cand['number']):02d} {cand.get('name', '')} ({score:.2f}): "
                   f"{clean_summary(cand.get('summary'))[:120]}")
         print('   (check one by eye, then file it with --accept ' + stamp + '=S02E15 using its own number)')
