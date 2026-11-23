@@ -78,6 +78,28 @@ def plan(files, transcripts, episodes, min_score=CONFIDENT_SCORE, margin=CONFIDE
     return rows
 
 
+def parse_clues(items):
+    """["2026-11-22_0808=amy break"] -> {"2026-11-22_0808": ["amy", "break"]}"""
+    clues = {}
+    for item in items or []:
+        stamp, _eq, text = str(item).partition('=')
+        if not stamp.strip() or not text.strip():
+            raise ValueError(f'Cannot read "{item}": use 2026-11-22_0808=amy')
+        clues[stamp.strip()] = [w for w in re.findall(r"[a-z0-9']+", text.lower()) if w]
+    return clues
+
+
+def episodes_with_clue(episodes, clue_words):
+    """The episodes whose title or story mention every clue word (the start of a word counts: "break" finds "breaks")."""
+    found = []
+    for episode in episodes:
+        text = ' '.join(episode_story_texts(episode)).lower()
+        tokens = re.findall(r"[a-z0-9']+", text)
+        if all(any(token.startswith(word) for token in tokens) for word in clue_words):
+            found.append(episode)
+    return found
+
+
 def transcribe(path, model_name='small.en', model=None):
     """The words spoken in a video.  Needs faster-whisper; returns (text, model) so the model is loaded once."""
     if model is None:
@@ -119,6 +141,9 @@ def main(argv=None):
     parser.add_argument('--min-score', type=float, default=CONFIDENT_SCORE)
     parser.add_argument('--margin', type=float, default=CONFIDENT_MARGIN)
     parser.add_argument('--top', type=int, default=3, help='how many close episodes to list for an unsure video')
+    parser.add_argument('--clue', action='append', default=[], metavar='STAMP=WORDS',
+                        help='a clue for one video: only episodes whose plot mentions these words are ranked, e.g. '
+                             '2026-11-22_0808=amy break (repeat for more videos)')
     parser.add_argument('--accept', default='', help='matches you checked by eye, e.g. 2026-11-22_0808=S02E15')
     parser.add_argument('--apply', action='store_true', help='move the confident matches into Plex')
     args = parser.parse_args(argv)
@@ -141,6 +166,18 @@ def main(argv=None):
     for message in ne.apply_accepted(rows, ne.parse_accept(args.accept), episodes) if args.accept else []:
         print('NOTE:', message)
 
+    for stamp, clue_words in parse_clues(args.clue).items():
+        name = next((n for n in files if f' - {stamp}.' in n), None)
+        if name is None:
+            print(f'NOTE: no video for {stamp}')
+            continue
+        pool = episodes_with_clue(episodes, clue_words)
+        print(f'\nClue "{" ".join(clue_words)}" for {name}: {len(pool)} episode(s) mention it.')
+        for score, cand in rank_by_transcript(transcripts[name], pool)[:max(1, args.top)]:
+            print(f"   - S{int(cand['season']):02d}E{int(cand['number']):02d} {cand.get('name', '')} ({score:.2f}): "
+                  f"{clean_summary(cand.get('summary'))[:120]}")
+        print('   (check one by eye, then file it with --accept ' + stamp + '=S02E15 using its own number)')
+    print()
     for row in rows:
         ep = row['episode']
         label = f"S{int(ep['season']):02d}E{int(ep['number']):02d} {ep.get('name', '')}" if ep else ''

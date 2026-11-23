@@ -45,5 +45,18 @@ class IdentifyTests(unittest.TestCase):
         self.assertTrue(all(r["status"].startswith("duplicate") for r in rows))
 
 
+class ClueTests(unittest.TestCase):
+    def test_a_clue_is_read_as_words_for_one_video(self):
+        self.assertEqual(ie.parse_clues(["2026-11-22_0808=Amy break"]), {"2026-11-22_0808": ["amy", "break"]})
+        with self.assertRaises(ValueError):
+            ie.parse_clues(["nonsense"])
+
+    def test_only_episodes_that_mention_every_clue_word_are_kept(self):
+        episodes = EPISODES + [{"season": 6, "number": 2, "name": "Split", "summary": "Robert and Amy break up after a fight."}]
+        found = ie.episodes_with_clue(episodes, ["amy", "break"])
+        self.assertEqual([e["name"] for e in found], ["Split"])
+        self.assertEqual(ie.episodes_with_clue(episodes, ["marble"])[0]["name"], "The Sculpture")
+
+
 if __name__ == "__main__":
     unittest.main()
