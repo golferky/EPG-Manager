@@ -83,7 +83,8 @@ def capture(cfg, api, info, popen=subprocess.Popen, now=time.time, sleep=time.sl
                 if now() - last_poll >= STATUS_POLL_SECONDS:
                     last_poll = now()
                     try:
-                        status = api.filler_status(info['id'])
+                        status = api.filler_status(info['id'], sum(
+                            os.path.getsize(part) for part in segments + [segment] if os.path.exists(part)))
                     except Exception:
                         status = {}
                     if status.get('until_ts'):
