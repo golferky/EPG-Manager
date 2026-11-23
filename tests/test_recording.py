@@ -877,6 +877,7 @@ class ProviderBusyTests(unittest.TestCase):
                                return_value=("http://x/1.ts", None, {"provider": "eaglecast"})):
             data = server.app.test_client().get(
                 "/epg-web/api/play/provider", query_string={"channel_id": "18086"}).get_json()
+        data.pop("primestreams_why_not", None)          # the reason PrimeStreams cannot take over, tested separately
         self.assertEqual(data, {"provider": "eaglecast", "busy": True, "busy_with": ["The Amateur"]})
         with server._rec_lock:
             server._recs.clear()
@@ -5765,8 +5766,10 @@ class MobileFriendlyPageTests(unittest.TestCase):
     def test_play_opens_vlc_straight_from_the_tap_on_an_iphone_or_ipad(self):
         self.assertIn("function relayUrl(channelId)", self.html)
         self.assertIn("window.location.origin + '/epg-web/api/play/proxy?channel_id='", self.html)
-        self.assertIn("window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);", self.html)
-        self.assertIn("if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }", self.html)
+        self.assertIn("window.location.href = vlcLaunchUrl(relayUrl(_nextAiring.channel_id));", self.html)
+        self.assertIn("if (isAppleMobile() && params.channel_id) { _vlcNavigate(vlcLaunchUrl(relayUrl(params.channel_id))); return; }", self.html)
+        self.assertIn("'vlc-x-callback://x-callback-url/stream?url=' + encodeURIComponent(mediaUrl)", self.html)
+        self.assertIn("fetch('/epg-web/api/play/check?channel_id='", self.html)
 
     def test_a_tap_opens_the_programme_window_at_once_because_touch_devices_get_no_hover_tooltip(self):
         self.assertIn("if (isAppleMobile() || (window.matchMedia && window.matchMedia('(hover: none)').matches)) return;", self.html)
@@ -5777,3 +5780,32 @@ class MobileFriendlyPageTests(unittest.TestCase):
         self.assertIn("#prog-modal-overlay{overflow-y:auto;", self.html)
         self.assertIn("@media (max-width:820px)", self.html)
         self.assertIn("#pm-content > div:first-child{flex-direction:column!important;}", self.html)
+
+
+class PlayCheckTests(unittest.TestCase):
+    def test_the_check_says_ok_or_why_not_without_opening_the_stream(self):
+        client = server.app.test_client()
+        with mock.patch.object(server, "_play_target", return_value=("http://x/relay", None, {})):
+            self.assertEqual(client.get("/epg-web/api/play/check?channel_id=1").get_json(), {"ok": True, "error": ""})
+        with mock.patch.object(server, "_play_target", return_value=(None, 'A recording ("Film") is recording on this connection now.', {})):
+            data = client.get("/epg-web/api/play/check?channel_id=1").get_json()
+        self.assertFalse(data["ok"])
+        self.assertIn("Film", data["error"])
+
+
+class LiveFallbackReasonTests(unittest.TestCase):
+    def test_the_provider_check_says_why_primestreams_cannot_take_over_a_busy_eaglecast(self):
+        def fake_stream_url(channel_id, provider=None):
+            if provider == "primestreams":
+                return None, "No stream_id found for channel", {}
+            return "http://e/1.ts", None, {"provider": "eaglecast"}
+        with mock.patch.object(server, "_stream_url", side_effect=fake_stream_url), \
+             mock.patch.object(server, "_busy_eaglecast_titles", return_value=["NFL GameDay Final"]):
+            data = server.app.test_client().get("/epg-web/api/play/provider?channel_id=c1").get_json()
+        self.assertTrue(data["busy"])
+        self.assertEqual(data["busy_with"], ["NFL GameDay Final"])
+        self.assertIn("no recording stream is mapped", data["primestreams_why_not"])
+
+    def test_the_close_button_is_above_the_content_and_finger_sized(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('aria-label="Close" style="position:absolute;top:4px;right:4px;z-index:20;min-width:44px;min-height:44px;', html)
