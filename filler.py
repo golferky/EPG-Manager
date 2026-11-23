@@ -25,6 +25,7 @@ MAX_EMPTY_IN_A_ROW = 5
 TERMINATE_WAIT_SECONDS = 10
 MIN_CAPTURE_SECONDS = 20 * 60           # shorter than this is not worth cutting
 VIDEO_TYPES = ('.mp4', '.mkv', '.m4v')
+CHAIN_GAP_SECONDS = 22.0
 
 
 def captures_dir(cfg):
@@ -177,7 +178,11 @@ def cut_episodes(cfg, clean_path, info, log=print):
         float(profile.get('min_minutes', 15.0)) * 60, float(profile.get('max_minutes', 45.0)) * 60)
     for start, end, why in skipped:
         log('[filler] skipped %s to %s: %s' % (split.clock(start), split.clock(end), why))
-    cuts = split.trim_episodes(episodes, float(profile.get('skip_start', 0.0)), float(profile.get('keep_after', 0.0)))
+    skip_start = float(profile.get('skip_start', 0.0))
+    # A channel that needs a lead-in skipped finds each episode's start by the run of blacks after its marker (any break
+    # layout); the fixed skip is the fallback.
+    chain_gap = float(profile.get('chain_gap', CHAIN_GAP_SECONDS if skip_start else 0.0))
+    cuts = split.trim_episodes(episodes, skip_start, float(profile.get('keep_after', 0.0)), blacks, chain_gap)
     began = float(info['start_ts'])
     out_dir = Path(clean_path).parent / 'episodes' / recording_agent.safe_filename(show)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -224,8 +229,9 @@ def identify_and_file(cfg, files, info, log=print):
             text, model = ident.transcribe(str(path), cfg.get('whisper_model', 'small.en'), model)
             transcripts[Path(path).name] = text
         rows = ident.plan(names, transcripts, episodes)
-    except SystemExit as exc:               # the speech package is not installed
-        notes.append(str(exc))
+    except SystemExit as exc:               # the speech package could not be imported
+        import sys as _sys
+        notes.append('%s [python: %s]' % (exc, _sys.executable))
     except Exception as exc:
         notes.append(f'could not identify: {exc}')
     by_name = {r['name']: r for r in rows}

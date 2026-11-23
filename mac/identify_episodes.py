@@ -105,8 +105,9 @@ def transcribe(path, model_name='small.en', model=None):
     if model is None:
         try:
             from faster_whisper import WhisperModel
-        except ImportError:
-            raise SystemExit('This needs the speech-to-text package.  Run once:   pip3 install faster-whisper')
+        except ImportError as exc:
+            raise SystemExit('This needs the speech-to-text package (%s).  Run once:   pip3 install faster-whisper'
+                             % exc)
         model = WhisperModel(model_name, device='cpu', compute_type='int8')
     segments, _info = model.transcribe(path, language='en', vad_filter=True)
     return ' '.join(segment.text.strip() for segment in segments), model
