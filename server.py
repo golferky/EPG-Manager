@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123k"
+VERSION = "v20261123l"
 
 app = Flask(__name__)
 
@@ -3740,7 +3740,10 @@ def api_agent_filler_next():
         return jsonify({'ok': True, 'capture': None})
     with _filler_lock:
         if _filler_state['id'] is not None:
-            return jsonify({'ok': True, 'capture': None})
+            if now - _filler_state.get('seen', 0.0) <= FILLER_QUIET_SECONDS:
+                return jsonify({'ok': True, 'capture': None})
+            # The recorder stopped reporting on that capture (it was restarted): it is dead, so let a new one start.
+            _filler_state.update({'id': None, 'stop': False, 'max_until': 0.0, 'seen': 0.0, 'bytes': 0})
         until = _filler_window(now, fcfg)
         if not until:
             return jsonify({'ok': True, 'capture': None})
