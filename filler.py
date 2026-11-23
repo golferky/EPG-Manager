@@ -224,8 +224,9 @@ def identify_and_file(cfg, files, info, log=print):
             text, model = ident.transcribe(str(path), cfg.get('whisper_model', 'small.en'), model)
             transcripts[Path(path).name] = text
         rows = ident.plan(names, transcripts, episodes)
-    except SystemExit as exc:               # the speech package is not installed
-        notes.append(str(exc))
+    except SystemExit as exc:               # the speech package could not be imported
+        import sys as _sys
+        notes.append('%s [python: %s]' % (exc, _sys.executable))
     except Exception as exc:
         notes.append(f'could not identify: {exc}')
     by_name = {r['name']: r for r in rows}
