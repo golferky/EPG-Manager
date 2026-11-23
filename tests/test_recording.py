@@ -5753,6 +5753,22 @@ class AutomaticCaptureServerTests(unittest.TestCase):
         self.assertEqual(rows[capture["id"]], "running")
         server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
 
+    def test_a_capture_the_recorder_stopped_reporting_on_does_not_block_the_next_one(self):
+        db = self._db()
+        now = time.time()
+        fcfg = dict(self.FCFG, filler_channels=[{"channel_id": "a", "channel": "A", "show": "A"}])
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_filler_config", return_value=fcfg), \
+             mock.patch.object(server, "_filler_blocked_now", return_value=""), \
+             mock.patch.object(server, "_filler_stream_id", return_value="9"):
+            client = server.app.test_client()
+            server._filler_state.update({"id": 7, "stop": False, "max_until": now + 3000, "seen": now - 10})
+            self.assertIsNone(client.post("/epg-web/api/agent/filler/next", json={}).get_json()["capture"])   # alive
+            server._filler_state.update({"id": 7, "stop": False, "max_until": now + 3000, "seen": now - 300})
+            self.assertIsNotNone(client.post("/epg-web/api/agent/filler/next", json={}).get_json()["capture"])  # dead
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0, "seen": 0.0, "bytes": 0})
+
     def test_no_capture_is_offered_when_it_is_off_or_blocked(self):
         db = self._db()
         server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
