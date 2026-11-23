@@ -877,6 +877,7 @@ class ProviderBusyTests(unittest.TestCase):
                                return_value=("http://x/1.ts", None, {"provider": "eaglecast"})):
             data = server.app.test_client().get(
                 "/epg-web/api/play/provider", query_string={"channel_id": "18086"}).get_json()
+        data.pop("primestreams_why_not", None)          # the reason PrimeStreams cannot take over, tested separately
         self.assertEqual(data, {"provider": "eaglecast", "busy": True, "busy_with": ["The Amateur"]})
         with server._rec_lock:
             server._recs.clear()
@@ -5790,3 +5791,21 @@ class PlayCheckTests(unittest.TestCase):
             data = client.get("/epg-web/api/play/check?channel_id=1").get_json()
         self.assertFalse(data["ok"])
         self.assertIn("Film", data["error"])
+
+
+class LiveFallbackReasonTests(unittest.TestCase):
+    def test_the_provider_check_says_why_primestreams_cannot_take_over_a_busy_eaglecast(self):
+        def fake_stream_url(channel_id, provider=None):
+            if provider == "primestreams":
+                return None, "No stream_id found for channel", {}
+            return "http://e/1.ts", None, {"provider": "eaglecast"}
+        with mock.patch.object(server, "_stream_url", side_effect=fake_stream_url), \
+             mock.patch.object(server, "_busy_eaglecast_titles", return_value=["NFL GameDay Final"]):
+            data = server.app.test_client().get("/epg-web/api/play/provider?channel_id=c1").get_json()
+        self.assertTrue(data["busy"])
+        self.assertEqual(data["busy_with"], ["NFL GameDay Final"])
+        self.assertIn("no recording stream is mapped", data["primestreams_why_not"])
+
+    def test_the_close_button_is_above_the_content_and_finger_sized(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('aria-label="Close" style="position:absolute;top:4px;right:4px;z-index:20;min-width:44px;min-height:44px;', html)

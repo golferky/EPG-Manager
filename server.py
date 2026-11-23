@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123d"
+VERSION = "v20261123e"
 
 app = Flask(__name__)
 
@@ -9395,13 +9395,19 @@ def _live_stream_url(channel_id):
 def api_play_provider():
     """Which provider a live channel uses, and whether playing it would collide
     with a recording that already holds that provider's single connection."""
-    _url, _err, dbg = _live_stream_url(request.args.get("channel_id", ""))
+    channel_id = request.args.get("channel_id", "")
+    _url, _err, dbg = _live_stream_url(channel_id)
     provider = (dbg or {}).get('provider') or 'primestreams'
-    busy = []
+    busy, why_not_primestreams = [], ''
     if provider == 'eaglecast':
         with _rec_lock:
             busy = _busy_eaglecast_titles(list(_recs.values()))
-    return jsonify({'provider': provider, 'busy': bool(busy), 'busy_with': busy})
+        if busy:
+            # Eaglecast is taken and the live check stayed on it: PrimeStreams could not take over.  Say why.
+            _pu, ps_err, _pd = _stream_url(channel_id, 'primestreams')
+            why_not_primestreams = _play_blocked_note(ps_err) or 'it has no stream for this channel'
+    return jsonify({'provider': provider, 'busy': bool(busy), 'busy_with': busy,
+                    'primestreams_why_not': why_not_primestreams})
 
 @app.route("/epg-web/api/play/check")
 def api_play_check():
@@ -11708,7 +11714,7 @@ tr:hover td{background:#141414;}
 <div id="prog-modal-overlay" onclick="if(event.target===this)closeProg()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center;">
   <div style="background:#111827;border:1px solid #1e2d3d;border-radius:14px;width:90%;max-width:620px;box-shadow:0 24px 80px rgba(0,0,0,.7);overflow:hidden;position:relative;">
     <!-- Close -->
-    <button onclick="closeProg()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#64748b;font-size:20px;cursor:pointer;line-height:1;">✕</button>
+    <button onclick="closeProg()" aria-label="Close" style="position:absolute;top:4px;right:4px;z-index:20;min-width:44px;min-height:44px;background:none;border:none;color:#94a3b8;font-size:22px;cursor:pointer;line-height:1;touch-action:manipulation;">✕</button>
     <!-- Loading state -->
     <div id="pm-loading" style="padding:48px;text-align:center;color:#64748b;font-size:14px;">Loading…</div>
     <!-- Content -->
@@ -14591,7 +14597,8 @@ async function refreshPlayBusy(channelId) {
     if (!_nextAiring || _nextAiring.channel_id !== channelId) return;   // the modal moved on
     if (d.busy && pBtn.style.display !== 'none' && pBtn.textContent.indexOf('Stop') < 0) {
       pBtn.style.display = 'none';
-      lbl.textContent = '🦅 Eaglecast — in use by a recording' + (d.busy_with && d.busy_with.length ? ' (' + d.busy_with.join(', ') + ')' : '');
+      lbl.textContent = '🦅 Eaglecast — in use by a recording' + (d.busy_with && d.busy_with.length ? ' (' + d.busy_with.join(', ') + ')' : '')
+        + (d.primestreams_why_not ? '. PrimeStreams cannot take over: ' + d.primestreams_why_not : '');
       lbl.style.display = '';
     }
   } catch (e) { /* if the check fails, leave the Play button as it is */ }
