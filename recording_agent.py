@@ -31,7 +31,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261123a"
+AGENT_VERSION = "v20261123b"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -116,8 +116,11 @@ class AgentAPI:
         return self._request('POST', '/epg-web/api/agent/filler/next', {
             'agent_id': self.agent_id, 'agent_version': AGENT_VERSION}).get('capture')
 
-    def filler_status(self, capture_id):
-        return self._request('POST', f'/epg-web/api/agent/filler/{capture_id}/status', {'agent_id': self.agent_id})
+    def filler_status(self, capture_id, size=None):
+        payload = {'agent_id': self.agent_id}
+        if size is not None:
+            payload['bytes'] = int(size)
+        return self._request('POST', f'/epg-web/api/agent/filler/{capture_id}/status', payload)
 
     def filler_finish(self, capture_id, report):
         return self._request('POST', f'/epg-web/api/agent/filler/{capture_id}/finish',

@@ -5955,3 +5955,47 @@ class ViewerCountTests(unittest.TestCase):
                     seen.append(server._relays_active())
         self.assertTrue(seen and all(n == 1 for n in seen))
         self.assertEqual(server._relays_active(), 0)
+
+
+class CaptureProgressTests(unittest.TestCase):
+    def _db(self, start_ago, until_in):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE filler_captures (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id, channel, stream_id, "
+                     "show, start_ts, until_ts, status, seconds, drops, episodes, filed, held, file, note, finished_ts)")
+        now = time.time()
+        conn.execute("INSERT INTO filler_captures (id, channel_id, channel, show, start_ts, until_ts, status) "
+                     "VALUES (4,'a','RAYMOND','Everybody Loves Raymond',?,?,'running')", (now - start_ago, now + until_in))
+        conn.commit()
+        conn.close()
+        return db, now
+
+    def test_the_status_call_records_the_size_and_when_the_recorder_last_reported(self):
+        db, now = self._db(600, 5400)
+        server._filler_state.update({"id": 4, "stop": False, "max_until": now + 5400, "last_ask": now, "seen": 0.0, "bytes": 0})
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_filler_config", return_value=dict(AutomaticCaptureServerTests.FCFG)), \
+             mock.patch.object(server, "_filler_blocked_now", return_value=""):
+            server.app.test_client().post("/epg-web/api/agent/filler/4/status", json={"bytes": 48_000_000})
+            progress = server._filler_progress(now + 1, db)
+        self.assertEqual(progress["show"], "Everybody Loves Raymond")
+        self.assertEqual(progress["megabytes"], 48.0)
+        self.assertEqual(progress["minutes_planned"], 100)
+        self.assertLessEqual(progress["heard_seconds_ago"], 3)
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0, "seen": 0.0, "bytes": 0})
+
+    def test_a_capture_the_recorder_has_stopped_reporting_on_is_flagged(self):
+        fcfg = dict(AutomaticCaptureServerTests.FCFG, filler_channels=[{"channel_id": "a"}])
+        now = time.time()
+        server._filler_state.update({"id": 4, "stop": False, "max_until": now + 3000, "last_ask": now, "seen": now - 300})
+        self.assertIn("may have stopped", server._filler_explain(fcfg, now))
+        server._filler_state.update({"seen": now - 5})
+        self.assertEqual(server._filler_explain(fcfg, now), "Capturing now.")
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0, "seen": 0.0, "bytes": 0})
+
+    def test_the_card_shows_progress_and_refreshes_itself(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("recorder reported", html)
+        self.assertIn("}, 15000);", html)

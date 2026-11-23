@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123i"
+VERSION = "v20261123j"
 
 app = Flask(__name__)
 
@@ -3580,7 +3580,8 @@ FILLER_DEFAULTS = {'filler_enabled': False, 'filler_channels': [], 'filler_min_m
                    'filler_max_minutes': 150, 'filler_margin_minutes': 8, 'filler_keep_days': 7}
 FILLER_YIELD_WAIT_SECONDS = 20
 FILLER_STALE_SECONDS = 600
-_filler_state = {'id': None, 'stop': False, 'max_until': 0.0, 'last_ask': 0.0}
+FILLER_QUIET_SECONDS = 90
+_filler_state = {'id': None, 'stop': False, 'max_until': 0.0, 'last_ask': 0.0, 'seen': 0.0, 'bytes': 0}
 _filler_lock = threading.Lock()
 RELAY_ALIVE_SECONDS = 30
 _relays = {}                  # relay id -> when it last delivered video to its player
@@ -3669,6 +3670,10 @@ def _filler_explain(fcfg, now=None, db_path=None):
         running = _filler_state['id']
         last_ask = _filler_state.get('last_ask', 0.0)
     if running is not None:
+        quiet = now - _filler_state.get('seen', 0.0)
+        if _filler_state.get('seen') and quiet > FILLER_QUIET_SECONDS:
+            return (f'A capture is marked as running, but the recorder has not reported for {int(quiet)} seconds: '
+                    f'it may have stopped.')
         return 'Capturing now.'
     blocked = _filler_blocked_now()
     if blocked:
@@ -3679,6 +3684,30 @@ def _filler_explain(fcfg, now=None, db_path=None):
     if not last_ask or now - last_ask > 180:
         return 'There is an opening, but the recorder has not asked for it recently: restart the recorder so it runs the new version.'
     return 'There is an opening: the recorder will start a capture within a minute.'
+
+
+def _filler_progress(now=None, db_path=None):
+    """What the running capture is doing (channel, minutes done, size, when it stops, how long since the recorder
+    reported), or None."""
+    now = time.time() if now is None else now
+    with _filler_lock:
+        capture_id, seen, size, until = (_filler_state['id'], _filler_state.get('seen', 0.0),
+                                         _filler_state.get('bytes', 0), _filler_state['max_until'])
+    if capture_id is None:
+        return None
+    try:
+        conn = sqlite3.connect(db_path or _guide_db_path(), timeout=3)
+        row = conn.execute('SELECT channel, show, start_ts, until_ts FROM filler_captures WHERE id=?', (capture_id,)).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        row = None
+    if not row:
+        return None
+    start = float(row[2] or now)
+    stop_at = min(float(row[3] or until or now), until or float(row[3] or now))
+    return {'channel': row[0] or '', 'show': row[1] or '', 'minutes_done': int(max(0, now - start) // 60),
+            'minutes_planned': int(max(0, stop_at - start) // 60), 'megabytes': round(size / 1e6, 1),
+            'stops_at': stop_at, 'heard_seconds_ago': int(now - seen) if seen else None}
 
 
 def _filler_pick_channel(fcfg, db_path=None):
@@ -3727,7 +3756,7 @@ def api_agent_filler_next():
         capture_id = cursor.lastrowid
         conn.commit()
         conn.close()
-        _filler_state.update({'id': capture_id, 'stop': False, 'max_until': until})
+        _filler_state.update({'id': capture_id, 'stop': False, 'max_until': until, 'seen': now, 'bytes': 0})
     profile = {k: entry.get(k) for k in ('skip_start', 'keep_after', 'min_minutes', 'max_minutes') if entry.get(k) is not None}
     return jsonify({'ok': True, 'capture': {
         'id': capture_id, 'channel': entry.get('channel', ''), 'show': entry.get('show', ''), 'stream_id': stream_id,
@@ -3754,6 +3783,12 @@ def api_agent_filler_status(capture_id):
             if row and row[0] and float(row[0]) > now:
                 _filler_state.update({'id': capture_id, 'stop': False, 'max_until': float(row[0])})
         mine = _filler_state['id'] == capture_id
+        if mine:
+            _filler_state['seen'] = now
+            try:
+                _filler_state['bytes'] = int((request.json or {}).get('bytes') or _filler_state.get('bytes') or 0)
+            except (TypeError, ValueError):
+                pass
         stop = (not mine) or _filler_state['stop'] or not fcfg['filler_enabled']
         max_until = _filler_state['max_until']
     if not stop and _filler_blocked_now() in ('PrimeStreams is switched off', 'PrimeStreams is not working'):
@@ -3870,7 +3905,7 @@ def api_filler_settings():
         running = _filler_state['id']
     return jsonify({'enabled': fcfg['filler_enabled'], 'channels': fcfg['filler_channels'],
                     'keep_days': fcfg['filler_keep_days'], 'running': running, 'history': history,
-                    'explain': _filler_explain(fcfg)})
+                    'explain': _filler_explain(fcfg), 'progress': _filler_progress()})
 
 
 @app.route('/epg-web/api/primestreams/move-to-eaglecast', methods=['POST'])
@@ -15724,7 +15759,15 @@ function fillerRender(d) {
   fillerChosen = {};
   (d.channels || []).forEach(c => { fillerChosen[c.channel_id] = true; });
   document.getElementById('filler-enabled').checked = !!d.enabled;
-  document.getElementById('filler-explain').textContent = d.explain || '';
+  let live = d.explain || '';
+  if (d.progress) {
+    const g = d.progress;
+    live += ' ' + (g.show || g.channel) + ': ' + g.minutes_done + ' of ' + g.minutes_planned + ' min'
+      + (g.megabytes ? ', ' + g.megabytes + ' MB' : '')
+      + ', stops about ' + new Date(g.stops_at * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})
+      + (g.heard_seconds_ago != null ? ' (recorder reported ' + g.heard_seconds_ago + ' s ago)' : '');
+  }
+  document.getElementById('filler-explain').textContent = live;
   const box = document.getElementById('filler-channels');
   const num = 'width:60px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:4px;color:#e2e8f0;padding:2px 4px;font-size:12px;';
   box.innerHTML = (d.channels || []).map(c => {
@@ -15746,6 +15789,10 @@ function fillerRender(d) {
         + (h.note ? ' · ' + esc(h.note) : '') + '</div>').join('')
     : '';
 }
+setInterval(function () {
+  const pane = document.getElementById('pane-247');
+  if (pane && pane.classList.contains('active') && !document.hidden) loadFiller();
+}, 15000);
 async function loadFiller() {
   try { fillerRender(await (await fetch('/epg-web/api/filler')).json()); } catch (e) { /* the card just stays empty */ }
 }
