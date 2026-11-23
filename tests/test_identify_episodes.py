@@ -67,6 +67,29 @@ class CloseCallTests(unittest.TestCase):
             "ray and debra be nicer each other vow surprise party frank marie anniversary", episodes)
         self.assertFalse(confident)
 
+class CommonSpeechWordsTests(unittest.TestCase):
+    EPISODES = [{"season": 3, "number": 23, "name": "Be Nice",
+                 "summary": "Ray and Debra vow to be nicer to each other and to change their ways."},
+                {"season": 2, "number": 6, "name": "Anniversary",
+                 "summary": "A surprise party for Frank and Marie's anniversary, and Ray is shocked."},
+                {"season": 1, "number": 1, "name": "Pilot", "summary": "Ray and Debra host Marie and Frank for dinner."}]
+    COMMON = "ray debra nicer change ways each other vow be to and "
+
+    def test_words_every_transcript_says_no_longer_make_a_generic_plot_win(self):
+        party = self.COMMON + "surprise party frank marie anniversary shocked"
+        others = [self.COMMON + "dinner", self.COMMON + "monsters drawing", self.COMMON + "radio psychologist"]
+        plain = ie.pick_by_transcript(party, self.EPISODES)
+        aware = ie.pick_by_transcript(party, self.EPISODES, background=others)
+        self.assertEqual(plain[0]["name"], "Be Nice")                 # recall alone is fooled
+        self.assertEqual(aware[0]["name"], "Anniversary")             # common speech is discounted
+        self.assertGreater(aware[3][0][0] - aware[3][1][0], plain[3][0][0] - plain[3][1][0] - 1)
+
+    def test_a_batch_of_files_is_each_others_background(self):
+        transcripts = {"a.mp4": (self.COMMON + "surprise party frank marie anniversary shocked ") * 6,
+                       "b.mp4": (self.COMMON + "dinner ") * 6, "c.mp4": (self.COMMON + "radio psychologist ") * 6}
+        rows = ie.plan(["a.mp4", "b.mp4", "c.mp4"], transcripts, self.EPISODES)
+        self.assertEqual(rows[0]["episode"]["name"], "Anniversary")
+
 
 if __name__ == "__main__":
     unittest.main()

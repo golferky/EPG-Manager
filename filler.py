@@ -230,7 +230,9 @@ def identify_and_file(cfg, files, info, log=print):
         for path in files:
             text, model = ident.transcribe(str(path), cfg.get('whisper_model', 'small.en'), model)
             transcripts[Path(path).name] = text
-        rows = ident.plan(names, transcripts, episodes)
+        # Transcripts kept from earlier captures show which words every episode of the show says.
+        background = ident.saved_transcripts([str(holding_folder(cfg, show))])
+        rows = ident.plan(names, transcripts, episodes, background=background)
     except SystemExit as exc:               # the speech package could not be imported
         import sys as _sys
         notes.append('%s [python: %s]' % (exc, _sys.executable))
