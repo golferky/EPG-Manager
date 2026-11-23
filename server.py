@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123f"
+VERSION = "v20261123g"
 
 app = Flask(__name__)
 
@@ -3580,7 +3580,7 @@ FILLER_DEFAULTS = {'filler_enabled': False, 'filler_channels': [], 'filler_min_m
                    'filler_max_minutes': 150, 'filler_margin_minutes': 8, 'filler_keep_days': 7}
 FILLER_YIELD_WAIT_SECONDS = 20
 FILLER_STALE_SECONDS = 600
-_filler_state = {'id': None, 'stop': False, 'max_until': 0.0}
+_filler_state = {'id': None, 'stop': False, 'max_until': 0.0, 'last_ask': 0.0}
 _filler_lock = threading.Lock()
 _relays_open = 0
 _relays_lock = threading.Lock()
@@ -3650,6 +3650,29 @@ def _filler_blocked_now():
     return ''
 
 
+def _filler_explain(fcfg, now=None, db_path=None):
+    """One plain sentence on what the automatic capture is doing, or why it is not capturing right now."""
+    now = time.time() if now is None else now
+    if not fcfg['filler_enabled']:
+        return 'Off: tick the box to start capturing.'
+    if not fcfg['filler_channels']:
+        return 'No channels chosen yet: press the ⏺ on a channel tile.'
+    with _filler_lock:
+        running = _filler_state['id']
+        last_ask = _filler_state.get('last_ask', 0.0)
+    if running is not None:
+        return 'Capturing now.'
+    blocked = _filler_blocked_now()
+    if blocked:
+        return f'Waiting: {blocked}.'
+    if not _filler_window(now, fcfg, db_path):
+        return (f"No opening right now: a PrimeStreams recording is running or due within {int(fcfg['filler_margin_minutes'])} "
+                f"minutes, or the free time before the next one is under {int(fcfg['filler_min_minutes'])} minutes.")
+    if not last_ask or now - last_ask > 180:
+        return 'There is an opening, but the recorder has not asked for it recently: restart the recorder so it runs the new version.'
+    return 'There is an opening: the recorder will start a capture within a minute.'
+
+
 def _filler_pick_channel(fcfg, db_path=None):
     """The chosen channel captured longest ago (never captured first), with its current stream number."""
     last = {}
@@ -3674,6 +3697,7 @@ def api_agent_filler_next():
         return _agent_auth_failure()
     fcfg = _filler_config()
     now = time.time()
+    _filler_state['last_ask'] = now
     if not fcfg['filler_enabled'] or not fcfg['filler_channels'] or _filler_blocked_now():
         return jsonify({'ok': True, 'capture': None})
     with _filler_lock:
@@ -3826,7 +3850,8 @@ def api_filler_settings():
     with _filler_lock:
         running = _filler_state['id']
     return jsonify({'enabled': fcfg['filler_enabled'], 'channels': fcfg['filler_channels'],
-                    'keep_days': fcfg['filler_keep_days'], 'running': running, 'history': history})
+                    'keep_days': fcfg['filler_keep_days'], 'running': running, 'history': history,
+                    'explain': _filler_explain(fcfg)})
 
 
 @app.route('/epg-web/api/primestreams/move-to-eaglecast', methods=['POST'])
@@ -11893,6 +11918,7 @@ tr:hover td{background:#141414;}
         Each capture is cut into episodes, identified from what is said, and the confident ones are filed in Plex; the rest wait in
         TV Needing Episode Info.
       </div>
+      <div id="filler-explain" style="font-size:12px;color:#fbbf24;margin:0 0 8px 24px;"></div>
       <div id="filler-channels"></div>
       <div id="filler-history" style="margin-top:10px;"></div>
     </div>
@@ -15676,6 +15702,7 @@ function fillerRender(d) {
   fillerChosen = {};
   (d.channels || []).forEach(c => { fillerChosen[c.channel_id] = true; });
   document.getElementById('filler-enabled').checked = !!d.enabled;
+  document.getElementById('filler-explain').textContent = d.explain || '';
   const box = document.getElementById('filler-channels');
   const num = 'width:60px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:4px;color:#e2e8f0;padding:2px 4px;font-size:12px;';
   box.innerHTML = (d.channels || []).map(c => {
@@ -15735,7 +15762,7 @@ async function load247() {
     });
     setEl('c247-status', `${visible.length} of ${d.total} channels`, '');
     document.getElementById('c247-grid').innerHTML = visible.map(c => `
-      <div style="background:${c.hidden?'#0f172a':'#1e293b'};border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:8px;${c.hidden?'opacity:0.45;':''}cursor:pointer;"
+      <div style="${fillerChosen[c.id] ? 'outline:2px solid #ef4444;' : ''}background:${c.hidden?'#0f172a':'#1e293b'};border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:8px;${c.hidden?'opacity:0.45;':''}cursor:pointer;"
            onclick='${c.hidden ? '' : `play247(${JSON.stringify(c.id)},${JSON.stringify(c.name)})`}'>
         <span style="flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
               title="${esc(c.name)}">${esc(c.name)}</span>
