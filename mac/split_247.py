@@ -62,14 +62,27 @@ def episodes_from_blacks(blacks, total, min_black=4.0, min_len=15 * 60, max_len=
     """
     starts = [start for start, end in blacks if end - start >= min_black]
     episodes, skipped = [], []
-    for here, there in zip(starts, starts[1:]):
-        length = there - here
-        if length < min_len:
-            skipped.append((here, there, 'too short (%.1f min)' % (length / 60)))
-        elif length > max_len:
-            skipped.append((here, there, 'too long (%.1f min): a marker may have been missed' % (length / 60)))
+    # A marker inside an episode (a stream glitch that shows as a black) leaves two stretches that are each too short;
+    # they are joined when together they make one episode.
+    i = 0
+    while i < len(starts) - 1:
+        j = i + 1
+        while j < len(starts) and starts[j] - starts[i] < min_len:
+            j += 1
+        if j >= len(starts):
+            skipped.append((starts[i], starts[-1], 'too short (%.1f min)' % ((starts[-1] - starts[i]) / 60)))
+            break
+        length = starts[j] - starts[i]
+        if length <= max_len:
+            episodes.append((starts[i], starts[j], length))
+            i = j
+        elif j > i + 1:
+            # Joining overshot, so the short stretch was a piece left over, not part of an episode.
+            skipped.append((starts[i], starts[i + 1], 'too short (%.1f min)' % ((starts[i + 1] - starts[i]) / 60)))
+            i += 1
         else:
-            episodes.append((here, there, length))
+            skipped.append((starts[i], starts[j], 'too long (%.1f min): a marker may have been missed' % (length / 60)))
+            i = j
     return episodes, skipped
 
 
@@ -112,7 +125,14 @@ def trim_episodes(episodes, skip_start=0.0, keep_after=0.0, blacks=None, chain_g
                 cut_start = found - 0.5               # half a second inside the last black, so no frame is missed
         if cut_start is None:
             cut_start = start + (skip_start if skip_start else 1.0)
-        cuts.append((cut_start, end + keep_after))
+        cut_end = end + keep_after
+        if chain_gap and blacks and keep_after:
+            # The credits can run on past the next marker through the run of blacks that follows it; end where that run
+            # ends, but never later than keep_after seconds past the marker (past that it is a logo or bumper).
+            found = chain_end(blacks, end, chain_gap)
+            if found:
+                cut_end = min(cut_end, found - 0.3)
+        cuts.append((cut_start, cut_end))
     return cuts
 
 

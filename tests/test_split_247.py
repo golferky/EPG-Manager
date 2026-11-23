@@ -57,6 +57,35 @@ class SplitTests(unittest.TestCase):
             open(sp.unique_path(path), "w").close()
             self.assertEqual(sp.unique_path(path), os.path.join(temp, "Show - 2026-11-20_0700 (3).mp4"))
 
+class GlitchAndCreditsTests(unittest.TestCase):
+    # The black screens of the Nov 23 Raymond capture from 2074 s on (marker = a black of 4 s or more).
+    REAL = [(2074.33, 2077.69), (2116.13, 2117.21), (2117.25, 2122.21), (2122.25, 2123.21), (2123.25, 2124.17),
+            (2127.73, 2129.73), (2141.21, 2143.53), (2212.29, 2212.65), (2247.41, 2250.73), (2498.33, 2499.97),
+            (2503.09, 2504.41), (2526.49, 2530.49), (2530.57, 2532.57), (2912.49, 2915.81), (3460.45, 3463.73),
+            (3491.97, 3492.29), (3498.13, 3505.25), (3509.25, 3511.25), (3523.29, 3526.11)]
+
+    def test_a_glitch_inside_an_episode_is_joined_not_cut_as_a_break(self):
+        episodes, skipped = sp.episodes_from_blacks(self.REAL, 4500, 4.0, 18 * 60, 26 * 60)
+        self.assertEqual([(round(a), round(b)) for a, b, _ in episodes], [(2117, 3498)])
+        self.assertEqual(skipped, [])
+
+    def test_the_episode_runs_from_the_end_of_its_break_to_the_end_of_its_credits(self):
+        episodes, _ = sp.episodes_from_blacks(self.REAL, 4500, 4.0, 18 * 60, 26 * 60)
+        (start, end), = sp.trim_episodes(episodes, 36.0, 28.0, self.REAL, 22.0)
+        self.assertAlmostEqual(start, 2143.0, places=0)
+        self.assertAlmostEqual(end, 3525.8, places=0)
+
+    def test_the_end_never_runs_past_keep_after_into_a_logo_or_bumper(self):
+        blacks = [(1000.0, 1012.0), (1016.0, 1017.0), (1035.0, 1038.0), (1100.0, 1101.0)]   # a long chain
+        (start, end), = sp.trim_episodes([(100.0, 1000.0, 900.0)], 36.0, 28.0, blacks, 22.0)
+        self.assertAlmostEqual(end, 1028.0, places=1)
+
+    def test_a_short_piece_before_a_full_episode_is_not_glued_to_it(self):
+        starts = [(0.0, 5.0), (180.0, 185.0), (1500.0, 1505.0)]            # a 3 minute left-over, then an episode
+        episodes, skipped = sp.episodes_from_blacks(starts, 3000, 4.0, 18 * 60, 22 * 60)
+        self.assertEqual([(round(a), round(b)) for a, b, _ in episodes], [(180, 1500)])
+        self.assertEqual(len(skipped), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

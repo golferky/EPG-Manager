@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123l"
+VERSION = "v20261123m"
 
 app = Flask(__name__)
 
@@ -3608,7 +3608,7 @@ def _filler_preset(name):
     """Starting cut settings for a channel name (the owner can change them)."""
     low = str(name or '').lower()
     if 'raymond' in low:
-        return {'show': 'Everybody Loves Raymond', 'skip_start': 36.0, 'keep_after': 15.5, 'min_minutes': 15, 'max_minutes': 22}
+        return {'show': 'Everybody Loves Raymond', 'skip_start': 36.0, 'keep_after': 28.0, 'min_minutes': 18, 'max_minutes': 26}
     if 'griffith' in low:
         return {'show': 'The Andy Griffith Show', 'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 15, 'max_minutes': 45}
     return {'show': str(name or '').title(), 'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 15, 'max_minutes': 45}
