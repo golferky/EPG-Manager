@@ -57,6 +57,16 @@ class ClueTests(unittest.TestCase):
         self.assertEqual([e["name"] for e in found], ["Split"])
         self.assertEqual(ie.episodes_with_clue(episodes, ["marble"])[0]["name"], "The Sculpture")
 
+class CloseCallTests(unittest.TestCase):
+    def test_a_win_of_less_than_the_margin_is_held_not_filed(self):
+        # Nov 23: "Be Nice" scored 1.00 against 0.85 for the real episode, and was filed wrongly.
+        self.assertGreaterEqual(ie.CONFIDENT_MARGIN, 0.20)
+        episodes = [{"season": 3, "number": 23, "name": "Be Nice", "summary": "Ray and Debra vow to be nicer to each other."},
+                    {"season": 2, "number": 6, "name": "Anniversary", "summary": "A surprise party for Frank and Marie's anniversary."}]
+        _ep, _score, confident, _ranked = ie.pick_by_transcript(
+            "ray and debra be nicer each other vow surprise party frank marie anniversary", episodes)
+        self.assertFalse(confident)
+
 
 if __name__ == "__main__":
     unittest.main()
