@@ -5706,6 +5706,32 @@ class AutomaticCaptureServerTests(unittest.TestCase):
         row = sq.connect(db).execute("SELECT status, episodes, filed, held FROM filler_captures").fetchone()
         self.assertEqual(row, ("done", 5, 3, 2))
 
+    def test_a_capture_survives_a_dashboard_restart(self):
+        import sqlite3 as sq
+        db = self._db()
+        now = time.time()
+        conn = sq.connect(db)
+        conn.execute("INSERT INTO filler_captures (id, channel_id, start_ts, until_ts, status) VALUES (9,'a',?,?,'running')",
+                     (now - 120, now + 3000))
+        conn.execute("INSERT INTO filler_captures (id, channel_id, start_ts, until_ts, status) VALUES (10,'a',?,?,'done')",
+                     (now - 5000, now - 100))
+        conn.commit()
+        conn.close()
+        fcfg = dict(self.FCFG, filler_channels=[{"channel_id": "a"}])
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})      # the restart wiped the memory
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_filler_config", return_value=fcfg), \
+             mock.patch.object(server, "_filler_blocked_now", return_value=""):
+            client = server.app.test_client()
+            status = client.post("/epg-web/api/agent/filler/9/status", json={}).get_json()
+            self.assertFalse(status["stop"])
+            self.assertEqual(server._filler_state["id"], 9)
+            server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
+            self.assertTrue(client.post("/epg-web/api/agent/filler/10/status", json={}).get_json()["stop"])   # already finished
+            self.assertTrue(client.post("/epg-web/api/agent/filler/77/status", json={}).get_json()["stop"])   # never existed
+        server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})
+
     def test_no_capture_is_offered_when_it_is_off_or_blocked(self):
         db = self._db()
         server._filler_state.update({"id": None, "stop": False, "max_until": 0.0})

@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123g"
+VERSION = "v20261123h"
 
 app = Flask(__name__)
 
@@ -3734,6 +3734,17 @@ def api_agent_filler_status(capture_id):
     fcfg = _filler_config()
     now = time.time()
     with _filler_lock:
+        if _filler_state['id'] is None:
+            # The dashboard was restarted (a deploy) while this capture was running: take it back up from the database.
+            try:
+                conn = sqlite3.connect(_guide_db_path(), timeout=3)
+                row = conn.execute("SELECT until_ts FROM filler_captures WHERE id=? AND status='running'",
+                                   (capture_id,)).fetchone()
+                conn.close()
+            except sqlite3.Error:
+                row = None
+            if row and row[0] and float(row[0]) > now:
+                _filler_state.update({'id': capture_id, 'stop': False, 'max_until': float(row[0])})
         mine = _filler_state['id'] == capture_id
         stop = (not mine) or _filler_state['stop'] or not fcfg['filler_enabled']
         max_until = _filler_state['max_until']
