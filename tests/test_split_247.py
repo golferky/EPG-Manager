@@ -86,6 +86,18 @@ class GlitchAndCreditsTests(unittest.TestCase):
         self.assertEqual([(round(a), round(b)) for a, b, _ in episodes], [(180, 1500)])
         self.assertEqual(len(skipped), 1)
 
+    def test_a_smaller_start_gap_keeps_an_opening_that_sits_after_the_last_black(self):
+        # The break before Raymond S01E22: blacks, 11 s of opening, then one more black.
+        blacks = [(1406.06, 1414.18), (1418.18, 1420.18), (1431.14, 1433.87)]
+        episode = [(1406.06, 2680.0, 1273.9)]
+        self.assertAlmostEqual(sp.trim_episodes(episode, 36.0, 0.0, blacks, 22.0)[0][0], 1433.4, places=1)
+        self.assertAlmostEqual(sp.trim_episodes(episode, 36.0, 0.0, blacks, 22.0, 10.0)[0][0], 1419.7, places=1)
+
+    def test_the_break_before_s01e19_starts_at_its_opening_too(self):
+        episodes, _ = sp.episodes_from_blacks(GlitchAndCreditsTests.REAL, 4500, 4.0, 18 * 60, 26 * 60)
+        (start, _end), = sp.trim_episodes(episodes, 36.0, 28.0, GlitchAndCreditsTests.REAL, 22.0, 10.0)
+        self.assertAlmostEqual(start, 2129.2, places=1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -107,20 +107,22 @@ def chain_end(blacks, marker_start, gap):
     return end
 
 
-def trim_episodes(episodes, skip_start=0.0, keep_after=0.0, blacks=None, chain_gap=0.0):
+def trim_episodes(episodes, skip_start=0.0, keep_after=0.0, blacks=None, chain_gap=0.0, start_gap=0.0):
     """Move each episode's cut points off the marker: ``[(cut_start, cut_end)]``.
 
     The marker is where a long black begins.  With ``chain_gap`` and the list of black screens, an episode starts where
     the run of close-together blacks after its marker ends (so a break of any layout is handled); otherwise
     ``skip_start`` seconds are skipped after the marker.  Where the credits of an episode sit on the black that is the
     marker, ``keep_after`` seconds past the next marker are kept so they are not cut off.  With none of these set a
-    cut starts one second into the black, as before.
+    cut starts one second into the black, as before.  ``start_gap`` (default ``chain_gap``) is the gap that ends a run
+    when finding the START: a smaller one starts the cut earlier, so an opening that sits a few seconds after the last
+    black is kept (a little of the previous show or a logo may come with it).
     """
     cuts = []
     for start, end, _length in episodes:
         cut_start = None
         if chain_gap and blacks:
-            found = chain_end(blacks, start, chain_gap)
+            found = chain_end(blacks, start, start_gap or chain_gap)
             if found:
                 cut_start = found - 0.5               # half a second inside the last black, so no frame is missed
         if cut_start is None:
