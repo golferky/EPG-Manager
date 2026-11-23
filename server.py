@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123a"
+VERSION = "v20261123b"
 
 app = Flask(__name__)
 
@@ -11489,6 +11489,30 @@ tr:hover td{background:#141414;}
 .search-row input{flex:1;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:6px;
                   color:#e2e8f0;padding:7px 10px;font-size:13px;}
 .search-row input:focus{outline:none;border-color:#3b5bdb;}
+
+/* Small screens (iPhone, iPad portrait, foldables) */
+#prog-modal-overlay{overflow-y:auto;-webkit-overflow-scrolling:touch;align-items:flex-start!important;
+  padding:max(10px,env(safe-area-inset-top)) 10px max(24px,env(safe-area-inset-bottom));}
+#prog-modal-overlay > div{margin:auto;}
+@media (max-width:820px){
+  header{padding:8px 10px;gap:6px;}
+  nav{padding:0 6px;}
+  .tab{padding:10px 12px;}
+  .pane{padding:10px;}
+  .card{padding:12px;}
+  .btn{padding:8px 12px;}
+  .btn-sm{padding:7px 10px;}
+  .modal{width:96%;max-width:96vw;}
+  #prog-modal-overlay > div{width:100%!important;}
+  #pm-content > div:first-child{flex-direction:column!important;}
+  #pm-poster-wrap{width:100%!important;display:flex;justify-content:center;}
+  #pm-poster{height:180px!important;width:auto!important;max-width:100%;}
+  #planner-grid{-webkit-overflow-scrolling:touch;}
+}
+@media (max-width:480px){
+  .badge-live,#clock{display:none;}
+  .brand{font-size:14px;}
+}
 </style>
 </head>
 <body>
@@ -12957,7 +12981,13 @@ function vlcLaunchUrl(mediaUrl) {
   return isAppleMobile() ? 'vlc://' + mediaUrl : 'epgvlc://play/' + encodeURIComponent(mediaUrl);
 }
 let _vlcNavigate = u => { window.location.href = u; };
+function relayUrl(channelId) {
+  return window.location.origin + '/epg-web/api/play/proxy?channel_id=' + encodeURIComponent(channelId);
+}
 async function openInVlc(params) {
+  // On an iPhone or iPad the app must be opened straight from the tap (Chrome ignores it after a network wait),
+  // and from the address this browser is already using.
+  if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }
   try {
     const r = await fetch('/epg-web/api/play/playlist.m3u?' + new URLSearchParams(params).toString());
     const text = await r.text();
@@ -14561,11 +14591,7 @@ async function playStream() {
   document.getElementById('pm-status').className = 'status-msg';
   const isIOS = isAppleMobile();
   if (isIOS && _nextAiring) {
-    const r = await fetch(`/epg-web/api/play/stream-url?channel_id=${encodeURIComponent(_nextAiring.channel_id)}`);
-    const d = await r.json();
-    if (d.ok) { window.location.href = 'vlc://' + d.url; return; }
-    document.getElementById('pm-status').textContent = '❌ ' + (d.error || 'Could not get stream');
-    document.getElementById('pm-status').className = 'status-msg err';
+    window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);      // straight from the tap
     return;
   }
   if (!_nextAiring) return;

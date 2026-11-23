@@ -5756,3 +5756,19 @@ class AutomaticCaptureServerTests(unittest.TestCase):
             self.assertEqual(client.get("/epg-web/api/filler").get_json()["channels"][0]["skip_start"], 30.0)
             client.post("/epg-web/api/filler", json={"remove": "c1"})
             self.assertEqual(client.get("/epg-web/api/filler").get_json()["channels"], [])
+
+
+class MobileFriendlyPageTests(unittest.TestCase):
+    def setUp(self):
+        self.html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+
+    def test_play_opens_vlc_straight_from_the_tap_on_an_iphone_or_ipad(self):
+        self.assertIn("function relayUrl(channelId)", self.html)
+        self.assertIn("window.location.origin + '/epg-web/api/play/proxy?channel_id='", self.html)
+        self.assertIn("window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);", self.html)
+        self.assertIn("if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }", self.html)
+
+    def test_the_programme_window_scrolls_and_the_page_has_small_screen_rules(self):
+        self.assertIn("#prog-modal-overlay{overflow-y:auto;", self.html)
+        self.assertIn("@media (max-width:820px)", self.html)
+        self.assertIn("#pm-content > div:first-child{flex-direction:column!important;}", self.html)
