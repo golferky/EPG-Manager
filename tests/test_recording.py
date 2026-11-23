@@ -5765,8 +5765,10 @@ class MobileFriendlyPageTests(unittest.TestCase):
     def test_play_opens_vlc_straight_from_the_tap_on_an_iphone_or_ipad(self):
         self.assertIn("function relayUrl(channelId)", self.html)
         self.assertIn("window.location.origin + '/epg-web/api/play/proxy?channel_id='", self.html)
-        self.assertIn("window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);", self.html)
-        self.assertIn("if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }", self.html)
+        self.assertIn("window.location.href = vlcLaunchUrl(relayUrl(_nextAiring.channel_id));", self.html)
+        self.assertIn("if (isAppleMobile() && params.channel_id) { _vlcNavigate(vlcLaunchUrl(relayUrl(params.channel_id))); return; }", self.html)
+        self.assertIn("'vlc-x-callback://x-callback-url/stream?url=' + encodeURIComponent(mediaUrl)", self.html)
+        self.assertIn("fetch('/epg-web/api/play/check?channel_id='", self.html)
 
     def test_a_tap_opens_the_programme_window_at_once_because_touch_devices_get_no_hover_tooltip(self):
         self.assertIn("if (isAppleMobile() || (window.matchMedia && window.matchMedia('(hover: none)').matches)) return;", self.html)
@@ -5777,3 +5779,14 @@ class MobileFriendlyPageTests(unittest.TestCase):
         self.assertIn("#prog-modal-overlay{overflow-y:auto;", self.html)
         self.assertIn("@media (max-width:820px)", self.html)
         self.assertIn("#pm-content > div:first-child{flex-direction:column!important;}", self.html)
+
+
+class PlayCheckTests(unittest.TestCase):
+    def test_the_check_says_ok_or_why_not_without_opening_the_stream(self):
+        client = server.app.test_client()
+        with mock.patch.object(server, "_play_target", return_value=("http://x/relay", None, {})):
+            self.assertEqual(client.get("/epg-web/api/play/check?channel_id=1").get_json(), {"ok": True, "error": ""})
+        with mock.patch.object(server, "_play_target", return_value=(None, 'A recording ("Film") is recording on this connection now.', {})):
+            data = client.get("/epg-web/api/play/check?channel_id=1").get_json()
+        self.assertFalse(data["ok"])
+        self.assertIn("Film", data["error"])

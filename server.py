@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123c"
+VERSION = "v20261123d"
 
 app = Flask(__name__)
 
@@ -9403,6 +9403,12 @@ def api_play_provider():
             busy = _busy_eaglecast_titles(list(_recs.values()))
     return jsonify({'provider': provider, 'busy': bool(busy), 'busy_with': busy})
 
+@app.route("/epg-web/api/play/check")
+def api_play_check():
+    """Would Play work right now?  {ok: true} or {ok: false, error: reason}, without opening the stream."""
+    _url, err, _dbg = _play_target(request.args.get("channel_id", ""))
+    return jsonify({"ok": not err, "error": str(err or "")})
+
 @app.route("/epg-web/api/play/stream-url")
 def api_play_stream_url():
     channel_id = request.args.get("channel_id", "")
@@ -12978,7 +12984,9 @@ function isAppleMobile() {
     || (/Mac/.test(navigator.platform || navigator.userAgent) && navigator.maxTouchPoints > 1);
 }
 function vlcLaunchUrl(mediaUrl) {
-  return isAppleMobile() ? 'vlc://' + mediaUrl : 'epgvlc://play/' + encodeURIComponent(mediaUrl);
+  // VLC for iPhone/iPad: its documented "stream" action takes the address as an encoded parameter.
+  return isAppleMobile() ? 'vlc-x-callback://x-callback-url/stream?url=' + encodeURIComponent(mediaUrl)
+                         : 'epgvlc://play/' + encodeURIComponent(mediaUrl);
 }
 let _vlcNavigate = u => { window.location.href = u; };
 function relayUrl(channelId) {
@@ -12987,7 +12995,7 @@ function relayUrl(channelId) {
 async function openInVlc(params) {
   // On an iPhone or iPad the app must be opened straight from the tap (Chrome ignores it after a network wait),
   // and from the address this browser is already using.
-  if (isAppleMobile() && params.channel_id) { _vlcNavigate('vlc://' + relayUrl(params.channel_id)); return; }
+  if (isAppleMobile() && params.channel_id) { _vlcNavigate(vlcLaunchUrl(relayUrl(params.channel_id))); return; }
   try {
     const r = await fetch('/epg-web/api/play/playlist.m3u?' + new URLSearchParams(params).toString());
     const text = await r.text();
@@ -14594,7 +14602,16 @@ async function playStream() {
   document.getElementById('pm-status').className = 'status-msg';
   const isIOS = isAppleMobile();
   if (isIOS && _nextAiring) {
-    window.location.href = 'vlc://' + relayUrl(_nextAiring.channel_id);      // straight from the tap
+    // Check in step with the tap (the page is backgrounded once VLC opens) and say why when the stream is refused.
+    fetch('/epg-web/api/play/check?channel_id=' + encodeURIComponent(_nextAiring.channel_id))
+      .then(r => r.json())
+      .then(d => {
+        if (!d.ok) {
+          document.getElementById('pm-status').textContent = '❌ ' + (d.error || 'Could not start the stream');
+          document.getElementById('pm-status').className = 'status-msg err';
+        }
+      }).catch(() => {});
+    window.location.href = vlcLaunchUrl(relayUrl(_nextAiring.channel_id));      // straight from the tap
     return;
   }
   if (!_nextAiring) return;
