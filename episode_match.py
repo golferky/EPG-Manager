@@ -50,7 +50,11 @@ def word_weights(episodes):
 
 def similarity(guide_text, summary, weights=None):
     """0 to 1: how much of a short guide plot line is found in an episode summary, rare words counting most."""
-    guide_words, summary_words = set(words(guide_text)), set(words(summary))
+    return similarity_sets(set(words(guide_text)), set(words(summary)), weights)
+
+
+def similarity_sets(guide_words, summary_words, weights=None):
+    """``similarity`` for word sets already made (a long transcript is split into words once, not once per episode)."""
     if not guide_words or not summary_words:
         return 0.0
     weights = weights or {}

@@ -27,7 +27,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from episode_match import clean_summary, episode_texts, merge_episodes, similarity, title_key, word_weights, words  # noqa: E402
+from episode_match import clean_summary, episode_texts, merge_episodes, similarity, similarity_sets, title_key, word_weights, words  # noqa: E402
 import name_episodes as ne  # noqa: E402
 
 CONFIDENT_SCORE = 0.40      # share of an episode summary's telling words that are spoken in the video
@@ -61,12 +61,12 @@ def rank_by_transcript(transcript, episodes, background=None):
     A story word counts by how rare it is in the plots (``word_weights``) times how rare it is in speech
     (``spoken_weights``): a plot of common sitcom words that every episode's dialogue contains no longer scores 1.00."""
     weights = word_weights(episodes)
-    spoken = ' '.join(words(transcript))
+    spoken = set(words(transcript))                   # split once, not once per episode
     heard = spoken_weights(background)
     combined = {w: weight * heard(w) for w, weight in weights.items()}
     ranked = []
     for episode in episodes:
-        score = max([similarity(text, spoken, combined) for text in episode_story_texts(episode)] or [0.0])
+        score = max([similarity_sets(set(words(text)), spoken, combined) for text in episode_story_texts(episode)] or [0.0])
         ranked.append((score, episode))
     return sorted(ranked, key=lambda pair: pair[0], reverse=True)
 
@@ -189,6 +189,8 @@ def main(argv=None):
     parser.add_argument('--background', action='append', default=[], metavar='FOLDER',
                         help='another folder whose .transcripts show which words are common in the show (repeat); '
                              'the folder itself is always used')
+    parser.add_argument('--clues-only', action='store_true',
+                        help='with --clue: print only the clue results (skips ranking every video, much faster)')
     parser.add_argument('--accept', default='', help='matches you checked by eye, e.g. 2026-11-22_0808=S02E15')
     parser.add_argument('--apply', action='store_true', help='move the confident matches into Plex')
     args = parser.parse_args(argv)
@@ -206,9 +208,15 @@ def main(argv=None):
     _y, omdb_eps = ne.load_omdb(args.server, args.show)
     episodes = merge_episodes(tmdb_eps, omdb_eps)
     print(f'{len(episodes)} episodes of {args.show} to choose from.')
-    transcripts = load_transcripts(folder, files, args.model)
+    clued = [n for n in files if any(f' - {stamp}.' in n for stamp in parse_clues(args.clue))]
+    # With --clues-only only the clued videos are listened to; the rest are not needed to rank a clue.
+    transcripts = load_transcripts(folder, clued if args.clues_only and args.clue and not args.apply else files,
+                                   args.model)
     background = saved_transcripts([folder] + list(args.background))
-    rows = plan(files, transcripts, episodes, args.min_score, args.margin, background)
+    if args.clues_only and args.clue and not args.apply:
+        rows = []
+    else:
+        rows = plan(files, transcripts, episodes, args.min_score, args.margin, background)
     for message in ne.apply_accepted(rows, ne.parse_accept(args.accept), episodes) if args.accept else []:
         print('NOTE:', message)
 
