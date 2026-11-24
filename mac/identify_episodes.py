@@ -208,7 +208,10 @@ def main(argv=None):
     _y, omdb_eps = ne.load_omdb(args.server, args.show)
     episodes = merge_episodes(tmdb_eps, omdb_eps)
     print(f'{len(episodes)} episodes of {args.show} to choose from.')
-    transcripts = load_transcripts(folder, files, args.model)
+    clued = [n for n in files if any(f' - {stamp}.' in n for stamp in parse_clues(args.clue))]
+    # With --clues-only only the clued videos are listened to; the rest are not needed to rank a clue.
+    transcripts = load_transcripts(folder, clued if args.clues_only and args.clue and not args.apply else files,
+                                   args.model)
     background = saved_transcripts([folder] + list(args.background))
     if args.clues_only and args.clue and not args.apply:
         rows = []
