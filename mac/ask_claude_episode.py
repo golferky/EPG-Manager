@@ -96,7 +96,8 @@ def ask_cli(model, show, episodes, transcript, run=None):
     except Exception as exc:
         return {'error': 'could not run claude (%s)' % exc.__class__.__name__}
     if done.returncode != 0:
-        return {'error': 'claude stopped with code %s: %s' % (done.returncode, (done.stderr or '').strip()[:200])}
+        said = ((done.stderr or '').strip() + ' ' + (done.stdout or '').strip()).strip()
+        return {'error': 'claude stopped with code %s: %s' % (done.returncode, said[:300])}
     found = re.search(r'\{.*\}', done.stdout or '', flags=re.S)
     if not found:
         return {'error': 'no JSON in the answer'}
