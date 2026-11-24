@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Ask Claude which episode a video is, from what is said in it.  Guesses only: nothing is filed or moved.
 
-Run on the Mac mini.  Needs your Anthropic API key in the environment (never typed into chat or a command):
-    export ANTHROPIC_API_KEY=...      (set once in ~/.zshrc, or for one window)
+Run on the Mac mini.  It asks Claude in one of two ways:
+  * the Claude Code command-line tool (``claude``), signed in once with your Claude account: no key to keep (default when
+    ``claude`` is installed and no key is set), or
+  * the Anthropic API with a key in the environment (never typed into chat or a command):
+        export ANTHROPIC_API_KEY=...      (set once in ~/.zshrc, or for one window)
 
     # How good is it?  Test on episodes you already confirmed (it prints right or wrong for each):
     python3 ~/EPG-Manager/mac/ask_claude_episode.py --show "Everybody Loves Raymond" \
@@ -19,6 +22,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -82,6 +87,25 @@ def ask(key, model, show, episodes, transcript, post=None):
         return {'error': 'the answer was not valid JSON'}
 
 
+def ask_cli(model, show, episodes, transcript, run=None):
+    """The same question through the Claude Code command line (``claude -p``), which uses the signed-in account."""
+    text = SYSTEM + '\n\n' + prompt(show, episodes, transcript)
+    try:
+        done = (run or subprocess.run)(['claude', '-p', '--model', model], input=text, capture_output=True,
+                                       text=True, timeout=300)
+    except Exception as exc:
+        return {'error': 'could not run claude (%s)' % exc.__class__.__name__}
+    if done.returncode != 0:
+        return {'error': 'claude stopped with code %s: %s' % (done.returncode, (done.stderr or '').strip()[:200])}
+    found = re.search(r'\{.*\}', done.stdout or '', flags=re.S)
+    if not found:
+        return {'error': 'no JSON in the answer'}
+    try:
+        return json.loads(found.group(0))
+    except ValueError:
+        return {'error': 'the answer was not valid JSON'}
+
+
 def code(answer):
     try:
         return 'S%02dE%02d' % (int(answer['season']), int(answer['episode']))
@@ -99,14 +123,26 @@ def main(argv=None):
     parser.add_argument('--show', required=True)
     parser.add_argument('--folder', action='append', required=True)
     parser.add_argument('--server', default='http://192.168.1.176:5001')
-    parser.add_argument('--model', default=DEFAULT_MODEL)
+    parser.add_argument('--model', default='')
+    parser.add_argument('--via', choices=['auto', 'cli', 'api'], default='auto',
+                        help='cli = the claude command (signed-in account), api = ANTHROPIC_API_KEY')
     parser.add_argument('--truth', default='', help='confirmed ones to test against: 2026-11-23_0847=S01E21,...')
     parser.add_argument('--only', action='append', default=[], help='a stamp to guess (repeat)')
     args = parser.parse_args(argv)
     key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
-    if not key:
+    via = args.via
+    if via == 'auto':
+        via = 'cli' if shutil.which('claude') else ('api' if key else '')
+    if via == 'api' and not key:
         print('Set ANTHROPIC_API_KEY first (export ANTHROPIC_API_KEY=... in the Terminal window, typed by you).')
         return 2
+    if via == 'cli' and not shutil.which('claude'):
+        print('The claude command is not installed on this Mac (see the notes at the top of this file).')
+        return 2
+    if not via:
+        print('Neither the claude command nor ANTHROPIC_API_KEY is available.')
+        return 2
+    model = args.model or ('sonnet' if via == 'cli' else DEFAULT_MODEL)
     truth = {}
     for part in [p for p in args.truth.split(',') if p.strip()]:
         stamp, _eq, wanted = part.strip().partition('=')
@@ -126,7 +162,8 @@ def main(argv=None):
     right = wrong = 0
     for name, text in sorted(chosen.items()):
         stamp = stamp_of(name)
-        answer = ask(key, args.model, args.show, episodes, text)
+        answer = (ask_cli(model, args.show, episodes, text) if via == 'cli'
+                  else ask(key, model, args.show, episodes, text))
         if 'error' in answer:
             print('%s: %s' % (stamp, answer['error']))
             continue
