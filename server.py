@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125b"
+VERSION = "v20261125c"
 
 app = Flask(__name__)
 
@@ -2069,6 +2069,22 @@ def _db_update_rec_status(rec_id, status, failure_reason='', file=''):
     except Exception as e:
         print(f'[recdb] status update error: {e}')
         return False
+
+def _reliability_rank(reliability):
+    """0 reliable (green dot), 1 no history yet, 2 some failures (yellow), 3 suspect (red): how a channel sorts."""
+    level = (reliability or {}).get('level')
+    return {'reliable': 0, 'warning': 2, 'suspect': 3}.get(level, 1)
+
+
+def _sort_favorite_channels(channels):
+    """Premium favorites first, then within each group the channels that record well, then the doubtful ones, then the
+    ones that keep failing; by name within each step."""
+    channels.sort(key=lambda channel: (
+        not _is_premium_favorite_channel(channel['name']),
+        _reliability_rank(channel.get('reliability')),
+        channel['name'].lower()))
+    return channels
+
 
 def _channel_recording_reliability(days=30):
     """Summarize recent real recording outcomes by source channel.
@@ -5101,9 +5117,7 @@ def api_guide():
         })
 
     if fav_only:
-        ordered_channels.sort(key=lambda channel: (
-            not _is_premium_favorite_channel(channel['name']), channel['name'].lower()
-        ))
+        _sort_favorite_channels(ordered_channels)
         for channel in ordered_channels:
             channel['favorite_group'] = (
                 'Premium favorites' if _is_premium_favorite_channel(channel['name'])
@@ -11718,6 +11732,11 @@ tr:hover td{background:#141414;}
   <span id="ps-text"></span>
 </div>
 
+<div id="overlap-bar" style="display:none;padding:6px 16px;font-size:13px;border-bottom:1px solid #2d2d2d;background:#78350f;color:#fde68a;">
+  <span id="overlap-text"></span>
+  <button class="btn btn-ghost btn-sm" style="margin-left:12px;" onclick="switchTab('planner')">Open Planner</button>
+</div>
+
 <div id="health-bar" style="display:none;padding:6px 16px;font-size:13px;border-bottom:1px solid #2d2d2d;">
   <span id="health-text"></span>
   <button class="btn btn-ghost btn-sm" style="margin-left:12px;" onclick="switchTab('health')">Open Recording Health</button>
@@ -13407,6 +13426,24 @@ async function dismissHealthBar() {
   document.getElementById('health-bar').style.display = 'none';
 }
 document.addEventListener('DOMContentLoaded', loadHealthBar);
+
+// Bookings that want the same streaming connection at the same time in the next day and a half.
+async function loadOverlapBar() {
+  try {
+    const d = await (await fetch('/epg-web/api/recording-overlaps')).json();
+    const bar = document.getElementById('overlap-bar');
+    const list = d.overlaps || [];
+    if (!list.length) { bar.style.display = 'none'; return; }
+    const first = list[0];
+    const names = first.bookings.slice(0, 3).map(b => b.title).join(', ');
+    document.getElementById('overlap-text').textContent = '⚠ ' + list.length + ' overlap' + (list.length > 1 ? 's' : '')
+      + ' coming up: ' + first.bookings.length + ' bookings want the same ' + first.provider + ' connection at once ('
+      + first.when + '): ' + names + '. Only one can record.';
+    bar.style.display = '';
+  } catch (e) { /* a status line is never worth an error */ }
+}
+document.addEventListener('DOMContentLoaded', loadOverlapBar);
+setInterval(loadOverlapBar, 600000);
 
 // How often recordings on each channel worked over the last 30 days: a warning beside a channel when you pick it to record.
 window._chReliability = {};
@@ -17082,6 +17119,101 @@ def _run_daily_guide_refresh():
     except Exception as exc:
         print(f'[daily-guide] Schedules Direct failed: {exc}')
 
+OVERLAP_LOOKAHEAD_HOURS = 36
+_overlap_state = {'date': ''}
+
+
+def _booking_overlaps(hours=OVERLAP_LOOKAHEAD_HOURS, now=None):
+    """Bookings that want one streaming connection at the same time, more of them than it allows.
+
+    Looks at everything running or booked to start in the next ``hours`` hours.  Returns a list, earliest first, of
+    ``{'provider', 'capacity', 'start_ts', 'when', 'bookings': [{'id', 'title', 'channel', 'start_ts', 'stop_ts'}]}``.
+    """
+    now = time.time() if now is None else now
+    live = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        conn.execute('PRAGMA busy_timeout=5000')
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT rec_id, title, channel, start_ts, stop_ts, COALESCE(stream_provider,'primestreams') AS provider "
+            "FROM recordings WHERE status IN ({}) AND start_ts < ? AND stop_ts > ? ORDER BY start_ts".format(
+                ','.join('?' * len(live))), list(live) + [now + hours * 3600, now]).fetchall()]
+        conn.close()
+    except sqlite3.Error:
+        return []
+    capacity = {'eaglecast': 1, 'primestreams': _primestreams_max_connections()}
+    found = []
+    for provider in ('primestreams', 'eaglecast'):
+        mine = [r for r in rows if r['provider'] == provider]
+        allowed = capacity.get(provider, 1)
+        clusters, current, reach = [], [], 0.0
+        for row in mine:                                   # runs of bookings that overlap one another
+            if current and float(row['start_ts']) >= reach:
+                clusters.append(current)
+                current, reach = [], 0.0
+            current.append(row)
+            reach = max(reach, float(row['stop_ts']))
+        if current:
+            clusters.append(current)
+        for cluster in clusters:
+            peak = max(sum(1 for other in cluster if other['start_ts'] <= row['start_ts'] < other['stop_ts'])
+                       for row in cluster)
+            if peak > allowed:
+                start = float(cluster[0]['start_ts'])
+                found.append({'provider': provider, 'capacity': allowed, 'start_ts': start,
+                              'when': _local_dt(start).strftime('%a %-I:%M %p'),
+                              'bookings': [{'id': r['rec_id'], 'title': r['title'], 'channel': r['channel'],
+                                            'start_ts': r['start_ts'], 'stop_ts': r['stop_ts']} for r in cluster]})
+    found.sort(key=lambda item: item['start_ts'])
+    return found
+
+
+@app.route('/epg-web/api/recording-overlaps')
+def api_recording_overlaps():
+    """Read-only: bookings in the next day and a half that want the same connection together."""
+    return jsonify({'hours': OVERLAP_LOOKAHEAD_HOURS, 'overlaps': _booking_overlaps()})
+
+
+def _overlap_check_due(now, last_date, hour=21, enabled=True, window_hours=3):
+    """True once per local day, in the window that opens at ``hour`` (a restart in the window catches a missed run)."""
+    if not enabled or last_date == now.date().isoformat():
+        return False
+    return hour <= now.hour < hour + window_hours
+
+
+def _run_overlap_check():
+    """Give the films-first placement one more go, then report what still overlaps.  Returns the overlaps."""
+    try:
+        result = _rebalance_slots(True)
+        moved = len(result.get('moves') or [])
+        if moved:
+            print(f'[overlap-check] moved {moved} booking(s) to the other connection')
+    except Exception as exc:
+        print(f'[overlap-check] could not rebalance: {exc}')
+    overlaps = _booking_overlaps()
+    if not overlaps:
+        print('[overlap-check] no bookings overlap in the next 36 hours')
+    for item in overlaps:
+        names = '; '.join('"%s"' % b['title'] for b in item['bookings'])
+        print(f"[overlap-check] {item['provider']} (allows {item['capacity']}) at {item['when']}: {names}")
+    return overlaps
+
+
+def _overlap_check_loop():
+    while True:
+        try:
+            cfg = load_config()
+            now = datetime.now(ZoneInfo(cfg.get('timezone', 'America/New_York')))
+            if _overlap_check_due(now, _overlap_state['date'], int(cfg.get('overlap_check_hour', 21)),
+                                  bool(cfg.get('overlap_check', True))):
+                _overlap_state['date'] = now.date().isoformat()
+                _run_overlap_check()
+        except Exception as exc:
+            print(f'[overlap-check] error: {exc}')
+        time.sleep(60)
+
+
 def _daily_guide_loop():
     while True:
         try:
@@ -17111,6 +17243,7 @@ if __name__ == '__main__':
     _load_pending_recs()
     threading.Thread(target=_daily_guide_loop, name='epg-daily-guide', daemon=True).start()
     threading.Thread(target=_auto_record_wanted_loop, name='epg-auto-wanted-loop', daemon=True).start()
+    threading.Thread(target=_overlap_check_loop, name='epg-overlap-check', daemon=True).start()
     print(f'\n  EPG Manager Web {VERSION}')
     print(  '  ──────────────────────')
     print(  '  Open: http://localhost:5001/epg-web\n')

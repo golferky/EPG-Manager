@@ -49,6 +49,9 @@ Read this first. It records how the owner's machines are set up and how changes 
 
 - Recording Health (dashboard v20261125b): a recording you stopped yourself (`cancelled` / `Cancelled by user`) shows as a grey "Cancelled by you", is left out of the "Needs attention" filter and has no Find re-record button; the banner and channel reports never counted it.
 
+- Nightly overlap check (dashboard v20261125c): `_booking_overlaps` finds bookings that want the same connection together in the next 36 hours (more than the account allows: Eaglecast 1, PrimeStreams its `max_connections`); `/epg-web/api/recording-overlaps` reports it read-only and an amber bar under the header shows it (Open Planner). Every evening from `overlap_check_hour` (default 21, setting `overlap_check` turns it off) `_overlap_check_loop` gives `_rebalance_slots(True)` one more go and logs `[overlap-check] ...` lines in the dashboard log for what is left. It never cancels anything by itself.
+- The Favorites view sorts channels within Premium and Other favorites by the dot: reliable (green), no history, some failures (yellow), suspect (red), then name (`_sort_favorite_channels`).
+
 ## Naming 24/7 captures
 - `mac/identify_episodes.py --show "Everybody Loves Raymond" --folder DIR [--apply]`: for episode videos with no guide data. It listens to each video (faster-whisper, installed once with `pip3 install faster-whisper`, runs on the Mac), matches the speech to the TMDb and OMDb plot summaries of every episode of the show (fetched through the dashboard), and prints the best match with the next closest. It is a GUESS: only a confident match (best clearly ahead of the runner-up) is filed in Plex, and only with `--apply`; unsure ones stay put, and `--accept "2026-11-22_0808=S02E15"` adds one you checked by eye. Transcripts are kept in `DIR/.transcripts` and reused. The owner wants Raymond in Plex only when an episode can be identified.
 

@@ -798,6 +798,70 @@ class CancelledByYouIsNotCriticalTests(unittest.TestCase):
         self.assertIn("!isGood && !isActive && !isCancelled", html)               # no re-record button for it
         self.assertNotIn("\\", html.split("async function loadRecordingHealth")[1].split("function commercialClock")[0])
 
+class OvernightOverlapCheckTests(unittest.TestCase):
+    def _db(self, rows):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, start_ts, stop_ts, status, stream_provider)")
+        now = time.time()
+        for i, (title, provider, start_in, length, status) in enumerate(rows):
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?,?,?)",
+                         (f"r{i}", title, "Chan", now + start_in, now + start_in + length, status, provider))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_two_bookings_on_the_one_connection_at_once_are_reported(self):
+        db = self._db([("Enemy at the Gates", "primestreams", 3600, 7800, "queued"),
+                       ("The Shape of Water", "primestreams", 9000, 7200, "queued"),
+                       ("Elsewhere", "primestreams", 40000, 3600, "queued")])
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+            found = server._booking_overlaps()
+        self.assertEqual(len(found), 1)
+        self.assertEqual([b["title"] for b in found[0]["bookings"]], ["Enemy at the Gates", "The Shape of Water"])
+        self.assertEqual(found[0]["provider"], "primestreams")
+
+    def test_other_providers_and_spare_connections_and_far_away_bookings_are_not_overlaps(self):
+        rows = [("A", "primestreams", 3600, 7200, "queued"), ("B", "eaglecast", 3600, 7200, "queued"),
+                ("C", "primestreams", 3 * 86400, 3600, "queued"), ("Done", "primestreams", 3700, 3600, "done")]
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db(rows)), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+            self.assertEqual(server._booking_overlaps(), [])
+        two = [("A", "primestreams", 3600, 7200, "queued"), ("B", "primestreams", 3700, 7200, "queued")]
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db(two)), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=2):
+            self.assertEqual(server._booking_overlaps(), [])           # the account allows two at once
+
+    def test_the_check_runs_once_a_day_in_its_evening_window(self):
+        from datetime import datetime
+        at = lambda hour: datetime(2026, 11, 25, hour, 5)
+        self.assertTrue(server._overlap_check_due(at(21), "2026-11-24"))
+        self.assertTrue(server._overlap_check_due(at(23), "2026-11-24"))
+        self.assertFalse(server._overlap_check_due(at(20), "2026-11-24"))        # too early
+        self.assertFalse(server._overlap_check_due(at(21), "2026-11-25"))        # already done today
+        self.assertFalse(server._overlap_check_due(at(21), "", enabled=False))
+
+    def test_the_nightly_run_tries_the_rebalance_then_reports_what_is_left(self):
+        with mock.patch.object(server, "_rebalance_slots", return_value={"moves": [{"id": "x"}]}) as rebalance, \
+             mock.patch.object(server, "_booking_overlaps", return_value=[]):
+            self.assertEqual(server._run_overlap_check(), [])
+        rebalance.assert_called_once_with(True)
+
+
+class FavoriteChannelsSortByReliabilityTests(unittest.TestCase):
+    def test_good_channels_first_then_no_history_then_some_failures_then_suspect_within_each_group(self):
+        def channel(name, level):
+            return {"name": name, "reliability": {"level": level} if level else {}}
+        channels = [channel("Cinemax Classics", "suspect"), channel("Cinemax", "warning"), channel("HBO", "suspect"),
+                    channel("HBO Comedy HD", "reliable"), channel("Starz", None), channel("Flix", "suspect"),
+                    channel("Zeta Premium", "reliable")]
+        with mock.patch.object(server, "_is_premium_favorite_channel",
+                               side_effect=lambda name: name.startswith(("Cinemax", "HBO", "Flix"))):
+            ordered = [c["name"] for c in server._sort_favorite_channels(channels)]
+        self.assertEqual(ordered, ["HBO Comedy HD", "Cinemax", "Cinemax Classics", "Flix", "HBO", "Zeta Premium", "Starz"])
+
 
 if __name__ == "__main__":
     unittest.main()
