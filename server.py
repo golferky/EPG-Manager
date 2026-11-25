@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125c"
+VERSION = "v20261125d"
 
 app = Flask(__name__)
 
@@ -7465,6 +7465,16 @@ def _wanted_scheduled_summary(active_recs, plain_title):
             'commercial_free': bool(_is_rerecord_channel(first.get('channel')))}
 
 
+def _wanted_age(created_at, now=None):
+    """(whole days since a wanted title was added, 'Nov 25, 2026') from the table's UTC time text; (None, '') if unknown."""
+    now = time.time() if now is None else now
+    try:
+        added = datetime.strptime(str(created_at or '')[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None, ''
+    return max(0, int((now - added) // 86400)), _local_dt(added).strftime('%b %-d, %Y')
+
+
 @app.route('/epg-web/api/recommendations')
 def api_recommendations():
     # Wanted titles from DB cross-referenced with guide
@@ -7543,6 +7553,8 @@ def api_recommendations():
             'source':     w['source'],
             'imdb_id':    w['imdb_id'],
             'updated_at': w['updated_at'],
+            'age_days':   _wanted_age(w.get('created_at'))[0],
+            'added':      _wanted_age(w.get('created_at'))[1],
             'next_airing': airing,
             'auto_record': auto_record,
             'channel_poor': bool(airing and _channel_history_warning(airing.get('channel_id'), reliability)),
@@ -11981,6 +11993,12 @@ tr:hover td{background:#141414;}
 
 <!-- RECOMMENDATIONS -->
 <div id="pane-recommendations" class="pane">
+  <div id="wanted-toolbar" style="position:sticky;top:0;z-index:20;background:#0d0d0d;padding:8px 0 10px;margin-bottom:6px;border-bottom:1px solid #1e1e1e;display:flex;gap:9px;align-items:center;flex-wrap:wrap;">
+    <button class="btn btn-primary" onclick="addWanted('movie')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Movie</button>
+    <button class="btn btn-primary" onclick="addWanted('series')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Series</button>
+    <button class="btn btn-ghost btn-sm" onclick="loadRecs()">Refresh</button>
+    <span style="color:#94a3b8;font-size:12px;">EPG Manager watches the guide for what you add. The Age column shows how long each title has been waiting.</span>
+  </div>
   <div class="card" style="margin-bottom:12px;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
       <h2 style="margin:0;">↑ Upgrade Opportunities</h2>
@@ -11995,16 +12013,11 @@ tr:hover td{background:#141414;}
         <h2 style="margin:0 0 4px;">Wanted Titles</h2>
         <div style="font-size:13px;color:#94a3b8;">Add something you want; EPG Manager will watch the guide for it.</div>
       </div>
-      <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap;">
-        <button class="btn btn-primary" onclick="addWanted('movie')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Movie</button>
-        <button class="btn btn-primary" onclick="addWanted('series')" style="font-weight:700;padding:8px 13px;">＋ Add Wanted Series</button>
-        <button class="btn btn-ghost btn-sm" onclick="loadRecs()">Refresh</button>
-      </div>
     </div>
     <div id="rec-status" class="status-msg"></div>
     <div style="overflow-x:auto;">
       <table><thead><tr>
-        <th>Title</th><th>Next Airing on Guide</th><th>Airs</th><th>Recording</th>
+        <th>Title</th><th>Age</th><th>Next Airing on Guide</th><th>Airs</th><th>Recording</th>
       </tr></thead><tbody id="rec-body"></tbody></table>
     </div>
   </div>
@@ -15645,6 +15658,14 @@ function wantedAutoStatus(r, a, airingArg, titleArg, yearArg) {
   if (a) return '<span style="color:#94a3b8;font-size:12px;" title="Wanted films are scheduled automatically (checked every 30 minutes)">Will record automatically</span>';
   return '';
 }
+// How long a wanted title has been waiting: a quick way to see what is taking its time.
+function wantedAgeText(days) {
+  if (days === null || days === undefined) return '—';
+  if (days < 1) return 'today';
+  if (days === 1) return '1 day';
+  if (days < 60) return days + ' days';
+  return Math.floor(days / 30) + ' months';
+}
 async function loadRecs() {
   loadUpgradeOpportunities();
   document.getElementById('rec-status').textContent = 'Loading…';
@@ -15680,6 +15701,7 @@ async function loadRecs() {
           ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
           <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
         </td>
+        <td class="time-cell" title="${r.added ? 'Added ' + esc(r.added) : ''}" style="white-space:nowrap;${(!r.in_plex && !isSeries && r.age_days >= 30) ? 'color:#fbbf24;' : ''}">${wantedAgeText(r.age_days)}</td>
         <td class="ch-cell">${a ? esc(a.channel) : (r.ad_supported_only ? '<span style="color:#64748b" title="It airs only on channels with ads, which are not offered">Only on channels with ads</span>' : (window._wantedGuideLoading ? '<span style="color:#fbbf24">Guide still loading…</span>' : '<span style="color:#333">Not in guide</span>'))}</td>
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
         <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button></td>
@@ -15691,7 +15713,7 @@ async function loadRecs() {
       ['SERIES — EPISODE TRACKING', recs.filter(r => r.type === 'series')],
     ];
     tbody.innerHTML = groups.filter(([, rows]) => rows.length).map(([label, rows]) =>
-      `<tr><td colspan="4" style="padding:14px 0 5px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.1em;">${label}</td></tr>` +
+      `<tr><td colspan="5" style="padding:14px 0 5px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.1em;">${label}</td></tr>` +
       rows.map(renderRow).join('')
     ).join('');
   } catch(e) { setEl('rec-status','Failed: '+e.message,'err'); }
