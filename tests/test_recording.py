@@ -845,9 +845,11 @@ class OvernightOverlapCheckTests(unittest.TestCase):
 
     def test_the_nightly_run_tries_the_rebalance_then_reports_what_is_left(self):
         with mock.patch.object(server, "_rebalance_slots", return_value={"moves": [{"id": "x"}]}) as rebalance, \
-             mock.patch.object(server, "_booking_overlaps", return_value=[]):
+             mock.patch.object(server, "_booking_overlaps", return_value=[]), \
+             mock.patch.object(server, "_write_overlap_state") as saved:
             self.assertEqual(server._run_overlap_check(), [])
         rebalance.assert_called_once_with(True)
+        self.assertEqual(saved.call_args[0][1]["moved"], 1)
 
 
 class FavoriteChannelsSortByReliabilityTests(unittest.TestCase):
@@ -972,6 +974,84 @@ class WantedTitleLinksToImdbTests(unittest.TestCase):
         self.assertIn("https://www.imdb.com/find/?q=", html)
         self.assertIn('target="_blank" rel="noopener noreferrer"', html)
         self.assertIn("/^tt[0-9]+$/.test(r.imdb_id", html)          # only a real IMDb id is put in the address
+
+class OverlapStatusInThePlannerTests(unittest.TestCase):
+    def test_when_the_check_runs_next_in_words(self):
+        from datetime import datetime
+        at = lambda day, hour: datetime(2026, 11, day, hour, 5)
+        self.assertEqual(server._overlap_next_check_text(at(25, 14), "2026-11-24", 21), "tonight 9:00 PM")
+        self.assertEqual(server._overlap_next_check_text(at(25, 21), "2026-11-24", 21), "due now")
+        self.assertEqual(server._overlap_next_check_text(at(25, 22), "2026-11-25", 21), "tomorrow 9:00 PM")
+        self.assertEqual(server._overlap_next_check_text(at(25, 23), "2026-11-24", 21, window_hours=1), "tomorrow 9:00 PM")
+        self.assertEqual(server._overlap_next_check_text(at(25, 14), "", 21, enabled=False), "off")
+
+    def test_the_result_is_saved_in_a_file_so_a_deploy_does_not_forget_it(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(server, "BASE_DIR", folder):
+            self.assertEqual(server._read_overlap_state(), {})
+            overlaps = [{"provider": "primestreams", "capacity": 1, "when": "Wed 3:26 AM",
+                         "bookings": [{"title": "A"}, {"title": "B"}]}]
+            with mock.patch.object(server, "_rebalance_slots", return_value={"moves": []}), \
+                 mock.patch.object(server, "_booking_overlaps", return_value=overlaps):
+                server._run_overlap_check()
+            state = server._read_overlap_state()
+            self.assertTrue(state["date"])
+            self.assertEqual(state["last_check"]["overlap_count"], 1)
+            self.assertEqual(state["last_check"]["overlaps"][0]["titles"], ["A", "B"])
+            # the loop does not run it again the same day
+            from datetime import datetime
+            today = datetime.fromisoformat(state["date"] + "T21:30:00")
+            self.assertFalse(server._overlap_check_due(today, state["date"], 21))
+
+    def test_the_endpoint_reports_the_last_check_the_next_one_and_the_live_overlaps(self):
+        saved = {"date": "2026-11-24", "last_check": {"when": "Tue 9:00 PM", "moved": 1, "overlap_count": 0, "overlaps": []}}
+        with mock.patch.object(server, "_read_overlap_state", return_value=saved), \
+             mock.patch.object(server, "_booking_overlaps", return_value=[]):
+            data = server.app.test_client().get("/epg-web/api/recording-overlaps").get_json()
+        self.assertEqual(data["last_check"]["moved"], 1)
+        self.assertTrue(data["enabled"])
+        self.assertIn("9:00 PM", data["next_check"])
+        self.assertEqual(data["overlaps"], [])
+
+    def test_the_planner_shows_the_status_and_loads_it_with_the_grid(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        pane = html.split('id="pane-planner"')[1].split('id="pane-storage"')[0]
+        self.assertIn('id="overlap-status-text"', pane)
+        self.assertIn("Check now", pane)
+        self.assertIn("loadOverlapStatus();\n  const box = document.getElementById('planner-grid');", html)
+
+
+class GuideTabSectionsCollapseTests(unittest.TestCase):
+    def test_the_active_and_recurring_recording_headings_open_and_close_their_lists(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("toggleSection('recs')", html)
+        self.assertIn("toggleSection('series')", html)
+        self.assertIn("Active &amp; Upcoming Recordings", html)
+        self.assertIn("Recurring Recordings", html)
+
+    def test_a_closed_section_stays_closed_and_the_choice_is_remembered(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is not installed")
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        body = html.split("// Open or close a block on the Guide tab")[1].split("\n", 1)[1].split("// Open or close a block on the Recommendations")[0]
+        script = """
+        const store = {};
+        const localStorage = {getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v; }};
+        const els = {'rec-list': {style: {display: ''}}, 'series-list': {style: {display: ''}}};
+        const arrow = {textContent: '▾'};
+        const document = {addEventListener() {}, getElementById: id => id === 'section-head-recs' ? {querySelector: () => arrow} : (els[id] || null)};
+        """ + body + """
+        toggleSection('recs');
+        const closed = els['rec-list'].style.display + ' ' + els['series-list'].style.display + ' ' + arrow.textContent;
+        applySections();                                  // as after a refresh
+        const still = els['rec-list'].style.display;
+        toggleSection('recs');
+        console.log(closed + ' | ' + still + ' | ' + JSON.stringify(els['rec-list'].style.display) + ' ' + arrow.textContent);
+        """
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), 'none  ▸ | none | "" ▾')
 
 
 if __name__ == "__main__":
