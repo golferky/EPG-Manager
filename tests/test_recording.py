@@ -735,6 +735,61 @@ class RecordingTests(unittest.TestCase):
         self.assertIn("A bare year in a\n    # plot is often part of the story", text)
         self.assertIn("(?:this|from|released", text)
 
+class StreamScanStaysOffTheConnectionTests(unittest.TestCase):
+    """The nightly sampling of every channel opened up to 4 streams on a one-connection account at 3 AM, so recordings
+    starting then saw "1 of 1 connection open" or had their stream cut."""
+
+    def _db(self, provider, start_in, length=3600, status="queued"):
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, start_ts, stop_ts, status, stream_provider)")
+        now = time.time()
+        conn.execute("INSERT INTO recordings VALUES ('a','Fatal Attraction',?,?,?,?)",
+                     (now + start_in, now + start_in + length, status, provider))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_sampling_waits_for_a_recording_that_is_running_or_starts_within_15_minutes(self):
+        for provider in ("primestreams", "eaglecast"):
+            with mock.patch.object(server, "_guide_db_path", return_value=self._db(provider, 600)), \
+                 mock.patch.object(server, "_relays_active", return_value=0):
+                self.assertIn("Fatal Attraction", server._stream_scan_pause_reason())
+            with mock.patch.object(server, "_guide_db_path", return_value=self._db(provider, -600, 3600, "recording")), \
+                 mock.patch.object(server, "_relays_active", return_value=0):
+                self.assertIn("Fatal Attraction", server._stream_scan_pause_reason())
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db("primestreams", 3 * 3600)), \
+             mock.patch.object(server, "_relays_active", return_value=0):
+            self.assertEqual(server._stream_scan_pause_reason(), "")
+
+    def test_sampling_also_waits_for_a_viewer(self):
+        with mock.patch.object(server, "_guide_db_path", return_value=self._db("primestreams", 3 * 3600)), \
+             mock.patch.object(server, "_relays_active", return_value=1):
+            self.assertIn("watching", server._stream_scan_pause_reason())
+
+    def test_it_waits_in_steps_and_goes_on_when_the_connection_is_free(self):
+        answers = iter(["a recording", "a recording", ""])
+        slept = []
+        with mock.patch.object(server, "_stream_scan_pause_reason", side_effect=lambda: next(answers)):
+            self.assertTrue(server._wait_for_quiet_connection(sleep=slept.append, pause=30))
+        self.assertEqual(slept, [30, 30])
+
+    def test_it_gives_up_after_its_patience_runs_out(self):
+        slept = []
+        with mock.patch.object(server, "_stream_scan_pause_reason", return_value="a recording"):
+            self.assertFalse(server._wait_for_quiet_connection(sleep=slept.append, patience=90, pause=30))
+        self.assertEqual(slept, [30, 30, 30])
+
+    def test_one_probe_at_a_time_and_a_full_scan_at_most_every_six_hours(self):
+        import inspect
+        source = inspect.getsource(server._refresh_stream_quality_cache)
+        self.assertIn("max_workers=1", source)
+        self.assertIn("STREAM_SCAN_MIN_INTERVAL", source)
+        with mock.patch.dict(server._stream_quality_scan, {"running": False, "last_done": time.time()}), \
+             mock.patch.object(server, "load_config", side_effect=AssertionError("must not start a scan")):
+                server._refresh_stream_quality_cache()          # returns at once: the last scan was just now
+
 
 if __name__ == "__main__":
     unittest.main()
