@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -1052,6 +1053,24 @@ class GuideTabSectionsCollapseTests(unittest.TestCase):
         out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip(), 'none  ▸ | none | "" ▾')
+
+class AdminPasswordFieldsForThePasswordsAppTests(unittest.TestCase):
+    def test_the_admin_box_is_a_real_form_with_a_username_and_proper_autocomplete_hints(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        box = html.split('id="adult-modal"')[1].split('id="prog-modal-overlay"')[0]
+        self.assertIn('<form id="adult-form"', box)
+        self.assertIn('autocomplete="username"', box)                       # something to save the password under
+        self.assertIn('id="adult-pw-main" name="password" type="password" autocomplete="current-password"', box)
+        self.assertIn('id="adult-pw-confirm" name="confirm-password" type="password" autocomplete="new-password"', box)
+        self.assertNotIn('autocomplete="off"', box)                         # that told the manager not to offer
+        self.assertIn('<button type="submit" class="btn btn-primary btn-sm">OK</button>', box)
+        # no other button in the form may submit it by accident
+        for button in re.findall(r"<button[^>]*>", box):
+            self.assertIn("type=", button)
+
+    def test_the_main_box_asks_for_the_current_password_to_unlock_and_a_new_one_to_set(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("mode === 'unlock' ? 'current-password' : 'new-password'", html)
 
 
 if __name__ == "__main__":

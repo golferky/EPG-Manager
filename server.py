@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125f"
+VERSION = "v20261125g"
 
 app = Flask(__name__)
 
@@ -11893,21 +11893,23 @@ tr:hover td{background:#141414;}
   </div>
 </div>
 <div id="adult-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:2000;align-items:center;justify-content:center;">
-  <div style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:20px 22px;width:340px;max-width:92vw;color:#e2e8f0;">
+  <!-- A real form with a username and the right autocomplete hints, so the Passwords app (iCloud Keychain) can fill and save it. -->
+  <form id="adult-form" autocomplete="on" onsubmit="submitAdultModal(); return false;" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:20px 22px;width:340px;max-width:92vw;color:#e2e8f0;">
     <div id="adult-modal-title" style="font-weight:700;margin-bottom:6px;">Adult content</div>
     <div id="adult-modal-help" style="font-size:12px;color:#94a3b8;margin-bottom:12px;"></div>
-    <input id="adult-pw-current" type="password" autocomplete="off" placeholder="Current password" style="display:none;width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;">
-    <input id="adult-pw-main" type="password" autocomplete="off" placeholder="Password" style="width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;" onkeydown="if(event.key==='Enter')submitAdultModal()">
-    <input id="adult-pw-confirm" type="password" autocomplete="off" placeholder="Type it again" style="display:none;width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;" onkeydown="if(event.key==='Enter')submitAdultModal()">
+    <input id="adult-username" name="username" type="text" autocomplete="username" value="EPG Manager admin" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;">
+    <input id="adult-pw-current" name="current-password" type="password" autocomplete="current-password" placeholder="Current password" style="display:none;width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;">
+    <input id="adult-pw-main" name="password" type="password" autocomplete="current-password" placeholder="Password" style="width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;">
+    <input id="adult-pw-confirm" name="confirm-password" type="password" autocomplete="new-password" placeholder="Type it again" style="display:none;width:100%;box-sizing:border-box;margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #334155;background:#020617;color:#e2e8f0;">
     <div id="adult-modal-msg" style="font-size:12px;min-height:16px;margin-bottom:10px;color:#f87171;"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;">
-      <button class="btn btn-ghost btn-sm" id="adult-remove-btn" style="display:none;margin-right:auto;" onclick="removeAdultPassword()">Remove password</button>
-      <button class="btn btn-ghost btn-sm" id="admin-change-btn" style="display:none;" onclick="showAdultModal('set')">Change password</button>
-      <button class="btn btn-ghost btn-sm" id="admin-lock-btn" style="display:none;" onclick="lockAdmin()">Lock admin</button>
-      <button class="btn btn-ghost btn-sm" onclick="closeAdultModal()">Cancel</button>
-      <button class="btn btn-primary btn-sm" onclick="submitAdultModal()">OK</button>
+      <button type="button" class="btn btn-ghost btn-sm" id="adult-remove-btn" style="display:none;margin-right:auto;" onclick="removeAdultPassword()">Remove password</button>
+      <button type="button" class="btn btn-ghost btn-sm" id="admin-change-btn" style="display:none;" onclick="showAdultModal('set')">Change password</button>
+      <button type="button" class="btn btn-ghost btn-sm" id="admin-lock-btn" style="display:none;" onclick="lockAdmin()">Lock admin</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="closeAdultModal()">Cancel</button>
+      <button type="submit" class="btn btn-primary btn-sm">OK</button>
     </div>
-  </div>
+  </form>
 </div>
 <div id="prog-modal-overlay" onclick="if(event.target===this)closeProg()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center;">
   <div style="background:#111827;border:1px solid #1e2d3d;border-radius:14px;width:90%;max-width:620px;box-shadow:0 24px 80px rgba(0,0,0,.7);overflow:hidden;position:relative;">
@@ -13555,6 +13557,8 @@ function showAdultModal(mode) {
   has('admin-change-btn').style.display = 'none';
   has('admin-lock-btn').style.display = 'none';
   has('adult-pw-main').style.display = '';
+  // Tell the Passwords app whether this is the existing password to fill, or a new one to suggest and save.
+  has('adult-pw-main').setAttribute('autocomplete', mode === 'unlock' ? 'current-password' : 'new-password');
   if (mode === 'menu') {
     has('adult-modal-title').textContent = 'Admin';
     has('adult-modal-help').textContent = 'Admin is unlocked in this browser tab. It locks again when you close the tab, press Lock admin, or the dashboard restarts.';
