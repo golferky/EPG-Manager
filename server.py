@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125a"
+VERSION = "v20261125b"
 
 app = Flask(__name__)
 
@@ -16214,9 +16214,13 @@ async function loadRecordingHealth() {
     const d = await (await fetch('/epg-web/api/recording-health')).json();
     if (d.error) throw new Error(d.error);
     const filter = document.getElementById('health-filter')?.value || 'attention';
+    // A recording you stopped yourself is not a failure: it is shown quietly and is not in "Needs attention".
+    const cancelledByUser = r => (r.status || '').toLowerCase() === 'cancelled' || String(r.failure_reason || '') === 'Cancelled by user';
     const reports = (d.reports || []).filter(r => {
       const complete = ['done', 'skipped_existing_better'].includes((r.status || '').toLowerCase());
-      return filter === 'all' || (filter === 'complete' ? complete : !complete);
+      if (filter === 'all') return true;
+      if (filter === 'complete') return complete;
+      return !complete && !cancelledByUser(r);
     });
     if (!reports.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
@@ -16228,7 +16232,8 @@ async function loadRecordingHealth() {
       const actual = Number(recorded.duration || 0);
       const isGood = ['done','skipped_existing_better'].includes((r.status || '').toLowerCase());
       const isActive = ['recording','converting','awaiting_transfer','transferring'].includes((r.status || '').toLowerCase());
-      const color = isGood ? '#4ade80' : '#f87171';
+      const isCancelled = !isGood && cancelledByUser(r);
+      const color = isGood ? '#4ade80' : (isCancelled ? '#94a3b8' : '#f87171');
       const label = isGood ? 'Complete' : (r.failure_reason || r.quality_decision || String(r.status || 'Result').replace(/_/g, ' '));
       const timing = actual ? `${healthDuration(actual)} captured${scheduled ? ` / ${healthDuration(scheduled)} scheduled` : ''}` : '';
       const video = healthVideo(recorded) || healthVideo(result.incoming);
@@ -16237,8 +16242,8 @@ async function loadRecordingHealth() {
       const score = recordingQualityScore(recorded, scheduled, actual, result.transferred_to_plex, result.log_excerpt);
       const minorBlips = isGood && String(r.quality_decision || '').includes('minor video errors');
       const compactResult = isGood ? (minorBlips ? 'Complete · minor blips' : 'Complete')
-        : (isActive ? (timing || label) : 'CRITICAL · ' + (timing || label));
-      const action = !isGood && !isActive ? (retry
+        : (isCancelled ? 'Cancelled by you' : (isActive ? (timing || label) : 'CRITICAL · ' + (timing || label)));
+      const action = !isGood && !isActive && !isCancelled ? (retry
         ? `<span style="color:#86efac;font-size:11px;font-weight:700;white-space:nowrap;">✓ Re-record queued</span>`
         : `<button class="btn btn-sm" style="background:#1d4ed8;color:#dbeafe;white-space:nowrap;" onclick="rerecordFromHealth('${String(r.rec_id || '').replace(/[^a-zA-Z0-9-]/g,'')}',this)">↻ Find re-record</button>`) : '';
       return `<tr>
