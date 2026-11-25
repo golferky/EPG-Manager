@@ -790,6 +790,14 @@ class StreamScanStaysOffTheConnectionTests(unittest.TestCase):
              mock.patch.object(server, "load_config", side_effect=AssertionError("must not start a scan")):
                 server._refresh_stream_quality_cache()          # returns at once: the last scan was just now
 
+class CancelledByYouIsNotCriticalTests(unittest.TestCase):
+    def test_the_recording_health_list_shows_a_recording_you_stopped_quietly(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("Cancelled by you", html)
+        self.assertIn("return !complete && !cancelledByUser(r);", html)          # not in "Needs attention"
+        self.assertIn("!isGood && !isActive && !isCancelled", html)               # no re-record button for it
+        self.assertNotIn("\\", html.split("async function loadRecordingHealth")[1].split("function commercialClock")[0])
+
 
 if __name__ == "__main__":
     unittest.main()
