@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125d"
+VERSION = "v20261125e"
 
 app = Flask(__name__)
 
@@ -12001,7 +12001,7 @@ tr:hover td{background:#141414;}
   </div>
   <div class="card" style="margin-bottom:12px;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-      <h2 style="margin:0;">↑ Upgrade Opportunities</h2>
+      <h2 id="upgrade-head" style="margin:0;cursor:pointer;user-select:none;" onclick="toggleWantedGroup('upgrade')" title="Click to open or close"><span class="wanted-arrow">▾</span> ↑ Upgrade Opportunities</h2>
       <button class="btn btn-ghost btn-sm" onclick="loadUpgradeOpportunities()">Refresh</button>
     </div>
     <div id="upgrade-status" class="status-msg"></div>
@@ -12017,7 +12017,7 @@ tr:hover td{background:#141414;}
     <div id="rec-status" class="status-msg"></div>
     <div style="overflow-x:auto;">
       <table><thead><tr>
-        <th>Title</th><th>Age</th><th>Next Airing on Guide</th><th>Airs</th><th>Recording</th>
+        <th onclick="sortWantedBy('title')" style="cursor:pointer;user-select:none;">Title <span class="wanted-sort" data-key="title"></span></th><th onclick="sortWantedBy('age')" style="cursor:pointer;user-select:none;">Age <span class="wanted-sort" data-key="age"></span></th><th onclick="sortWantedBy('channel')" style="cursor:pointer;user-select:none;">Next Airing on Guide <span class="wanted-sort" data-key="channel"></span></th><th onclick="sortWantedBy('airs')" style="cursor:pointer;user-select:none;">Airs <span class="wanted-sort" data-key="airs"></span></th><th>Recording</th>
       </tr></thead><tbody id="rec-body"></tbody></table>
     </div>
   </div>
@@ -15658,6 +15658,114 @@ function wantedAutoStatus(r, a, airingArg, titleArg, yearArg) {
   if (a) return '<span style="color:#94a3b8;font-size:12px;" title="Wanted films are scheduled automatically (checked every 30 minutes)">Will record automatically</span>';
   return '';
 }
+// Draw the wanted titles: three groups, each sorted by the column you picked (if any) and open or closed as you left it.
+function renderWantedTable() {
+  const recs = window._wantedData || [];
+    const tbody = document.getElementById('rec-body');
+    const renderRow = (r, groupClass, hidden) => {
+      const a = r.next_airing;
+      const isSeries = r.type === 'series';
+      const titleArg = JSON.stringify(r.title).replace(/"/g,'&quot;');
+      const airingArg = a ? JSON.stringify(a).replace(/"/g,'&quot;') : '';
+      const yearArg = JSON.stringify(r.year || '').replace(/"/g,'&quot;');
+      const action = isSeries
+        ? (r.scheduled ? `<span class="badge badge-record" title="Missing episodes are recorded automatically. Next: ${esc(r.scheduled.channel)}">⏱ ${r.scheduled.count} scheduled</span> ` : (r.auto_record ? '<span style="color:#94a3b8;font-size:12px;" title="Missing episodes are recorded automatically when they air">Auto-recording</span> ' : ''))
+          + (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
+        : r.in_plex
+          ? (r.upgrade_scheduled
+              ? `<span class="badge badge-record" title="A better commercial-free airing was found and scheduled automatically">✓ Upgrade scheduled</span>`
+              : (a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing: ${esc(a.channel || '')}" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>` : ''))
+          : wantedAutoStatus(r, a, airingArg, titleArg, yearArg);
+      // The title opens its IMDb page (a search when the title was added without an IMDb id), in a new tab.
+      const imdbHref = /^tt[0-9]+$/.test(r.imdb_id || '') ? 'https://www.imdb.com/title/' + r.imdb_id + '/'
+        : 'https://www.imdb.com/find/?q=' + encodeURIComponent(r.title + (r.year ? ' ' + r.year : ''));
+      return `<tr class="${groupClass || ''}" style="${hidden ? 'display:none;' : ''}">
+        <td class="title-cell"><a href="${imdbHref}" target="_blank" rel="noopener noreferrer" title="Open on IMDb" style="color:inherit;text-decoration:none;border-bottom:1px dotted #64748b;">${esc(r.title)}</a> ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
+          ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
+          ${(!isSeries && r.year)?`<button class="btn btn-ghost btn-sm" style="margin:0 0 0 5px;padding:1px 6px;${r.private?'color:#c4b5fd;border-color:#7c3aed;':''}" title="${r.private?'Private: recordings go to the private folder, not Plex. Click to make it public.':'Click to record this film privately, outside Plex.'}" onclick="togglePrivateWanted(${titleArg},${yearArg},${r.private?'false':'true'})">${r.private?'🔒 Private':'🔓'}</button>`:''}
+          ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
+          <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
+        </td>
+        <td class="time-cell" title="${r.added ? 'Added ' + esc(r.added) : ''}" style="white-space:nowrap;${(!r.in_plex && !isSeries && r.age_days >= 30) ? 'color:#fbbf24;' : ''}">${wantedAgeText(r.age_days)}</td>
+        <td class="ch-cell">${a ? esc(a.channel) : (r.ad_supported_only ? '<span style="color:#64748b" title="It airs only on channels with ads, which are not offered">Only on channels with ads</span>' : (window._wantedGuideLoading ? '<span style="color:#fbbf24">Guide still loading…</span>' : '<span style="color:#333">Not in guide</span>'))}</td>
+        <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
+        <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button></td>
+      </tr>`;
+    };
+    // Each group can be closed; what you closed is remembered in this browser.
+    const shut = wantedCollapsedState();
+    const groups = [
+      ['movies', 'MOVIES', recs.filter(r => r.type !== 'series' && !r.in_plex)],
+      ['in-plex', 'MOVIES — IN PLEX', recs.filter(r => r.type !== 'series' && r.in_plex)],
+      ['series', 'SERIES — EPISODE TRACKING', recs.filter(r => r.type === 'series')],
+    ];
+    tbody.innerHTML = groups.filter(([, , rows]) => rows.length).map(([key, label, rows]) =>
+      `<tr id="wanted-head-${key}" onclick="toggleWantedGroup('${key}')" style="cursor:pointer;user-select:none;" title="Click to open or close">`
+      + `<td colspan="5" style="padding:14px 0 5px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.1em;"><span class="wanted-arrow">${shut[key] ? '▸' : '▾'}</span> ${label} <span style="color:#64748b;font-weight:500;letter-spacing:0;">(${rows.length})</span></td></tr>`
+      + wantedSorted(rows).map(r => renderRow(r, 'wanted-grp-' + key, !!shut[key])).join('')
+    ).join('');
+    applyWantedCollapse();
+  updateWantedSortArrows();
+}
+// Sorting by a column header: click once to sort, again to reverse.  Age starts with the oldest title.
+function wantedSortState() {
+  try { return JSON.parse(localStorage.getItem('epg_wanted_sort') || '{}') || {}; } catch (e) { return {}; }
+}
+function wantedSortValue(r, key) {
+  if (key === 'title') return String(r.title || '').toLowerCase();
+  if (key === 'age') return (r.age_days === null || r.age_days === undefined) ? -1 : r.age_days;
+  if (key === 'channel') return r.next_airing ? String(r.next_airing.channel || '').toLowerCase() : '';
+  if (key === 'airs') return (r.next_airing && r.next_airing.start_ts) ? r.next_airing.start_ts : 0;
+  return 0;
+}
+function wantedSorted(rows) {
+  const state = wantedSortState();
+  if (!state.key) return rows;
+  const sign = state.dir === 'desc' ? -1 : 1;
+  const empty = r => (state.key === 'channel' && !r.next_airing) || (state.key === 'airs' && !(r.next_airing && r.next_airing.start_ts));
+  return rows.slice().sort((a, b) => {
+    if (empty(a) !== empty(b)) return empty(a) ? 1 : -1;          // titles with no airing always go last
+    const x = wantedSortValue(a, state.key), y = wantedSortValue(b, state.key);
+    if (x < y) return -sign;
+    if (x > y) return sign;
+    return String(a.title || '').toLowerCase() < String(b.title || '').toLowerCase() ? -1 : 1;
+  });
+}
+function sortWantedBy(key) {
+  const state = wantedSortState();
+  const first = key === 'age' ? 'desc' : 'asc';
+  const dir = state.key === key ? (state.dir === 'asc' ? 'desc' : 'asc') : first;
+  try { localStorage.setItem('epg_wanted_sort', JSON.stringify({key: key, dir: dir})); } catch (e) { /* not remembered */ }
+  renderWantedTable();
+}
+function updateWantedSortArrows() {
+  const state = wantedSortState();
+  document.querySelectorAll('.wanted-sort').forEach(span => {
+    span.textContent = span.dataset.key === state.key ? (state.dir === 'desc' ? '▼' : '▲') : '';
+  });
+}
+// Open or close a block on the Recommendations tab (the upgrade card and the three groups of wanted titles).
+function wantedCollapsedState() {
+  try { return JSON.parse(localStorage.getItem('epg_wanted_collapsed') || '{}') || {}; } catch (e) { return {}; }
+}
+function applyWantedCollapse() {
+  const state = wantedCollapsedState();
+  ['upgrade', 'movies', 'in-plex', 'series'].forEach(key => {
+    // setEl() rewrites the upgrade message's class, so the upgrade parts are found by id
+    const parts = key === 'upgrade' ? ['upgrade-status', 'upgrade-list'].map(id => document.getElementById(id)).filter(Boolean)
+                                    : Array.from(document.querySelectorAll('.wanted-grp-' + key));
+    parts.forEach(row => { row.style.display = state[key] ? 'none' : ''; });
+    const head = document.getElementById(key === 'upgrade' ? 'upgrade-head' : 'wanted-head-' + key);
+    const arrow = head && head.querySelector('.wanted-arrow');
+    if (arrow) arrow.textContent = state[key] ? '▸' : '▾';
+  });
+}
+function toggleWantedGroup(key) {
+  const state = wantedCollapsedState();
+  state[key] = !state[key];
+  try { localStorage.setItem('epg_wanted_collapsed', JSON.stringify(state)); } catch (e) { /* private browsing: it just will not be remembered */ }
+  applyWantedCollapse();
+}
 // How long a wanted title has been waiting: a quick way to see what is taking its time.
 function wantedAgeText(days) {
   if (days === null || days === undefined) return '—';
@@ -15679,43 +15787,8 @@ async function loadRecs() {
       window._wantedReloadTimer = setTimeout(() => { window._wantedReloadTimer = null; loadRecs(); }, 20000);
     }
     window._wantedGuideLoading = !!d.guide_loading;
-    const tbody = document.getElementById('rec-body');
-    const renderRow = r => {
-      const a = r.next_airing;
-      const isSeries = r.type === 'series';
-      const titleArg = JSON.stringify(r.title).replace(/"/g,'&quot;');
-      const airingArg = a ? JSON.stringify(a).replace(/"/g,'&quot;') : '';
-      const yearArg = JSON.stringify(r.year || '').replace(/"/g,'&quot;');
-      const action = isSeries
-        ? (r.scheduled ? `<span class="badge badge-record" title="Missing episodes are recorded automatically. Next: ${esc(r.scheduled.channel)}">⏱ ${r.scheduled.count} scheduled</span> ` : (r.auto_record ? '<span style="color:#94a3b8;font-size:12px;" title="Missing episodes are recorded automatically when they air">Auto-recording</span> ' : ''))
-          + (a ? `<button class="btn btn-primary btn-sm" onclick="openWantedSeries(${titleArg},${airingArg})">📺 Episodes</button>` : '')
-        : r.in_plex
-          ? (r.upgrade_scheduled
-              ? `<span class="badge badge-record" title="A better commercial-free airing was found and scheduled automatically">✓ Upgrade scheduled</span>`
-              : (a ? `<button class="btn btn-ghost btn-sm" title="Next commercial-free English airing: ${esc(a.channel || '')}" onclick="checkWantedMovieUpgrade(this,${titleArg},${yearArg})">Check upgrade</button>` : ''))
-          : wantedAutoStatus(r, a, airingArg, titleArg, yearArg);
-      return `<tr>
-        <td class="title-cell">${esc(r.title)} ${r.year?'<span style="color:#555;font-size:11px;">('+r.year+')</span>':''}
-          ${r.in_plex?`<span class="badge badge-recorded" title="Found in Plex (${esc(r.plex_kind)})" style="margin-left:5px;">▶ IN PLEX</span>`:''}
-          ${(!isSeries && r.year)?`<button class="btn btn-ghost btn-sm" style="margin:0 0 0 5px;padding:1px 6px;${r.private?'color:#c4b5fd;border-color:#7c3aed;':''}" title="${r.private?'Private: recordings go to the private folder, not Plex. Click to make it public.':'Click to record this film privately, outside Plex.'}" onclick="togglePrivateWanted(${titleArg},${yearArg},${r.private?'false':'true'})">${r.private?'🔒 Private':'🔓'}</button>`:''}
-          ${(!r.in_plex && r.plex_year_unknown)?`<span class="badge" title="Plex has a folder with this title but no year in its name, so it may be a different film. Rename the folder to Title (Year)." style="margin-left:5px;background:#3a3a3a;color:#cbd5e1;">Plex copy: year unknown</span>`:''}
-          <span style="color:#64748b;font-size:10px;margin-left:5px;text-transform:uppercase;">${isSeries ? 'Series · episode tracking' : 'Movie'}</span>
-        </td>
-        <td class="time-cell" title="${r.added ? 'Added ' + esc(r.added) : ''}" style="white-space:nowrap;${(!r.in_plex && !isSeries && r.age_days >= 30) ? 'color:#fbbf24;' : ''}">${wantedAgeText(r.age_days)}</td>
-        <td class="ch-cell">${a ? esc(a.channel) : (r.ad_supported_only ? '<span style="color:#64748b" title="It airs only on channels with ads, which are not offered">Only on channels with ads</span>' : (window._wantedGuideLoading ? '<span style="color:#fbbf24">Guide still loading…</span>' : '<span style="color:#333">Not in guide</span>'))}</td>
-        <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
-        <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button></td>
-      </tr>`;
-    };
-    const groups = [
-      ['MOVIES', recs.filter(r => r.type !== 'series' && !r.in_plex)],
-      ['MOVIES — IN PLEX', recs.filter(r => r.type !== 'series' && r.in_plex)],
-      ['SERIES — EPISODE TRACKING', recs.filter(r => r.type === 'series')],
-    ];
-    tbody.innerHTML = groups.filter(([, rows]) => rows.length).map(([label, rows]) =>
-      `<tr><td colspan="5" style="padding:14px 0 5px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.1em;">${label}</td></tr>` +
-      rows.map(renderRow).join('')
-    ).join('');
+    window._wantedData = recs;
+    renderWantedTable();
   } catch(e) { setEl('rec-status','Failed: '+e.message,'err'); }
 }
 async function checkWantedMovieUpgrade(btn, title, year) {
