@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125j"
+VERSION = "v20261125k"
 
 app = Flask(__name__)
 
@@ -13283,6 +13283,7 @@ let plannerItems = [];
 let plannerCurrent = null;
 async function plannerCall(url, body) {
   const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  overlapBarSoon(url);
   return r.json();
 }
 function plannerWhen(it) {
@@ -13536,7 +13537,13 @@ async function loadOverlapBar() {
   } catch (e) { /* a status line is never worth an error */ }
 }
 document.addEventListener('DOMContentLoaded', loadOverlapBar);
-setInterval(loadOverlapBar, 600000);
+// Keep the bar in step with what you do: look again right after anything that books, cancels or moves a recording,
+// when you come back to this tab, and every minute (it used to be every 10, so a cancelled booking kept showing).
+function overlapBarSoon(url) {
+  if (/record/.test(String(url || ''))) setTimeout(loadOverlapBar, 1500);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadOverlapBar(); });
+setInterval(loadOverlapBar, 60000);
 
 // How often recordings on each channel worked over the last 30 days: a warning beside a channel when you pick it to record.
 window._chReliability = {};
@@ -16838,6 +16845,7 @@ async function cancelConv(id) { await post('/epg-web/api/convert/cancel',{id}); 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function post(url,body) {
   const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  overlapBarSoon(url);
   return r.json();
 }
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}

@@ -64,6 +64,8 @@ Read this first. It records how the owner's machines are set up and how changes 
 
 - Admin password box (dashboard v20261125g): `#adult-form` is a real form with a hidden username (`autocomplete="username"`), `current-password` to unlock and `new-password` to set or change (set per mode in `showAdultModal`), instead of `autocomplete="off"`, so the Passwords app / iCloud Keychain can offer to fill and save it. The password itself is still only a salted hash in the dashboard config and is never shown.
 
+- Overlap bar stays current (dashboard v20261125k): the amber overlap bar looks again every minute (it was every 10, so a booking you had just cancelled kept showing), when you return to the tab, and 1.5 s after any `/record...` request made through `post()` or `plannerCall()` (book, cancel, move, fix).
+
 ## Naming 24/7 captures
 - `mac/identify_episodes.py --show "Everybody Loves Raymond" --folder DIR [--apply]`: for episode videos with no guide data. It listens to each video (faster-whisper, installed once with `pip3 install faster-whisper`, runs on the Mac), matches the speech to the TMDb and OMDb plot summaries of every episode of the show (fetched through the dashboard), and prints the best match with the next closest. It is a GUESS: only a confident match (best clearly ahead of the runner-up) is filed in Plex, and only with `--apply`; unsure ones stay put, and `--accept "2026-11-22_0808=S02E15"` adds one you checked by eye. Transcripts are kept in `DIR/.transcripts` and reused. The owner wants Raymond in Plex only when an episode can be identified.
 

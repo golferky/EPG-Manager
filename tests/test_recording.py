@@ -1266,6 +1266,39 @@ class OverlapScanLooksFarAheadTests(unittest.TestCase):
         self.assertIn("d.hours >= 48 ? Math.round(d.hours / 24) + ' days' : d.hours + ' hours'", html)
         self.assertNotIn("in the next ' + d.hours + ' hours", html)
 
+class OverlapBarStaysCurrentTests(unittest.TestCase):
+    def test_the_bar_looks_again_after_a_cancel_or_move_when_you_return_to_the_tab_and_every_minute(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("setInterval(loadOverlapBar, 60000)", html)
+        self.assertNotIn("setInterval(loadOverlapBar, 600000)", html)
+        self.assertIn("document.addEventListener('visibilitychange', () => { if (!document.hidden) loadOverlapBar(); });", html)
+        # both helpers the page uses to book, cancel and move recordings tell the bar to look again
+        post = html.split("async function post(url,body) {")[1].split("\n}\n", 1)[0]
+        planner = html.split("async function plannerCall(url, body) {")[1].split("\n}\n", 1)[0]
+        self.assertIn("overlapBarSoon(url)", post)
+        self.assertIn("overlapBarSoon(url)", planner)
+
+    def test_only_recording_requests_trigger_a_look(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is not installed")
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        body = html.split("function overlapBarSoon(url) {")[1].split("\n}\n", 1)[0]
+        script = """
+        const looks = [];
+        function loadOverlapBar() { looks.push('look'); }
+        const real = setTimeout; global.setTimeout = (fn) => fn();
+        function overlapBarSoon(url) {""" + body + """
+        }
+        overlapBarSoon('/epg-web/api/record/cancel');
+        overlapBarSoon('/epg-web/api/recording-plan/switch-source');
+        overlapBarSoon('/epg-web/api/wanted');
+        console.log(looks.length);
+        """
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "2")
+
 
 if __name__ == "__main__":
     unittest.main()
