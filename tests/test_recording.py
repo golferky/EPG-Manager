@@ -862,6 +862,45 @@ class FavoriteChannelsSortByReliabilityTests(unittest.TestCase):
             ordered = [c["name"] for c in server._sort_favorite_channels(channels)]
         self.assertEqual(ordered, ["HBO Comedy HD", "Cinemax", "Cinemax Classics", "Flix", "HBO", "Zeta Premium", "Starz"])
 
+class WantedAgeAndToolbarTests(unittest.TestCase):
+    def test_age_counts_whole_days_since_the_title_was_added(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(server._wanted_age("2026-11-25 03:00:00", now)[0], 0)
+        self.assertEqual(server._wanted_age("2026-11-24 11:00:00", now)[0], 1)
+        days, label = server._wanted_age("2026-10-26 12:00:00", now)
+        self.assertEqual(days, 30)
+        self.assertEqual(label, "Oct 26, 2026")
+
+    def test_an_unknown_or_future_time_is_not_an_error(self):
+        self.assertEqual(server._wanted_age(None), (None, ""))
+        self.assertEqual(server._wanted_age("not a date"), (None, ""))
+        self.assertEqual(server._wanted_age("2999-01-01 00:00:00")[0], 0)
+
+    def test_the_add_buttons_are_in_a_bar_at_the_top_of_the_tab_and_the_table_has_an_age_column(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        pane = html.split('id="pane-recommendations"')[1]
+        self.assertLess(pane.index("addWanted('movie')"), pane.index("Upgrade Opportunities"))     # above everything else
+        self.assertIn("position:sticky;top:0", pane.split("addWanted('movie')")[0])               # and stays in view
+        self.assertEqual(html.count("addWanted('movie')"), 1)
+        self.assertIn("<th>Title</th><th>Age</th>", html)
+        self.assertIn("function wantedAgeText", html)
+
+    def test_the_recommendations_reply_carries_the_age(self):
+        wanted = [{"id": 1, "title": "Walking Tall", "normalized_title": "walking tall", "year": "1973", "type": "movie",
+                   "status": "wanted", "notes": "", "source": "imdb", "imdb_id": "tt0070895",
+                   "created_at": "2026-11-20 12:00:00", "updated_at": "2026-11-20 12:00:00"}]
+        with mock.patch.object(server, "db_rows", return_value=wanted), \
+             mock.patch.object(server, "_plex_wanted_title_index", return_value={"movies": set(), "shows": set()}), \
+             mock.patch.object(server, "_private_titles", return_value=set()), \
+             mock.patch.object(server, "_channel_recording_reliability", return_value={}), \
+             mock.patch.object(server, "_wanted_scheduled_summary", return_value=None), \
+             mock.patch.object(server, "_wanted_auto_reason", return_value=""):
+            data = server.app.test_client().get("/epg-web/api/recommendations").get_json()
+        row = data["recommendations"][0]
+        self.assertIsInstance(row["age_days"], int)
+        self.assertEqual(row["added"], "Nov 20, 2026")
+
 
 if __name__ == "__main__":
     unittest.main()
