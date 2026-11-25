@@ -31,7 +31,7 @@ DEFAULT_RECORDING_TAIL_SECONDS = 45
 # Shown in the recorder's log when it connects.  Bump it with every change to the recorder,
 # the same way as the dashboard's VERSION: "v" + the date + a letter (a, b, c ...), the
 # letter starting again at "a" on a new day.
-AGENT_VERSION = "v20261123k"
+AGENT_VERSION = "v20261125a"
 TERMINAL_STATES = {
     'done', 'done_ts', 'cancelled', 'failed', 'error',
     'skipped_existing_better', 'skipped_too_short',
@@ -1171,8 +1171,10 @@ def verified_unidentified_episode_transfer(source, tv_root, show_title, start_ts
 
 
 RESUME_PAUSE_SECONDS = 20
-RESUME_MAX_ATTEMPTS = 20
-RESUME_MAX_EMPTY_SEGMENTS = 5
+RESUME_QUICK_RETRIES = 3            # restarts in a row that got nothing before the pause gets longer
+RESUME_LONG_PAUSE_SECONDS = 60      # the pause after those: do not hammer a provider that is down
+RESUME_MAX_ATTEMPTS = 100
+RESUME_GIVE_UP_SECONDS = 20 * 60    # give up only when the stream has given nothing at all for this long
 
 
 def segment_path(ts_path, attempt):
@@ -1212,6 +1214,7 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time, adopt=No
     ts_path = Path(ts_path)
     segments = []
     empty_in_a_row = 0
+    dead_since = None               # when the stream last started giving nothing
     attempt = 0
     rc = 0
     watchdog = ProgrammeWatchdog(cfg, job)
@@ -1248,15 +1251,22 @@ def record_with_resume(api, job, cfg, url, ts_path, log_path, end_time, adopt=No
             return None
         segments.append(segment)
         size = segment.stat().st_size if segment.exists() else 0
-        empty_in_a_row = empty_in_a_row + 1 if size == 0 else 0
+        if size == 0:
+            empty_in_a_row += 1
+            dead_since = time.time() if dead_since is None else dead_since
+        else:
+            empty_in_a_row, dead_since = 0, None
         if end_time - time.time() < 90:
             break
         attempt += 1
-        if attempt > RESUME_MAX_ATTEMPTS or empty_in_a_row >= RESUME_MAX_EMPTY_SEGMENTS:
+        # A provider can be down for several minutes.  Keep trying until the recording is due to end, and give up
+        # only when it has given nothing at all for RESUME_GIVE_UP_SECONDS.
+        if attempt > RESUME_MAX_ATTEMPTS or (dead_since is not None and time.time() - dead_since >= RESUME_GIVE_UP_SECONDS):
             break
+        pause = RESUME_PAUSE_SECONDS if empty_in_a_row < RESUME_QUICK_RETRIES else RESUME_LONG_PAUSE_SECONDS
         print(f'[resume] {job["title"]}: stream stopped early; retrying in '
-              f'{RESUME_PAUSE_SECONDS}s (attempt {attempt})', flush=True)
-        if not heartbeat_sleep(api, job, 'recording', RESUME_PAUSE_SECONDS, cfg,
+              f'{pause}s (attempt {attempt})', flush=True)
+        if not heartbeat_sleep(api, job, 'recording', pause, cfg,
                                file=str(ts_path)):
             for extra in segments[1:]:
                 discard_failed_media(extra)
