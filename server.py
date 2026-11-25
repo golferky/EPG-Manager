@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125e"
+VERSION = "v20261125f"
 
 app = Flask(__name__)
 
@@ -11865,12 +11865,12 @@ tr:hover td{background:#141414;}
   <div id="eagle-live-catalog" style="display:none;"></div>
   <!-- Recordings panel -->
   <div id="rec-panel" style="margin-top:16px;display:none;">
-    <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">🔴 Active Recordings</h3>
+    <h3 id="section-head-recs" style="font-size:13px;color:#64748b;margin-bottom:8px;cursor:pointer;user-select:none;" onclick="toggleSection('recs')" title="Click to open or close"><span class="section-arrow">▾</span> 🔴 Active &amp; Upcoming Recordings <span id="recs-count" style="font-weight:400;"></span></h3>
     <div id="rec-list"></div>
   </div>
   <!-- Series Recordings panel -->
   <div style="margin-top:24px;">
-    <h3 style="font-size:13px;color:#64748b;margin-bottom:8px;">📺 Recurring Recordings</h3>
+    <h3 id="section-head-series" style="font-size:13px;color:#64748b;margin-bottom:8px;cursor:pointer;user-select:none;" onclick="toggleSection('series')" title="Click to open or close"><span class="section-arrow">▾</span> 📺 Recurring Recordings <span id="series-count" style="font-weight:400;"></span></h3>
     <div id="series-list" style="max-height:300px;overflow-y:auto;"></div>
   </div>
 </div>
@@ -12264,6 +12264,10 @@ tr:hover td{background:#141414;}
 
 <!-- STORAGE -->
 <div id="pane-planner" class="pane">
+  <div id="overlap-status" class="card" style="margin-bottom:12px;padding:10px 14px;font-size:13px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+    <span id="overlap-status-text" style="flex:1;min-width:260px;color:#94a3b8;">Checking for overlapping bookings…</span>
+    <button class="btn btn-ghost btn-sm" onclick="loadOverlapStatus()" title="Look at the bookings again now (this does not move anything)">Check now</button>
+  </div>
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
       <h2 style="margin:0;">Recording planner</h2>
@@ -13330,7 +13334,34 @@ async function plannerRerecord() {
   loadPlanner();
 }
 
+// The nightly overlap check: when it last ran and what it found, the bookings that overlap right now, and when it runs next.
+async function loadOverlapStatus() {
+  const text = document.getElementById('overlap-status-text');
+  const card = document.getElementById('overlap-status');
+  if (!text) return;
+  try {
+    const d = await (await fetch('/epg-web/api/recording-overlaps')).json();
+    const last = d.last_check;
+    const parts = [];
+    if (!d.enabled) parts.push('The nightly overlap check is switched off.');
+    else if (!last) parts.push('The nightly overlap check has not run yet.');
+    else if (last.error) parts.push('Nightly overlap check (' + last.when + ') could not finish: ' + last.error);
+    else parts.push('Nightly overlap check ran ' + last.when + ': ' + (last.overlap_count ? last.overlap_count + ' overlap' + (last.overlap_count > 1 ? 's' : '') + ' left' : 'no overlaps') + (last.moved ? ', moved ' + last.moved + ' booking' + (last.moved > 1 ? 's' : '') + ' to the other connection' : '') + '.');
+    if (d.enabled) parts.push('Next: ' + d.next_check + '.');
+    const now = d.overlaps || [];
+    if (now.length) {
+      const first = now[0];
+      parts.push('Right now ' + now.length + ' overlap' + (now.length > 1 ? 's' : '') + ' in the next ' + d.hours + ' hours: ' + first.bookings.map(b => b.title).join(' and ') + ' on ' + first.provider + ' (' + first.when + ').');
+    } else if (d.enabled || last) {
+      parts.push('No bookings overlap in the next ' + d.hours + ' hours.');
+    }
+    text.textContent = parts.join(' ');
+    text.style.color = now.length ? '#fde68a' : '#94a3b8';
+    card.style.borderColor = now.length ? '#b45309' : '';
+  } catch (e) { text.textContent = 'Could not read the overlap check: ' + e.message; }
+}
 async function loadPlanner() {
+  loadOverlapStatus();
   const box = document.getElementById('planner-grid');
   box.innerHTML = '<div class="empty">Loading…</div>';
   try {
@@ -14976,6 +15007,9 @@ async function loadSeriesRecordings() {
     if (!el) return;
     const active = (d.series || []).filter(s => s.active);
     const inactive = (d.series || []).filter(s => !s.active);
+    const seriesCount = document.getElementById('series-count');
+    if (seriesCount) seriesCount.textContent = '(' + active.length + ')';
+    applySections();
     if (!d.series || !d.series.length) {
       el.innerHTML = '<div style="color:#64748b;font-size:13px;">No recurring recordings set up.</div>';
       return;
@@ -15468,6 +15502,9 @@ async function updateRecPanel() {
     return;
   }
   document.getElementById('rec-panel').style.display = 'block';
+  const countEl = document.getElementById('recs-count');
+  if (countEl) countEl.textContent = '(' + recs.length + ')';
+  applySections();
   const statusIcons = {
     queued:'⏳', scheduled:'⏱', recording:'🔴', converting:'⚙️',
     agent_claimed:'🤝', preflight:'🔎', waiting:'⏳',
@@ -15744,6 +15781,27 @@ function updateWantedSortArrows() {
     span.textContent = span.dataset.key === state.key ? (state.dir === 'desc' ? '▼' : '▲') : '';
   });
 }
+// Open or close a block on the Guide tab (active and upcoming recordings, recurring recordings); remembered in this browser.
+const SECTION_BODIES = {recs: ['rec-list'], series: ['series-list']};
+function sectionState() {
+  try { return JSON.parse(localStorage.getItem('epg_sections_closed') || '{}') || {}; } catch (e) { return {}; }
+}
+function applySections() {
+  const state = sectionState();
+  Object.keys(SECTION_BODIES).forEach(key => {
+    SECTION_BODIES[key].forEach(id => { const el = document.getElementById(id); if (el) el.style.display = state[key] ? 'none' : ''; });
+    const head = document.getElementById('section-head-' + key);
+    const arrow = head && head.querySelector('.section-arrow');
+    if (arrow) arrow.textContent = state[key] ? '▸' : '▾';
+  });
+}
+function toggleSection(key) {
+  const state = sectionState();
+  state[key] = !state[key];
+  try { localStorage.setItem('epg_sections_closed', JSON.stringify(state)); } catch (e) { /* not remembered */ }
+  applySections();
+}
+document.addEventListener('DOMContentLoaded', applySections);
 // Open or close a block on the Recommendations tab (the upgrade card and the three groups of wanted titles).
 function wantedCollapsedState() {
   try { return JSON.parse(localStorage.getItem('epg_wanted_collapsed') || '{}') || {}; } catch (e) { return {}; }
@@ -17215,7 +17273,6 @@ def _run_daily_guide_refresh():
         print(f'[daily-guide] Schedules Direct failed: {exc}')
 
 OVERLAP_LOOKAHEAD_HOURS = 36
-_overlap_state = {'date': ''}
 
 
 def _booking_overlaps(hours=OVERLAP_LOOKAHEAD_HOURS, now=None):
@@ -17266,8 +17323,50 @@ def _booking_overlaps(hours=OVERLAP_LOOKAHEAD_HOURS, now=None):
 
 @app.route('/epg-web/api/recording-overlaps')
 def api_recording_overlaps():
-    """Read-only: bookings in the next day and a half that want the same connection together."""
-    return jsonify({'hours': OVERLAP_LOOKAHEAD_HOURS, 'overlaps': _booking_overlaps()})
+    """Read-only: bookings in the next day and a half that want the same connection together, plus the nightly check's
+    last result and when it runs next (shown at the top of the Planner)."""
+    cfg = load_config()
+    enabled = bool(cfg.get('overlap_check', True))
+    hour = int(cfg.get('overlap_check_hour', 21))
+    zone = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+    state = _read_overlap_state()
+    return jsonify({'hours': OVERLAP_LOOKAHEAD_HOURS, 'overlaps': _booking_overlaps(),
+                    'enabled': enabled, 'hour': hour, 'last_check': state.get('last_check'),
+                    'next_check': _overlap_next_check_text(datetime.now(zone), state.get('date', ''), hour, enabled)})
+
+
+OVERLAP_STATE_FILE = 'overlap_check.json'
+
+
+def _read_overlap_state():
+    """The nightly check's memory: the day it last ran and what it found.  Kept in a file so a deploy does not forget it."""
+    try:
+        with open(os.path.join(BASE_DIR, OVERLAP_STATE_FILE), encoding='utf-8') as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_overlap_state(day, last_check):
+    try:
+        with open(os.path.join(BASE_DIR, OVERLAP_STATE_FILE), 'w', encoding='utf-8') as handle:
+            json.dump({'date': day, 'last_check': last_check}, handle)
+    except OSError as exc:
+        print(f'[overlap-check] could not save its result: {exc}')
+
+
+def _overlap_next_check_text(now, last_date, hour=21, enabled=True, window_hours=3):
+    """When the nightly check runs next, in words: 'off', 'due now', 'tonight 9:00 PM', 'tomorrow 9:00 PM'."""
+    if not enabled:
+        return 'off'
+    clock = datetime(2000, 1, 1, hour).strftime('%-I:%M %p')
+    ran_today = last_date == now.date().isoformat()
+    if not ran_today and hour <= now.hour < hour + window_hours:
+        return 'due now'
+    if not ran_today and now.hour < hour:
+        return f'tonight {clock}'
+    return f'tomorrow {clock}'
 
 
 def _overlap_check_due(now, last_date, hour=21, enabled=True, window_hours=3):
@@ -17278,7 +17377,11 @@ def _overlap_check_due(now, last_date, hour=21, enabled=True, window_hours=3):
 
 
 def _run_overlap_check():
-    """Give the films-first placement one more go, then report what still overlaps.  Returns the overlaps."""
+    """Give the films-first placement one more go, then report what still overlaps.  Returns the overlaps.
+
+    What it found is saved (``overlap_check.json``) for the Planner to show.
+    """
+    moved = 0
     try:
         result = _rebalance_slots(True)
         moved = len(result.get('moves') or [])
@@ -17292,7 +17395,16 @@ def _run_overlap_check():
     for item in overlaps:
         names = '; '.join('"%s"' % b['title'] for b in item['bookings'])
         print(f"[overlap-check] {item['provider']} (allows {item['capacity']}) at {item['when']}: {names}")
+    now = time.time()
+    _write_overlap_state(_overlap_state_day(now), {
+        'ran_at': now, 'when': _local_dt(now).strftime('%a %-I:%M %p'), 'moved': moved, 'overlap_count': len(overlaps),
+        'overlaps': [{'provider': i['provider'], 'when': i['when'], 'titles': [b['title'] for b in i['bookings']]}
+                     for i in overlaps]})
     return overlaps
+
+
+def _overlap_state_day(now_ts):
+    return _local_dt(now_ts).date().isoformat()
 
 
 def _overlap_check_loop():
@@ -17300,10 +17412,14 @@ def _overlap_check_loop():
         try:
             cfg = load_config()
             now = datetime.now(ZoneInfo(cfg.get('timezone', 'America/New_York')))
-            if _overlap_check_due(now, _overlap_state['date'], int(cfg.get('overlap_check_hour', 21)),
+            if _overlap_check_due(now, _read_overlap_state().get('date', ''), int(cfg.get('overlap_check_hour', 21)),
                                   bool(cfg.get('overlap_check', True))):
-                _overlap_state['date'] = now.date().isoformat()
-                _run_overlap_check()
+                try:
+                    _run_overlap_check()
+                except Exception as exc:
+                    print(f'[overlap-check] failed: {exc}')
+                    _write_overlap_state(now.date().isoformat(), {'error': str(exc)[:120], 'when': now.strftime('%a %-I:%M %p'),
+                                                                  'moved': 0, 'overlap_count': 0, 'overlaps': []})
         except Exception as exc:
             print(f'[overlap-check] error: {exc}')
         time.sleep(60)
