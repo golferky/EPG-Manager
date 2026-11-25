@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261123m"
+VERSION = "v20261125a"
 
 app = Flask(__name__)
 
@@ -625,7 +625,10 @@ _startup_status = {
 }
 _ps_channel_cache = {'paths': (), 'loaded_at': 0, 'ids': set()}
 _provider_live_epg_lock = threading.Lock()
-_stream_quality_scan = {'running': False, 'completed': 0, 'total': 0}
+_stream_quality_scan = {'running': False, 'completed': 0, 'total': 0, 'last_done': 0.0}
+STREAM_SCAN_MARGIN_SECONDS = 900          # no sampling from 15 minutes before a recording until it ends
+STREAM_SCAN_MIN_INTERVAL = 6 * 3600       # a full sampling at most every 6 hours (each Refresh Guide used to start one)
+STREAM_SCAN_PATIENCE_SECONDS = 12 * 3600  # how long one probe waits for a quiet connection before giving up
 _stream_quality_scan_lock = threading.Lock()
 _commercial_review_lock = threading.Lock()
 _commercial_review_running = set()
@@ -2668,10 +2671,37 @@ def _saved_stream_quality(channel_id):
     except Exception:
         return None
 
+def _stream_scan_pause_reason():
+    """Why channel sampling must wait, or ''.  Each probe opens a stream, and the provider accounts allow ONE, so a
+    probe while a recording runs (or starts) made the recording see "1 of 1 connection open" or have its stream cut."""
+    for provider in ('primestreams', 'eaglecast'):
+        due = _recordings_due_on(provider, STREAM_SCAN_MARGIN_SECONDS)
+        if due:
+            return f'"{due[0][0]}" is recording or about to'
+    if _relays_active():
+        return 'someone is watching'
+    if _filler_state.get('id') is not None:
+        return 'a 24/7 capture is running'
+    return ''
+
+
+def _wait_for_quiet_connection(sleep=time.sleep, patience=STREAM_SCAN_PATIENCE_SECONDS, pause=30):
+    """True once no recording, viewer or capture needs the connection; False if it stayed busy for ``patience``."""
+    waited = 0
+    while _stream_scan_pause_reason():
+        if waited >= patience:
+            return False
+        sleep(pause)
+        waited += pause
+    return True
+
+
 def _refresh_stream_quality_cache():
     """Sample recordable channels in the background after a guide refresh."""
     with _stream_quality_scan_lock:
         if _stream_quality_scan['running']:
+            return
+        if time.time() - float(_stream_quality_scan.get('last_done') or 0) < STREAM_SCAN_MIN_INTERVAL:
             return
         _stream_quality_scan.update({'running': True, 'completed': 0, 'total': 0})
     try:
@@ -2691,6 +2721,8 @@ def _refresh_stream_quality_cache():
         with _stream_quality_scan_lock:
             _stream_quality_scan['total'] = len(channel_ids)
         def sample(channel_id):
+            if not _wait_for_quiet_connection():
+                return channel_id, None
             url, error, _debug = _stream_url(channel_id)
             if error:
                 return channel_id, None
@@ -2705,7 +2737,7 @@ def _refresh_stream_quality_cache():
                 }
             except Exception:
                 return channel_id, None
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix='epg-quality') as pool:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='epg-quality') as pool:   # one stream at a time
             futures = [pool.submit(sample, channel_id) for channel_id in channel_ids]
             for future in as_completed(futures):
                 channel_id, quality = future.result()
@@ -2734,6 +2766,7 @@ def _refresh_stream_quality_cache():
     finally:
         with _stream_quality_scan_lock:
             _stream_quality_scan['running'] = False
+            _stream_quality_scan['last_done'] = time.time()
 
 def _safe_filename(title):
     return re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:60]
@@ -9296,8 +9329,9 @@ PLAY_CUTOFF_SECONDS = 120
 PLAY_GUARD_CHECK_SECONDS = 5
 
 
-def _recordings_due_on(provider):
+def _recordings_due_on(provider, margin=None):
     """Recordings on this connection that are running now or start within the cutoff: [(title, start_ts)]."""
+    margin = PLAY_CUTOFF_SECONDS if margin is None else margin
     now = time.time()
     statuses = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
     try:
@@ -9306,7 +9340,7 @@ def _recordings_due_on(provider):
         rows = conn.execute(
             "SELECT title, start_ts FROM recordings WHERE COALESCE(stream_provider,'primestreams')=? "
             "AND status IN ({}) AND start_ts<=? AND stop_ts>? ORDER BY start_ts".format(','.join('?' * len(statuses))),
-            [provider] + list(statuses) + [now + PLAY_CUTOFF_SECONDS, now]).fetchall()
+            [provider] + list(statuses) + [now + margin, now]).fetchall()
         conn.close()
         return rows
     except sqlite3.Error:
