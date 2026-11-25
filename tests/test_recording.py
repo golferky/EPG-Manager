@@ -436,9 +436,9 @@ class RecordingTests(unittest.TestCase):
         self.assertIn('↻ Find re-record', server.HTML)
 
     def test_wanted_ui_separates_movies_and_series(self):
-        self.assertIn("['MOVIES', recs.filter", server.HTML)
-        self.assertIn("['MOVIES — IN PLEX', recs.filter", server.HTML)
-        self.assertIn("['SERIES — EPISODE TRACKING', recs.filter", server.HTML)
+        self.assertIn("['movies', 'MOVIES', recs.filter", server.HTML)
+        self.assertIn("['in-plex', 'MOVIES — IN PLEX', recs.filter", server.HTML)
+        self.assertIn("['series', 'SERIES — EPISODE TRACKING', recs.filter", server.HTML)
 
     def test_wanted_movies_can_check_for_a_better_copy(self):
         self.assertIn("checkWantedMovieUpgrade", server.HTML)
