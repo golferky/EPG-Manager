@@ -883,7 +883,7 @@ class WantedAgeAndToolbarTests(unittest.TestCase):
         self.assertLess(pane.index("addWanted('movie')"), pane.index("Upgrade Opportunities"))     # above everything else
         self.assertIn("position:sticky;top:0", pane.split("addWanted('movie')")[0])               # and stays in view
         self.assertEqual(html.count("addWanted('movie')"), 1)
-        self.assertIn("<th>Title</th><th>Age</th>", html)
+        self.assertIn("sortWantedBy('age')", html)
         self.assertIn("function wantedAgeText", html)
 
     def test_the_recommendations_reply_carries_the_age(self):
@@ -900,6 +900,78 @@ class WantedAgeAndToolbarTests(unittest.TestCase):
         row = data["recommendations"][0]
         self.assertIsInstance(row["age_days"], int)
         self.assertEqual(row["added"], "Nov 20, 2026")
+
+class WantedTableBehaviourTests(unittest.TestCase):
+    """Runs the page's own sorting and collapsing functions in node, with a stub browser."""
+
+    @staticmethod
+    def _run(script):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            raise unittest.SkipTest("node is not installed")
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        sorting = html.split("// Sorting by a column header")[1].split("\n", 1)[1].split("// Open or close a block")[0]
+        collapsing = html.split("// Open or close a block on the Recommendations tab")[1].split("\n", 1)[1].split("// How long a wanted title")[0]
+        prelude = """
+        const store = {};
+        const localStorage = {getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v; }};
+        const rows = {};
+        const document = {querySelectorAll: sel => rows[sel] || [], getElementById: () => null};
+        let drawn = 0;
+        function renderWantedTable() { drawn += 1; }
+        function updateWantedSortArrows() {}
+        """
+        out = subprocess.run(["node", "-e", prelude + sorting + collapsing + script], capture_output=True, text=True, timeout=30)
+        if out.returncode:
+            raise AssertionError(out.stderr)
+        return out.stdout.strip()
+
+    def test_each_column_sorts_and_a_second_click_reverses_it(self):
+        out = self._run("""
+        const recs = [
+          {title: 'Bravo', age_days: 3, next_airing: {channel: 'HBO', start_ts: 300}},
+          {title: 'Alpha', age_days: 40, next_airing: null},
+          {title: 'Charlie', age_days: 10, next_airing: {channel: 'Cinemax', start_ts: 100}},
+        ];
+        const names = () => wantedSorted(recs).map(r => r.title).join(',');
+        const results = [];
+        sortWantedBy('title'); results.push(names());      // Alpha,Bravo,Charlie
+        sortWantedBy('title'); results.push(names());      // reversed
+        sortWantedBy('age');   results.push(names());      // oldest first
+        sortWantedBy('age');   results.push(names());      // youngest first
+        sortWantedBy('channel'); results.push(names());    // Cinemax, HBO, then the one with no airing last
+        sortWantedBy('channel'); results.push(names());    // descending, still last
+        sortWantedBy('airs');  results.push(names());      // soonest first, no airing last
+        console.log(results.join(' | '));
+        """)
+        self.assertEqual(out, "Alpha,Bravo,Charlie | Charlie,Bravo,Alpha | Alpha,Charlie,Bravo | Bravo,Charlie,Alpha | "
+                              "Charlie,Bravo,Alpha | Bravo,Charlie,Alpha | Charlie,Bravo,Alpha")
+
+    def test_the_sort_choice_is_remembered_and_redraws_the_table(self):
+        out = self._run("""
+        sortWantedBy('age');
+        console.log(JSON.stringify(wantedSortState()) + ' ' + drawn);
+        """)
+        self.assertEqual(out, '{"key":"age","dir":"desc"} 1')
+
+    def test_a_group_can_be_closed_and_the_choice_is_remembered(self):
+        out = self._run("""
+        const row = {style: {display: ''}};
+        rows['.wanted-grp-movies'] = [row];
+        toggleWantedGroup('movies');
+        const closed = row.style.display + ' ' + JSON.stringify(wantedCollapsedState());
+        toggleWantedGroup('movies');
+        console.log(closed + ' | ' + JSON.stringify(row.style.display));
+        """)
+        self.assertEqual(out, 'none {"movies":true} | ""')
+
+class WantedTitleLinksToImdbTests(unittest.TestCase):
+    def test_the_title_is_a_link_to_the_imdb_page_or_an_imdb_search(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("https://www.imdb.com/title/", html)
+        self.assertIn("https://www.imdb.com/find/?q=", html)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', html)
+        self.assertIn("/^tt[0-9]+$/.test(r.imdb_id", html)          # only a real IMDb id is put in the address
 
 
 if __name__ == "__main__":
