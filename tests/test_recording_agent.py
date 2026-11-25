@@ -300,11 +300,40 @@ class ResumeRecordingTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.ts.read_bytes(), b"AAAA")
 
-    def test_gives_up_after_repeated_empty_segments(self):
-        plan = [(b"", 1, 1)] * 20
-        rc, calls = self._run(plan)
+    def test_gives_up_only_after_the_stream_has_given_nothing_for_twenty_minutes(self):
+        plan = [(b"", 1, 1)] * 200
+        rc, calls = self._run(plan, end_time=1000.0 + 4000)
         self.assertNotEqual(rc, 0)
-        self.assertEqual(len(calls), recording_agent.RESUME_MAX_EMPTY_SEGMENTS)
+        self.assertGreaterEqual(self.now[0] - 1000.0, recording_agent.RESUME_GIVE_UP_SECONDS)
+        self.assertLess(self.now[0] - 1000.0, recording_agent.RESUME_GIVE_UP_SECONDS + 200)
+        self.assertGreater(len(calls), recording_agent.RESUME_QUICK_RETRIES)          # it did not give up after a few
+
+    def test_a_stream_that_is_down_for_ten_minutes_and_comes_back_is_recovered(self):
+        # Solitary Man, Nov 25: five failed restarts in a row used to end the recording with 32 minutes still to go.
+        plan = [(b"AAAA", 100, 0)] + [(b"", 1, 1)] * 12 + [(b"BBBB", 3500, 0)]     # BBBB then runs to the scheduled end
+        rc, calls = self._run(plan, end_time=1000.0 + 4000)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.ts.read_bytes(), b"AAAABBBB")
+        self.assertEqual(len(calls), 14)
+
+    def test_the_pause_gets_longer_after_a_few_restarts_in_a_row_that_got_nothing(self):
+        pauses = []
+
+        def fake_run_process(api, job, status, cmd, cfg, log_path, file_path="", watchdog=None, **kwargs):
+            Path(cmd[-1]).write_bytes(b"")
+            self.now[0] += 1
+            return 1
+
+        def fake_sleep(api, job, status, seconds, cfg, **fields):
+            pauses.append(seconds)
+            self.now[0] += seconds
+            return True
+
+        with mock.patch.object(recording_agent, "run_process", fake_run_process), \
+             mock.patch.object(recording_agent, "heartbeat_sleep", fake_sleep), \
+             mock.patch.object(recording_agent.time, "time", lambda: self.now[0]):
+            recording_agent.record_with_resume(None, self.job, self.cfg, "http://x/y.ts", self.ts, self.log, 1000.0 + 4000)
+        self.assertEqual(pauses[:5], [20, 20, 60, 60, 60])
 
     def test_data_already_captured_is_kept_when_later_attempts_fail(self):
         plan = [(b"AAAA", 50, 0)] + [(b"", 1, 1)] * 10
