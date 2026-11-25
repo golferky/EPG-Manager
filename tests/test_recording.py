@@ -1240,6 +1240,32 @@ class AdminPasswordFieldsForThePasswordsAppTests(unittest.TestCase):
         html = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("mode === 'unlock' ? 'current-password' : 'new-password'", html)
 
+class OverlapScanLooksFarAheadTests(unittest.TestCase):
+    def test_the_scan_covers_every_booking_ahead_not_just_the_next_day_and_a_half(self):
+        self.assertGreaterEqual(server.OVERLAP_LOOKAHEAD_HOURS, 21 * 24)       # the guide runs about three weeks
+        now = time.time()
+        import sqlite3 as sq, tempfile
+        db = os.path.join(tempfile.mkdtemp(), "g.db")
+        conn = sq.connect(db)
+        conn.execute("CREATE TABLE recordings (rec_id, title, channel, start_ts, stop_ts, status, stream_provider)")
+        day = 86400
+        for i, (title, start_in) in enumerate((("Rob Peace", 3 * day), ("Joker", 3 * day + 5000), ("The Last Face", 3 * day + 12000))):
+            conn.execute("INSERT INTO recordings VALUES (?,?,?,?,?,?,?)",
+                         (f"r{i}", title, "Chan", now + start_in, now + start_in + 8000, "queued", "primestreams"))
+        conn.commit()
+        conn.close()
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+            found = server._booking_overlaps()
+            fixed = server._fix_overlaps(False)
+        self.assertEqual(len(found), 1)                                            # three days ahead is found
+        self.assertEqual([d["title"] for d in fixed["dropped"]], ["Joker"])
+
+    def test_the_planner_says_days_for_a_long_span(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("d.hours >= 48 ? Math.round(d.hours / 24) + ' days' : d.hours + ' hours'", html)
+        self.assertNotIn("in the next ' + d.hours + ' hours", html)
+
 
 if __name__ == "__main__":
     unittest.main()

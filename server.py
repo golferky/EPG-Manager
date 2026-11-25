@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125i"
+VERSION = "v20261125j"
 
 app = Flask(__name__)
 
@@ -13376,11 +13376,12 @@ async function loadOverlapStatus() {
     else parts.push('Nightly overlap check ran ' + last.when + ': ' + (last.overlap_count ? last.overlap_count + ' overlap' + (last.overlap_count > 1 ? 's' : '') + ' left' : 'no overlaps') + (last.moved ? ', moved ' + last.moved + ' booking' + (last.moved > 1 ? 's' : '') + ' to the other connection' : '') + ((last.dropped && last.dropped.length) ? ', not recording ' + last.dropped.map(x => x.title).join(', ') + ' (they overlapped)' : '') + '.');
     if (d.enabled) parts.push('Next: ' + d.next_check + '.');
     const now = d.overlaps || [];
+    const span = d.hours >= 48 ? Math.round(d.hours / 24) + ' days' : d.hours + ' hours';
     if (now.length) {
       const first = now[0];
-      parts.push('Right now ' + now.length + ' overlap' + (now.length > 1 ? 's' : '') + ' in the next ' + d.hours + ' hours: ' + first.bookings.map(b => b.title).join(' and ') + ' on ' + first.provider + ' (' + first.when + ').');
+      parts.push('Right now ' + now.length + ' overlap' + (now.length > 1 ? 's' : '') + ' in the bookings of the next ' + span + ', the first at ' + first.when + ': ' + first.bookings.map(b => b.title).join(' and ') + ' on ' + first.provider + '.');
     } else if (d.enabled || last) {
-      parts.push('No bookings overlap in the next ' + d.hours + ' hours.');
+      parts.push('No bookings overlap in the next ' + span + '.');
     }
     text.textContent = parts.join(' ');
     text.style.color = now.length ? '#fde68a' : '#94a3b8';
@@ -17322,7 +17323,8 @@ def _run_daily_guide_refresh():
     except Exception as exc:
         print(f'[daily-guide] Schedules Direct failed: {exc}')
 
-OVERLAP_LOOKAHEAD_HOURS = 36
+OVERLAP_LOOKAHEAD_DAYS = 60          # every booking ahead: the guide runs about 3 weeks, series rules can book further
+OVERLAP_LOOKAHEAD_HOURS = OVERLAP_LOOKAHEAD_DAYS * 24
 
 
 def _booking_overlaps(hours=OVERLAP_LOOKAHEAD_HOURS, now=None):
@@ -17550,7 +17552,7 @@ def _run_overlap_check():
         print(f'[overlap-check] could not fix overlaps: {exc}')
     overlaps = _booking_overlaps()
     if not overlaps:
-        print('[overlap-check] no bookings overlap in the next 36 hours')
+        print('[overlap-check] no bookings overlap in the next %d days' % OVERLAP_LOOKAHEAD_DAYS)
     for item in overlaps:
         names = '; '.join('"%s"' % b['title'] for b in item['bookings'])
         print(f"[overlap-check] {item['provider']} (allows {item['capacity']}) at {item['when']}: {names}")
