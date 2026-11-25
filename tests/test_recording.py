@@ -1053,6 +1053,174 @@ class GuideTabSectionsCollapseTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip(), 'none  ▸ | none | "" ▾')
 
+class MoveToPrimeStreamsKeepsTheOneConnectionTests(unittest.TestCase):
+    """The move used to ask only "does PrimeStreams carry this channel?", so bookings could land on top of each other."""
+
+    def _db(self, temp, rows):
+        guide_db = os.path.join(temp, "guide.db")
+        server.ensure_guide_db(guide_db)
+        with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+            server._init_recordings_table()
+        conn = sqlite3.connect(guide_db)
+        conn.executemany(
+            "INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,stream_id,"
+            "season_num,episode_num) VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.commit(); conn.close()
+        return guide_db
+
+    @staticmethod
+    def _stream(channel_id, preferred=None):
+        return "url", None, {"stream_id": "9", "stream_extension": "ts"}
+
+    def _move(self, guide_db):
+        with mock.patch.object(server, "_guide_db_path", return_value=guide_db), \
+             mock.patch.object(server, "_stream_url", self._stream), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+            return server._move_eaglecast_bookings(False)
+
+    def test_a_booking_is_not_moved_onto_a_time_primestreams_is_already_booked(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp, [("mine", "Rob Peace", "Crave1", "c1", now + 7200, now + 14400, "queued", "eaglecast", "1", None, None),
+                                 ("held", "Joker", "Cinemax Hits", "c2", now + 9000, now + 16000, "queued", "primestreams", "2", None, None)])
+            data = self._move(db)
+        self.assertEqual(data["can_move"], [])
+        self.assertEqual([e["id"] for e in data["cannot_move"]], ["mine"])
+        self.assertIn("already booked", data["cannot_move"][0]["why"])
+
+    def test_bookings_moved_in_the_same_run_do_not_stack_on_each_other(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp, [("a", "Film A", "HBO", "h", now + 7200, now + 14400, "queued", "eaglecast", "1", None, None),
+                                 ("b", "Film B", "Starz", "s", now + 9000, now + 16000, "queued", "eaglecast", "2", None, None),
+                                 ("c", "Film C", "Max", "m", now + 30000, now + 36000, "queued", "eaglecast", "3", None, None)])
+            data = self._move(db)
+        self.assertEqual(sorted(e["id"] for e in data["can_move"]), ["a", "c"])        # b would overlap a
+        self.assertEqual([e["id"] for e in data["cannot_move"]], ["b"])
+
+    def test_a_film_gets_the_connection_before_an_episode(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp, [("ep", "A Show", "HBO", "h", now + 7000, now + 14000, "queued", "eaglecast", "1", 2, 5),
+                                 ("film", "A Film", "Starz", "s", now + 9000, now + 16000, "queued", "eaglecast", "2", None, None)])
+            data = self._move(db)
+        self.assertEqual([e["id"] for e in data["can_move"]], ["film"])
+        self.assertEqual([e["id"] for e in data["cannot_move"]], ["ep"])
+
+    def test_the_conflict_check_counts_windows_given_to_it_as_extra(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp, [])
+            with mock.patch.object(server, "_guide_db_path", return_value=db), \
+                 mock.patch.object(server, "_primestreams_max_connections", return_value=1):
+                self.assertIsNone(server._primestreams_conflict(100, 200))
+                self.assertIsNotNone(server._primestreams_conflict(100, 200, extra=[(150, 250)]))
+                self.assertIsNone(server._primestreams_conflict(100, 200, extra=[(300, 400)]))
+
+class ScanAndFixOverlapsTests(unittest.TestCase):
+    """Overlapping bookings are scanned for and fixed, so they do not fail at recording time."""
+
+    def _db(self, temp, rows):
+        guide_db = os.path.join(temp, "guide.db")
+        server.ensure_guide_db(guide_db)
+        with mock.patch.object(server, "_guide_db_path", return_value=guide_db):
+            server._init_recordings_table()
+        conn = sqlite3.connect(guide_db)
+        if "origin" not in {r[1] for r in conn.execute("PRAGMA table_info(recordings)")}:
+            conn.execute("ALTER TABLE recordings ADD COLUMN origin TEXT")
+        conn.executemany(
+            "INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,season_num,episode_num,origin) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.commit(); conn.close()
+        return guide_db
+
+    def _fix(self, db, apply_it):
+        with mock.patch.object(server, "_guide_db_path", return_value=db), \
+             mock.patch.object(server, "_primestreams_max_connections", return_value=1), \
+             mock.patch.object(server, "_rebook_after_overlap"):
+            return server._fix_overlaps(apply_it)
+
+    def _status(self, db, rec_id):
+        conn = sqlite3.connect(db)
+        row = conn.execute("SELECT status, failure_reason FROM recordings WHERE rec_id=?", (rec_id,)).fetchone()
+        conn.close()
+        return row
+
+    def test_a_chain_of_three_films_keeps_the_ones_that_fit_and_drops_the_one_in_the_middle(self):
+        # Rob Peace 11:15 PM, Joker 12:40 AM, The Last Face 2:12 AM: each overlaps the next
+        now = time.time()
+        rows = [("rob", "Rob Peace", "Crave1", "c1", now + 3600, now + 12000, "queued", "primestreams", None, None, "wanted"),
+                ("joker", "Joker", "Cinemax Hits", "c2", now + 8000, now + 16000, "queued", "primestreams", None, None, "wanted"),
+                ("face", "The Last Face", "Starz in Black", "c3", now + 14000, now + 22000, "queued", "primestreams", None, None, "wanted")]
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp, rows)
+            report = self._fix(db, False)
+            self.assertEqual([d["id"] for d in report["dropped"]], ["joker"])           # the middle one breaks both neighbours
+            self.assertEqual(self._status(db, "joker")[0], "queued")                    # a report changes nothing
+            done = self._fix(db, True)
+            self.assertEqual([d["id"] for d in done["dropped"]], ["joker"])
+            self.assertEqual(self._status(db, "rob")[0], "queued")
+            self.assertEqual(self._status(db, "face")[0], "queued")
+            status, reason = self._status(db, "joker")
+            self.assertEqual(status, "failed")
+            self.assertIn("overlapped", reason)
+
+    def test_a_film_beats_an_episode_and_a_booking_made_by_hand_beats_an_automatic_one(self):
+        now = time.time()
+        rows = [("ep", "A Show", "HBO", "h", now + 3600, now + 9000, "queued", "primestreams", 1, 1, "wanted"),
+                ("film", "A Film", "Starz", "s", now + 4000, now + 10000, "queued", "primestreams", None, None, "wanted"),
+                ("auto", "Auto Film", "Max", "m", now + 40000, now + 46000, "queued", "primestreams", None, None, "wanted"),
+                ("hand", "Hand Film", "Max", "m", now + 41000, now + 47000, "queued", "primestreams", None, None, "manual")]
+        with tempfile.TemporaryDirectory() as temp:
+            done = self._fix(self._db(temp, rows), False)
+        self.assertEqual(sorted(d["id"] for d in done["dropped"]), ["auto", "ep"])
+
+    def test_a_recording_that_is_running_or_about_to_start_is_never_touched(self):
+        now = time.time()
+        rows = [("running", "On Now", "HBO", "h", now - 1800, now + 3600, "recording", "primestreams", None, None, "manual"),
+                ("soon", "Starts Soon", "Starz", "s", now + 120, now + 7200, "queued", "primestreams", None, None, "wanted")]
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp, rows)
+            done = self._fix(db, True)
+            self.assertEqual(done["dropped"], [])
+            self.assertEqual(self._status(db, "soon")[0], "queued")
+
+    def test_bookings_on_different_connections_or_that_do_not_overlap_are_left_alone(self):
+        now = time.time()
+        rows = [("a", "Film A", "HBO", "h", now + 3600, now + 9000, "queued", "primestreams", None, None, "wanted"),
+                ("b", "Film B", "Starz", "s", now + 3600, now + 9000, "queued", "eaglecast", None, None, "wanted"),
+                ("c", "Film C", "Max", "m", now + 20000, now + 26000, "queued", "primestreams", None, None, "wanted")]
+        with tempfile.TemporaryDirectory() as temp:
+            done = self._fix(self._db(temp, rows), True)
+        self.assertEqual(done["dropped"], [])
+
+    def test_a_dropped_film_is_looked_up_again_but_an_episode_is_left_to_the_series_pass(self):
+        calls = []
+        with mock.patch.object(server, "_best_incomplete_rerecord", side_effect=lambda t, e: calls.append(t) or ({"x": 1}, {})), \
+             mock.patch.object(server, "_queue_best_retry") as queued:
+            server._rebook_after_overlap({"title": "A Film", "film": True})
+            server._rebook_after_overlap({"title": "A Show", "film": False})
+        self.assertEqual(calls, ["A Film"])
+        queued.assert_called_once()
+
+    def test_the_endpoint_reports_without_apply_and_rebalances_then_drops_with_it(self):
+        with mock.patch.object(server, "_rebalance_slots", return_value={"moves": [{"id": "m"}]}) as rebalance, \
+             mock.patch.object(server, "_fix_overlaps", return_value={"applied": False, "dropped": [], "kept": 0}) as fixer:
+            report = server.app.test_client().post("/epg-web/api/recording-overlaps/fix", json={}).get_json()
+            rebalance.assert_not_called()
+            done = server.app.test_client().post("/epg-web/api/recording-overlaps/fix", json={"apply": True}).get_json()
+        rebalance.assert_called_once_with(True)
+        self.assertEqual(done["moved"], 1)
+        self.assertEqual(report["moved"], 0)
+        self.assertEqual(fixer.call_args_list[-1][0][0], True)
+
+    def test_the_planner_offers_a_fix_button_and_the_half_hourly_loop_runs_the_fix(self):
+        import inspect
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="overlap-fix-btn"', html)
+        self.assertIn("async function fixOverlapsNow", html)
+        self.assertIn("_fix_overlaps(True)", inspect.getsource(server._auto_record_wanted_loop))
+        self.assertIn("_fix_overlaps(True)", inspect.getsource(server._run_overlap_check))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -3807,7 +3975,7 @@ class EaglecastSwitchAndMoveTests(unittest.TestCase):
         rows = [("covered", "Film A", "HBO", "hbo", now + 7200, "queued", "eaglecast", "111"),
                 ("uncovered", "Film B", "STARZ 1", "starz1", now + 7200, "queued", "eaglecast", "176929"),
                 ("too_soon", "Film C", "HBO", "hbo", now + 60, "queued", "eaglecast", "111"),
-                ("on_ps", "Film D", "HBO", "hbo", now + 7200, "queued", "primestreams", "222")]
+                ("on_ps", "Film D", "HBO", "hbo", now + 40000, "queued", "primestreams", "222")]      # another time: no overlap
         conn.executemany(
             "INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,stream_provider,stream_id) "
             "VALUES (?,?,?,?,?,?,?,?,?)", [(r[0], r[1], r[2], r[3], r[4], r[4] + 3600, r[5], r[6], r[7]) for r in rows])
