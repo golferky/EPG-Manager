@@ -2566,11 +2566,12 @@ def _eaglecast_overlap(start_ts, stop_ts, exclude_rec_id=''):
     except Exception:
         return None
 
-def _primestreams_conflict(start_ts, stop_ts, exclude_rec_id=''):
+def _primestreams_conflict(start_ts, stop_ts, exclude_rec_id='', extra=()):
     """One booking that already holds the PrimeStreams account in this window, when it is full (else None).
 
     The account allows ``max_connections`` streams at once (one, for this account); a second stream makes the
-    provider cut the new one after a few seconds.  Only bookings that stream from PrimeStreams count.
+    provider cut the new one after a few seconds.  Only bookings that stream from PrimeStreams count.  ``extra`` is a
+    list of ``(start, stop)`` windows being placed in the same batch that are not in the database yet.
     """
     active = ('queued', 'scheduled', 'agent_claimed', 'preflight', 'waiting', 'recording')
     limit = _primestreams_max_connections()
@@ -2585,7 +2586,10 @@ def _primestreams_conflict(start_ts, stop_ts, exclude_rec_id=''):
         conn.close()
     except Exception:
         return None
-    return rows[0] if len(rows) >= limit else None
+    extras = [w for w in extra if float(w[0]) < float(stop_ts) and float(w[1]) > float(start_ts)]
+    if len(rows) + len(extras) >= limit:
+        return rows[0] if rows else ('another booking moved in the same batch', '', extras[0][0], extras[0][1])
+    return None
 
 
 def _primestreams_source(channel_id, start_ts, stop_ts, exclude_rec_id=''):
@@ -4309,28 +4313,42 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
     cfg = load_config()
     reliability = _channel_recording_reliability()
     movable, stuck = [], []
+    taken = []          # windows already given to PrimeStreams in this run: the account allows few streams at once
+    # Films first, then earlier first, so when they cannot all fit the ones that matter most get the connection.
+    rows.sort(key=lambda r: (0 if _is_film_booking({'season_num': r[7], 'episode_num': r[8]}) else 1, float(r[4])))
     for rec_id, title, channel, channel_id, start_ts, stop_ts, guide_stop_ts, season, number, ep_title in rows:
         if after_expiry_only and not (stop_ts and float(stop_ts) > expiry):
             continue
         url, error, debug = _stream_url(channel_id, 'primestreams')
         entry = {'id': rec_id, 'title': title, 'channel': channel, 'start_ts': start_ts}
         if url and not error:
+            clash = _primestreams_conflict(start_ts, stop_ts or start_ts, rec_id, extra=taken)
+            if clash:
+                stuck.append(dict(entry, why=f'PrimeStreams is already booked for "{clash[0]}" then'))
+                continue
             entry['stream_id'] = str(debug.get('stream_id') or '')
             entry['stream_extension'] = str(debug.get('stream_extension') or 'ts')
+            taken.append((float(start_ts), float(stop_ts or start_ts)))
             movable.append(entry)
             continue
         other = _same_airing_elsewhere(title, channel_id, start_ts, rec_id, cfg, reliability,
                                        (season, number, ep_title or ''))
         if other:
             shift = other['start_ts'] - float(start_ts)
+            new_stop = (float(stop_ts) + shift) if stop_ts else None
+            clash = _primestreams_conflict(other['start_ts'], new_stop or other['start_ts'], rec_id, extra=taken)
+            if clash:
+                stuck.append(dict(entry, why=f'PrimeStreams is already booked for "{clash[0]}" then'))
+                continue
             entry.update({'stream_id': other['stream_id'], 'stream_extension': other['stream_extension'],
                           'via': other['channel'], 'new_channel_id': other['channel_id'],
                           'new_start_ts': other['start_ts'],
-                          'new_stop_ts': (float(stop_ts) + shift) if stop_ts else None,
+                          'new_stop_ts': new_stop,
                           'new_guide_stop_ts': (float(guide_stop_ts) + shift) if guide_stop_ts else None})
+            taken.append((float(other['start_ts']), float(new_stop or other['start_ts'])))
             movable.append(entry)
         else:
-            stuck.append(entry)
+            stuck.append(dict(entry, why='PrimeStreams does not carry this channel or airing'))
     moved = 0
     if apply_it and movable:
         conn = sqlite3.connect(_guide_db_path(), timeout=10)
@@ -4360,7 +4378,7 @@ def _move_eaglecast_bookings(apply_it, after_expiry_only=False):
                     if entry.get('via'):
                         rec.update({'channel': entry['via'], 'channel_id': entry['new_channel_id'],
                                     'start_ts': entry['new_start_ts'], 'stop_ts': entry['new_stop_ts']})
-    keep = ('id', 'title', 'channel', 'start_ts', 'via')
+    keep = ('id', 'title', 'channel', 'start_ts', 'via', 'why')
     strip = lambda items: [{k: v for k, v in e.items() if k in keep} for e in items]
     return {'applied': bool(apply_it), 'moved': moved, 'can_move': strip(movable), 'cannot_move': strip(stuck)}
 
@@ -7422,6 +7440,12 @@ def _auto_record_wanted_loop():
                       f"because a film needed the connection")
         except Exception as exc:
             print(f'[slots] rebalance error: {exc}')
+        try:                      # then whatever still overlaps on one connection: keep the best, drop the rest
+            fixed = _fix_overlaps(True)
+            for item in fixed['dropped']:
+                print(f"[overlap-fix] not recording {item['title']!r} ({item['when']}, {item['provider']}): {item.get('reason', '')}")
+        except Exception as exc:
+            print(f'[overlap-fix] error: {exc}')
         time.sleep(1800)
 
 
@@ -12267,6 +12291,7 @@ tr:hover td{background:#141414;}
   <div id="overlap-status" class="card" style="margin-bottom:12px;padding:10px 14px;font-size:13px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
     <span id="overlap-status-text" style="flex:1;min-width:260px;color:#94a3b8;">Checking for overlapping bookings…</span>
     <button class="btn btn-ghost btn-sm" onclick="loadOverlapStatus()" title="Look at the bookings again now (this does not move anything)">Check now</button>
+    <button id="overlap-fix-btn" class="btn btn-primary btn-sm" style="display:none;" onclick="fixOverlapsNow(this)" title="Move overlapping bookings to the other connection where possible, and stop recording the ones that cannot be placed">Fix overlaps…</button>
   </div>
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
@@ -13346,7 +13371,7 @@ async function loadOverlapStatus() {
     if (!d.enabled) parts.push('The nightly overlap check is switched off.');
     else if (!last) parts.push('The nightly overlap check has not run yet.');
     else if (last.error) parts.push('Nightly overlap check (' + last.when + ') could not finish: ' + last.error);
-    else parts.push('Nightly overlap check ran ' + last.when + ': ' + (last.overlap_count ? last.overlap_count + ' overlap' + (last.overlap_count > 1 ? 's' : '') + ' left' : 'no overlaps') + (last.moved ? ', moved ' + last.moved + ' booking' + (last.moved > 1 ? 's' : '') + ' to the other connection' : '') + '.');
+    else parts.push('Nightly overlap check ran ' + last.when + ': ' + (last.overlap_count ? last.overlap_count + ' overlap' + (last.overlap_count > 1 ? 's' : '') + ' left' : 'no overlaps') + (last.moved ? ', moved ' + last.moved + ' booking' + (last.moved > 1 ? 's' : '') + ' to the other connection' : '') + ((last.dropped && last.dropped.length) ? ', not recording ' + last.dropped.map(x => x.title).join(', ') + ' (they overlapped)' : '') + '.');
     if (d.enabled) parts.push('Next: ' + d.next_check + '.');
     const now = d.overlaps || [];
     if (now.length) {
@@ -13358,7 +13383,28 @@ async function loadOverlapStatus() {
     text.textContent = parts.join(' ');
     text.style.color = now.length ? '#fde68a' : '#94a3b8';
     card.style.borderColor = now.length ? '#b45309' : '';
+    const fix = document.getElementById('overlap-fix-btn');
+    if (fix) fix.style.display = now.length ? '' : 'none';
   } catch (e) { text.textContent = 'Could not read the overlap check: ' + e.message; }
+}
+// Fix overlapping bookings: show what would be dropped, then do it once you agree.
+async function fixOverlapsNow(btn) {
+  btn.disabled = true;
+  try {
+    const post = (body) => fetch('/epg-web/api/recording-overlaps/fix', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).then(r => r.json());
+    const report = await post({});
+    const list = (report.dropped || []).map(d => d.title + ' (' + d.when + ', ' + d.provider + ')').join(String.fromCharCode(10));
+    const text = report.dropped && report.dropped.length
+      ? 'The bookings that overlap are first moved to the other connection where possible. If these still cannot be placed they will not be recorded, and another airing is looked for:' + String.fromCharCode(10, 10) + list + String.fromCharCode(10, 10) + 'Go ahead?'
+      : 'Nothing has to be dropped. Try moving the overlapping bookings to the other connection?';
+    if (!confirm(text)) return;
+    const done = await post({apply: true});
+    const names = (done.dropped || []).map(d => d.title).join(', ');
+    alert('Moved ' + (done.moved || 0) + ' booking(s) to the other connection.' + (names ? String.fromCharCode(10) + 'Not recording: ' + names : ''));
+  } catch (e) { alert('Could not fix the overlaps: ' + e.message); }
+  btn.disabled = false;
+  loadOverlapStatus();
+  loadPlanner();
 }
 async function loadPlanner() {
   loadOverlapStatus();
@@ -17287,9 +17333,12 @@ def _booking_overlaps(hours=OVERLAP_LOOKAHEAD_HOURS, now=None):
         conn = sqlite3.connect(_guide_db_path(), timeout=5)
         conn.execute('PRAGMA busy_timeout=5000')
         conn.row_factory = sqlite3.Row
+        have = {r[1] for r in conn.execute('PRAGMA table_info(recordings)')}
+        extra_cols = ''.join(', ' + c for c in ('season_num', 'episode_num', 'is_series', 'origin') if c in have)
         rows = [dict(r) for r in conn.execute(
-            "SELECT rec_id, title, channel, start_ts, stop_ts, COALESCE(stream_provider,'primestreams') AS provider "
-            "FROM recordings WHERE status IN ({}) AND start_ts < ? AND stop_ts > ? ORDER BY start_ts".format(
+            "SELECT rec_id, title, channel, start_ts, stop_ts, status, COALESCE(stream_provider,'primestreams') AS provider"
+            + extra_cols +
+            " FROM recordings WHERE status IN ({}) AND start_ts < ? AND stop_ts > ? ORDER BY start_ts".format(
                 ','.join('?' * len(live))), list(live) + [now + hours * 3600, now]).fetchall()]
         conn.close()
     except sqlite3.Error:
@@ -17316,7 +17365,9 @@ def _booking_overlaps(hours=OVERLAP_LOOKAHEAD_HOURS, now=None):
                 found.append({'provider': provider, 'capacity': allowed, 'start_ts': start,
                               'when': _local_dt(start).strftime('%a %-I:%M %p'),
                               'bookings': [{'id': r['rec_id'], 'title': r['title'], 'channel': r['channel'],
-                                            'start_ts': r['start_ts'], 'stop_ts': r['stop_ts']} for r in cluster]})
+                                            'start_ts': r['start_ts'], 'stop_ts': r['stop_ts'], 'status': r['status'],
+                                            'film': _is_film_booking(r), 'origin': r.get('origin') or ''}
+                                           for r in cluster]})
     found.sort(key=lambda item: item['start_ts'])
     return found
 
@@ -17333,6 +17384,103 @@ def api_recording_overlaps():
     return jsonify({'hours': OVERLAP_LOOKAHEAD_HOURS, 'overlaps': _booking_overlaps(),
                     'enabled': enabled, 'hour': hour, 'last_check': state.get('last_check'),
                     'next_check': _overlap_next_check_text(datetime.now(zone), state.get('date', ''), hour, enabled)})
+
+
+def _peak_concurrency(windows):
+    """The most of these (start, stop) windows that are open at the same moment."""
+    return max((sum(1 for a, b in windows if a <= start < b) for start, _stop in windows), default=0)
+
+
+def _fix_overlaps(apply_it, hours=OVERLAP_LOOKAHEAD_HOURS):
+    """Scan the future bookings for ones that overlap on a connection and keep the best, not recorded the rest.
+
+    Within each overlapping run a booking that is already recording, or starts within ten minutes, is never touched.
+    The others are kept in priority order (a film before an episode, one you booked by hand before an automatic one,
+    then the earlier one) for as long as the connection has room; the rest are marked failed with the reason, so the
+    Wanted and series passes look for another airing and Recording Health offers a re-record.  Nothing changes unless
+    ``apply_it``.  Returns ``{'applied', 'dropped': [...], 'kept': n}``.
+    """
+    now = time.time()
+    lead = now + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS
+    dropped, kept_total = [], 0
+    for cluster in _booking_overlaps(hours, now):
+        allowed = int(cluster['capacity'])
+        everyone = cluster['bookings']
+        fixed = [b for b in everyone if b['status'] not in ('queued', 'scheduled') or float(b['start_ts']) <= lead]
+        free = [b for b in everyone if b not in fixed]
+        free.sort(key=lambda b: (0 if b.get('film') else 1, 0 if b.get('origin') == 'manual' else 1, float(b['start_ts'])))
+        kept = list(fixed)
+        for booking in free:
+            windows = [(float(k['start_ts']), float(k['stop_ts'])) for k in kept] + [(float(booking['start_ts']), float(booking['stop_ts']))]
+            if _peak_concurrency(windows) > allowed:
+                holder = next((k for k in kept if float(k['start_ts']) < float(booking['stop_ts'])
+                               and float(k['stop_ts']) > float(booking['start_ts'])), kept[0] if kept else None)
+                dropped.append({'id': booking['id'], 'title': booking['title'], 'channel': booking['channel'],
+                                'start_ts': booking['start_ts'], 'provider': cluster['provider'],
+                                'film': bool(booking.get('film')),
+                                'when': _local_dt(float(booking['start_ts'])).strftime('%a %-I:%M %p'),
+                                'because': holder['title'] if holder else ''})
+            else:
+                kept.append(booking)
+        kept_total += len(kept)
+    if apply_it and dropped:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.execute('PRAGMA busy_timeout=10000')
+        for item in dropped:
+            reason = (f'Not recorded: it overlapped "{item["because"]}" on the only {item["provider"]} connection'
+                      if item['because'] else 'Not recorded: it overlapped another booking on the only streaming connection')
+            item['reason'] = reason
+            conn.execute("UPDATE recordings SET status='failed', failure_reason=? WHERE rec_id=? "
+                         "AND status IN ('queued','scheduled')", (reason, item['id']))
+        conn.commit()
+        conn.close()
+        with _rec_lock:
+            for item in dropped:
+                rec = _recs.get(item['id'])
+                if rec:
+                    rec.update({'status': 'failed', 'failure_reason': item['reason']})
+        for item in dropped:                 # look for another airing now, rather than at the next Wanted pass
+            _rebook_after_overlap(item)
+    return {'applied': bool(apply_it), 'dropped': dropped, 'kept': kept_total}
+
+
+def _rebook_after_overlap(item):
+    """Best effort: queue the best future airing of a FILM that had to be dropped.  Never raises.
+
+    An episode is left to the series and Wanted passes, which know which episode it was; this looks a film up by
+    title.  The airing it offers has already been checked against the connections, so it cannot overlap again.
+    """
+    if not item.get('film'):
+        return
+    try:
+        candidate, detail = _best_incomplete_rerecord(item['title'], 0)
+        if candidate:
+            _queue_best_retry(item['title'], candidate, 'auto-retry after an overlap')
+            item['rebooked'] = True
+            print(f'[overlap-fix] queued another airing of {item["title"]!r}')
+        elif detail.get('already_queued'):
+            item['rebooked'] = True
+        else:
+            _watch_abandoned_transfer(item['title'], source='overlap_auto_retry')
+            item['on_wanted'] = True
+    except Exception as exc:
+        print(f'[overlap-fix] could not look for another airing of {item.get("title")!r}: {exc}')
+
+
+@app.route('/epg-web/api/recording-overlaps/fix', methods=['POST'])
+def api_fix_overlaps():
+    """Scan the next day and a half for overlapping bookings: ``{}`` reports what would be dropped, ``{"apply": true}``
+    first gives the films-first placement a go (moving bookings to the other connection) and then drops what is left."""
+    apply_it = (request.json or {}).get('apply') is True
+    moved = 0
+    if apply_it:
+        try:
+            moved = len(_rebalance_slots(True).get('moves') or [])
+        except Exception as exc:
+            print(f'[overlap-fix] could not rebalance: {exc}')
+    result = _fix_overlaps(apply_it)
+    result['moved'] = moved
+    return jsonify(result)
 
 
 OVERLAP_STATE_FILE = 'overlap_check.json'
@@ -17389,6 +17537,13 @@ def _run_overlap_check():
             print(f'[overlap-check] moved {moved} booking(s) to the other connection')
     except Exception as exc:
         print(f'[overlap-check] could not rebalance: {exc}')
+    dropped = []
+    try:
+        dropped = _fix_overlaps(True)['dropped']
+        for item in dropped:
+            print(f"[overlap-check] not recording {item['title']!r} ({item['when']}, {item['provider']}): {item.get('reason', '')}")
+    except Exception as exc:
+        print(f'[overlap-check] could not fix overlaps: {exc}')
     overlaps = _booking_overlaps()
     if not overlaps:
         print('[overlap-check] no bookings overlap in the next 36 hours')
@@ -17398,6 +17553,7 @@ def _run_overlap_check():
     now = time.time()
     _write_overlap_state(_overlap_state_day(now), {
         'ran_at': now, 'when': _local_dt(now).strftime('%a %-I:%M %p'), 'moved': moved, 'overlap_count': len(overlaps),
+        'dropped': [{'title': d['title'], 'when': d['when']} for d in dropped],
         'overlaps': [{'provider': i['provider'], 'when': i['when'], 'titles': [b['title'] for b in i['bookings']]}
                      for i in overlaps]})
     return overlaps
