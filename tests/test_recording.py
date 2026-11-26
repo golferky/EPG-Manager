@@ -1299,6 +1299,44 @@ class OverlapBarStaysCurrentTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip(), "2")
 
+class WhyAShowingCannotBeRecordedTests(unittest.TestCase):
+    """The programme window used to skip a showing that cannot be recorded without saying why."""
+
+    def _airings(self, resolve):
+        with tempfile.TemporaryDirectory() as temp:
+            guide_db = os.path.join(temp, "guide.db")
+            server.ensure_guide_db(guide_db)
+            conn = sqlite3.connect(guide_db)
+            for column, typedef in (("episode_title", "TEXT"), ("season_num", "INTEGER"),
+                                    ("episode_num", "INTEGER"), ("prog_type", "TEXT")):
+                conn.execute(f"ALTER TABLE guide ADD COLUMN {column} {typedef}")
+            conn.execute("INSERT INTO guide (title,channel_id,channel_name,start_utc,end_utc,episode_title,season_num,episode_num,prog_type) "
+                         "VALUES (?,?,?,?,?,?,?,?,?)",
+                         ("Racing with the Moon", "sw", "SHOWTIME WOMEN", "20990812170000", "20990812190000", "", None, None, "MV"))
+            conn.commit()
+            conn.close()
+            with mock.patch.object(server, "load_config", return_value={"guide_db_path": guide_db, "timezone": "America/New_York"}), \
+                 mock.patch.object(server, "_resolve_recording_source", side_effect=resolve):
+                return server.app.test_client().get("/epg-web/api/airings?title=Racing+with+the+Moon").get_json()
+
+    def test_a_showing_whose_only_connection_is_booked_says_so_in_plain_words(self):
+        data = self._airings(lambda *a, **k: (None, 'Eaglecast is already scheduled for overlapping "Men at Work", '
+                                                    'and PrimeStreams has no usable stream for this channel.', {}))
+        airing = data["airings"][0]
+        self.assertFalse(airing["can_record"])
+        self.assertEqual(airing["record_note"], 'Eaglecast has one connection and it is busy with "Men at Work"')
+
+    def test_a_recordable_showing_has_no_note(self):
+        data = self._airings(lambda *a, **k: ("url", None, {"provider": "eaglecast"}))
+        self.assertTrue(data["airings"][0]["can_record"])
+        self.assertEqual(data["airings"][0]["record_note"], "")
+
+    def test_the_window_shows_the_reason_for_the_showing_that_was_clicked(self):
+        html = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="pm-record-why"', html)
+        self.assertIn("!selectedAiring.can_record && selectedAiring.record_note", html)
+        self.assertIn("cannot be recorded: ' + selectedAiring.record_note", html)
+
 
 if __name__ == "__main__":
     unittest.main()
