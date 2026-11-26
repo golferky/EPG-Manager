@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261125k"
+VERSION = "v20261126a"
 
 app = Flask(__name__)
 
@@ -9155,6 +9155,10 @@ def api_airings():
                 'stop_fmt':     el.strftime('%-I:%M %p'),
                 'can_play':     can_play,
                 'can_record':   not stream_error and not _is_foreign_recording_feed(r['channel_name']),
+                # Plain words for why it cannot be recorded (the window hid such showings without a word)
+                'record_note':  (_play_blocked_note(stream_error) if stream_error else
+                                 ('automatic recording skips foreign-language channels'
+                                  if _is_foreign_recording_feed(r['channel_name']) else '')),
                 'stream_provider': str(stream_debug.get('provider') or ''),
                 'stream_quality': {
                     'width': stream_quality.get('width', 0),
@@ -11979,6 +11983,8 @@ tr:hover td{background:#141414;}
         <span style="font-size:10px;font-weight:700;color:#60a5fa;text-transform:uppercase;letter-spacing:.07em;margin-right:10px;">📡 RECORDING STREAM</span>
         <span id="pm-stream-info" style="font-size:12px;color:#93c5fd;font-family:monospace;"></span>
       </div>
+      <!-- Why the showing that was clicked cannot be recorded (otherwise it is skipped without a word) -->
+      <div id="pm-record-why" style="display:none;border-top:1px solid #1e293b;padding:10px 20px;background:#1f1a0b;color:#fbbf24;font-size:13px;"></div>
       <!-- Next usable provider airing (featured) -->
       <div id="pm-next-wrap" style="display:none;border-top:1px solid #1e293b;padding:14px 20px;background:#0f1923;">
         <div id="pm-next-heading" style="font-size:11px;font-weight:600;color:#3b82f6;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">📡 Next Available Stream</div>
@@ -14598,6 +14604,7 @@ async function openProg(p) {
   const keepImmediateAction = !!_nextAiring;
   if (!keepImmediateAction) document.getElementById('pm-next-wrap').style.display = 'none';
   document.getElementById('pm-airings-wrap').style.display = 'none';
+  document.getElementById('pm-record-why').style.display = 'none';
   // Wanted must not depend on the optional airing lookup succeeding.  It is
   // especially useful for an on-now programme with no later guide listing.
   const showWantedAction = (isSeries = p.season_num != null) => {
@@ -14743,6 +14750,14 @@ async function openProg(p) {
           rBtn.style.display = 'none';
         }
         document.getElementById('pm-next-wrap').style.display = 'block';
+      }
+
+      // The showing that was clicked is not recordable (for example its only connection is booked then): say why,
+      // instead of quietly offering a later one.
+      if (selectedAiring && !selectedAiring.on_now && !selectedAiring.can_record && selectedAiring.record_note) {
+        const whyRec = document.getElementById('pm-record-why');
+        whyRec.textContent = '⏱ This showing (' + selectedAiring.start_fmt + ', ' + selectedAiring.channel_name + ') cannot be recorded: ' + selectedAiring.record_note + '.';
+        whyRec.style.display = 'block';
       }
 
       // The airing that was opened is live but cannot be played: say why

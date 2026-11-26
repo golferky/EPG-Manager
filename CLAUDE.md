@@ -66,6 +66,8 @@ Read this first. It records how the owner's machines are set up and how changes 
 
 - Overlap bar stays current (dashboard v20261125k): the amber overlap bar looks again every minute (it was every 10, so a booking you had just cancelled kept showing), when you return to the tab, and 1.5 s after any `/record...` request made through `post()` or `plannerCall()` (book, cancel, move, fix).
 
+- Why a showing is not offered (dashboard v20261126a): the programme window offers a showing only when `/api/airings` says `can_record`, i.e. `_resolve_recording_source` finds a connection for its whole window; for an Eaglecast-only channel (the EC badge) that fails while Eaglecast is booked then. The window used to skip such a showing without a word (Racing with the Moon on Showtime Women, Nov 26 12:00, jumped to Dec 3). Each airing now carries `record_note` (plain words from `_play_blocked_note`) and the window shows it for the showing that was clicked (`#pm-record-why`).
+
 ## Naming 24/7 captures
 - `mac/identify_episodes.py --show "Everybody Loves Raymond" --folder DIR [--apply]`: for episode videos with no guide data. It listens to each video (faster-whisper, installed once with `pip3 install faster-whisper`, runs on the Mac), matches the speech to the TMDb and OMDb plot summaries of every episode of the show (fetched through the dashboard), and prints the best match with the next closest. It is a GUESS: only a confident match (best clearly ahead of the runner-up) is filed in Plex, and only with `--apply`; unsure ones stay put, and `--accept "2026-11-22_0808=S02E15"` adds one you checked by eye. Transcripts are kept in `DIR/.transcripts` and reused. The owner wants Raymond in Plex only when an episode can be identified.
 
