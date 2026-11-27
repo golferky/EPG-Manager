@@ -6555,7 +6555,7 @@ class AutomaticCaptureExplainTests(unittest.TestCase):
     def test_each_state_has_a_plain_sentence(self):
         on = dict(self.FCFG, filler_channels=[{"channel_id": "a"}])
         self.assertIn("Off", self._explain(dict(on, filler_enabled=False)))
-        self.assertIn("No channels", self._explain(dict(self.FCFG, filler_channels=[])))
+        self.assertIn("No channel chosen", self._explain(dict(self.FCFG, filler_channels=[])))
         self.assertIn("Capturing now", self._explain(on, running=5))
         self.assertIn("someone is watching", self._explain(on, blocked="someone is watching"))
         self.assertIn("No opening", self._explain(on, window=False))
