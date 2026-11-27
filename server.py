@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261127c"
+VERSION = "v20261127d"
 
 app = Flask(__name__)
 
@@ -3975,7 +3975,7 @@ def _filler_explain(fcfg, now=None, db_path=None):
     if not fcfg['filler_enabled']:
         return 'Off: tick the box to start capturing.'
     if not fcfg['filler_channels']:
-        return 'No channels chosen yet: press the ⏺ on a channel tile.'
+        return 'No channel chosen yet: press the ⏺ on a channel tile (one at a time; choosing another replaces it).'
     with _filler_lock:
         running = _filler_state['id']
         last_ask = _filler_state.get('last_ask', 0.0)
@@ -4189,7 +4189,9 @@ def api_filler_settings():
             if not any(c.get('channel_id') == cid for c in channels):
                 entry = {'channel_id': cid, 'channel': str(add.get('channel') or cid)}
                 entry.update(_filler_preset(entry['channel']))
-                channels.append(entry)
+                channels = [entry]          # one 24/7 title at a time: choosing a channel replaces the previous one
+            elif len(channels) > 1:
+                channels = [c for c in channels if c.get('channel_id') == cid]
         if body.get('remove'):
             channels = [c for c in channels if c.get('channel_id') != str(body['remove'])]
         update = body.get('update')
@@ -12440,7 +12442,7 @@ tr:hover td{background:#141414;}
     <div id="filler-card" style="background:#141414;border:1px solid #2d2d2d;border-radius:8px;padding:12px;margin-bottom:14px;">
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#e2e8f0;cursor:pointer;">
         <input type="checkbox" id="filler-enabled" onchange="fillerSetEnabled(this.checked)">
-        <b>Capture chosen channels automatically</b> when the PrimeStreams connection is free
+        <b>Capture the chosen channel automatically</b> when the PrimeStreams connection is free
       </label>
       <div style="font-size:12px;color:#64748b;margin:4px 0 8px 24px;">
         Pick channels with the ⏺ on a tile below. A capture ends the moment a recording or someone watching needs the connection.

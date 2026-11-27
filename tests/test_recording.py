@@ -6851,3 +6851,19 @@ class FilmChannelSettingTests(unittest.TestCase):
     def test_capture_info_and_page_carry_the_film_flag(self):
         self.assertIn("'film': bool(entry.get('film'))", inspect.getsource(server.api_agent_filler_next))
         self.assertIn('data-field="film"', server.app.test_client().get("/epg-web").get_data(as_text=True))
+
+
+class OneChannelAtATimeTests(unittest.TestCase):
+    """Choosing a 24/7 channel replaces the previously chosen one."""
+
+    def test_adding_replaces_and_re_adding_trims(self):
+        store = {}
+        with mock.patch.object(server, "load_config", side_effect=lambda: dict(store)), \
+             mock.patch.object(server, "save_config", side_effect=lambda c: store.update(c)):
+            client = server.app.test_client()
+            client.post("/epg-web/api/filler", json={"add": {"channel_id": "c1", "channel": "Raymond"}})
+            client.post("/epg-web/api/filler", json={"add": {"channel_id": "c2", "channel": "Andy Griffith"}})
+            self.assertEqual([c["channel_id"] for c in store["filler_channels"]], ["c2"])
+            store["filler_channels"] = [{"channel_id": "c1"}, {"channel_id": "c2"}, {"channel_id": "c3"}]   # an old list
+            client.post("/epg-web/api/filler", json={"add": {"channel_id": "c2", "channel": "Andy Griffith"}})
+            self.assertEqual([c["channel_id"] for c in store["filler_channels"]], ["c2"])
