@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261127a"
+VERSION = "v20261127b"
 
 app = Flask(__name__)
 
@@ -2364,7 +2364,7 @@ def _channel_recording_reliability(days=30):
     resets = _channel_resets()
     for row in rows:
         status = _rec_status_base(row['status'])
-        if row['start_ts'] is not None and row['start_ts'] < resets.get(str(row['channel_id']), 0):
+        if row['start_ts'] is not None and not _counts_after_reset(resets, str(row['channel_id']), row['start_ts'], row['failure_reason']):
             continue                      # before a reset on this channel: it no longer counts
         if status == 'done':
             key = row['channel_id']
@@ -6071,16 +6071,61 @@ def _failure_kind(reason):
     return 'other failures'
 
 
+STATS_SINCE_DEFAULT = '2026-11-25'     # the day the connection fixes landed; failures before it were mostly our own
+
+
+def _stats_since_ts():
+    """When the channel statistics start counting (0 = all history).  Setting ``stats_since`` (YYYY-MM-DD, '' for all)."""
+    from zoneinfo import ZoneInfo
+    cfg = load_config()
+    text = str(cfg.get('stats_since', STATS_SINCE_DEFAULT) or '').strip()
+    if not text:
+        return 0.0
+    try:
+        try:
+            tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+        except Exception:
+            tz = ZoneInfo('America/New_York')
+        return datetime.strptime(text, '%Y-%m-%d').replace(tzinfo=tz).timestamp()
+    except ValueError:
+        return 0.0
+
+
+class _Resets(dict):
+    """Per-channel reset times; ``get`` also honours the global stats-since date.  Always truthy."""
+    since = 0.0
+
+    def get(self, key, default=0):
+        return max(super().get(key, default) or 0, self.since)
+
+    def __bool__(self):
+        return True
+
+
+def _counts_after_reset(resets, channel_id, start, reason=''):
+    """False when a recording is older than its channel's reset / the stats-since date and so no longer counts.
+
+    A failure for the wrong programme stays counted: that is a real provider problem, not one of our own bugs.
+    """
+    if start >= (resets or {}).get(channel_id, 0):
+        return True
+    return 'wrong programme' in str(reason or '').lower()
+
+
 def _channel_resets():
-    """{channel_id: reset time}: after a reset only newer recordings count against a channel."""
+    """{channel_id: reset time}: after a reset only newer recordings count against a channel (and none before ``stats_since``)."""
+    out = _Resets()
+    out.since = _stats_since_ts()
     try:
         conn = sqlite3.connect(_guide_db_path(), timeout=30)
         conn.execute('CREATE TABLE IF NOT EXISTS channel_report_resets (channel_id TEXT PRIMARY KEY, reset_ts REAL NOT NULL)')
         rows = conn.execute('SELECT channel_id, reset_ts FROM channel_report_resets').fetchall()
         conn.close()
-        return {str(r[0]): float(r[1]) for r in rows}
+        for r in rows:
+            dict.__setitem__(out, str(r[0]), float(r[1]))
     except sqlite3.Error:
-        return {}
+        pass
+    return out
 
 
 def _set_channel_reset(channel_id, when):
@@ -6126,7 +6171,7 @@ def _channel_reliability(rows, now, days=30, min_attempts=3, resets=None):
     for row in rows:
         start = row.get('start_ts') or 0
         cid = row.get('channel_id') or ''
-        if not cid or not (since <= start <= now) or start < (resets or {}).get(cid, 0):
+        if not cid or not (since <= start <= now) or not _counts_after_reset(resets, cid, start, row.get('failure_reason')):
             continue
         status = _rec_status_base(row.get('status'))
         if status in ('done', 'done_ts'):
@@ -6176,7 +6221,7 @@ def _channel_report(rows, now, days=30, text='', resets=None, include_reset=Fals
                                         'last_success': ''})
         if reset_ts:
             entry['reset_at'] = _local_dt(reset_ts).strftime('%Y-%m-%d')
-        if start < reset_ts:                      # before the reset: it no longer counts
+        if not _counts_after_reset(resets, cid, start, row.get('failure_reason')):   # before the reset: it no longer counts
             entry['before_reset'] += 1 if failed else 0
             continue
         entry['providers'].add(row.get('stream_provider') or 'primestreams')
@@ -6289,6 +6334,24 @@ def api_recording_health_channel_reset():
     except sqlite3.Error as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 500
     return jsonify({'ok': True})
+
+
+@app.route('/epg-web/api/recording-health/stats-since', methods=['GET', 'POST'])
+def api_recording_health_stats_since():
+    """The date the channel statistics start counting.  POST {"date": "YYYY-MM-DD"} sets it, {"date": ""} counts all history."""
+    if request.method == 'POST':
+        text = str((request.get_json(silent=True) or {}).get('date', '')).strip()
+        if text:
+            try:
+                datetime.strptime(text, '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'ok': False, 'error': 'date must look like 2026-11-25, or be empty for all history'}), 400
+        cfg = load_config()
+        cfg['stats_since'] = text
+        save_config(cfg)
+    since = _stats_since_ts()
+    return jsonify({'ok': True, 'date': str(load_config().get('stats_since', STATS_SINCE_DEFAULT) or ''),
+                    'since_ts': since, 'note': 'Failures before this date no longer count against a channel, except wrong-programme ones.'})
 
 
 @app.route('/epg-web/api/recording-health/channels')
@@ -12452,6 +12515,7 @@ tr:hover td{background:#141414;}
         <option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option>
       </select>
       <label style="font-size:12px;color:#94a3b8;white-space:nowrap;cursor:pointer;"><input id="chreport-reset" type="checkbox" onchange="loadChannelReport()"> Show reset channels</label>
+      <label style="font-size:12px;color:#94a3b8;white-space:nowrap;" title="Failures before this date no longer count against a channel (wrong-programme ones still do). Empty counts all history.">Stats since <input id="stats-since" type="date" onchange="saveStatsSince()" style="background:#111827;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:4px 6px;font-size:12px;"></label>
       <button class="btn btn-ghost btn-sm" onclick="resetAllChannels('reset_all')" title="Start fresh: older recordings stop counting against every channel">Reset all</button>
       <button class="btn btn-ghost btn-sm" onclick="resetAllChannels('clear_all')" title="Bring back the history of every channel you reset">Undo all resets</button>
       <input id="chreport-q" type="search" placeholder="Channel contains…" onchange="loadChannelReport()" style="width:170px;background:#111827;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:6px 9px;font-size:12px;">
@@ -12762,7 +12826,7 @@ function switchTab(name) {
   if (name === '247') load247();
   if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
   if (name === 'plex-series') loadPlexSeries();
-  if (name === 'health') { loadRecordingHealth(); loadChannelReport(); loadBlockedFeeds(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
+  if (name === 'health') { loadRecordingHealth(); loadStatsSince(); loadChannelReport(); loadBlockedFeeds(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
   if (name === 'planner') loadPlanner();
@@ -16650,6 +16714,20 @@ function recordingQualityScore(probe, scheduledSeconds, actualSeconds, inPlex, l
   const color = score >= 90 ? '#4ade80' : score >= 75 ? '#a3e635' : score >= 60 ? '#facc15' : '#fb923c';
   const detail = `Completion ${completion}/40 · Resolution ${resolution}/35 · Bitrate ${bitrateScore}/15 · Motion ${motion}/5 · Audio ${audio}/5${logPenalty.detail ? ' · ' + logPenalty.detail : ''}${incomplete ? ' · Incomplete capture capped below 60' : ''}`;
   return {score, color, detail};
+}
+async function loadStatsSince() {
+  try {
+    const d = await (await fetch('/epg-web/api/recording-health/stats-since')).json();
+    const box = document.getElementById('stats-since');
+    if (box) box.value = d.date || '';
+  } catch (e) {}
+}
+async function saveStatsSince() {
+  const box = document.getElementById('stats-since');
+  await fetch('/epg-web/api/recording-health/stats-since', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({date: box.value})});
+  loadChannelReport();
+  if (typeof loadChannelReliability === 'function') loadChannelReliability();
 }
 async function resetAllChannels(action) {
   const text = action === 'reset_all'
