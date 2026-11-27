@@ -352,3 +352,91 @@ class RecoveryTests(unittest.TestCase):
              mock.patch.object(filler, "cut_episodes", return_value=[]):
             filler.run_capture(self.cfg, api, info, log=lambda *a: None)
         self.assertTrue(Path(str(raw) + filler.PROCESSED_SUFFIX).exists())
+
+
+class FilmCaptureTests(unittest.TestCase):
+    """A film channel: films are named from the provider's timeline and filed in Movies only when certainly complete."""
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp()
+        self.cfg = make_cfg(self.temp)
+        self.cfg["plex_path"] = str(Path(self.temp) / "Plex" / "Movies")
+        Path(self.cfg["plex_path"]).mkdir(parents=True)
+        self.info = {"start_ts": 1000.0, "film": True}
+        self.lines = []
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _cut(self, name="Heat.mp4"):
+        path = Path(self.temp) / "cuts" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b"film" * 100)
+        return path
+
+    def _timeline(self, title, start, end):
+        return [(1000.0 + t, title) for t in range(int(start), int(end), 60)]
+
+    def _file(self, span, timeline, found):
+        return filler.file_films(self.cfg, [span], self.info, timeline, lookup=lambda t: found, log=self.lines.append)
+
+    def test_title_needs_agreeing_lookups_through_the_middle(self):
+        line = self._timeline("Heat", 0, 8000)
+        self.assertEqual(filler.film_title(line, 1000.0, 0, 8000), "Heat")
+        self.assertIsNone(filler.film_title(line[:2], 1000.0, 0, 8000))              # too few lookups
+        mixed = self._timeline("Heat", 0, 4000) + self._timeline("Top Gun", 4000, 8000)
+        self.assertIsNone(filler.film_title(mixed, 1000.0, 0, 8000))                  # two films in the middle
+        edge = self._timeline("Other Film", 0, 1000) + self._timeline("Heat", 1000, 8000)
+        self.assertEqual(filler.film_title(edge, 1000.0, 0, 8000), "Heat")            # the handover at the edge is ignored
+
+    def test_complete_film_is_filed_in_movies_and_the_cut_removed(self):
+        cut = self._cut()
+        filed, held, _ = self._file((cut, 0, 170 * 60), self._timeline("Heat", 0, 170 * 60), ("Heat", "1995", 170))
+        self.assertEqual((filed, held), (1, 0))
+        self.assertTrue((Path(self.cfg["plex_path"]) / "Heat (1995)" / "Heat.mp4").exists())
+        self.assertFalse(cut.exists())
+
+    def test_partial_film_is_never_filed(self):
+        cut = self._cut()
+        filed, held, _ = self._file((cut, 0, 100 * 60), self._timeline("Heat", 0, 100 * 60), ("Heat", "1995", 170))
+        self.assertEqual((filed, held), (0, 1))
+        self.assertFalse(list(Path(self.cfg["plex_path"]).rglob("*.mp4")))
+        review = filler.film_review_folder(self.cfg, "Heat (1995)")
+        self.assertTrue((review / "Heat.mp4").exists())
+        self.assertIn("partial", (review / "Notes.txt").read_text())
+
+    def test_unknown_runtime_year_or_title_is_held(self):
+        for found, timeline in ((("Heat", "1995", 0), self._timeline("Heat", 0, 9000)), (None, self._timeline("Heat", 0, 9000)),
+                                ("x", [])):
+            cut = self._cut("Film %s.mp4" % time.time())
+            filed, held, _ = self._file((cut, 0, 9000), timeline, found if found != "x" else ("Heat", "1995", 150))
+            self.assertEqual((filed, held), (0, 1))
+        self.assertFalse(list(Path(self.cfg["plex_path"]).rglob("*.mp4")))
+
+    def test_film_already_in_plex_is_not_overwritten(self):
+        existing = Path(self.cfg["plex_path"]) / "Heat (1995)" / "Heat.mp4"
+        existing.parent.mkdir(parents=True)
+        existing.write_bytes(b"original")
+        cut = self._cut()
+        filed, held, _ = self._file((cut, 0, 170 * 60), self._timeline("Heat", 0, 170 * 60), ("Heat", "1995", 170))
+        self.assertEqual((filed, held), (0, 1))
+        self.assertEqual(existing.read_bytes(), b"original")
+
+    def test_completeness_window(self):
+        self.assertTrue(filler.film_is_complete(170, 170))
+        self.assertTrue(filler.film_is_complete(190, 170))          # commercials inside
+        self.assertFalse(filler.film_is_complete(150, 170))
+        self.assertFalse(filler.film_is_complete(170, 0))
+        self.assertFalse(filler.film_is_complete(400, 170))
+
+    def test_timeline_polls_once_a_minute_and_saves(self):
+        clock = Clock()
+        path = Path(self.temp) / "cap.ts.titles.json"
+        line = filler.TitleTimeline(self.cfg, {"stream_id": "5"}, str(path), clock.now)
+        with mock.patch.object(recording_agent, "fetch_now_playing", return_value={"title": "Heat"}) as fetch:
+            line.poll(); line.poll()
+            clock.t += 61
+            line.poll()
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(len(filler.load_titles(str(path)[:-len(filler.TITLES_SUFFIX)])), 2)

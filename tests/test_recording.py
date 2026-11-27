@@ -6555,7 +6555,7 @@ class AutomaticCaptureExplainTests(unittest.TestCase):
     def test_each_state_has_a_plain_sentence(self):
         on = dict(self.FCFG, filler_channels=[{"channel_id": "a"}])
         self.assertIn("Off", self._explain(dict(on, filler_enabled=False)))
-        self.assertIn("No channels", self._explain(dict(self.FCFG, filler_channels=[])))
+        self.assertIn("No channel chosen", self._explain(dict(self.FCFG, filler_channels=[])))
         self.assertIn("Capturing now", self._explain(on, running=5))
         self.assertIn("someone is watching", self._explain(on, blocked="someone is watching"))
         self.assertIn("No opening", self._explain(on, window=False))
@@ -6825,3 +6825,45 @@ class StatsSinceTests(unittest.TestCase):
         page = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn('id="stats-since"', page)
         self.assertIn("loadStatsSince()", page)
+
+
+class FilmChannelSettingTests(unittest.TestCase):
+    """The 24/7 card can mark a channel as films, which changes its cut settings and is passed to the recorder."""
+
+    def test_film_switch_sets_film_cut_settings_and_back(self):
+        store = {"filler_channels": [{"channel_id": "c1", "channel": "Cinema One", "show": "Cinema One",
+                                      "skip_start": 36.0, "keep_after": 28.0, "min_minutes": 18, "max_minutes": 26}]}
+        with mock.patch.object(server, "load_config", side_effect=lambda: dict(store)), \
+             mock.patch.object(server, "save_config", side_effect=lambda c: store.update(c)):
+            client = server.app.test_client()
+            client.post("/epg-web/api/filler", json={"update": {"channel_id": "c1", "film": True}})
+            entry = store["filler_channels"][0]
+            self.assertTrue(entry["film"])
+            self.assertEqual((entry["min_minutes"], entry["max_minutes"], entry["skip_start"]), (70, 240, 0.0))
+            client.post("/epg-web/api/filler", json={"update": {"channel_id": "c1", "film": False}})
+            self.assertFalse(store["filler_channels"][0]["film"])
+            self.assertLess(store["filler_channels"][0]["max_minutes"], 100)
+
+    def test_movie_named_channel_gets_a_film_preset(self):
+        self.assertTrue(server._filler_preset("Hallmark Movies")["film"])
+        self.assertNotIn("film", server._filler_preset("Everybody Loves Raymond"))
+
+    def test_capture_info_and_page_carry_the_film_flag(self):
+        self.assertIn("'film': bool(entry.get('film'))", inspect.getsource(server.api_agent_filler_next))
+        self.assertIn('data-field="film"', server.app.test_client().get("/epg-web").get_data(as_text=True))
+
+
+class OneChannelAtATimeTests(unittest.TestCase):
+    """Choosing a 24/7 channel replaces the previously chosen one."""
+
+    def test_adding_replaces_and_re_adding_trims(self):
+        store = {}
+        with mock.patch.object(server, "load_config", side_effect=lambda: dict(store)), \
+             mock.patch.object(server, "save_config", side_effect=lambda c: store.update(c)):
+            client = server.app.test_client()
+            client.post("/epg-web/api/filler", json={"add": {"channel_id": "c1", "channel": "Raymond"}})
+            client.post("/epg-web/api/filler", json={"add": {"channel_id": "c2", "channel": "Andy Griffith"}})
+            self.assertEqual([c["channel_id"] for c in store["filler_channels"]], ["c2"])
+            store["filler_channels"] = [{"channel_id": "c1"}, {"channel_id": "c2"}, {"channel_id": "c3"}]   # an old list
+            client.post("/epg-web/api/filler", json={"add": {"channel_id": "c2", "channel": "Andy Griffith"}})
+            self.assertEqual([c["channel_id"] for c in store["filler_channels"]], ["c2"])
