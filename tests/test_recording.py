@@ -6758,3 +6758,70 @@ class AutomaticStreamBlockTests(unittest.TestCase):
         page = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("blocked-feeds-list", page)
         self.assertIn("loadBlockedFeeds()", page)
+
+
+class StatsSinceTests(unittest.TestCase):
+    """Channel statistics start counting at the stats-since date (Nov 25), but wrong-programme failures stay."""
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp()
+        self.db = os.path.join(self.temp, "guide.db")
+        server.ensure_guide_db(self.db)
+        self.cfg = {"timezone": "America/New_York", "stats_since": "2026-11-25"}
+        self.p1 = mock.patch.object(server, "_guide_db_path", return_value=self.db)
+        self.p2 = mock.patch.object(server, "load_config", side_effect=lambda: dict(self.cfg))
+        self.p1.start(); self.p2.start()
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        self.tz = ZoneInfo("America/New_York")
+        self.day = lambda d, h=12: datetime(2026, 11, d, h, tzinfo=self.tz).timestamp()
+
+    def tearDown(self):
+        self.p1.stop(); self.p2.stop()
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _rows(self):
+        mk = lambda d, status, reason="": {"channel_id": "c1", "channel": "Chan", "start_ts": self.day(d), "status": status,
+                                           "failure_reason": reason, "title": "T"}
+        return [mk(20, "failed", "connection already in use"), mk(21, "failed", "connection already in use"),
+                mk(22, "failed", 'Wrong programme on stream: provider shows "A" but "B" was scheduled'),
+                mk(26, "done"), mk(26, "done"), mk(27, "done")]
+
+    def test_since_ts_is_local_midnight(self):
+        self.assertEqual(server._stats_since_ts(), self.day(25, 0))
+        self.cfg["stats_since"] = ""
+        self.assertEqual(server._stats_since_ts(), 0.0)
+
+    def test_old_failures_stop_counting_but_wrong_programme_stays(self):
+        now = self.day(27, 18)
+        stats = server._channel_reliability(self._rows(), now, days=30, resets=server._channel_resets())
+        self.assertEqual(stats["c1"]["done"], 3)
+        self.assertEqual(stats["c1"]["failed"], 1)           # only the wrong-programme one
+        self.cfg["stats_since"] = ""
+        stats = server._channel_reliability(self._rows(), now, days=30, resets=server._channel_resets())
+        self.assertEqual(stats["c1"]["failed"], 3)
+
+    def test_report_counts_the_same_way(self):
+        now = self.day(27, 18)
+        report = server._channel_report(self._rows(), now, 30, "", server._channel_resets())
+        self.assertEqual(report[0]["failed"], 1)
+
+    def test_per_channel_reset_still_wins_when_later(self):
+        server._set_channel_reset("c1", self.day(26, 6))
+        resets = server._channel_resets()
+        self.assertEqual(resets.get("c1", 0), self.day(26, 6))
+        self.assertEqual(resets.get("other", 0), self.day(25, 0))
+        self.assertTrue(resets)
+
+    def test_endpoint_reads_and_sets_the_date(self):
+        client = server.app.test_client()
+        self.assertEqual(client.get("/epg-web/api/recording-health/stats-since").get_json()["date"], "2026-11-25")
+        with mock.patch.object(server, "save_config", side_effect=lambda c: self.cfg.update(c)):
+            self.assertTrue(client.post("/epg-web/api/recording-health/stats-since", json={"date": "2026-12-01"}).get_json()["ok"])
+            self.assertEqual(self.cfg["stats_since"], "2026-12-01")
+            self.assertEqual(client.post("/epg-web/api/recording-health/stats-since", json={"date": "nope"}).status_code, 400)
+
+    def test_page_has_the_date_box(self):
+        page = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn('id="stats-since"', page)
+        self.assertIn("loadStatsSince()", page)
