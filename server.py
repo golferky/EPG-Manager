@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261127b"
+VERSION = "v20261127c"
 
 app = Flask(__name__)
 
@@ -3918,6 +3918,8 @@ def _filler_preset(name):
         return {'show': 'Everybody Loves Raymond', 'skip_start': 36.0, 'keep_after': 28.0, 'min_minutes': 18, 'max_minutes': 26}
     if 'griffith' in low:
         return {'show': 'The Andy Griffith Show', 'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 15, 'max_minutes': 45}
+    if any(word in low for word in ('movie', 'cinema', 'film')):
+        return {'show': str(name or '').title(), 'film': True, 'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 70, 'max_minutes': 240}
     return {'show': str(name or '').title(), 'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 15, 'max_minutes': 45}
 
 
@@ -4073,7 +4075,8 @@ def api_agent_filler_next():
     profile = {k: entry.get(k) for k in ('skip_start', 'keep_after', 'min_minutes', 'max_minutes') if entry.get(k) is not None}
     return jsonify({'ok': True, 'capture': {
         'id': capture_id, 'channel': entry.get('channel', ''), 'show': entry.get('show', ''), 'stream_id': stream_id,
-        'start_ts': now, 'until_ts': until, 'profile': profile, 'keep_days': fcfg['filler_keep_days']}})
+        'start_ts': now, 'until_ts': until, 'profile': profile, 'keep_days': fcfg['filler_keep_days'],
+        'film': bool(entry.get('film'))}})
 
 
 @app.route('/epg-web/api/agent/filler/<int:capture_id>/status', methods=['POST'])
@@ -4196,6 +4199,16 @@ def api_filler_settings():
                     for key in ('show',):
                         if update.get(key):
                             entry[key] = str(update[key])[:100]
+                    if 'film' in update:
+                        entry['film'] = bool(update['film'])
+                        if entry['film']:       # a film is far longer than an episode, and has no lead-in to skip
+                            entry.update({'skip_start': 0.0, 'keep_after': 0.0, 'min_minutes': 70, 'max_minutes': 240})
+                        else:                   # back to episode settings (a movie-named channel's preset is the film one)
+                            preset = _filler_preset(entry.get('channel'))
+                            if preset.pop('film', False):
+                                preset.update({'min_minutes': 15, 'max_minutes': 45})
+                            entry.update(preset)
+                            entry['film'] = False
                     for key in ('skip_start', 'keep_after', 'min_minutes', 'max_minutes'):
                         if key in update:
                             try:
@@ -16444,6 +16457,7 @@ function fillerRender(d) {
     return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0;font-size:12px;color:#94a3b8;">'
       + '<b style="color:#e2e8f0;">' + esc(c.channel) + '</b> filed as'
       + '<input value="' + esc(c.show || '') + '" style="width:200px;background:#1a1a1a;border:1px solid #2d2d2d;border-radius:4px;color:#e2e8f0;padding:2px 4px;font-size:12px;" data-cid="' + id + '" data-field="show" onchange="fillerField(this)">'
+      + ' <label title="A channel of films: each cut is one film, named from the provider guide, and filed in Movies only when it is the right length for the film. Anything uncertain is held in Films Needing Review."><input type="checkbox" ' + (c.film ? 'checked ' : '') + 'data-cid="' + id + '" data-field="film" onchange="fillerField(this)"> films</label>'
       + ' skip <input value="' + esc(c.skip_start) + '" style="' + num + '" data-cid="' + id + '" data-field="skip_start" onchange="fillerField(this)">s'
       + ' keep <input value="' + esc(c.keep_after) + '" style="' + num + '" data-cid="' + id + '" data-field="keep_after" onchange="fillerField(this)">s after'
       + ' longest <input value="' + esc(c.max_minutes) + '" style="' + num + '" data-cid="' + id + '" data-field="max_minutes" onchange="fillerField(this)">min'
@@ -16473,7 +16487,7 @@ async function fillerToggle(channelId, name) {
 async function fillerRemove(channelId) { fillerRender(await fillerPost({remove: channelId})); load247(); }
 async function fillerField(el) {
   const update = {channel_id: el.getAttribute('data-cid')};
-  update[el.getAttribute('data-field')] = el.value;
+  update[el.getAttribute('data-field')] = el.type === 'checkbox' ? el.checked : el.value;
   const d = await fillerPost({update: update});
   if (d.error) alert(d.error); else fillerRender(d);
 }

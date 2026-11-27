@@ -6,8 +6,11 @@ the recorder runs it here.  A capture is always the lowest priority: it ends ear
 is identified from what is said in it, and the confident ones are filed in Plex.  An episode that cannot be
 identified goes to the holding folder, never into Plex.  Nothing here ever deletes an episode.
 """
+import json
 import os
 import re
+import urllib.parse
+import urllib.request
 import shutil
 import subprocess
 import sys
@@ -72,6 +75,7 @@ def capture(cfg, api, info, popen=subprocess.Popen, now=time.time, sleep=time.sl
     ACTIVE_CAPTURES.add(str(joined))
     until = float(info['until_ts'])
     segments, drops, empty, attempt, began, stopped = [], 0, 0, 0, now(), False
+    timeline = TitleTimeline(cfg, info, str(joined) + TITLES_SUFFIX, now) if info.get('film') else None
     while until - now() > 30 and not stopped:
         segment = recording_agent.segment_path(str(joined), attempt)
         command = build_capture_command(cfg, info['stream_id'], until - now(), segment)
@@ -84,6 +88,8 @@ def capture(cfg, api, info, popen=subprocess.Popen, now=time.time, sleep=time.sl
                     _stop_process(process)
                     stopped = True
                     break
+                if timeline:
+                    timeline.poll()
                 if now() - last_poll >= STATUS_POLL_SECONDS:
                     last_poll = now()
                     try:
@@ -138,6 +144,167 @@ def repair(cfg, path, run=subprocess.run):
     return clean
 
 
+TITLES_SUFFIX = '.titles.json'
+TITLE_POLL_SECONDS = 60
+FILM_MIN_AGREEING_POLLS = 3         # lookups, inside the middle of a cut, that must all name the same film
+FILM_MIN_RUNTIME_SHARE = 0.9        # a cut shorter than this share of the film's running time is not the whole film
+FILM_MAX_RUNTIME_SHARE = 1.4        # longer than this (plus ten minutes) is two films or a missed break
+FILM_FOLDER = 'Films Needing Review'
+
+
+class TitleTimeline:
+    """What the provider's own guide says is on the channel, asked once a minute while a film capture runs.
+
+    The list ``[[time, title], ...]`` is kept beside the capture (``<capture>.titles.json``) so a film can be named
+    after the capture has ended.  A failed lookup just leaves a gap; it never stops the capture.
+    """
+
+    def __init__(self, cfg, info, path, now=time.time):
+        self.cfg, self.info, self.path, self.now = cfg, info, path, now
+        self.entries, self.next_at = [], 0.0
+
+    def poll(self):
+        if self.now() < self.next_at:
+            return
+        self.next_at = self.now() + TITLE_POLL_SECONDS
+        try:
+            playing = recording_agent.fetch_now_playing(self.cfg, 'primestreams', self.info.get('stream_id'), self.now(), timeout=4)
+        except Exception:
+            playing = None
+        if playing and playing.get('title'):
+            self.entries.append([self.now(), playing['title']])
+            try:
+                Path(self.path).write_text(json.dumps(self.entries), encoding='utf-8')
+            except OSError:
+                pass
+
+
+def load_titles(capture_path):
+    """The saved title timeline of a capture (the raw capture's path or the repaired one's), or []."""
+    base = str(capture_path).replace('.clean.ts', '.ts')
+    try:
+        data = json.loads(Path(base + TITLES_SUFFIX).read_text(encoding='utf-8'))
+        return [(float(t), str(name)) for t, name in data]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def film_title(timeline, capture_start, cut_start, cut_end):
+    """The film a cut is, from what the provider said was on during its middle; None when that is not clear.
+
+    Only lookups inside the middle 60% of the cut count (the edges are where one film hands over to the next), at least
+    ``FILM_MIN_AGREEING_POLLS`` of them, and no two may clearly disagree.  The capture clock and the file clock drift by
+    a few seconds per dropped stream, which does not matter on a film that is over an hour long.
+    """
+    length = cut_end - cut_start
+    low, high = capture_start + cut_start + 0.2 * length, capture_start + cut_start + 0.8 * length
+    names = [name for when, name in timeline if low <= when <= high]
+    if len(names) < FILM_MIN_AGREEING_POLLS:
+        return None
+    first = names[0]
+    if any(recording_agent.titles_clearly_differ(first, other) for other in names[1:]):
+        return None
+    return max(set(names), key=names.count)
+
+
+def lookup_film(cfg, title):
+    """(clean title, year, running minutes) of a film from the dashboard's IMDb/OMDb search, or None when not certain.
+
+    A title the search lists with more than one year, none given in the guide's title, is not certain.
+    """
+    base, hint = recording_agent.split_title_year(title)
+    url = cfg['server_url'].rstrip('/') + '/epg-web/api/wanted/movie-matches?type=movie&q=' + urllib.parse.quote(title)
+    try:
+        request = urllib.request.Request(url, headers={'User-Agent': 'epg-manager-filler'})
+        with urllib.request.urlopen(request, timeout=30) as reply:
+            matches = json.loads(reply.read().decode('utf-8')).get('matches') or []
+    except Exception:
+        return None
+    key = recording_agent._title_key(base)
+    same = [m for m in matches if recording_agent._title_key(recording_agent.split_title_year(m.get('title', ''))[0]) == key]
+    if hint:
+        same = [m for m in same if str(m.get('year', ''))[:4] == hint] or same
+    years = {str(m.get('year', ''))[:4] for m in same}
+    if not same or len(years) != 1:
+        return None
+    best = same[0]
+    found = re.search(r'(\d+)', str(best.get('runtime') or ''))
+    return best.get('title') or base, str(best.get('year', ''))[:4], int(found.group(1)) if found else 0
+
+
+def film_is_complete(minutes, runtime):
+    """True only when the cut's length matches the film's running time (a film is never filed on a guess)."""
+    if not runtime:
+        return False
+    return FILM_MIN_RUNTIME_SHARE * runtime <= minutes <= FILM_MAX_RUNTIME_SHARE * runtime + 10
+
+
+def film_review_folder(cfg, name):
+    base = str(cfg.get('films_review_path', '') or '')
+    if not base:
+        base = os.path.join(os.path.dirname(str(cfg.get('plex_path', '/Volumes/Plex/Movies')).rstrip('/')), FILM_FOLDER)
+    return Path(base) / recording_agent.safe_filename(name or 'Unidentified')
+
+
+def file_films(cfg, spans, info, timeline, lookup=None, log=print):
+    """File each cut film in Plex's Movies when it is certainly complete, otherwise hold it.  Returns (filed, held, notes).
+
+    A film is filed only when it was named by the provider's guide throughout its middle, found by title and year, is the
+    right length for its running time, is not already in Plex and Plex is mounted.  Anything else goes to
+    ``Films Needing Review/<title>/`` with a note saying why.  A partial film never goes into Plex.
+    """
+    lookup = lookup or (lambda title: lookup_film(cfg, title))
+    plex_root = cfg.get('plex_path', '/Volumes/Plex/Movies')
+    plex_ready = recording_agent.plex_mount_available(Path(plex_root), cfg.get('plex_mount_marker', ''))
+    filed, held, notes = 0, 0, []
+
+    def hold(path, folder_name, why):
+        folder = film_review_folder(cfg, folder_name)
+        dest = _move(path, folder / Path(path).name)
+        try:
+            with open(folder / 'Notes.txt', 'a', encoding='utf-8') as handle:
+                handle.write('%s: %s\n' % (Path(dest).name, why))
+        except OSError:
+            pass
+        log('[filler] held %s: %s' % (Path(path).name, why))
+        return 1
+
+    for path, start, end in spans:
+        minutes = (end - start) / 60.0
+        title = film_title(timeline, float(info['start_ts']), start, end)
+        if not title:
+            held += hold(path, 'Unidentified', 'the provider guide did not name one film throughout (%.0f min)' % minutes)
+            continue
+        found = lookup(title)
+        if not found:
+            held += hold(path, title, 'could not find its year and running time for "%s" (%.0f min)' % (title, minutes))
+            continue
+        name, year, runtime = found
+        label = '%s (%s)' % (name, year)
+        if not film_is_complete(minutes, runtime):
+            held += hold(path, label, 'cut is %.0f min but the film runs %s min: not filed in case it is partial'
+                         % (minutes, runtime or 'an unknown number of'))
+            continue
+        if not plex_ready:
+            held += hold(path, label, 'Plex is not mounted')
+            continue
+        if recording_agent.find_movie_candidates(cfg, plex_root, label, year):
+            held += hold(path, label, 'already in Plex or the private folder; nothing was overwritten')
+            continue
+        try:
+            dest = recording_agent.verified_transfer(path, plex_root, label, None, None, year)
+        except Exception as exc:
+            held += hold(path, label, 'the copy to Plex failed (%s)' % exc)
+            continue
+        try:
+            Path(path).unlink()          # the verified copy is in Plex; this was only our own cut
+        except OSError:
+            pass
+        filed += 1
+        log('[filler] filed %s' % dest)
+    return filed, held, notes
+
+
 def holding_folder(cfg, show):
     """Where an episode that could not be identified waits: the holding folder, in a folder for the show."""
     tv_root = cfg.get('plex_tv_path', '/Volumes/Plex/TV Shows')
@@ -166,7 +333,7 @@ def _move(source, destination):
     return destination
 
 
-def cut_episodes(cfg, clean_path, info, log=print):
+def cut_episodes(cfg, clean_path, info, log=print, spans=None):
     """Cut the capture into its complete episodes.  Returns [(file, label)] of what was cut."""
     _tools_on_path()
     import split_247 as split
@@ -197,6 +364,8 @@ def cut_episodes(cfg, clean_path, info, log=print):
                                  str(target)], stdin=subprocess.DEVNULL)
         if result.returncode == 0 and split.cut_is_good(str(target), length):
             made.append(target)
+            if spans is not None:
+                spans.append((target, cut_start, cut_end))
         else:
             log('[filler] a cut did not come out right; removing the unfinished file')
             try:
@@ -356,12 +525,16 @@ def recover_leftovers(cfg, api, channels, log=print, now=time.time):
             continue
         profile = {k: entry.get(k) for k in ('skip_start', 'keep_after', 'min_minutes', 'max_minutes') if entry.get(k) is not None}
         info = {'show': entry.get('show', ''), 'channel': entry.get('channel', ''), 'start_ts': float(started),
-                'profile': profile}
+                'profile': profile, 'film': bool(entry.get('film'))}
         log('[filler] recovering the capture %s (%.0f MB)' % (path.name, size / 1e6))
         try:
             clean = repair(cfg, path)
-            files = cut_episodes(cfg, clean, info, log=log)
-            filed, held, notes = identify_and_file(cfg, files, info, log=log) if files else (0, 0, [])
+            spans = []
+            files = cut_episodes(cfg, clean, info, log=log, spans=spans)
+            if info['film']:
+                filed, held, notes = file_films(cfg, spans, info, load_titles(clean), log=log) if files else (0, 0, [])
+            else:
+                filed, held, notes = identify_and_file(cfg, files, info, log=log) if files else (0, 0, [])
             marker.write_text('processed: %d episode(s), %d filed, %d held %s' % (len(files), filed, held, '; '.join(notes)))
             log('[filler] recovered %s: %d episode(s), %d in Plex, %d held' % (path.name, len(files), filed, held))
             done += 1
@@ -383,9 +556,13 @@ def run_capture(cfg, api, info, log=print):
         else:
             clean = repair(cfg, path)
             report['file'] = str(clean)
-            files = cut_episodes(cfg, clean, info, log=log)
+            spans = []
+            files = cut_episodes(cfg, clean, info, log=log, spans=spans)
             report['episodes'] = len(files)
-            filed, held, notes = identify_and_file(cfg, files, info, log=log) if files else (0, 0, [])
+            if info.get('film'):
+                filed, held, notes = file_films(cfg, spans, info, load_titles(clean), log=log) if files else (0, 0, [])
+            else:
+                filed, held, notes = identify_and_file(cfg, files, info, log=log) if files else (0, 0, [])
             report.update({'status': 'done', 'filed': filed, 'held': held, 'note': '; '.join(notes)})
         if report['status'] in ('done', 'too_short') and report['file']:
             try:
