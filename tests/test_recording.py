@@ -1,4 +1,6 @@
+import inspect
 import json
+import shutil
 import os
 import re
 import sqlite3
@@ -6672,3 +6674,87 @@ class AutomaticBookingsRespectACancelTests(unittest.TestCase):
         weeks = server._weeks_cancelled_by_user(conn, "nfl gameday final", "ch1", tz)
         conn.close()
         self.assertEqual(weeks, {datetime.fromtimestamp(now - 3600, tz).isocalendar()[:2]})
+
+
+class AutomaticStreamBlockTests(unittest.TestCase):
+    """A stream caught delivering the wrong programme twice is blocked, re-sourced and reported."""
+
+    MSG = 'Wrong programme on stream: provider shows "Top Gun" but "Behind Enemy Lines" was scheduled'
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp()
+        self.db = os.path.join(self.temp, "guide.db")
+        server.ensure_guide_db(self.db)
+        self.patch = mock.patch.object(server, "_guide_db_path", return_value=self.db)
+        self.patch.start()
+        server._invalidate_stream_block_cache()
+        self.row = {"stream_provider": "eaglecast", "stream_id": "777", "channel_id": "c1",
+                    "channel": "Showtime Pacific", "title": "Behind Enemy Lines", "rec_id": "r1"}
+
+    def tearDown(self):
+        self.patch.stop()
+        server._invalidate_stream_block_cache()
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _note(self, n=1):
+        out = None
+        with mock.patch.object(server, "_clear_blocked_stream_bookings", return_value={"moved": 1, "dropped": []}):
+            for _ in range(n):
+                out = server._note_wrong_programme(self.row, self.MSG)
+        return out
+
+    def test_one_catch_only_watches(self):
+        out = self._note(1)
+        self.assertEqual(out["strikes"], 1)
+        self.assertFalse(out["blocked"])
+        self.assertFalse(server._stream_auto_blocked("eaglecast", "777"))
+
+    def test_second_catch_blocks_and_quarantine_functions_see_it(self):
+        out = self._note(2)
+        self.assertTrue(out["blocked"])
+        self.assertTrue(server._stream_auto_blocked("eaglecast", "777"))
+        self.assertTrue(server._is_quarantined_eaglecast_stream(("777",)))
+        self.assertFalse(server._is_quarantined_primestream_stream("777"))
+        self.assertFalse(server._stream_auto_blocked("eaglecast", "999"))
+
+    def test_old_catches_do_not_count(self):
+        self._note(1)
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE stream_wrong_events SET ts=?", (time.time() - 20 * 86400,))
+        conn.commit(); conn.close()
+        self.assertEqual(self._note(1)["strikes"], 1)
+
+    def test_report_and_release(self):
+        self._note(2)
+        client = server.app.test_client()
+        data = client.get("/epg-web/api/stream-blocks").get_json()
+        self.assertEqual(len(data["blocks"]), 1)
+        block = data["blocks"][0]
+        self.assertEqual(block["events"][0]["seen"], "Top Gun")
+        self.assertEqual(block["events"][0]["scheduled"], "Behind Enemy Lines")
+        self.assertIn("Top Gun", block["advice"]["why"])
+        self.assertTrue(block["advice"]["todo"])
+        self.assertTrue(data["advice"])
+        self.assertTrue(client.post("/epg-web/api/stream-blocks/release",
+                                    json={"provider": "eaglecast", "stream_id": "777"}).get_json()["ok"])
+        self.assertFalse(server._stream_auto_blocked("eaglecast", "777"))
+        self.assertEqual(client.get("/epg-web/api/stream-blocks").get_json()["blocks"], [])
+        self.assertEqual(client.post("/epg-web/api/stream-blocks/release", json={}).status_code, 400)
+
+    def test_watch_list_shows_single_catch(self):
+        self._note(1)
+        data = server.app.test_client().get("/epg-web/api/stream-blocks").get_json()
+        self.assertEqual(data["blocks"], [])
+        self.assertEqual(len(data["watch"]), 1)
+
+    def test_read_path_does_not_create_database(self):
+        os.remove(self.db)
+        server._invalidate_stream_block_cache()
+        self.assertFalse(server._stream_auto_blocked("eaglecast", "1"))
+        self.assertFalse(os.path.exists(self.db))
+
+    def test_heartbeat_hook_and_page(self):
+        self.assertIn("_note_wrong_programme(dict(row)", inspect.getsource(server.api_agent_heartbeat))
+        page = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("blocked-feeds-list", page)
+        self.assertIn("loadBlockedFeeds()", page)

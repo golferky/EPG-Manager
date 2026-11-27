@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261126a"
+VERSION = "v20261127a"
 
 app = Flask(__name__)
 
@@ -930,6 +930,47 @@ def _eaglecast_stream_for_channel(channel_id):
         return _eaglecast_verified_override(channel_id)
 
 
+STREAM_BLOCK_STRIKES = 2          # wrong-programme catches on one stream, inside the window, that block it
+STREAM_BLOCK_WINDOW_DAYS = 14
+STREAM_BLOCK_DAYS = 14            # a blocked stream gets another chance after this
+_stream_block_cache = {'at': 0.0, 'blocked': set()}
+_WRONG_PROGRAMME = re.compile(r'provider shows "(.*?)" but "(.*?)" was scheduled', re.S)
+
+
+def _stream_block_conn():
+    """The guide database with the two tables behind the automatic block (created when first needed)."""
+    conn = sqlite3.connect(_guide_db_path(), timeout=10)
+    conn.execute('PRAGMA busy_timeout=10000')
+    conn.execute('CREATE TABLE IF NOT EXISTS stream_wrong_events (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, '
+                 'stream_id TEXT, channel_id TEXT, channel TEXT, scheduled TEXT, seen TEXT, ts REAL, rec_id TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS stream_blocks (provider TEXT, stream_id TEXT, channel_id TEXT, channel TEXT, '
+                 'since_ts REAL, until_ts REAL, strikes INTEGER, action_json TEXT, PRIMARY KEY (provider, stream_id))')
+    return conn
+
+
+def _invalidate_stream_block_cache():
+    _stream_block_cache.update({'at': 0.0, 'blocked': set()})
+
+
+def _stream_auto_blocked(provider, stream_id):
+    """True while a stream is blocked because it kept delivering the wrong programme.  Reads only, never raises."""
+    now = time.time()
+    if now - _stream_block_cache['at'] > 30:
+        blocked = set()
+        try:
+            path = _guide_db_path()
+            if os.path.exists(path):
+                conn = sqlite3.connect(path, timeout=2)
+                conn.execute('PRAGMA busy_timeout=2000')
+                blocked = {(str(r[0]), str(r[1])) for r in
+                           conn.execute('SELECT provider, stream_id FROM stream_blocks WHERE until_ts > ?', (now,))}
+                conn.close()
+        except sqlite3.Error:
+            blocked = set()
+        _stream_block_cache.update({'at': now, 'blocked': blocked})
+    return (str(provider), str(stream_id)) in _stream_block_cache['blocked']
+
+
 def _is_quarantined_eaglecast_stream(stream):
     """Return whether an Eaglecast mapping is unsafe for unattended capture.
 
@@ -937,10 +978,13 @@ def _is_quarantined_eaglecast_stream(stream):
     Vendetta* for the Oct. 5, 2026 *MobLand* airing.  Do not trust it for a
     scheduled recording until the provider corrects the mapping.  The rule is
     tied to the stream ID rather than a broad Showtime label so other valid
-    Eaglecast Showtime feeds remain usable.
+    Eaglecast Showtime feeds remain usable.  Since v20261127a a stream is also blocked automatically for two weeks
+    once it has been caught delivering the wrong programme twice (``_note_wrong_programme``).
     """
-    return bool(stream and str(stream[0] if not isinstance(stream, dict)
-                               else stream.get('stream_id', '')) == '45503')
+    if not stream:
+        return False
+    stream_id = str(stream[0] if not isinstance(stream, dict) else stream.get('stream_id', ''))
+    return stream_id == '45503' or _stream_auto_blocked('eaglecast', stream_id)
 
 def _is_quarantined_primestream_stream(stream_id):
     """Block a confirmed wrong PrimeStreams feed from play and recording.
@@ -948,9 +992,219 @@ def _is_quarantined_primestream_stream(stream_id):
     Stream 114269 is currently mapped to the Hollywood Suite 00s guide ID but
     played an unrelated Lucha Libre programme while *Lucky Number Slevin* was
     scheduled on Oct. 20, 2026.  Keep the guide listing, but do not allow this
-    unverified stream to masquerade as that linear channel.
+    unverified stream to masquerade as that linear channel.  A stream is also blocked automatically for two weeks
+    once it has been caught delivering the wrong programme twice.
     """
-    return str(stream_id or '') in {'114269'}
+    return str(stream_id or '') in {'114269'} or _stream_auto_blocked('primestreams', stream_id)
+
+
+def _note_wrong_programme(row, message):
+    """Record that a stream delivered the wrong programme and block it when that keeps happening.
+
+    ``row`` is the failed booking (dict with stream_provider, stream_id, channel_id, channel, title, rec_id) and
+    ``message`` the recorder's "Wrong programme on stream: provider shows "X" but "Y" was scheduled".  The second catch
+    inside ``STREAM_BLOCK_WINDOW_DAYS`` blocks the stream for ``STREAM_BLOCK_DAYS`` and re-sources what was booked on it.
+    Returns ``{'strikes', 'blocked', 'action'}`` or None when the booking has no stream.
+    """
+    provider = str(row.get('stream_provider') or 'primestreams')
+    stream_id = str(row.get('stream_id') or '')
+    if not stream_id:
+        return None
+    found = _WRONG_PROGRAMME.search(str(message or ''))
+    seen, scheduled = (found.group(1), found.group(2)) if found else ('', str(row.get('title') or ''))
+    now = time.time()
+    conn = _stream_block_conn()
+    try:
+        conn.execute('INSERT INTO stream_wrong_events (provider, stream_id, channel_id, channel, scheduled, seen, ts, rec_id) '
+                     'VALUES (?,?,?,?,?,?,?,?)', (provider, stream_id, row.get('channel_id') or '', row.get('channel') or '',
+                                                  scheduled[:200], seen[:200], now, row.get('rec_id') or ''))
+        strikes = conn.execute('SELECT COUNT(*) FROM stream_wrong_events WHERE provider=? AND stream_id=? AND ts>?',
+                               (provider, stream_id, now - STREAM_BLOCK_WINDOW_DAYS * 86400)).fetchone()[0]
+        already = conn.execute('SELECT 1 FROM stream_blocks WHERE provider=? AND stream_id=? AND until_ts>?',
+                               (provider, stream_id, now)).fetchone()
+        newly = strikes >= STREAM_BLOCK_STRIKES and not already
+        if newly:
+            conn.execute('INSERT OR REPLACE INTO stream_blocks (provider, stream_id, channel_id, channel, since_ts, until_ts, '
+                         'strikes, action_json) VALUES (?,?,?,?,?,?,?,?)',
+                         (provider, stream_id, row.get('channel_id') or '', row.get('channel') or '', now,
+                          now + STREAM_BLOCK_DAYS * 86400, strikes, '{}'))
+        conn.commit()
+    finally:
+        conn.close()
+    _invalidate_stream_block_cache()
+    result = {'strikes': strikes, 'blocked': bool(newly or already), 'action': None}
+    if newly:
+        print(f'[stream-block] {provider} stream {stream_id} ({row.get("channel")}) blocked for {STREAM_BLOCK_DAYS} days '
+              f'after {strikes} wrong-programme catches')
+        try:
+            result['action'] = _clear_blocked_stream_bookings(provider, stream_id)
+        except Exception as exc:
+            print(f'[stream-block] could not re-source the bookings on {provider} stream {stream_id}: {exc}')
+        try:
+            conn = _stream_block_conn()
+            conn.execute('UPDATE stream_blocks SET action_json=? WHERE provider=? AND stream_id=?',
+                         (json.dumps(result['action'] or {}), provider, stream_id))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error:
+            pass
+    return result
+
+
+def _clear_blocked_stream_bookings(provider, stream_id):
+    """Move what is booked on a newly blocked stream elsewhere; drop (and look for another airing of) what cannot move."""
+    lead = time.time() + AUTO_WANTED_REPLACE_MIN_LEAD_SECONDS
+
+    def queued():
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.execute('PRAGMA busy_timeout=10000')
+        rows = conn.execute("SELECT rec_id, title, channel, start_ts, season_num, episode_num FROM recordings "
+                            "WHERE status IN ('queued','scheduled') AND COALESCE(stream_provider,'primestreams')=? "
+                            "AND stream_id=? AND start_ts>?", (provider, str(stream_id), lead)).fetchall()
+        conn.close()
+        return rows
+    before = queued()
+    if not before:
+        return {'moved': 0, 'dropped': []}
+    try:
+        _rebalance_slots(True)           # to the other provider where it carries the channel (a blocked stream is skipped)
+    except Exception as exc:
+        print(f'[stream-block] could not rebalance: {exc}')
+    still = queued()
+    dropped = []
+    if still:
+        reason = 'Not recorded: its stream was blocked after it delivered the wrong programme'
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        conn.execute('PRAGMA busy_timeout=10000')
+        for rec_id, title, channel, start_ts, season, number in still:
+            conn.execute("UPDATE recordings SET status='failed', failure_reason=? WHERE rec_id=? "
+                         "AND status IN ('queued','scheduled')", (reason, rec_id))
+            dropped.append({'id': rec_id, 'title': title, 'channel': channel, 'start_ts': start_ts,
+                            'when': _local_dt(float(start_ts)).strftime('%a %-I:%M %p'),
+                            'film': _is_film_booking({'season_num': season, 'episode_num': number}), 'reason': reason})
+        conn.commit()
+        conn.close()
+        with _rec_lock:
+            for item in dropped:
+                rec = _recs.get(item['id'])
+                if rec:
+                    rec.update({'status': 'failed', 'failure_reason': reason})
+        for item in dropped:
+            _rebook_after_overlap(item, 'a blocked stream')
+    return {'moved': len(before) - len(still), 'dropped': dropped}
+
+
+def _stream_block_advice(block, other_carries):
+    """Plain-words advice for one blocked stream."""
+    name = 'Eaglecast' if block['provider'] == 'eaglecast' else 'PrimeStreams'
+    other = 'PrimeStreams' if block['provider'] == 'eaglecast' else 'Eaglecast'
+    seen = sorted({e['seen'] for e in block['events'] if e['seen']})
+    scheduled = sorted({e['scheduled'] for e in block['events'] if e['scheduled']})
+    why = (f'The {name} feed for "{block["channel"]}" showed '
+           + (', '.join('"%s"' % t for t in seen) if seen else 'another programme')
+           + ' when the guide said ' + (', '.join('"%s"' % t for t in scheduled) if scheduled else 'something else')
+           + '. That usually means the provider\'s schedule or channel mapping for it is shifted (for example an East Coast '
+             'feed listed under a Pacific channel).')
+    done = f'It is blocked until {block["until"]}, so nothing new is booked on it.'
+    action = block.get('action') or {}
+    if action.get('moved') or action.get('dropped'):
+        done += (f' {action.get("moved", 0)} booking(s) on it were moved to another source'
+                 + (f' and {len(action["dropped"])} could not be placed (films get another airing looked up)' if action.get('dropped') else '')
+                 + '.')
+    todo = []
+    if other_carries:
+        todo.append(f'{other} also carries this channel, so new bookings use it automatically. Nothing is needed from you.')
+    else:
+        todo.append(f'{other} does not carry this channel, so nothing will be booked on it until the block ends. For a film '
+                    'you want, look for another airing on a different channel in the programme window.')
+    todo.append('If you know the provider has fixed it, press Release to try it again. If it delivers the wrong programme '
+                f'{STREAM_BLOCK_STRIKES} more times it is blocked again for {STREAM_BLOCK_DAYS} days.')
+    todo.append('If it keeps happening, tell the provider which channel it was and the titles above: they can correct the mapping.')
+    return {'why': why, 'done': done, 'todo': todo}
+
+
+STREAM_BLOCK_GENERAL_ADVICE = [
+    'A stream is blocked after it delivers the wrong programme twice in 14 days. One catch only puts it on the watch list.',
+    'The recorder checks a minute into each recording that the stream carries the scheduled film, so a wrong programme is '
+    'caught early and never reaches Plex.',
+    'A block ends by itself after 14 days and the stream gets another chance. Release it sooner only when the provider says '
+    'it is fixed.',
+    'Films booked on a blocked stream are moved to the other provider or another airing automatically. Episodes follow the '
+    'series pass.',
+    'Look at this list after a run of "wrong programme" failures in Recording Health: the same channel several times is a '
+    'provider problem, not something wrong with your setup.',
+]
+
+
+def _stream_block_report():
+    """Blocked streams (with what they showed, what was done and advice), streams on the watch list, general advice."""
+    now = time.time()
+    conn = _stream_block_conn()
+    window = now - STREAM_BLOCK_WINDOW_DAYS * 86400
+    events = conn.execute('SELECT provider, stream_id, channel, scheduled, seen, ts FROM stream_wrong_events WHERE ts>? '
+                          'ORDER BY ts DESC', (window,)).fetchall()
+    block_rows = conn.execute('SELECT provider, stream_id, channel_id, channel, since_ts, until_ts, strikes, action_json '
+                              'FROM stream_blocks WHERE until_ts>? ORDER BY since_ts DESC', (now,)).fetchall()
+    conn.close()
+
+    def mine(provider, stream_id):
+        return [{'when': _local_dt(r[5]).strftime('%a %b %-d, %-I:%M %p'), 'scheduled': r[3], 'seen': r[4]}
+                for r in events if r[0] == provider and r[1] == stream_id]
+    blocks = []
+    for provider, stream_id, channel_id, channel, since, until, strikes, action_json in block_rows:
+        try:
+            action = json.loads(action_json or '{}')
+        except ValueError:
+            action = {}
+        block = {'provider': provider, 'stream_id': stream_id, 'channel_id': channel_id, 'channel': channel,
+                 'since': _local_dt(since).strftime('%a %b %-d, %-I:%M %p'), 'until': _local_dt(until).strftime('%a %b %-d'),
+                 'days_left': max(0, int((until - now) // 86400) + 1), 'strikes': strikes, 'events': mine(provider, stream_id),
+                 'action': action}
+        try:
+            if provider == 'eaglecast':
+                other_carries = bool(_slot_source('primestreams', channel_id, None, None))
+            else:
+                other_carries = bool(_slot_source('eaglecast', channel_id, None, _eaglecast_expiry()[0]))
+        except Exception:
+            other_carries = False
+        block['advice'] = _stream_block_advice(block, other_carries)
+        blocks.append(block)
+    blocked_keys = {(b['provider'], b['stream_id']) for b in blocks}
+    watch, seen_keys = [], set()
+    for provider, stream_id, channel, scheduled, seen, ts in events:
+        key = (provider, stream_id)
+        if key in blocked_keys or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        watch.append({'provider': provider, 'stream_id': stream_id, 'channel': channel, 'events': mine(provider, stream_id)})
+    return {'strikes_to_block': STREAM_BLOCK_STRIKES, 'window_days': STREAM_BLOCK_WINDOW_DAYS, 'block_days': STREAM_BLOCK_DAYS,
+            'blocks': blocks, 'watch': watch, 'advice': STREAM_BLOCK_GENERAL_ADVICE}
+
+
+@app.route('/epg-web/api/stream-blocks')
+def api_stream_blocks():
+    """Read-only report of the streams blocked for delivering the wrong programme, with advice."""
+    try:
+        return jsonify(_stream_block_report())
+    except sqlite3.Error as exc:
+        return jsonify({'error': str(exc), 'blocks': [], 'watch': [], 'advice': STREAM_BLOCK_GENERAL_ADVICE}), 503
+
+
+@app.route('/epg-web/api/stream-blocks/release', methods=['POST'])
+def api_stream_blocks_release():
+    """Lift a block (and forget that stream's wrong-programme history) so it is tried again."""
+    body = request.json or {}
+    provider, stream_id = str(body.get('provider', '')), str(body.get('stream_id', ''))
+    if provider not in SLOT_PROVIDERS or not stream_id:
+        return jsonify({'ok': False, 'error': 'provider and stream_id are needed'}), 400
+    conn = _stream_block_conn()
+    conn.execute('DELETE FROM stream_blocks WHERE provider=? AND stream_id=?', (provider, stream_id))
+    conn.execute('DELETE FROM stream_wrong_events WHERE provider=? AND stream_id=?', (provider, stream_id))
+    conn.commit()
+    conn.close()
+    _invalidate_stream_block_cache()
+    return jsonify({'ok': True})
+
 
 def _primestream_verified_override(channel_id):
     """Return a locally verified PrimeStreams correction, when one exists.
@@ -11470,6 +11724,11 @@ def api_agent_heartbeat(rec_id):
     conn.close()
     # Auto-retry: if a recording ended early due to stream drop, queue the best future airing
     reason_text = failure_reason.lower()
+    if terminal and status == 'failed' and 'wrong programme' in reason_text:
+        try:                      # count it against the stream first, so the retry below skips a stream that is now blocked
+            _note_wrong_programme(dict(row), failure_reason)
+        except Exception as _e:
+            print(f'[stream-block] could not note the wrong programme: {_e}')
     if terminal and status == 'failed' and ('ended early' in reason_text or 'wrong programme' in reason_text):
         try:
             expected = (row['stop_ts'] - row['start_ts']) if row['stop_ts'] and row['start_ts'] else 0
@@ -12201,6 +12460,16 @@ tr:hover td{background:#141414;}
     <div id="chreport-list" style="max-height:420px;overflow-y:auto;font-size:13px;"></div>
   </div>
   <div class="card" style="margin-top:12px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+      <div>
+        <h2 style="margin:0;">🚫 Blocked feeds</h2>
+        <div style="font-size:12px;color:#64748b;margin-top:3px;">Streams that kept delivering the wrong programme are blocked for a while so they stop costing you films. What was done and what to do is listed for each.</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="loadBlockedFeeds()">Refresh</button>
+    </div>
+    <div id="blocked-feeds-list" style="font-size:13px;"></div>
+  </div>
+  <div class="card" style="margin-top:12px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
       <div>
         <h2 style="margin:0;">✂️ Commercial Review</h2>
@@ -12493,7 +12762,7 @@ function switchTab(name) {
   if (name === '247') load247();
   if (name === 'schedule') { loadSchedule(); loadSeriesRecordings(); }
   if (name === 'plex-series') loadPlexSeries();
-  if (name === 'health') { loadRecordingHealth(); loadChannelReport(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
+  if (name === 'health') { loadRecordingHealth(); loadChannelReport(); loadBlockedFeeds(); loadCommercialReview(); loadIncompletePlexCopies(); loadPlexTransferDebris(); loadRawLogFiles(); loadRecFiles(); }
   if (name === 'conversions') { loadTsFiles(); pollConversions(); }
   if (name === 'storage') loadStorageTab();
   if (name === 'planner') loadPlanner();
@@ -16468,6 +16737,40 @@ async function loadChannelReport() {
   } catch (e) { list.textContent = 'Could not load the channel report: ' + e.message; }
 }
 
+// The streams blocked for delivering the wrong programme: why, what was done, what to do, and a way to release them.
+async function loadBlockedFeeds() {
+  const box = document.getElementById('blocked-feeds-list');
+  if (!box) return;
+  try {
+    const d = await (await fetch('/epg-web/api/stream-blocks')).json();
+    const name = p => p === 'eaglecast' ? 'Eaglecast' : 'PrimeStreams';
+    const events = list => '<div style="color:#94a3b8;font-size:12px;margin:3px 0 0 14px;">' + list.map(e => esc(e.when) + ': the guide said "' + esc(e.scheduled) + '"' + (e.seen ? ', the stream showed "' + esc(e.seen) + '"' : '')).join('<br>') + '</div>';
+    let html = '';
+    (d.blocks || []).forEach(b => {
+      html += '<div style="border:1px solid #7f1d1d;background:#1c0f12;border-radius:8px;padding:10px 12px;margin-bottom:10px;">'
+        + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;"><b>' + esc(b.channel) + '</b> <span style="color:#94a3b8;">' + name(b.provider) + '</span>'
+        + '<span style="color:#fca5a5;">blocked since ' + esc(b.since) + ', until ' + esc(b.until) + ' (' + b.days_left + ' day' + (b.days_left === 1 ? '' : 's') + ' left)</span>'
+        + '<button class="btn btn-ghost btn-sm" style="margin-left:auto;" onclick="releaseBlockedFeed(' + "'" + esc(b.provider) + "','" + esc(b.stream_id) + "'" + ')">Release</button></div>'
+        + events(b.events || [])
+        + '<div style="margin-top:8px;color:#cbd5e1;">' + esc(b.advice.why) + '</div>'
+        + '<div style="margin-top:6px;color:#fde68a;">' + esc(b.advice.done) + '</div>'
+        + '<ul style="margin:6px 0 0 18px;padding:0;color:#94a3b8;">' + b.advice.todo.map(t => '<li>' + esc(t) + '</li>').join('') + '</ul></div>';
+    });
+    if (!(d.blocks || []).length) html += '<div style="color:#86efac;margin-bottom:10px;">No feed is blocked.</div>';
+    if ((d.watch || []).length) {
+      html += '<div style="color:#fbbf24;font-weight:600;margin:6px 0 4px;">On the watch list (one more catch within ' + d.window_days + ' days blocks it)</div>'
+        + d.watch.map(w => '<div style="margin-bottom:6px;"><b>' + esc(w.channel) + '</b> <span style="color:#94a3b8;">' + name(w.provider) + '</span>' + events(w.events || []) + '</div>').join('');
+    }
+    html += '<details style="margin-top:10px;"><summary style="cursor:pointer;color:#93c5fd;">How to handle this going forward</summary><ul style="margin:6px 0 0 18px;padding:0;color:#94a3b8;">'
+      + (d.advice || []).map(t => '<li style="margin-bottom:4px;">' + esc(t) + '</li>').join('') + '</ul></details>';
+    box.innerHTML = html;
+  } catch (e) { box.textContent = 'Could not load the blocked feeds: ' + e.message; }
+}
+async function releaseBlockedFeed(provider, streamId) {
+  if (!confirm('Try this feed again? It is blocked again for two weeks if it delivers the wrong programme twice more.')) return;
+  await post('/epg-web/api/stream-blocks/release', {provider: provider, stream_id: streamId});
+  loadBlockedFeeds();
+}
 async function loadRecordingHealth() {
   const list = document.getElementById('recording-health-list');
   const empty = document.getElementById('recording-health-empty');
@@ -17473,7 +17776,7 @@ def _fix_overlaps(apply_it, hours=OVERLAP_LOOKAHEAD_HOURS):
     return {'applied': bool(apply_it), 'dropped': dropped, 'kept': kept_total}
 
 
-def _rebook_after_overlap(item):
+def _rebook_after_overlap(item, why='an overlap'):
     """Best effort: queue the best future airing of a FILM that had to be dropped.  Never raises.
 
     An episode is left to the series and Wanted passes, which know which episode it was; this looks a film up by
@@ -17484,7 +17787,7 @@ def _rebook_after_overlap(item):
     try:
         candidate, detail = _best_incomplete_rerecord(item['title'], 0)
         if candidate:
-            _queue_best_retry(item['title'], candidate, 'auto-retry after an overlap')
+            _queue_best_retry(item['title'], candidate, f'auto-retry after {why}')
             item['rebooked'] = True
             print(f'[overlap-fix] queued another airing of {item["title"]!r}')
         elif detail.get('already_queued'):
