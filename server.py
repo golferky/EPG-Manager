@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261128d"
+VERSION = "v20261128e"
 
 app = Flask(__name__)
 
@@ -7163,19 +7163,59 @@ def _queue_best_retry(title, candidate, decision):
     return rec
 
 
-def _watch_abandoned_transfer(title, source='abandoned_transfer'):
-    """Remember a failed transfer so a later guide refresh can retry it."""
+def _title_is_series(title):
+    """True when a title is a TV series, not a film: it is on Wanted as a series, a guide listing of it carries episode
+    information (an episode type, a season or an episode name), or one of its earlier bookings was numbered.
+
+    Used before a failed booking's title is put on Wanted as a MOVIE: an episode of Leave It to Beaver was added that way.
+    """
     clean = str(title or '').strip()
     if not clean:
-        return
+        return False
+    try:
+        if db_rows("SELECT 1 FROM wanted_titles WHERE type='series' AND lower(title)=lower(?) LIMIT 1", (clean,)):
+            return True
+    except Exception:
+        pass
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=5)
+        try:
+            if conn.execute("SELECT 1 FROM recordings WHERE lower(title)=lower(?) AND (season_num IS NOT NULL "
+                            "OR episode_num IS NOT NULL OR COALESCE(is_series,0)=1) LIMIT 1", (clean,)).fetchone():
+                return True
+        except sqlite3.Error:
+            pass                      # an older database without those columns
+        try:
+            return bool(conn.execute(
+                "SELECT 1 FROM guide WHERE lower(title)=lower(?) AND (prog_type IN ('EP','SH') OR season_num IS NOT NULL "
+                "OR COALESCE(episode_title,'')!='') LIMIT 1", (clean,)).fetchone())
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def _watch_abandoned_transfer(title, source='abandoned_transfer', skip_series=False):
+    """Remember a failed transfer so a later guide refresh can retry it.
+
+    Returns True when the title was put on Wanted, False when it was left off: with ``skip_series`` a title that is a TV
+    series is not added (as a movie it would be wrong; episodes are the series pass's job).
+    """
+    clean = str(title or '').strip()
+    if not clean:
+        return False
+    if skip_series and _title_is_series(clean):
+        return False
     try:
         db_run('''INSERT OR IGNORE INTO wanted_titles
                   (title,normalized_title,year,type,source,status,notes,created_at,updated_at)
                   VALUES (?,?,?,?,?,?,?,datetime("now"),datetime("now"))''',
                (clean, _norm_plex_show(clean), '', 'movie', source, 'wanted',
                 'Re-record after abandoned Plex transfer'))
+        return True
     except Exception as exc:
         print(f'[abandoned-transfer] Could not add {clean!r} to Wanted: {exc}')
+        return False
 
 
 def _auto_schedule_abandoned_transfer_wanted():
@@ -11812,8 +11852,10 @@ def _after_failed_report(row, failure_reason, reason_text):
         elif detail.get('already_queued'):
             print(f'[auto-retry] {row["title"]!r} already has a retry queued, skipping')
         else:
-            _watch_abandoned_transfer(row['title'], source='stream_drop_auto_retry')
-            print(f'[auto-retry] No future airing found for {row["title"]!r}, added to Wanted')
+            if _watch_abandoned_transfer(row['title'], source='stream_drop_auto_retry', skip_series=True):
+                print(f'[auto-retry] No future airing found for {row["title"]!r}, added to Wanted')
+            else:
+                print(f'[auto-retry] No future airing found for {row["title"]!r}; it is a series, so it is left to the series pass')
     except Exception as _e:
         print(f'[auto-retry] Error during auto-retry for {row["title"]!r}: {_e}')
 
@@ -17999,7 +18041,7 @@ def _rebook_after_overlap(item, why='an overlap'):
         elif detail.get('already_queued'):
             item['rebooked'] = True
         else:
-            _watch_abandoned_transfer(item['title'], source='overlap_auto_retry')
+            _watch_abandoned_transfer(item['title'], source='overlap_auto_retry', skip_series=True)
             item['on_wanted'] = True
     except Exception as exc:
         print(f'[overlap-fix] could not look for another airing of {item.get("title")!r}: {exc}')

@@ -7076,3 +7076,84 @@ class RepeatedFailureReportTests(unittest.TestCase):
             first = server._note_wrong_programme(row, self.MSG)
             second = server._note_wrong_programme(row, self.MSG)
         self.assertEqual((first["strikes"], second["strikes"]), (1, 1))
+
+
+class SeriesNotAddedAsWantedMovieTests(unittest.TestCase):
+    """A failed booking of a TV series (Leave It to Beaver) is not put on Wanted as a movie."""
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp()
+        self.db = os.path.join(self.temp, "guide.db")
+        server.ensure_guide_db(self.db)
+        conn = sqlite3.connect(self.db)        # the episode columns the running dashboard adds to the guide
+        for col, kind in (("episode_title", "TEXT"), ("season_num", "INTEGER"), ("episode_num", "INTEGER"),
+                          ("prog_type", "TEXT")):
+            try:
+                conn.execute("ALTER TABLE guide ADD COLUMN %s %s" % (col, kind))
+            except sqlite3.OperationalError:
+                pass
+        conn.commit(); conn.close()
+        self.p1 = mock.patch.object(server, "_guide_db_path", return_value=self.db)
+        self.p1.start()
+        server._init_recordings_table()
+        self.wanted_rows = []
+        self.added = []
+        self.p2 = mock.patch.object(server, "db_rows", side_effect=lambda sql, params=(): list(self.wanted_rows))
+        self.p3 = mock.patch.object(server, "db_run", side_effect=lambda sql, params=(): self.added.append(params))
+        self.p2.start(); self.p3.start()
+
+    def tearDown(self):
+        for p in (self.p1, self.p2, self.p3):
+            p.stop()
+        import shutil
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _guide(self, title, **cols):
+        conn = sqlite3.connect(self.db)
+        names = ["title", "channel_id", "start_utc", "end_utc"] + list(cols)
+        conn.execute("INSERT INTO guide (%s) VALUES (%s)" % (",".join(names), ",".join("?" * len(names))),
+                     [title, "c", "20261201120000", "20261201123000"] + list(cols.values()))
+        conn.commit(); conn.close()
+
+    def test_a_guide_listing_with_episode_information_makes_it_a_series(self):
+        self._guide("Leave It to Beaver", prog_type="EP")
+        self.assertTrue(server._title_is_series("leave it to beaver"))
+        self._guide("Another Show", episode_title="Pilot")
+        self.assertTrue(server._title_is_series("Another Show"))
+        self._guide("Third Show", season_num=2)
+        self.assertTrue(server._title_is_series("Third Show"))
+
+    def test_a_film_is_not_a_series(self):
+        self._guide("Quantum of Solace", prog_type="MV")
+        self.assertFalse(server._title_is_series("Quantum of Solace"))
+        self.assertFalse(server._title_is_series(""))
+
+    def test_an_earlier_numbered_booking_makes_it_a_series(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status,season_num,episode_num) "
+                     "VALUES ('x','Columbo','c','c',1,2,'done',1,2)")
+        conn.commit(); conn.close()
+        self.assertTrue(server._title_is_series("Columbo"))
+
+    def test_a_wanted_series_row_makes_it_a_series(self):
+        self.wanted_rows = [{"1": 1}]
+        self.assertTrue(server._title_is_series("Anything"))
+
+    def test_skip_series_leaves_a_series_off_wanted_and_a_film_on(self):
+        self._guide("Leave It to Beaver", prog_type="EP")
+        self.assertFalse(server._watch_abandoned_transfer("Leave It to Beaver", source="stream_drop_auto_retry", skip_series=True))
+        self.assertEqual(self.added, [])
+        self.assertTrue(server._watch_abandoned_transfer("Quantum of Solace", source="stream_drop_auto_retry", skip_series=True))
+        self.assertEqual(len(self.added), 1)
+        # callers that do not ask for the check behave as before
+        self.assertTrue(server._watch_abandoned_transfer("Leave It to Beaver", source="abandoned_transfer"))
+
+    def test_the_auto_retry_message_says_it_is_left_to_the_series_pass(self):
+        self._guide("Leave It to Beaver", prog_type="EP")
+        row = {"title": "Leave It to Beaver", "stop_ts": 2000.0, "start_ts": 100.0}
+        import io, contextlib
+        out = io.StringIO()
+        with mock.patch.object(server, "_best_incomplete_rerecord", return_value=(None, {})), contextlib.redirect_stdout(out):
+            server._after_failed_report(row, "ended early", "ended early")
+        self.assertIn("left to the series pass", out.getvalue())
+        self.assertEqual(self.added, [])
