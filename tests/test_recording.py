@@ -6920,3 +6920,70 @@ class CollapsibleHealthCardsTests(unittest.TestCase):
         """) % code
         result = subprocess.run(["node", "-e", harness], capture_output=True, text=True)
         self.assertEqual(result.stdout.strip(), "ok", result.stderr)
+
+
+class RemoveWantedSeriesCancelsQueuedTests(unittest.TestCase):
+    """Removing a Wanted series can also cancel the episodes already queued, never one that is recording."""
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp()
+        self.db = os.path.join(self.temp, "guide.db")
+        server.ensure_guide_db(self.db)
+        self.p = mock.patch.object(server, "_guide_db_path", return_value=self.db)
+        self.p.start()
+        server._init_recordings_table()
+        now = time.time()
+        conn = sqlite3.connect(self.db)
+        rows = [("c1", "Columbo", "queued", now + 3600), ("c2", "Columbo", "scheduled", now + 7200),
+                ("c3", "Columbo", "recording", now - 600), ("o1", "The Wire", "queued", now + 3600)]
+        for rec_id, title, status, start in rows:
+            conn.execute("INSERT INTO recordings(rec_id,title,channel,channel_id,start_ts,stop_ts,status) VALUES (?,?,?,?,?,?,?)",
+                         (rec_id, title, "GAF", "ch", start, start + 3600, status))
+        conn.commit(); conn.close()
+        self.wanted = {"title": "Columbo", "type": "series"}
+        self.removed = []
+        self.p2 = mock.patch.object(server, "db_rows", side_effect=lambda sql, params=(): [self.wanted])
+        self.p3 = mock.patch.object(server, "db_run", side_effect=lambda sql, params=(): self.removed.append(params))
+        self.p2.start(); self.p3.start()
+
+    def tearDown(self):
+        for p in (self.p, self.p2, self.p3):
+            p.stop()
+        import shutil
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _status(self, rec_id):
+        conn = sqlite3.connect(self.db)
+        row = conn.execute("SELECT status FROM recordings WHERE rec_id=?", (rec_id,)).fetchone()
+        conn.close()
+        return row[0]
+
+    def test_preview_counts_queued_and_removes_nothing(self):
+        data = server.app.test_client().post("/epg-web/api/wanted", json={"action": "remove", "id": 1, "preview": True}).get_json()
+        self.assertEqual(data["queued"], 2)
+        self.assertEqual(self.removed, [])
+
+    def test_remove_only_keeps_them_queued(self):
+        data = server.app.test_client().post("/epg-web/api/wanted", json={"action": "remove", "id": 1}).get_json()
+        self.assertEqual(data["cancelled"], 0)
+        self.assertEqual(self._status("c1"), "queued")
+
+    def test_remove_and_cancel_cancels_only_the_queued_ones_of_that_title(self):
+        data = server.app.test_client().post("/epg-web/api/wanted", json={"action": "remove", "id": 1, "cancel_queued": True}).get_json()
+        self.assertEqual(data["cancelled"], 2)
+        self.assertEqual(self._status("c1"), "cancelled")
+        self.assertEqual(self._status("c2"), "cancelled")
+        self.assertEqual(self._status("c3"), "recording")      # already recording: untouched
+        self.assertEqual(self._status("o1"), "queued")         # another title: untouched
+
+    def test_a_movie_never_cancels_queued_bookings(self):
+        self.wanted = {"title": "Columbo", "type": "movie"}
+        data = server.app.test_client().post("/epg-web/api/wanted", json={"action": "remove", "id": 1, "cancel_queued": True}).get_json()
+        self.assertEqual(data["cancelled"], 0)
+        self.assertEqual(self._status("c1"), "queued")
+
+    def test_page_asks_before_cancelling(self):
+        page = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("removeWanted(${r.id}, ${isSeries ? 1 : 0})", page)
+        self.assertIn("preview:true", page)
+        self.assertIn("cancel_queued: cancelQueued", page)

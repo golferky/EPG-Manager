@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261128a"
+VERSION = "v20261128b"
 
 app = Flask(__name__)
 
@@ -8071,6 +8071,18 @@ def _plex_wanted_title_index():
     })
     return _plex_title_cache
 
+def _queued_bookings_for_title(title):
+    """Ids of the bookings of a title that are queued and have not started (what removing a Wanted series leaves behind)."""
+    try:
+        conn = sqlite3.connect(_guide_db_path(), timeout=10)
+        rows = conn.execute("SELECT rec_id FROM recordings WHERE lower(title)=lower(?) AND status IN ('queued','scheduled') "
+                            "AND stop_ts>? ORDER BY start_ts", (str(title or '').strip(), time.time())).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return []
+    return [r[0] for r in rows]
+
+
 @app.route('/epg-web/api/wanted', methods=['POST'])
 def api_wanted():
     data = request.json or {}
@@ -8098,8 +8110,20 @@ def api_wanted():
         _start_auto_wanted_pass()
         return jsonify({'ok': True})
     if action == 'remove':
+        found = db_rows('SELECT title, type FROM wanted_titles WHERE id=?', (data.get('id'),))
+        wanted = found[0] if found else None
+        is_series = bool(wanted and wanted.get('type') == 'series')
+        queued = _queued_bookings_for_title(wanted['title']) if is_series else []
+        if data.get('preview') is True:          # how many queued recordings removing it would leave behind
+            return jsonify({'ok': True, 'type': wanted.get('type') if wanted else '', 'queued': len(queued)})
         db_run('DELETE FROM wanted_titles WHERE id=?', (data.get('id'),))
-        return jsonify({'ok': True})
+        cancelled = 0
+        if is_series and data.get('cancel_queued') is True:
+            for rec_id in queued:
+                with app.test_request_context('/epg-web/api/record/cancel', method='POST', json={'id': rec_id}):
+                    response = api_rec_cancel()
+                cancelled += 0 if isinstance(response, tuple) and response[1] != 200 else 1
+        return jsonify({'ok': True, 'cancelled': cancelled})
     if action == 'update':
         db_run('UPDATE wanted_titles SET status=?,notes=?,updated_at=datetime("now") WHERE id=?',
                (data.get('status'), data.get('notes',''), data.get('id')))
@@ -16147,7 +16171,7 @@ function renderWantedTable() {
         <td class="time-cell" title="${r.added ? 'Added ' + esc(r.added) : ''}" style="white-space:nowrap;${(!r.in_plex && !isSeries && r.age_days >= 30) ? 'color:#fbbf24;' : ''}">${wantedAgeText(r.age_days)}</td>
         <td class="ch-cell">${a ? esc(a.channel) : (r.ad_supported_only ? '<span style="color:#64748b" title="It airs only on channels with ads, which are not offered">Only on channels with ads</span>' : (window._wantedGuideLoading ? '<span style="color:#fbbf24">Guide still loading…</span>' : '<span style="color:#333">Not in guide</span>'))}</td>
         <td class="time-cell">${a ? esc(a.start_fmt) : ''}</td>
-        <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id})'>✕</button></td>
+        <td class="act-cell">${action}<button class="btn btn-danger btn-sm" onclick='removeWanted(${r.id}, ${isSeries ? 1 : 0})'>✕</button></td>
       </tr>`;
     };
     // Each group can be closed; what you closed is remembered in this browser.
@@ -16334,9 +16358,18 @@ async function checkWantedMovieUpgrade(btn, title, year) {
 function openWantedSeries(title, airing) {
   openProg({...airing, title, desc:'', year:'', category:''});
 }
-async function removeWanted(id) {
+async function removeWanted(id, isSeries) {
   if (!confirm('Remove from wanted list?')) return;
-  await post('/epg-web/api/wanted', {action:'remove', id});
+  let cancelQueued = false;
+  if (isSeries) {
+    // Removing a series stops new bookings; offer to cancel the episodes already queued too.
+    try {
+      const d = await post('/epg-web/api/wanted', {action:'remove', id, preview:true});
+      if (d && d.queued > 0) cancelQueued = confirm('It has ' + d.queued + ' queued recording' + (d.queued === 1 ? '' : 's') + '. Also cancel them? (OK = cancel them, Cancel = keep them queued. One already recording is not touched.)');
+    } catch (e) { /* just remove it */ }
+  }
+  const r = await post('/epg-web/api/wanted', {action:'remove', id, cancel_queued: cancelQueued});
+  if (r && r.cancelled) alert('Cancelled ' + r.cancelled + ' queued recording' + (r.cancelled === 1 ? '' : 's') + '.');
   loadRecs();
 }
 async function addWanted(type) {
