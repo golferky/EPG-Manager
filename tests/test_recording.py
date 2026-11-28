@@ -6867,3 +6867,56 @@ class OneChannelAtATimeTests(unittest.TestCase):
             store["filler_channels"] = [{"channel_id": "c1"}, {"channel_id": "c2"}, {"channel_id": "c3"}]   # an old list
             client.post("/epg-web/api/filler", json={"add": {"channel_id": "c2", "channel": "Andy Griffith"}})
             self.assertEqual([c["channel_id"] for c in store["filler_channels"]], ["c2"])
+
+
+class CollapsibleHealthCardsTests(unittest.TestCase):
+    """Every card on the Recording Health tab opens and closes by its heading."""
+
+    def test_page_sets_up_the_cards_and_remembers_the_state(self):
+        page = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        self.assertIn("function setupHealthCards()", page)
+        self.assertIn("epg_health_closed", page)
+        self.assertIn("DOMContentLoaded', setupHealthCards", page)
+        pane = page[page.index('id="pane-health"'):]
+        self.assertGreaterEqual(pane.count('<h2'), 8)
+
+    def test_collapse_runs_in_node(self):
+        import shutil as _sh, subprocess, textwrap
+        if not _sh.which("node"):
+            self.skipTest("node is not installed")
+        page = server.app.test_client().get("/epg-web").get_data(as_text=True)
+        start = page.index("function healthClosedState()")
+        end = page.index("document.addEventListener('DOMContentLoaded', setupHealthCards);")
+        code = page[start:end]
+        harness = textwrap.dedent("""
+            const store = {};
+            global.localStorage = {getItem: k => store[k] || null, setItem: (k, v) => { store[k] = v; }};
+            function el(tag) {
+              const e = {tag, children: [], parentElement: null, cls: new Set(), attrs: {}, style: {}, textContent: '', listeners: {},
+                classList: {add(c) { e.cls.add(c); }, toggle(c, on) { on ? e.cls.add(c) : e.cls.delete(c); }},
+                setAttribute(k, v) { e.attrs[k] = v; }, getAttribute(k) { return e.attrs[k]; },
+                addEventListener(n, f) { e.listeners[n] = f; },
+                insertBefore(n) { n.parentElement = e; e.children.unshift(n); },
+                appendChild(n) { n.parentElement = e; e.children.push(n); }};
+              return e;
+            }
+            const card = el('div'), head = el('div'), title = el('h2');
+            title.textContent = 'Channel report';
+            head.parentElement = card; title.parentElement = head; card.children = [head, el('div')];
+            card.querySelector = sel => sel === 'h2' ? title : null;
+            const pane = {querySelectorAll: () => [card]};
+            const doc = {getElementById: id => id === 'pane-health' ? pane : (id === 'health-collapse-style' ? {} : null),
+              createElement: () => el('span'), head: el('head')};
+            global.document = doc;
+            %s
+            setupHealthCards();
+            if (card.cls.has('health-collapsed')) throw new Error('starts open');
+            title.listeners.click();
+            if (!card.cls.has('health-collapsed')) throw new Error('did not close');
+            if (JSON.parse(store.epg_health_closed)['Channel report'] !== true) throw new Error('not remembered');
+            title.listeners.click();
+            if (card.cls.has('health-collapsed')) throw new Error('did not reopen');
+            console.log('ok');
+        """) % code
+        result = subprocess.run(["node", "-e", harness], capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "ok", result.stderr)

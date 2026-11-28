@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261127d"
+VERSION = "v20261128a"
 
 app = Flask(__name__)
 
@@ -16223,6 +16223,52 @@ function toggleSection(key) {
   applySections();
 }
 document.addEventListener('DOMContentLoaded', applySections);
+// Every card on the Recording Health tab opens and closes by clicking its heading (remembered in the browser as epg_health_closed).
+function healthClosedState() {
+  try { return JSON.parse(localStorage.getItem('epg_health_closed') || '{}') || {}; } catch (e) { return {}; }
+}
+function setupHealthCards() {
+  const pane = document.getElementById('pane-health');
+  if (!pane) return;
+  if (!document.getElementById('health-collapse-style')) {
+    const css = document.createElement('style');
+    css.id = 'health-collapse-style';
+    css.textContent = '#pane-health .card.health-collapsed > *:not(.health-head) { display: none !important; }';
+    document.head.appendChild(css);
+  }
+  const state = healthClosedState();
+  pane.querySelectorAll(':scope > .card').forEach(card => {
+    const title = card.querySelector('h2');
+    if (!title || title.getAttribute('data-collapsible')) return;
+    title.setAttribute('data-collapsible', '1');
+    let head = title;
+    while (head.parentElement && head.parentElement !== card) head = head.parentElement;
+    head.classList.add('health-head');
+    const key = title.textContent.trim();
+    const arrow = document.createElement('span');
+    arrow.className = 'health-arrow';
+    arrow.style.cssText = 'display:inline-block;width:16px;';
+    title.insertBefore(arrow, title.firstChild);
+    title.style.cursor = 'pointer';
+    title.style.userSelect = 'none';
+    title.title = 'Click to open or close';
+    const apply = () => {
+      const closed = !!healthClosedState()[key];
+      card.classList.toggle('health-collapsed', closed);
+      arrow.textContent = closed ? '▸' : '▾';
+    };
+    title.addEventListener('click', () => {
+      const now = healthClosedState();
+      now[key] = !now[key];
+      try { localStorage.setItem('epg_health_closed', JSON.stringify(now)); } catch (e) { /* not remembered */ }
+      apply();
+    });
+    card.classList.toggle('health-collapsed', !!state[key]);
+    arrow.textContent = state[key] ? '▸' : '▾';
+  });
+}
+document.addEventListener('DOMContentLoaded', setupHealthCards);
+
 // Open or close a block on the Recommendations tab (the upgrade card and the three groups of wanted titles).
 function wantedCollapsedState() {
   try { return JSON.parse(localStorage.getItem('epg_wanted_collapsed') || '{}') || {}; } catch (e) { return {}; }
