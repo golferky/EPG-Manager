@@ -1595,6 +1595,7 @@ class AutoRetryTests(unittest.TestCase):
         rec_id = "retry" + str(int(time.time() * 1000) % 100000)
         server._db_upsert_rec(rec_id, rec)
         with mock.patch.object(server, "_agent_authorized", return_value=True), \
+             mock.patch.object(server, "_run_in_background", side_effect=lambda fn, *a: fn(*a)), \
              mock.patch.object(server, "_best_incomplete_rerecord", return_value=(None, {})) as best, \
              mock.patch.object(server, "_watch_abandoned_transfer") as wanted:
             resp = server.app.test_client().post(
@@ -6755,7 +6756,8 @@ class AutomaticStreamBlockTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.db))
 
     def test_heartbeat_hook_and_page(self):
-        self.assertIn("_note_wrong_programme(dict(row)", inspect.getsource(server.api_agent_heartbeat))
+        self.assertIn("_note_wrong_programme(row", inspect.getsource(server._after_failed_report))
+        self.assertIn("_run_in_background(_after_failed_report", inspect.getsource(server.api_agent_heartbeat))
         page = server.app.test_client().get("/epg-web").get_data(as_text=True)
         self.assertIn("blocked-feeds-list", page)
         self.assertIn("loadBlockedFeeds()", page)
@@ -7006,16 +7008,37 @@ class RepeatedFailureReportTests(unittest.TestCase):
         server._init_recordings_table()
         server._invalidate_stream_block_cache()
         server._repeat_terminal_logged.clear()
+        self.p3 = mock.patch.object(server, "_run_in_background", side_effect=lambda fn, *a: fn(*a))
+        self.p3.start()
         now = time.time()
         server._db_upsert_rec("rj1", {"title": "Behind Enemy Lines", "channel": "Showtime Pacific", "channel_id": "c9",
                                       "stream_id": "777", "stream_provider": "eaglecast", "start_ts": now - 600,
                                       "stop_ts": now + 3000, "status": "recording", "backend": "agent", "file": ""})
 
     def tearDown(self):
-        self.p1.stop(); self.p2.stop()
+        self.p3.stop(); self.p1.stop(); self.p2.stop()
         server._invalidate_stream_block_cache()
         import shutil
         shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_the_answer_does_not_wait_for_the_slow_search(self):
+        import threading as _th
+        started, release = _th.Event(), _th.Event()
+
+        def slow(*args, **kwargs):
+            started.set()
+            release.wait(5)
+            return None, {}
+        with mock.patch.object(server, "_run_in_background", side_effect=lambda fn, *a: _th.Thread(target=fn, args=a, daemon=True).start()), \
+             mock.patch.object(server, "_best_incomplete_rerecord", side_effect=slow), \
+             mock.patch.object(server, "_watch_abandoned_transfer"):
+            began = time.time()
+            response = self._fail("4 min captured / 35 min scheduled: the stream ended early")
+            answered = time.time() - began
+            started.wait(2)
+            release.set()
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(answered, 2)                    # it did not sit through the search
 
     def _fail(self, message=None):
         return server.app.test_client().post(

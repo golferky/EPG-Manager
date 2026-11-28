@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261128c"
+VERSION = "v20261128d"
 
 app = Flask(__name__)
 
@@ -11791,6 +11791,33 @@ def _clean_stream_info(value):
             clean[key] = text
     return clean
 
+def _run_in_background(fn, *args):
+    """Run ``fn`` on a background thread (tests replace this with a direct call)."""
+    threading.Thread(target=fn, args=args, daemon=True, name='epg-after-failed-report').start()
+
+
+def _after_failed_report(row, failure_reason, reason_text):
+    """What follows a recording that failed: count a wrong programme against its stream, then look for another airing."""
+    if 'wrong programme' in reason_text:
+        try:                      # count it against the stream first, so the retry below skips a stream that is now blocked
+            _note_wrong_programme(row, failure_reason)
+        except Exception as _e:
+            print(f'[stream-block] could not note the wrong programme: {_e}')
+    try:
+        expected = (row['stop_ts'] - row['start_ts']) if row['stop_ts'] and row['start_ts'] else 0
+        candidate, detail = _best_incomplete_rerecord(row['title'], expected)
+        if candidate:
+            _queue_best_retry(row['title'], candidate, 'auto-retry after stream drop')
+            print(f'[auto-retry] Queued re-record of {row["title"]!r} after stream drop')
+        elif detail.get('already_queued'):
+            print(f'[auto-retry] {row["title"]!r} already has a retry queued, skipping')
+        else:
+            _watch_abandoned_transfer(row['title'], source='stream_drop_auto_retry')
+            print(f'[auto-retry] No future airing found for {row["title"]!r}, added to Wanted')
+    except Exception as _e:
+        print(f'[auto-retry] Error during auto-retry for {row["title"]!r}: {_e}')
+
+
 _repeat_terminal_logged = set()      # (rec_id, status) already logged as a repeated terminal report
 
 
@@ -11846,25 +11873,11 @@ def api_agent_heartbeat(rec_id):
         terminal_effects = False
     else:
         terminal_effects = True
-    if terminal_effects and terminal and status == 'failed' and 'wrong programme' in reason_text:
-        try:                      # count it against the stream first, so the retry below skips a stream that is now blocked
-            _note_wrong_programme(dict(row), failure_reason)
-        except Exception as _e:
-            print(f'[stream-block] could not note the wrong programme: {_e}')
     if terminal_effects and terminal and status == 'failed' and ('ended early' in reason_text or 'wrong programme' in reason_text):
-        try:
-            expected = (row['stop_ts'] - row['start_ts']) if row['stop_ts'] and row['start_ts'] else 0
-            candidate, detail = _best_incomplete_rerecord(row['title'], expected)
-            if candidate:
-                _queue_best_retry(row['title'], candidate, 'auto-retry after stream drop')
-                print(f'[auto-retry] Queued re-record of {row["title"]!r} after stream drop')
-            elif detail.get('already_queued'):
-                print(f'[auto-retry] {row["title"]!r} already has a retry queued, skipping')
-            else:
-                _watch_abandoned_transfer(row['title'], source='stream_drop_auto_retry')
-                print(f'[auto-retry] No future airing found for {row["title"]!r}, added to Wanted')
-        except Exception as _e:
-            print(f'[auto-retry] Error during auto-retry for {row["title"]!r}: {_e}')
+        # The strike count and the search for another airing can take longer than the recorder will wait for its answer
+        # (it then thinks the dashboard is down and sends the same report again, for up to two hours), so they run in
+        # the background and the recorder gets its answer at once.
+        _run_in_background(_after_failed_report, dict(row), failure_reason, reason_text)
     stream_info = _clean_stream_info(data.get('stream_info'))
     with _rec_lock:
         rec = _recs.setdefault(rec_id, {})
