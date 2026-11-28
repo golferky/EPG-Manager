@@ -30,7 +30,7 @@ def _build_version():
 
 # Shown in the dashboard header.  Bump it with every change: "v" + the date + a letter
 # (a, b, c ...) for the change that day; the letter starts again at "a" on a new day.
-VERSION = "v20261128b"
+VERSION = "v20261128c"
 
 app = Flask(__name__)
 
@@ -1015,6 +1015,11 @@ def _note_wrong_programme(row, message):
     now = time.time()
     conn = _stream_block_conn()
     try:
+        if row.get('rec_id') and conn.execute('SELECT 1 FROM stream_wrong_events WHERE rec_id=? AND provider=? AND stream_id=?',
+                                              (row['rec_id'], provider, stream_id)).fetchone():
+            strikes = conn.execute('SELECT COUNT(*) FROM stream_wrong_events WHERE provider=? AND stream_id=? AND ts>?',
+                                   (provider, stream_id, now - STREAM_BLOCK_WINDOW_DAYS * 86400)).fetchone()[0]
+            return {'strikes': strikes, 'blocked': _stream_auto_blocked(provider, stream_id), 'action': None}
         conn.execute('INSERT INTO stream_wrong_events (provider, stream_id, channel_id, channel, scheduled, seen, ts, rec_id) '
                      'VALUES (?,?,?,?,?,?,?,?)', (provider, stream_id, row.get('channel_id') or '', row.get('channel') or '',
                                                   scheduled[:200], seen[:200], now, row.get('rec_id') or ''))
@@ -11786,6 +11791,9 @@ def _clean_stream_info(value):
             clean[key] = text
     return clean
 
+_repeat_terminal_logged = set()      # (rec_id, status) already logged as a repeated terminal report
+
+
 @app.route('/epg-web/api/agent/jobs/<rec_id>/heartbeat', methods=['POST'])
 def api_agent_heartbeat(rec_id):
     if not _agent_authorized():
@@ -11816,6 +11824,9 @@ def api_agent_heartbeat(rec_id):
     file_path = str(data.get('file', row['file'] or ''))
     failure_reason = str(data.get('message', ''))[:1000]
     quality_decision = str(data.get('quality_decision', ''))[:1000]
+    # The same terminal report arriving again (a recorder that resends it) must not run the side effects twice:
+    # a repeated "wrong programme" would count as a new strike and a repeated failure would re-run the retry search.
+    repeat_report = bool(terminal and row['status'] == status)
     conn.execute('''UPDATE recordings SET status=?, agent_id=?, lease_until=?,
                     heartbeat_at=?, updated_at=?, file=?, failure_reason=?,
                     quality_decision=?, result_json=? WHERE rec_id=?''',
@@ -11826,12 +11837,21 @@ def api_agent_heartbeat(rec_id):
     conn.close()
     # Auto-retry: if a recording ended early due to stream drop, queue the best future airing
     reason_text = failure_reason.lower()
-    if terminal and status == 'failed' and 'wrong programme' in reason_text:
+    if repeat_report and status == 'failed':
+        key = (rec_id, status)
+        if key not in _repeat_terminal_logged:
+            _repeat_terminal_logged.add(key)
+            print(f'[heartbeat] {row["title"]!r} ({rec_id}) was reported {status} again; the retry search and stream '
+                  f'strikes are not repeated for it')
+        terminal_effects = False
+    else:
+        terminal_effects = True
+    if terminal_effects and terminal and status == 'failed' and 'wrong programme' in reason_text:
         try:                      # count it against the stream first, so the retry below skips a stream that is now blocked
             _note_wrong_programme(dict(row), failure_reason)
         except Exception as _e:
             print(f'[stream-block] could not note the wrong programme: {_e}')
-    if terminal and status == 'failed' and ('ended early' in reason_text or 'wrong programme' in reason_text):
+    if terminal_effects and terminal and status == 'failed' and ('ended early' in reason_text or 'wrong programme' in reason_text):
         try:
             expected = (row['stop_ts'] - row['start_ts']) if row['stop_ts'] and row['start_ts'] else 0
             candidate, detail = _best_incomplete_rerecord(row['title'], expected)

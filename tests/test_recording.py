@@ -6699,8 +6699,9 @@ class AutomaticStreamBlockTests(unittest.TestCase):
     def _note(self, n=1):
         out = None
         with mock.patch.object(server, "_clear_blocked_stream_bookings", return_value={"moved": 1, "dropped": []}):
-            for _ in range(n):
-                out = server._note_wrong_programme(self.row, self.MSG)
+            for i in range(n):          # each catch is a different recording
+                self._count = getattr(self, "_count", 0) + 1
+                out = server._note_wrong_programme(dict(self.row, rec_id="r%d" % self._count), self.MSG)
         return out
 
     def test_one_catch_only_watches(self):
@@ -6987,3 +6988,68 @@ class RemoveWantedSeriesCancelsQueuedTests(unittest.TestCase):
         self.assertIn("removeWanted(${r.id}, ${isSeries ? 1 : 0})", page)
         self.assertIn("preview:true", page)
         self.assertIn("cancel_queued: cancelQueued", page)
+
+
+class RepeatedFailureReportTests(unittest.TestCase):
+    """A failure the recorder reports again must not rerun the retry search or add a stream strike."""
+
+    MSG = 'Wrong programme on stream: provider shows "Top Gun" but "Behind Enemy Lines" was scheduled'
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp()
+        self.db = os.path.join(self.temp, "guide.db")
+        server.ensure_guide_db(self.db)
+        self.cfg = {"guide_db_path": self.db, "recording_backend": "agent", "recording_agent_token": "tok"}
+        self.p1 = mock.patch.object(server, "_guide_db_path", return_value=self.db)
+        self.p2 = mock.patch.object(server, "load_config", side_effect=lambda: dict(self.cfg))
+        self.p1.start(); self.p2.start()
+        server._init_recordings_table()
+        server._invalidate_stream_block_cache()
+        server._repeat_terminal_logged.clear()
+        now = time.time()
+        server._db_upsert_rec("rj1", {"title": "Behind Enemy Lines", "channel": "Showtime Pacific", "channel_id": "c9",
+                                      "stream_id": "777", "stream_provider": "eaglecast", "start_ts": now - 600,
+                                      "stop_ts": now + 3000, "status": "recording", "backend": "agent", "file": ""})
+
+    def tearDown(self):
+        self.p1.stop(); self.p2.stop()
+        server._invalidate_stream_block_cache()
+        import shutil
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _fail(self, message=None):
+        return server.app.test_client().post(
+            "/epg-web/api/agent/jobs/rj1/heartbeat", headers={"Authorization": "Bearer tok"},
+            json={"agent_id": "a", "status": "failed", "message": message or self.MSG})
+
+    def _events(self):
+        conn = sqlite3.connect(self.db)
+        n = conn.execute("SELECT COUNT(*) FROM stream_wrong_events").fetchone()[0]
+        conn.close()
+        return n
+
+    def test_a_repeated_report_adds_no_strike_and_does_not_search_again(self):
+        with mock.patch.object(server, "_best_incomplete_rerecord", return_value=(None, {})) as search, \
+             mock.patch.object(server, "_watch_abandoned_transfer") as watch, \
+             mock.patch.object(server, "_clear_blocked_stream_bookings", return_value={}):
+            for _ in range(5):
+                self.assertEqual(self._fail().status_code, 200)
+        self.assertEqual(self._events(), 1)             # one catch, not five
+        self.assertFalse(server._stream_auto_blocked("eaglecast", "777"))
+        self.assertEqual(search.call_count, 1)
+        self.assertEqual(watch.call_count, 1)
+
+    def test_ended_early_repeats_search_once(self):
+        with mock.patch.object(server, "_best_incomplete_rerecord", return_value=(None, {})) as search, \
+             mock.patch.object(server, "_watch_abandoned_transfer"):
+            for _ in range(4):
+                self._fail("4 min captured / 35 min scheduled: the stream ended early")
+        self.assertEqual(search.call_count, 1)
+
+    def test_the_same_recording_never_counts_twice_even_if_noted_again(self):
+        row = {"stream_provider": "eaglecast", "stream_id": "777", "channel_id": "c9", "channel": "X",
+               "title": "Behind Enemy Lines", "rec_id": "rj1"}
+        with mock.patch.object(server, "_clear_blocked_stream_bookings", return_value={}):
+            first = server._note_wrong_programme(row, self.MSG)
+            second = server._note_wrong_programme(row, self.MSG)
+        self.assertEqual((first["strikes"], second["strikes"]), (1, 1))
