@@ -6699,8 +6699,9 @@ class AutomaticStreamBlockTests(unittest.TestCase):
     def _note(self, n=1):
         out = None
         with mock.patch.object(server, "_clear_blocked_stream_bookings", return_value={"moved": 1, "dropped": []}):
-            for _ in range(n):
-                out = server._note_wrong_programme(self.row, self.MSG)
+            for i in range(n):          # each catch is a different recording
+                self._count = getattr(self, "_count", 0) + 1
+                out = server._note_wrong_programme(dict(self.row, rec_id="r%d" % self._count), self.MSG)
         return out
 
     def test_one_catch_only_watches(self):
